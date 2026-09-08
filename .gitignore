@@ -1,0 +1,71 @@
+# 密钥文件
+.env
+*.env
+*.key
+!.env.example
+deploy/.env.staging.local
+deploy/docker-compose.local.yml
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+backend/data/*.db
+backend/data/*.db-*
+backend/data/tax_exports/
+backend/data/backups/
+backend/data/migration_reports/
+!backend/data/chart_of_accounts.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# uni-app
+unpackage/
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+# Local tooling and runtime output
+.codegraph/
+logs/
+\.cache/
+*~[0-9]*
+
+# ── 开源前隐私/版权隔离 ──
+# 运行日志
+backend/data/*.log
+# 真实业务数据与版权材料（勿入库）
+微信支付账单.csv
+原始税务表格/
+测试发票.jpg
+*.pdf
+1777620180673.txt
+# 小程序端（含真实 appid / uniCloud 环境）
+solobooks/
+# 私有运维脚本（含服务器 IP / 凭据）
+deploy/deploy.sh
+deploy/update-dev.ps1
+deploy/backup-postgres.sh
+deploy/restore-drill.sh
+deploy/.env.staging
+# 设计与内部文档
+design-audit/
+设计原型/
+.claude/
+.impeccable/
+findings.md
+progress.md
+task_plan.md
+DESIGN.md
+DESIGN_SYSTEM.md
+PRODUCT.md
+design-qa.md
+opc_llm记账工具_prd_v_2.md
+页面原型设计.md
+每个页面的组件清单.md
+月度结账体验升级设计方案.md

@@ -1,0 +1,2 @@
+"""Core accounting domain primitives."""
+

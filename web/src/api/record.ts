@@ -1,0 +1,48 @@
+import apiClient from './client'
+import type {
+  RecordTextRequest,
+  RecordTextResponse,
+  RecordReceiptResponse,
+  RecordBatchResponse,
+  ConfirmRequest,
+  ConfirmResponse,
+  Entry,
+  EntryUpdateRequest,
+} from './types'
+
+export function recordText(data: RecordTextRequest): Promise<RecordTextResponse> {
+  return apiClient.post('/api/record/text', data)
+}
+
+export function recordReceipt(file: File): Promise<RecordReceiptResponse> {
+  const formData = new FormData()
+  formData.append('image', file)
+  return apiClient.post('/api/record/receipt', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 60000,
+  })
+}
+
+export function recordBatch(text: string): Promise<RecordBatchResponse> {
+  return apiClient.post('/api/record/batch', { text })
+}
+
+export function recordConfirm(data: ConfirmRequest): Promise<ConfirmResponse> {
+  return apiClient.post('/api/record/confirm', data, { headers: idempotencyHeaders() })
+}
+
+export function getEntries(): Promise<{ entries: Entry[] }> {
+  return apiClient.get('/api/record/entries')
+}
+
+export function updateEntry(entryId: string, data: EntryUpdateRequest): Promise<{ entry: Entry }> {
+  return apiClient.patch(`/api/record/entries/${entryId}`, data, { headers: idempotencyHeaders() })
+}
+
+export function deleteEntry(entryId: string): Promise<{ ok: boolean }> {
+  return apiClient.delete(`/api/record/entries/${entryId}`, { headers: idempotencyHeaders() })
+}
+
+function idempotencyHeaders(): Record<string, string> {
+  return { 'Idempotency-Key': crypto.randomUUID() }
+}

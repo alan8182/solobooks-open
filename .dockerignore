@@ -1,0 +1,17 @@
+.git
+.codex
+.claude
+.codegraph
+.impeccable
+**/__pycache__
+**/.pytest_cache
+**/*.pyc
+backend/data/*.db
+backend/data/*.log
+web/node_modules
+web/dist
+solobooks/node_modules
+solobooks/unpackage
+logs
+原始税务表格
+设计原型

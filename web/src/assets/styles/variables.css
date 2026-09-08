@@ -1,0 +1,57 @@
+:root {
+  /* Quiet Operations: one stable brand blue */
+  --solo-primary: #165dff;
+  --solo-primary-light: #3d78ff;
+  --solo-primary-dark: #0f46cc;
+  --solo-primary-glow: rgba(22, 93, 255, 0.08);
+  --solo-ai: #165dff;
+  --solo-ai-glow: rgba(22, 93, 255, 0.08);
+
+  /* Backgrounds */
+  --solo-bg-page: #f6f7f9;
+  --solo-bg-card: #ffffff;
+  --solo-bg-sidebar: #ffffff;
+  --solo-bg-nav: rgba(255, 255, 255, 0.94);
+  --solo-bg-soft: #f1f4f8;
+  --solo-bg-blue-soft: #edf3ff;
+
+  /* Text colors */
+  --solo-text-primary: #182230;
+  --solo-text-secondary: #586474;
+  --solo-text-muted: #8a95a3;
+  --solo-text-sidebar: #667281;
+  --solo-text-sidebar-hover: #182230;
+  --solo-text-sidebar-active: #165dff;
+
+  /* Borders & Dividers */
+  --solo-border: #dde3ea;
+  --solo-border-light: #edf0f4;
+  --solo-border-glass: #e5e9ef;
+  --solo-border-sidebar: #e8ecf1;
+
+  /* Status colors */
+  --solo-income: #12805c;
+  --solo-income-bg: #eaf7f1;
+  --solo-expense: #c74444;
+  --solo-expense-bg: #fbeeee;
+  --solo-warning: #b46b17;
+  --solo-warning-bg: #fff5e8;
+  --solo-info: #165dff;
+  --solo-info-bg: #edf3ff;
+
+  /* Shadows */
+  --solo-shadow-sm: 0 1px 2px rgba(24, 34, 48, 0.04);
+  --solo-shadow: 0 8px 24px rgba(24, 34, 48, 0.06);
+  --solo-shadow-lg: 0 16px 40px rgba(24, 34, 48, 0.09);
+
+  /* Border Radius */
+  --solo-radius-sm: 6px;
+  --solo-radius: 10px;
+  --solo-radius-lg: 14px;
+  --solo-radius-xl: 18px;
+
+  /* Layout dimensions */
+  --sidebar-width: 224px;
+  --sidebar-collapsed-width: 72px;
+  --navbar-height: 68px;
+}

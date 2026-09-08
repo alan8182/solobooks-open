@@ -1,0 +1,32 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass
+class AccountingError(Exception):
+    code: str
+    message: str
+    status_code: int = 422
+    context: dict[str, Any] | None = None
+
+    def __str__(self) -> str:
+        return self.message
+
+    def detail(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"code": self.code, "message": self.message}
+        if self.context:
+            payload["context"] = self.context
+        return payload
+
+
+PERIOD_CLOSED = "PERIOD_CLOSED"
+ENTRY_POSTED_IMMUTABLE = "ENTRY_POSTED_IMMUTABLE"
+UNBALANCED_ENTRY = "UNBALANCED_ENTRY"
+DUPLICATE_SOURCE = "DUPLICATE_SOURCE"
+REVIEW_REQUIRED = "REVIEW_REQUIRED"
+STEP_UP_REQUIRED = "STEP_UP_REQUIRED"
+FORBIDDEN = "FORBIDDEN"
+NOT_FOUND = "NOT_FOUND"
+

@@ -1,0 +1,123 @@
+/* Global layout and typography consistency rules */
+
+/* 1. All routing pages inside AppLayout main content have the exact same container layout */
+.content > * {
+  max-width: 1440px !important;
+  margin: 0 auto !important;
+  padding: 8px 0 56px !important;
+  width: 100% !important;
+  box-sizing: border-box !important;
+}
+
+/* 2. Unified Page Header Styles */
+.page-header,
+.report-header {
+  display: flex !important;
+  justify-content: space-between !important;
+  align-items: flex-end !important; /* Align baseline of title with right-side controls */
+  margin-bottom: 24px !important;
+  gap: 16px !important;
+  width: 100% !important;
+  box-sizing: border-box !important;
+}
+
+.page-header-left,
+.report-header-left,
+.header-left {
+  display: flex !important;
+  flex-direction: column !important;
+  gap: 8px !important;
+  min-width: 0 !important;
+}
+
+.page-header-right,
+.report-header-right,
+.header-right {
+  display: flex !important;
+  align-items: center !important;
+  gap: 12px !important;
+  flex-shrink: 0 !important;
+}
+
+/* 3. Unified Page Heading (Title) typography */
+.page-header h2,
+.report-header h2,
+.title-section h2,
+.header-row h2,
+.header-left h2,
+.report-title-section h2 {
+  margin: 0 !important;
+  font-size: 24px !important;
+  font-weight: 650 !important;
+  color: var(--solo-text-primary) !important;
+  letter-spacing: -0.5px !important;
+  line-height: 1.3 !important;
+}
+
+.n-button--primary-type:not(.n-button--secondary):not(.n-button--ghost):has(.n-button__border) {
+  --n-color: var(--solo-primary) !important;
+  --n-color-hover: var(--solo-primary-light) !important;
+  --n-color-pressed: var(--solo-primary-dark) !important;
+  --n-border: 1px solid var(--solo-primary) !important;
+  --n-border-hover: 1px solid var(--solo-primary-light) !important;
+}
+
+.n-button--primary-type.n-button--secondary {
+  --n-color: var(--solo-primary-glow) !important;
+  --n-color-hover: rgba(22, 93, 255, 0.14) !important;
+  --n-color-pressed: rgba(22, 93, 255, 0.22) !important;
+  --n-border: 1px solid transparent !important;
+  --n-border-hover: 1px solid transparent !important;
+  --n-text-color: var(--solo-primary) !important;
+  --n-text-color-hover: var(--solo-primary-light) !important;
+  --n-text-color-pressed: var(--solo-primary-dark) !important;
+}
+
+.n-button--primary-type.n-button--ghost {
+  --n-text-color: var(--solo-primary) !important;
+  --n-text-color-hover: var(--solo-primary-light) !important;
+  --n-text-color-pressed: var(--solo-primary-dark) !important;
+  --n-border: 1px solid var(--solo-primary) !important;
+  --n-border-hover: 1px solid var(--solo-primary-light) !important;
+}
+
+.n-button--primary-type:not(.n-button--secondary):not(.n-button--ghost):not(:has(.n-button__border)) {
+  --n-text-color: var(--solo-primary) !important;
+  --n-text-color-hover: var(--solo-primary-light) !important;
+  --n-text-color-pressed: var(--solo-primary-dark) !important;
+}
+
+.n-card {
+  border-radius: var(--solo-radius-lg);
+}
+
+/* 4. Unified Subtitle typography */
+.page-header .subtitle,
+.page-header .report-subtitle,
+.title-section .subtitle,
+.report-title-section .report-subtitle,
+.page-header .text-muted,
+.report-subtitle {
+  margin: 4px 0 0 0 !important;
+  font-size: 13px !important;
+  color: var(--solo-text-secondary) !important;
+  font-weight: normal !important;
+  line-height: 1.4 !important;
+}
+
+/* 5. Back Button */
+.back-btn,
+.report-back-btn {
+  font-weight: 500 !important;
+  color: var(--solo-text-secondary) !important;
+  transition: color 0.2s ease !important;
+  align-self: flex-start !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  gap: 4px !important;
+  font-size: 13px !important;
+}
+.back-btn:hover,
+.report-back-btn:hover {
+  color: var(--solo-primary) !important;
+}

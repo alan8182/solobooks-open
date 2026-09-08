@@ -1,0 +1,503 @@
+/* Stylesheet for Monthly Closing Wizard */
+
+/* 1. Dashboard Greeting Alert */
+.closing-wizard-alert {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 20px;
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.08) 0%, rgba(6, 182, 212, 0.05) 100%);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(99, 102, 241, 0.15);
+  border-radius: var(--solo-radius-lg);
+  box-shadow: var(--solo-shadow-sm);
+  gap: 16px;
+  transition: all 0.3s ease;
+}
+.closing-wizard-alert:hover {
+  border-color: rgba(99, 102, 241, 0.3);
+  box-shadow: var(--solo-shadow);
+}
+.alert-content {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
+}
+.alert-icon-wrapper {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  background: var(--solo-primary-glow);
+  color: var(--solo-primary);
+  flex-shrink: 0;
+}
+.sparkling-icon {
+  font-size: 20px;
+  animation: shine 2s ease-in-out infinite;
+}
+@keyframes shine {
+  0%, 100% { opacity: 0.8; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.1); }
+}
+.alert-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.alert-title {
+  font-weight: 700;
+  font-size: 14.5px;
+  color: var(--solo-text-primary);
+}
+.alert-desc {
+  font-size: 12.5px;
+  color: var(--solo-text-secondary);
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.wizard-go-btn {
+  font-weight: 600;
+  border-radius: var(--solo-radius);
+  flex-shrink: 0;
+}
+
+/* 2. Wizard Framework */
+.wizard-container {
+  max-width: 920px;
+  margin: 0 auto;
+}
+.steps-card {
+  background: var(--solo-bg-card);
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius-lg);
+  margin-bottom: 20px;
+}
+
+/* 3. Drag and Drop Zones */
+.uploader-zone {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 24px;
+  border: 2px dashed var(--solo-border);
+  border-radius: var(--solo-radius-lg);
+  background: rgba(255, 255, 255, 0.4);
+  color: inherit;
+  font: inherit;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.25s ease;
+}
+.uploader-zone:focus-visible {
+  outline: 2px solid var(--solo-primary);
+  outline-offset: 3px;
+}
+.uploader-zone:hover, .uploader-zone.active {
+  border-color: var(--solo-primary);
+  background: var(--solo-primary-glow);
+}
+.upload-icon {
+  font-size: 48px;
+  color: var(--solo-text-muted);
+  margin-bottom: 12px;
+  transition: transform 0.2s ease;
+}
+.uploader-zone:hover .upload-icon {
+  transform: translateY(-4px);
+  color: var(--solo-primary);
+}
+.upload-title {
+  font-weight: 700;
+  font-size: 15px;
+  color: var(--solo-text-primary);
+  margin-bottom: 4px;
+}
+.upload-subtitle {
+  font-size: 12.5px;
+  color: var(--solo-text-muted);
+}
+
+/* Split view zone for imports */
+.upload-split-layout {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+}
+
+/* 4. Split Canvas matching workstation */
+.canvas-layout {
+  display: grid;
+  grid-template-columns: 1fr 1.2fr 1fr;
+  gap: 16px;
+  margin-top: 12px;
+}
+.canvas-column {
+  background: rgba(255, 255, 255, 0.4);
+  border: 1px solid var(--solo-border-glass);
+  border-radius: var(--solo-radius-lg);
+  padding: 12px;
+  min-height: 480px;
+  max-height: 580px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.column-header {
+  font-weight: 800;
+  font-size: 13px;
+  color: var(--solo-text-secondary);
+  border-bottom: 1px solid var(--solo-border-light);
+  padding-bottom: 8px;
+  margin-bottom: 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.column-header > span:not(.column-header-hint) {
+  min-width: 0;
+}
+.column-header-hint {
+  margin-left: auto;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: color-mix(in oklch, var(--solo-primary) 9%, transparent);
+  color: var(--solo-primary);
+  font-size: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.canvas-card {
+  padding: 12px;
+  background: #ffffff;
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius);
+  box-shadow: var(--solo-shadow-sm);
+  cursor: pointer;
+  transition: border-color 180ms cubic-bezier(0.16, 1, 0.3, 1), background-color 180ms cubic-bezier(0.16, 1, 0.3, 1), box-shadow 180ms cubic-bezier(0.16, 1, 0.3, 1), transform 180ms cubic-bezier(0.16, 1, 0.3, 1);
+  user-select: none;
+  position: relative;
+}
+.canvas-card:focus-visible {
+  outline: 2px solid var(--solo-primary);
+  outline-offset: 2px;
+}
+.canvas-card:hover {
+  border-color: var(--solo-primary-light);
+  transform: translateY(-1px);
+  box-shadow: var(--solo-shadow);
+}
+.canvas-card.selected {
+  border-color: var(--solo-primary);
+  background: var(--solo-primary-glow);
+  box-shadow: 0 0 0 2px var(--solo-primary-light);
+}
+.card-header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 8px;
+}
+.card-selection-indicator {
+  width: 18px;
+  height: 18px;
+  border: 1px solid var(--solo-border);
+  border-radius: 5px;
+  background: var(--solo-bg-card);
+  color: var(--solo-bg-card);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 18px;
+  font-size: 12px;
+  transition: background-color 160ms cubic-bezier(0.16, 1, 0.3, 1), border-color 160ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.card-selection-indicator.radio {
+  border-radius: 999px;
+}
+.card-selection-indicator.active {
+  border-color: var(--solo-primary);
+  background: var(--solo-primary);
+  color: var(--solo-bg-card);
+}
+.card-title-text {
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--solo-text-primary);
+  word-break: break-all;
+}
+
+.match-composer {
+  padding: 12px;
+  border: 1px solid color-mix(in oklch, var(--solo-primary) 32%, var(--solo-border));
+  border-radius: var(--solo-radius);
+  background: color-mix(in oklch, var(--solo-primary) 5%, var(--solo-bg-card));
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.match-composer-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+.match-composer-title {
+  color: var(--solo-text-primary);
+  font-size: 13px;
+  font-weight: 800;
+}
+.match-composer-subtitle {
+  margin-top: 2px;
+  color: var(--solo-text-muted);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+.match-composer-math {
+  padding: 8px 10px;
+  border: 1px solid var(--solo-border-light);
+  border-radius: var(--solo-radius-sm);
+  background: var(--solo-bg-card);
+}
+.match-math-row {
+  min-height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--solo-text-secondary);
+  font-size: 11px;
+}
+.match-math-row strong {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.match-difference {
+  margin-top: 4px;
+  padding-top: 6px;
+  border-top: 1px solid var(--solo-border-light);
+  font-weight: 700;
+}
+.match-difference.exact {
+  color: var(--solo-income);
+}
+.match-difference.mismatch {
+  color: var(--solo-expense);
+}
+.match-awaiting {
+  color: var(--solo-text-muted);
+}
+.match-composer-hint {
+  display: flex;
+  align-items: flex-start;
+  gap: 5px;
+  color: var(--solo-text-muted);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+.match-composer-hint.ready {
+  color: var(--solo-income);
+}
+.card-amount {
+  font-weight: 700;
+  font-size: 13.5px;
+  font-family: 'Outfit', 'Inter', sans-serif;
+  text-align: right;
+  white-space: nowrap;
+}
+.card-meta {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--solo-text-muted);
+  margin-top: 6px;
+}
+
+/* Middle Matched Pairs Column */
+.matched-pair-card {
+  padding: 12px;
+  background: linear-gradient(135deg, rgba(16, 185, 129, 0.03) 0%, rgba(99, 102, 241, 0.02) 100%);
+  border: 1.5px dashed rgba(16, 185, 129, 0.3);
+  border-radius: var(--solo-radius);
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: all 0.2s ease;
+}
+.matched-pair-card:hover {
+  border-color: var(--solo-income);
+  background: linear-gradient(135deg, rgba(16, 185, 129, 0.05) 0%, rgba(99, 102, 241, 0.04) 100%);
+}
+.pair-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.confidence-badge {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 99px;
+  font-weight: bold;
+}
+.confidence-badge.high {
+  background: var(--solo-income-bg);
+  color: var(--solo-income);
+}
+.confidence-badge.manual {
+  background: var(--solo-info-bg);
+  color: var(--solo-info);
+}
+.pair-content {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: #ffffff;
+  padding: 8px;
+  border-radius: var(--solo-radius-sm);
+  border: 1px solid var(--solo-border-light);
+}
+.pair-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11.5px;
+}
+.pair-content > .pair-item + .pair-item {
+  padding-top: 6px;
+  border-top: 1px solid var(--solo-border-light);
+}
+.pair-item-label {
+  color: var(--solo-text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.pair-item-label span {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pair-item-val {
+  font-weight: 600;
+  font-family: 'Outfit', sans-serif;
+  color: var(--solo-text-primary);
+  flex-shrink: 0;
+}
+.pair-divider {
+  border-top: 1px dashed var(--solo-border);
+  position: relative;
+  margin: 2px 0;
+}
+.pair-divider-icon {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: #ffffff;
+  padding: 0 4px;
+  color: var(--solo-text-muted);
+  font-size: 12px;
+}
+.pair-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .canvas-card,
+  .card-selection-indicator {
+    transition: none;
+  }
+  .canvas-card:hover {
+    transform: none;
+  }
+}
+
+/* 5. Closing Ceremony Ceremony overlay */
+.closing-ceremony-modal {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 40px 24px;
+  text-align: center;
+}
+.checkmark-wrapper {
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  background: var(--solo-income-bg);
+  color: var(--solo-income);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 40px;
+  margin-bottom: 24px;
+  box-shadow: 0 0 0 8px rgba(16, 185, 129, 0.08);
+  animation: popScale 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;
+}
+@keyframes popScale {
+  from { transform: scale(0.6); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+.ceremony-title {
+  font-size: 20px;
+  font-weight: 800;
+  color: var(--solo-text-primary);
+  margin-bottom: 8px;
+}
+.ceremony-desc {
+  font-size: 13.5px;
+  color: var(--solo-text-secondary);
+  line-height: 1.6;
+  margin-bottom: 24px;
+}
+
+/* 6. CFO Diagnostic Dashboard Step */
+.diagnosis-container {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.diagnosis-hero-card {
+  padding: 24px;
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.03) 0%, rgba(6, 182, 212, 0.02) 100%);
+  border: 1px solid var(--solo-border-glass);
+}
+.metrics-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 20px;
+  margin-top: 20px;
+}
+.metric-box {
+  background: #ffffff;
+  padding: 16px;
+  border-radius: var(--solo-radius);
+  border: 1px solid var(--solo-border);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.metric-box-label {
+  font-size: 12px;
+  color: var(--solo-text-muted);
+  font-weight: 500;
+}
+.metric-box-val {
+  font-size: 20px;
+  font-weight: 800;
+  font-family: 'Outfit', sans-serif;
+  color: var(--solo-text-primary);
+}

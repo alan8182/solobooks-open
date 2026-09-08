@@ -1,0 +1,171 @@
+/* Global styles for unified report/statistics pages */
+
+.report-container {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 16px 0 48px 0;
+}
+
+/* Report Header */
+.report-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  margin-bottom: 24px;
+  gap: 16px;
+}
+.report-header-left {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+.report-back-btn {
+  font-weight: 500;
+  color: var(--solo-text-secondary);
+  transition: color 0.2s ease;
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.report-back-btn:hover {
+  color: var(--solo-primary);
+}
+.report-title-section {
+  display: flex;
+  flex-direction: column;
+}
+.report-title-section h2 {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--solo-text-primary);
+  letter-spacing: -0.5px;
+  line-height: 1.3;
+}
+.report-subtitle {
+  margin: 4px 0 0 0;
+  font-size: 13px;
+  color: var(--solo-text-secondary);
+}
+.report-header-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+/* Card wrappers */
+.report-card {
+  background: var(--solo-bg-card);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--solo-border-glass);
+  border-radius: var(--solo-radius-lg);
+  box-shadow: var(--solo-shadow-sm);
+  margin-bottom: 16px;
+  transition: all 0.2s ease;
+  padding: 4px; /* Default inner Naive UI Padding handles content */
+}
+.report-card:hover {
+  border-color: var(--solo-primary-light);
+  box-shadow: var(--solo-shadow-md);
+}
+
+/* Summary Grid/Rows */
+.report-summary-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 32px;
+}
+.report-summary-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.report-summary-label {
+  font-size: 12px;
+  color: var(--solo-text-muted);
+  font-weight: 500;
+}
+.report-summary-val {
+  font-size: 18px;
+  font-weight: 800;
+  color: var(--solo-text-primary);
+  font-family: 'Outfit', 'Inter', sans-serif;
+}
+.report-summary-val.income {
+  color: var(--solo-income);
+}
+.report-summary-val.expense {
+  color: var(--solo-expense);
+}
+
+/* Tables */
+.report-table-wrapper {
+  overflow-x: auto;
+  border: 1px solid var(--solo-border-light);
+  border-radius: var(--solo-radius);
+  background: rgba(255, 255, 255, 0.2);
+}
+.report-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13.5px;
+}
+.report-table th,
+.report-table td {
+  padding: 10px 14px;
+  text-align: left;
+  border-bottom: 1px solid var(--solo-border-light);
+}
+.report-table th {
+  background: var(--solo-border-light);
+  font-weight: 700;
+  color: var(--solo-text-secondary);
+  font-size: 12px;
+  letter-spacing: 0.5px;
+  border-bottom: 2px solid var(--solo-border-light);
+}
+.report-table tr:last-child td {
+  border-bottom: none;
+}
+.report-table tr:hover td {
+  background: rgba(99, 102, 241, 0.015);
+}
+.report-table td.amount-cell {
+  text-align: right;
+  font-family: 'Outfit', 'Inter', monospace;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.report-table td.code-cell {
+  font-family: 'Inter', monospace;
+  font-size: 12.5px;
+  color: var(--solo-text-secondary);
+  width: 100px;
+}
+.report-table tr.total-row td {
+  font-weight: 700;
+  border-top: 2px solid var(--solo-border);
+  background: rgba(99, 102, 241, 0.02) !important;
+}
+
+/* Headings inside cards */
+.report-section-title {
+  margin: 0 0 12px 0;
+  font-size: 14.5px;
+  font-weight: 750;
+  color: var(--solo-text-primary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.report-empty-cell {
+  text-align: center;
+  color: var(--solo-text-muted);
+  padding: 32px;
+  font-style: italic;
+}

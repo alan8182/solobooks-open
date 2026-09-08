@@ -1,0 +1,85 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-solobooks}
+      POSTGRES_USER: ${POSTGRES_USER:-solobooks_owner}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER:-solobooks_app}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?POSTGRES_APP_PASSWORD is required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - postgres_wal_archive:/var/lib/postgresql/wal_archive
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    command: >
+      postgres
+      -c wal_level=replica
+      -c archive_mode=on
+      -c archive_command='test ! -f /var/lib/postgresql/wal_archive/%f && cp %p /var/lib/postgresql/wal_archive/%f'
+      -c archive_timeout=300
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-solobooks_owner} -d ${POSTGRES_DB:-solobooks}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    networks:
+      - solobooks_net
+
+  backend:
+    build:
+      context: ../
+      dockerfile: deploy/backend.Dockerfile
+    command: >
+      sh -c "cd /app && DATABASE_URL=$$MIGRATION_DATABASE_URL alembic upgrade head && exec uvicorn main:app --host 0.0.0.0 --port 80"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=80
+      - CORS_ORIGINS=http://localhost:8080,http://your-domain:8080
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_APP_USER:-solobooks_app}:${POSTGRES_APP_PASSWORD}@postgres:5432/${POSTGRES_DB:-solobooks}
+      - MIGRATION_DATABASE_URL=postgresql+psycopg://${POSTGRES_USER:-solobooks_owner}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-solobooks}
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:?DASHSCOPE_API_KEY is required}
+      - ZHIPU_API_KEY=${ZHIPU_API_KEY:-}
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET is required}
+      - WECHAT_APPID=${WECHAT_APPID:-}
+      - WECHAT_SECRET=${WECHAT_SECRET:-}
+      - ALIYUN_ACCESS_KEY_ID=${ALIYUN_ACCESS_KEY_ID:-}
+      - ALIYUN_ACCESS_KEY_SECRET=${ALIYUN_ACCESS_KEY_SECRET:-}
+      - ALIYUN_SMS_SIGN_NAME=${ALIYUN_SMS_SIGN_NAME:-}
+      - ALIYUN_SMS_TEMPLATE_CODE=${ALIYUN_SMS_TEMPLATE_CODE:-}
+      - ACCOUNTING_TIMEZONE=Asia/Shanghai
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - solobooks_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  frontend:
+    build:
+      context: ../
+      dockerfile: deploy/nginx/Dockerfile
+      args:
+        VITE_API_BASE: ""
+    ports:
+      - "${EXTERNAL_PORT:-8080}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - solobooks_net
+
+volumes:
+  postgres_data:
+  postgres_wal_archive:
+
+networks:
+  solobooks_net:
+    driver: bridge
