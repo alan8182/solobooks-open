@@ -1,9 +1,8 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue'
 import { NCard, NTag, NInput, NSelect, NInputNumber, NButton, NDivider, NAlert } from 'naive-ui'
-import { amountSignForDirection } from '@/utils/accounting'
+import { moneyPresentation } from '@/utils/accounting'
 import { getEntryNaturePresentation } from '@/utils/entryNature'
-import { formatMoney } from '@/utils/format'
 import type { RecordTextResponse } from '@/api/types'
 import type { RdExpenseType, RdExpenseTypeOption, RdProject } from '@/api/types'
 import { getRdExpenseTypes, getRdProjects } from '@/api/rd'
@@ -57,6 +56,13 @@ const payerOptions = [
 const directionLabel = computed(() => {
   const presentation = getEntryNaturePresentation(editDirection.value, editCategory.value)
   return { ...presentation, label: presentation.detailLabel }
+})
+
+// 金额展示：冲退类负金额按资金实际流向显示（+¥x 绿 / -¥x 红），色调跟随展示口径
+const moneyDisplay = computed(() => {
+  const presentation = moneyPresentation(editDirection.value, editCategory.value, editAmount.value)
+  const toneDir = presentation.tone === 'neutral' ? editDirection.value : presentation.tone
+  return { text: presentation.text, color: getEntryNaturePresentation(toneDir, editCategory.value).color }
 })
 
 const confidencePercent = computed(() => Math.round(props.result.confidence * 100))
@@ -120,8 +126,8 @@ function handleConfirm() {
       <template v-if="!editing">
         <div class="result-row main-amount">
           <span class="label">金额</span>
-          <span class="amount" :style="{ color: directionLabel.color }">
-            {{ amountSignForDirection(editDirection, editCategory, editAmount) }}{{ formatMoney(editAmount) }}
+          <span class="amount" :style="{ color: moneyDisplay.color }">
+            {{ moneyDisplay.text }}
           </span>
         </div>
         <div class="result-row">

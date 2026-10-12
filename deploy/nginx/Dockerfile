@@ -6,6 +6,8 @@ WORKDIR /app
 ARG VITE_API_BASE=
 ENV VITE_API_BASE=$VITE_API_BASE
 
+ARG NPM_REGISTRY=https://registry.npmjs.org
+RUN npm config set registry $NPM_REGISTRY
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
 

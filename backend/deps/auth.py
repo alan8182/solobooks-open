@@ -2,11 +2,18 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 from dataclasses import dataclass
+from typing import Optional
 
 from fastapi import Header, HTTPException
 
 from services.token_service import decode_access_token
+
+logger = logging.getLogger(__name__)
+
+_column_check_warned = False
 
 
 @dataclass
@@ -45,21 +52,30 @@ def _normalize_token(raw: str) -> str:
     return token
 
 
-from typing import Optional
+def _dev_fallback_enabled() -> bool:
+    """开发兜底开关（读取自 .env / 环境变量，改后需重启进程）。
 
-def require_auth(authorization: Optional[str] = Header(default=None)) -> AuthContext:
-    """Validate bearer token and return auth context."""
+    兜底行为：test-token 前缀与非 JWT 垃圾 token 一律按测试身份放行，
+    仅供本地联调；生产部署（deploy/docker-compose.yml）必须显式
+    AUTH_DEV_FALLBACK=0 关闭，否则管理员接口形同虚设。
+    """
+    return os.getenv("AUTH_DEV_FALLBACK", "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _parse_identity(authorization: Optional[str]) -> AuthContext:
+    """从 Authorization 头解析登录身份（JWT 或开发兜底），失败抛 401。"""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="未登录或缺少 Authorization")
 
     token = _normalize_token(authorization.split(" ", 1)[1])
 
     # 开发联调兼容：测试账号 token（前端 mock 登录）不走 JWT 解码。
-    if token.startswith("test-token") or "test-token" in authorization:
-        return AuthContext(user_id="test_user_001", company_id="c1")
-    # 开发兜底：非 JWT（三段式）token 统一按测试身份处理，避免联调被历史脏 token 阻塞。
-    if token.count(".") != 2:
-        return AuthContext(user_id="test_user_001", company_id="c1")
+    if _dev_fallback_enabled():
+        if token.startswith("test-token") or "test-token" in authorization:
+            return AuthContext(user_id="test_user_001", company_id="c1")
+        # 开发兜底：非 JWT（三段式）token 统一按测试身份处理，避免联调被历史脏 token 阻塞。
+        if token.count(".") != 2:
+            return AuthContext(user_id="test_user_001", company_id="c1")
     try:
         payload = decode_access_token(token)
     except ValueError as exc:
@@ -70,3 +86,65 @@ def require_auth(authorization: Optional[str] = Header(default=None)) -> AuthCon
     if not user_id or not company_id:
         raise HTTPException(status_code=401, detail="token 缺少用户上下文")
     return AuthContext(user_id=user_id, company_id=company_id)
+
+
+async def _load_user_flags(user_id: str) -> Optional[tuple[bool, bool]]:
+    """查询用户的 (is_platform_admin, is_disabled)。
+
+    - 用户不存在时返回 None：JWT 只由登录签发、兜底身份可能无库记录，
+      此处 fail-open，禁用拦截只对真实存在的用户行生效。
+    - 查询本身失败（如迁移 a7c3e9f1b2d4 未执行、auth_users 缺新列）时
+      降级为 None 并只告警一次：业务请求不因缺列整体 500，管理员接口
+      仍按「非管理员」默认拒绝，安全面不受影响。
+    """
+    global _column_check_warned
+    from sqlalchemy import select
+
+    from db.models import AuthUser
+    from db.session import session_scope
+
+    try:
+        async with session_scope() as session:
+            row = (
+                await session.execute(
+                    select(AuthUser.is_platform_admin, AuthUser.is_disabled).where(
+                        AuthUser.user_id == user_id
+                    )
+                )
+            ).first()
+    except Exception as exc:  # noqa: BLE001
+        if not _column_check_warned:
+            _column_check_warned = True
+            logger.warning(
+                "auth_users 标记列查询失败，禁用/管理员校验降级为放行（迁移 a7c3e9f1b2d4 未执行？）: %s",
+                exc,
+            )
+        return None
+    return (row[0], row[1]) if row else None
+
+
+async def require_auth(authorization: Optional[str] = Header(default=None)) -> AuthContext:
+    """Validate bearer token and return auth context.
+
+    每次请求顺路查库校验 is_disabled，禁用即时生效（返回 401）。
+    """
+    ctx = _parse_identity(authorization)
+    flags = await _load_user_flags(ctx.user_id)
+    if flags and flags[1]:
+        raise HTTPException(status_code=401, detail="账号已被禁用，请联系管理员")
+    return ctx
+
+
+async def require_admin(authorization: Optional[str] = Header(default=None)) -> AuthContext:
+    """平台管理员依赖：在 require_auth 之上校验 is_platform_admin。
+
+    管理员身份不进 JWT claim，每次请求查库校验——撤销管理员权限即时生效。
+    """
+    ctx = _parse_identity(authorization)
+    flags = await _load_user_flags(ctx.user_id)
+    # 禁用优先于管理员校验：被禁账号无论访问什么都返回 401
+    if flags and flags[1]:
+        raise HTTPException(status_code=401, detail="账号已被禁用，请联系管理员")
+    if not flags or not flags[0]:
+        raise HTTPException(status_code=403, detail="需要平台管理员权限")
+    return ctx

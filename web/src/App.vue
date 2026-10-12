@@ -4,10 +4,10 @@ import type { GlobalThemeOverrides } from 'naive-ui'
 
 const themeOverrides: GlobalThemeOverrides = {
   common: {
-    primaryColor: '#165DFF',
-    primaryColorHover: '#3D78FF',
-    primaryColorPressed: '#0F46CC',
-    primaryColorSuppl: '#165DFF',
+    primaryColor: '#1747B0',
+    primaryColorHover: '#2B66E2',
+    primaryColorPressed: '#0D3282',
+    primaryColorSuppl: '#1747B0',
     borderRadius: '8px',
     bodyColor: '#F6F7F9',
     cardColor: '#FFFFFF',

@@ -1,4 +1,4 @@
-import apiClient from './client'
+import apiClient, { makeIdempotencyKey } from './client'
 import type {
   RecordTextRequest,
   RecordTextResponse,
@@ -23,6 +23,15 @@ export function recordReceipt(file: File): Promise<RecordReceiptResponse> {
   })
 }
 
+export async function recordSpeech(file: Blob): Promise<{ text: string }> {
+  const formData = new FormData()
+  formData.append('audio', file, 'speech.webm')
+  return (await apiClient.post('/api/record/speech', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 60000,
+  })) as unknown as { text: string }
+}
+
 export function recordBatch(text: string): Promise<RecordBatchResponse> {
   return apiClient.post('/api/record/batch', { text })
 }
@@ -44,5 +53,5 @@ export function deleteEntry(entryId: string): Promise<{ ok: boolean }> {
 }
 
 function idempotencyHeaders(): Record<string, string> {
-  return { 'Idempotency-Key': crypto.randomUUID() }
+  return { 'Idempotency-Key': makeIdempotencyKey() }
 }

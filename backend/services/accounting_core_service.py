@@ -142,6 +142,48 @@ def period_start_for(value: Any) -> date:
     return occurred_on.replace(day=1)
 
 
+MONEY_ACCOUNT_CODES = ("1002", "1012")
+
+
+async def _entry_money_link_amount(session: AsyncSession, company_id: str, entry_id: str) -> Decimal:
+    """核销关联金额：优先 1002 银行存款净额，为 0 时回落 1012 其他货币资金（微信待结算）净额。
+
+    微信商户资金先归集到 1012，提现结算才进 1002，与匹配层
+    _entry_group_reconciliation_effect 的口径保持一致。
+    """
+    for code in MONEY_ACCOUNT_CODES:
+        amount = (
+            await session.execute(
+                select(func.coalesce(func.sum(JournalLine.amount), 0)).where(
+                    JournalLine.journal_entry_id == entry_id,
+                    JournalLine.company_id == company_id,
+                    JournalLine.account_code == code,
+                )
+            )
+        ).scalar_one()
+        link_amount = abs(money(amount))
+        if link_amount != ZERO:
+            return link_amount
+    return ZERO
+
+
+async def assert_bank_reconciliable(session: AsyncSession, *, company_id: str, entry_ids: list[str]) -> None:
+    """在提交匹配状态前预检 sync_bank_reconciliation 的资金科目规则。
+
+    匹配状态（bank_statement_matches）与核销关联分属两个事务，
+    若等 sync_bank_reconciliation 才校验，失败会把流水卡在已匹配。
+    """
+    for entry_id in entry_ids:
+        entry = await session.get(JournalEntry, entry_id)
+        if entry is None or entry.company_id != company_id:
+            raise AccountingError(NOT_FOUND, "银行核销对应的权威凭证不存在", 404)
+        if await _entry_money_link_amount(session, company_id, entry_id) == ZERO:
+            raise AccountingError(
+                "BANK_EFFECT_REQUIRED",
+                "所选账目的凭证未包含银行存款或其他货币资金科目影响，请先补正凭证再对账",
+            )
+
+
 async def sync_bank_reconciliation(
     session: AsyncSession,
     *,
@@ -214,7 +256,9 @@ async def sync_bank_reconciliation(
         ).scalar_one()
         link_amount = abs(money(bank_amount))
         if link_amount == ZERO:
-            raise AccountingError("BANK_EFFECT_REQUIRED", "核销凭证必须包含银行存款科目影响")
+            link_amount = await _entry_money_link_amount(session, company_id, entry_id)
+        if link_amount == ZERO:
+            raise AccountingError("BANK_EFFECT_REQUIRED", "核销凭证必须包含银行存款或其他货币资金科目影响")
         current = existing_by_entry.get(entry_id)
         if current is None:
             session.add(
@@ -652,6 +696,14 @@ async def _post_existing(
     period = await get_or_create_period(session, entry.company_id, entry.period_start, lock=True)
     assert_period_writable(period)
     await _validate_postable(session, entry)
+    if entry.entry_type == "standard":
+        source = await session.get(SourceTransaction, entry.source_transaction_id) if entry.source_transaction_id else None
+        if source is None or source.company_id != entry.company_id or source.status == "void":
+            raise AccountingError("SOURCE_REQUIRED", "缺少有效原始业务来源，不能过账", 409)
+    from services.closing_validation_service import possible_duplicate_wechat_income
+    duplicate_candidates = await possible_duplicate_wechat_income(session, entry)
+    if duplicate_candidates:
+        raise AccountingError("POSSIBLE_DUPLICATE_WECHAT_INCOME", "银行到账可能重复记为微信收入，请先核对原收入和结算关系", 409, {"candidateEntryIds": duplicate_candidates})
     before = await serialize_journal(session, entry)
     entry.voucher_no = entry.voucher_no or await _allocate_voucher_no(session, entry.company_id, entry.period_start)
     entry.status = "posted"
@@ -663,7 +715,7 @@ async def _post_existing(
     entry.updated_at = _utcnow()
     if entry.source_transaction_id:
         source = await session.get(SourceTransaction, entry.source_transaction_id)
-        if source:
+        if source and source.status != "reconciled":
             source.status = "confirmed"
     await session.flush()
     after = await serialize_journal(session, entry)
@@ -803,6 +855,29 @@ async def get_journal(
     return entry
 
 
+def _mask_phone(phone: str) -> str:
+    digits = str(phone or "").strip()
+    if len(digits) == 11 and digits.isdigit():
+        return f"{digits[:3]}****{digits[-4:]}"
+    return digits
+
+
+async def _user_display_names(session: AsyncSession, user_ids: Iterable[str]) -> dict[str, str]:
+    """凭证署名显示名：昵称优先，其次掩码手机号，最后回落 user_id。"""
+    ids = {str(uid) for uid in user_ids if uid}
+    if not ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(AuthUser.user_id, AuthUser.nickname, AuthUser.phone).where(AuthUser.user_id.in_(ids))
+        )
+    ).all()
+    labels: dict[str, str] = {}
+    for uid, nickname, phone in rows:
+        labels[str(uid)] = str(nickname or "").strip() or _mask_phone(phone) or str(uid)
+    return labels
+
+
 async def serialize_journal(
     session: AsyncSession,
     entry: JournalEntry,
@@ -817,6 +892,23 @@ async def serialize_journal(
             for key in ("billingStatus", "reconciliationType", "paymentDate", "bankStatementId"):
                 if key in (source.raw_payload or {}):
                     payload[key] = source.raw_payload[key]
+    # 对账状态由银行确认/解绑路径直接维护在 legacy 投影 payload 上
+    # （json_set/json_remove），权威层 metadata 感知不到，这里以投影为准回填。
+    projection = await session.get(LegacyEntryProjection, entry.id)
+    if projection is not None:
+        try:
+            legacy_payload = json.loads(projection.payload) if isinstance(projection.payload, str) else (projection.payload or {})
+        except (json.JSONDecodeError, TypeError):
+            legacy_payload = {}
+        if isinstance(legacy_payload, dict):
+            for key in ("billingStatus", "reconciliationType", "paymentDate", "bankStatementId"):
+                if legacy_payload.get(key) is not None:
+                    payload[key] = legacy_payload[key]
+            # 归档标志由导入/迁移路径直接维护在投影 payload 上，同样以投影为准回填
+            if legacy_payload.get("is_archive_only") is not None:
+                payload["is_archive_only"] = legacy_payload.get("is_archive_only")
+            if legacy_payload.get("isArchiveOnly") is not None:
+                payload["isArchiveOnly"] = legacy_payload.get("isArchiveOnly")
     rd_details = {
         detail.journal_line_id: detail
         for detail in (
@@ -850,6 +942,9 @@ async def serialize_journal(
             }
         return result
 
+    name_map = await _user_display_names(
+        session, {entry.created_by, entry.reviewed_by, entry.posted_by}
+    )
     debit = [serialize_line(line) for line in lines if line.direction == "debit"]
     credit = [serialize_line(line) for line in lines if line.direction == "credit"]
     payload.update(
@@ -862,6 +957,10 @@ async def serialize_journal(
             "voucherStatus": entry.status,
             "voucherRef": entry.voucher_no,
             "entryType": entry.entry_type,
+            # 凭证署名：来自真实操作留痕（创建/复核/过账人），不提供手工配置
+            "createdByName": name_map.get(entry.created_by, entry.created_by),
+            "reviewedByName": (name_map.get(entry.reviewed_by, "") if entry.reviewed_by else ""),
+            "postedByName": (name_map.get(entry.posted_by, "") if entry.posted_by else ""),
             "voucherLines": {"debit": debit, "credit": credit},
             "currency": entry.currency,
             "version": entry.version,
@@ -901,6 +1000,44 @@ async def posted_entries_for_reports(session: AsyncSession, company_id: str) -> 
     )
 
 
+async def _update_posted_billing_status(
+    session: AsyncSession,
+    entry: JournalEntry,
+    billing_status: Any,
+    *,
+    user_id: str,
+    request_id: str,
+) -> JournalEntry:
+    """已过账凭证的开票状态只在 legacy 投影 payload 上维护（与银行对账路径 json_set billingStatus 同一模式），
+    权威凭证行保持不可变，不触碰借贷。"""
+    projection = await session.get(LegacyEntryProjection, entry.id)
+    if projection is None:
+        raise AccountingError(ENTRY_POSTED_IMMUTABLE, "已过账凭证不能修改，请使用冲销", 409)
+    try:
+        payload = json.loads(projection.payload) if isinstance(projection.payload, str) else dict(projection.payload or {})
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+    if billing_status:
+        payload["billingStatus"] = billing_status
+    else:
+        payload.pop("billingStatus", None)
+    projection.payload = json.dumps(_json_safe(payload), ensure_ascii=False, separators=(",", ":"))
+    projection.updated_at = _iso_now()
+    await record_audit(
+        session,
+        company_id=entry.company_id,
+        user_id=user_id,
+        action="update_billing_status",
+        entity_type="journal_entry",
+        entity_id=entry.id,
+        request_id=request_id,
+        after={"billingStatus": billing_status, "entryStatus": entry.status},
+        entity_version=entry.version,
+    )
+    await session.flush()
+    return entry
+
+
 async def update_draft(
     session: AsyncSession,
     entry_id: str,
@@ -913,7 +1050,15 @@ async def update_draft(
     await require_role(session, company_id, user_id, WRITE_ROLES)
     entry = await get_journal(session, entry_id, company_id=company_id, lock=True)
     if entry.status not in {"draft", "pending_review"}:
+        # 开票状态是申报跟踪标志，不影响借贷；已过账凭证允许仅更新它（投影层），
+        # 其余任何字段修改仍然必须走冲销。
+        if set(updates) == {"billingStatus"}:
+            return await _update_posted_billing_status(
+                session, entry, updates["billingStatus"], user_id=user_id, request_id=request_id
+            )
         raise AccountingError(ENTRY_POSTED_IMMUTABLE, "已过账凭证不能修改，请使用冲销", 409)
+    if (entry.metadata_json or {}).get("source") == "wechat_settlement":
+        raise AccountingError("SYSTEM_SETTLEMENT", "结算凭证按银行净额生成，请取消对账后重新确认，不能直接修改", 409)
     old_period = await get_or_create_period(session, company_id, entry.period_start, lock=True)
     assert_period_writable(old_period)
     before = await serialize_journal(session, entry)
@@ -985,6 +1130,13 @@ async def delete_draft(
     entry = await get_journal(session, entry_id, company_id=company_id, lock=True)
     if entry.status not in {"draft", "pending_review"}:
         raise AccountingError(ENTRY_POSTED_IMMUTABLE, "已过账凭证不能删除，请使用冲销", 409)
+    linked = (await session.execute(select(ReconciliationLink.id).where(
+        ReconciliationLink.company_id == company_id,
+        ReconciliationLink.journal_entry_id == entry_id,
+        ReconciliationLink.status == "confirmed",
+    ).limit(1))).first()
+    if linked:
+        raise AccountingError("ENTRY_RECONCILED", "凭证已关联银行流水，请先取消对账，不能直接删除", 409)
     period = await get_or_create_period(session, company_id, entry.period_start, lock=True)
     assert_period_writable(period)
     before = await serialize_journal(session, entry)
@@ -1040,6 +1192,25 @@ async def approve_journal(
     return await _post_existing(session, entry, user_id=user_id, request_id=request_id, reviewer=True)
 
 
+async def submit_journal_for_review(session: AsyncSession, entry_id: str, *, company_id: str, user_id: str, request_id: str) -> JournalEntry:
+    await require_role(session, company_id, user_id, WRITE_ROLES)
+    entry = await get_journal(session, entry_id, company_id=company_id, lock=True)
+    if entry.status == "pending_review":
+        return entry
+    if entry.status != "draft":
+        raise AccountingError(REVIEW_REQUIRED, "只有草稿凭证可以提交复核", 409)
+    period = await get_or_create_period(session, company_id, entry.period_start, lock=True)
+    assert_period_writable(period)
+    await _validate_postable(session, entry)
+    before = await serialize_journal(session, entry)
+    entry.status = "pending_review"
+    entry.version += 1
+    await session.flush()
+    await record_audit(session, company_id=company_id, user_id=user_id, action="submit_for_review", entity_type="journal_entry", entity_id=entry.id, request_id=request_id, before=before, after=await serialize_journal(session, entry), entity_version=entry.version)
+    await _sync_projection(session, entry)
+    return entry
+
+
 async def reverse_journal(
     session: AsyncSession,
     entry_id: str,
@@ -1056,10 +1227,23 @@ async def reverse_journal(
         raise AccountingError(ENTRY_POSTED_IMMUTABLE, "只有已过账凭证可以冲销", 409)
     if not reason or not reason.strip():
         raise AccountingError("REVERSAL_REASON_REQUIRED", "冲销必须填写原因")
-    occurred_on = _parse_date(reversal_date)
-    period = await get_or_create_period(session, company_id, occurred_on, lock=True)
-    assert_period_writable(period)
+    # 冲销默认落在原凭证期间（红字与原凭证同期相消，月度报表才不失真）；
+    # 原期间已关账时回落到指定日期/当天，走"当期调整"口径。
+    if reversal_date in (None, ""):
+        occurred_on = original.occurred_on
+    else:
+        occurred_on = _parse_date(reversal_date)
+    try:
+        period = await get_or_create_period(session, company_id, occurred_on, lock=True)
+        assert_period_writable(period)
+    except AccountingError as exc:
+        if exc.code != PERIOD_CLOSED or reversal_date not in (None, ""):
+            raise
+        occurred_on = _parse_date(None)
+        period = await get_or_create_period(session, company_id, occurred_on, lock=True)
+        assert_period_writable(period)
     original_lines = await _entry_lines(session, original.id)
+    reversal_total = money(sum((line.amount for line in original_lines if line.direction == "debit"), ZERO))
     original_rd_details = {
         detail.journal_line_id: detail
         for detail in (
@@ -1082,7 +1266,17 @@ async def reverse_journal(
         reversal_of_id=original.id,
         reason=reason.strip(),
         rule_version=original.rule_version,
-        metadata_json={"reversalOf": original.id, "reason": reason.strip()},
+        # 携带原凭证的展示字段（方向/分类），金额记为负数（红字口径）：
+        # 账本列表与月度汇总按金额求和即可自然抵消，前端对负数金额已做显示适配。
+        metadata_json={
+            "reversalOf": original.id,
+            "reason": reason.strip(),
+            "direction": (original.metadata_json or {}).get("direction") or "expense",
+            "category": (original.metadata_json or {}).get("category") or "",
+            "payer": (original.metadata_json or {}).get("payer") or "company_account",
+            "amount": money_text(-reversal_total),
+            "isReversal": True,
+        },
         version=1,
     )
     session.add(reversal)
@@ -1198,19 +1392,6 @@ async def period_close_checks(session: AsyncSession, company_id: str, month: Any
             .order_by(JournalLine.account_code)
         )
     ).all()
-    orphan_vouchers = int(
-        (
-            await session.execute(
-                select(func.count(JournalEntry.id)).where(
-                    JournalEntry.company_id == company_id,
-                    JournalEntry.period_start == month_start,
-                    JournalEntry.status.in_(("posted", "reversed")),
-                    JournalEntry.entry_type == "standard",
-                    JournalEntry.source_transaction_id.is_(None),
-                )
-            )
-        ).scalar_one()
-    )
     missing_rule_versions = int(
         (
             await session.execute(
@@ -1225,6 +1406,52 @@ async def period_close_checks(session: AsyncSession, company_id: str, month: Any
     )
     account_debit = sum((money(row[2]) for row in account_rows), ZERO)
     account_credit = sum((money(row[3]) for row in account_rows), ZERO)
+    voucher_issues = []
+    month_entries = (await session.execute(
+        select(JournalEntry, SourceTransaction)
+        .outerjoin(SourceTransaction, SourceTransaction.id == JournalEntry.source_transaction_id)
+        .where(JournalEntry.company_id == company_id, JournalEntry.period_start == month_start)
+        .order_by(JournalEntry.occurred_on, JournalEntry.id)
+    )).all()
+    for entry, source in month_entries:
+        metadata = entry.metadata_json or {}
+        # ponytail: 仅归档不记账单据不参与财务凭证核验与待过账阻断
+        if metadata.get("is_archive_only") or metadata.get("isArchiveOnly"):
+            continue
+        reasons = []
+        if entry.status == "draft":
+            reasons.append("pending_post")
+        elif entry.status == "pending_review":
+            reasons.append("pending_review")
+        if entry.entry_type == "standard" and entry.status in ACTIVE_ENTRY_STATUSES and (
+            source is None or source.company_id != company_id or source.status == "void"
+        ):
+            reasons.append("missing_source")
+        if reasons:
+            voucher_issues.append({
+                "entryId": entry.id, "title": entry.summary,
+                "date": entry.occurred_on.isoformat(), "status": entry.status,
+                "voucherRef": entry.voucher_no, "reasons": reasons,
+            })
+    orphan_vouchers = sum("missing_source" in item["reasons"] for item in voucher_issues)
+    draft_count = sum("pending_post" in item["reasons"] for item in voucher_issues)
+    review_count = sum("pending_review" in item["reasons"] for item in voucher_issues)
+    pending_count = draft_count + review_count
+    from services.closing_validation_service import bank_close_validation
+    bank_validation = _json_safe(await bank_close_validation(session, company_id, month_start))
+    from services.opening_balance_service import get_opening_balances
+    from services.tax_filing_export_service import build_statement_data_from_entries, parse_period
+    report_entries = await posted_entries_for_reports(session, company_id)
+    opening_items = await get_opening_balances(company_id, month_start.year, session=session)
+    company = await session.get(Company, company_id)
+    statement = build_statement_data_from_entries(report_entries, opening_items, parse_period(month_start.strftime("%Y-%m"), "month"), (company.payload or {}) if company else {})
+    report_issues = [item for item in statement.checks[2:] if item["level"] == "error"]
+    # Compare the actual exported statement's cash to authoritative account
+    # balances, rather than comparing debit and credit totals a second time.
+    ledger_cash = sum((money(row[2]) - money(row[3]) for row in account_rows if row[0] in {"1001", "1002", "1012"}), ZERO)
+    report_cash = money(statement.balance_current.get("cash", ZERO))
+    if ledger_cash != report_cash:
+        report_issues.append({"level": "error", "message": "账簿货币资金与申报财务报表不一致"})
     snapshot = {
         "period": month_start.isoformat()[:7],
         "debit": money_text(debit),
@@ -1247,7 +1474,11 @@ async def period_close_checks(session: AsyncSession, company_id: str, month: Any
             "status": "blocking" if pending_count or orphan_vouchers else "passed",
             "uiStatus": "blocked" if pending_count or orphan_vouchers else "complete",
             "pendingCount": pending_count,
+            "draftCount": draft_count,
+            "autoPostAtCloseCount": draft_count,
+            "pendingReviewCount": review_count,
             "orphanVoucherCount": orphan_vouchers,
+            "records": voucher_issues,
         },
         {
             "code": "LEDGER_TO_LEDGER",
@@ -1260,37 +1491,53 @@ async def period_close_checks(session: AsyncSession, company_id: str, month: Any
         {
             "code": "BOOK_TO_ACTUAL",
             "name": "账实核对",
-            "status": "blocking" if unreconciled_bank else "passed",
-            "uiStatus": "blocked" if unreconciled_bank else "complete",
+            "status": "blocking" if unreconciled_bank or bank_validation["issueCount"] else "passed",
+            "uiStatus": "blocked" if unreconciled_bank or bank_validation["issueCount"] else "complete",
             "unreconciledBankCount": unreconciled_bank,
+            **bank_validation,
         },
         {
             "code": "LEDGER_TO_REPORT",
             "name": "账表核对",
-            "status": "passed" if account_debit == account_credit else "blocking",
-            "uiStatus": "complete" if account_debit == account_credit else "blocked",
+            "status": "blocking" if report_issues else "passed",
+            "uiStatus": "blocked" if report_issues else "complete",
             "reportDebit": money_text(account_debit),
             "reportCredit": money_text(account_credit),
+            "ledgerCash": money_text(ledger_cash),
+            "reportCash": money_text(report_cash),
+            "issues": report_issues,
         },
         {
             "code": "REPORT_TO_TAX",
-            "name": "税表勾稽",
-            "status": "blocking" if missing_rule_versions else "passed",
-            "uiStatus": "blocked" if missing_rule_versions else "complete",
+            "name": "申报财务报表校验",
+            "status": "blocking" if missing_rule_versions or report_issues else "passed",
+            "uiStatus": "blocked" if missing_rule_versions or report_issues else "complete",
             "missingRuleVersionCount": missing_rule_versions,
+            "records": [{"entryId": entry.id, "title": entry.summary, "date": entry.occurred_on.isoformat(), "status": entry.status, "reasons": ["missing_rule"]}
+                        for entry, _ in month_entries if entry.status in {"posted", "reversed"} and not entry.rule_version],
+            "issues": report_issues,
+            "scope": "记账规则与申报财务报表内部勾稽，不含增值税/所得税申报表核验",
         },
     ]
+    # Other checks describe posted books only. Drafts must not produce a green
+    # "all verified" result for business which has not entered those books yet.
+    if pending_count:
+        for check in checks[1:]:
+            check["blockedByPendingCount"] = pending_count
+            if check["status"] == "passed":
+                check["status"] = "needs_review"
+                check["uiStatus"] = "incomplete"
     return {
         "period": month_start.isoformat()[:7],
         "periodStatus": period.status if period else "open",
+        "canClose": all(check["status"] == "passed" for check in checks),
+        "blockingCount": sum(check["status"] == "blocking" for check in checks),
         "checks": checks,
         "snapshot": snapshot,
-        "blockingCount": sum(check["status"] == "blocking" for check in checks),
-        "canClose": not any(check["status"] == "blocking" for check in checks),
     }
 
 
-async def close_period(
+async def _close_period_in_transaction(
     session: AsyncSession,
     company_id: str,
     month: Any,
@@ -1302,6 +1549,28 @@ async def close_period(
     period = await get_or_create_period(session, company_id, month, lock=True)
     if period.status == "closed":
         return await period_close_checks(session, company_id, month)
+
+    # The user's single final close action also posts this period's drafts.
+    # Keep posting and close validation in one savepoint so a failed posting or
+    # any later check leaves every voucher and the period unchanged.
+    draft_entries = (await session.execute(
+        select(JournalEntry).where(
+            JournalEntry.company_id == company_id,
+            JournalEntry.period_start == period.period_start,
+            JournalEntry.status == "draft",
+        ).order_by(JournalEntry.occurred_on, JournalEntry.id).with_for_update()
+    )).scalars().all()
+    posted_at_close: list[JournalEntry] = []
+    for entry in draft_entries:
+        metadata = entry.metadata_json or {}
+        # ponytail: 仅归档不记账的草稿凭证不自动过账进总账，避免产生未核对银行存款分录
+        if metadata.get("is_archive_only") or metadata.get("isArchiveOnly"):
+            continue
+        posted_at_close.append(await post_journal(
+            session, entry.id, company_id=company_id, user_id=user_id,
+            request_id=f"{request_id}:close-post:{entry.id}",
+        ))
+
     period.status = "closing"
     await session.flush()
     result = await period_close_checks(session, company_id, month)
@@ -1337,12 +1606,31 @@ async def close_period(
         entity_type="accounting_period",
         entity_id=period.id,
         request_id=request_id,
-        after={"period": result["period"], "status": "closed", "snapshotHash": digest},
+        after={"period": result["period"], "status": "closed", "snapshotHash": digest,
+               "autoPostedEntryIds": [entry.id for entry in posted_at_close],
+               "autoPostedVoucherRefs": [entry.voucher_no for entry in posted_at_close]},
         entity_version=period.version,
     )
     result["status"] = "closed"
     result["snapshotHash"] = digest
+    result["autoPostedCount"] = len(posted_at_close)
+    result["autoPostedVoucherRefs"] = [entry.voucher_no for entry in posted_at_close]
     return result
+
+
+async def close_period(
+    session: AsyncSession,
+    company_id: str,
+    month: Any,
+    *,
+    user_id: str,
+    request_id: str,
+) -> dict[str, Any]:
+    """Atomically post eligible drafts and close after all checks pass."""
+    async with session.begin_nested():
+        return await _close_period_in_transaction(
+            session, company_id, month, user_id=user_id, request_id=request_id,
+        )
 
 
 async def issue_step_up_token(

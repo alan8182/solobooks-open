@@ -53,6 +53,9 @@ async def parse_invoice_columns(req: ParseColumnsRequest, ctx: AuthContext = Dep
         prompt,
         fallback=fallback,
         max_retries=1,
+        scene="invoice",
+        user_id=ctx.user_id,
+        company_id=ctx.company_id,
     )
     return {"mappings": result}
 

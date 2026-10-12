@@ -1,12 +1,12 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { ref, computed, onMounted, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import {
   NCard, NButton, NTag, NSpace, useMessage,
   NSelect, NSpin, NInput, NFormItem
 } from 'naive-ui'
 import apiClient from '@/api/client'
-import { formatMoney, formatDate } from '@/utils/format'
+import { formatMoney, formatDate, getCurrentMonth } from '@/utils/format'
 
 interface Counterparty {
   code: string
@@ -23,11 +23,15 @@ interface SubLedgerItem {
   counterparties: Counterparty[]
 }
 
+const route = useRoute()
 const router = useRouter()
 const message = useMessage()
 
-const month = ref('2026-06')
-const accountCode = ref('1122')
+const initialMonth = route.query.month ? String(route.query.month) : getCurrentMonth()
+const initialCode = route.query.account_code ? String(route.query.account_code) : '1122'
+
+const month = ref(initialMonth)
+const accountCode = ref(initialCode)
 const loading = ref(false)
 const items = ref<SubLedgerItem[]>([])
 
@@ -66,9 +70,41 @@ const accountOptions = [
   { label: '6601 销售费用-推广费', value: '6601' },
 ]
 
+if (initialCode && !accountOptions.some(o => o.value === initialCode)) {
+  const customName = route.query.account_name ? String(route.query.account_name) : '明细科目'
+  accountOptions.unshift({ label: `${initialCode} ${customName}`, value: initialCode })
+}
+
 const totalDebit = ref(0)
 const totalCredit = ref(0)
 const endBalance = ref(0)
+
+const backButtonLabel = computed(() => {
+  if (route.query.from === 'balance-sheet') return '返回资产负债表'
+  if (route.query.from === 'income-statement') return '返回利润表'
+  return '返回报表中心'
+})
+
+function handleBack() {
+  if (route.query.from) {
+    router.push(`/reports/${route.query.from}`)
+  } else {
+    router.push('/reports')
+  }
+}
+
+watch(() => route.query, (q) => {
+  if (q.account_code) {
+    accountCode.value = String(q.account_code)
+    if (!accountOptions.some(o => o.value === accountCode.value)) {
+      accountOptions.unshift({ label: `${accountCode.value} ${q.account_name || '明细科目'}`, value: accountCode.value })
+    }
+  }
+  if (q.month) {
+    month.value = String(q.month)
+  }
+  query()
+})
 
 async function query() {
   if (!accountCode.value || !month.value) return
@@ -95,9 +131,9 @@ onMounted(query)
   <div class="report-container">
     <div class="report-header">
       <div class="report-header-left">
-        <NButton text class="report-back-btn" @click="router.push('/reports')">
+        <NButton text class="report-back-btn" @click="handleBack">
           <template #icon><i class="ri-arrow-left-line" /></template>
-          返回
+          {{ backButtonLabel }}
         </NButton>
         <div class="report-title-section">
           <h2>明细分类账</h2>

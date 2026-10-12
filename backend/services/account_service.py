@@ -42,6 +42,8 @@ async def _ensure_schema() -> None:
                 current_company_id TEXT NOT NULL DEFAULT '',
                 nickname TEXT NOT NULL DEFAULT '',
                 avatar TEXT NOT NULL DEFAULT '',
+                password_hash TEXT NOT NULL DEFAULT '',
+                password_updated_at TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 last_login_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL DEFAULT ''
@@ -116,6 +118,8 @@ def _row_to_user(row) -> Dict:
         "current_company_id": row["current_company_id"] or "",
         "nickname": row["nickname"] or "",
         "avatar": row["avatar"] or "",
+        "password_hash": row["password_hash"] or "",
+        "password_updated_at": row["password_updated_at"] or "",
         "created_at": row["created_at"] or "",
         "last_login_at": row["last_login_at"] or "",
         "updated_at": row["updated_at"] or "",
@@ -123,12 +127,17 @@ def _row_to_user(row) -> Dict:
 
 
 async def _persist_user(conn, user: Dict) -> None:
+    # 密码列只随 INSERT 落库、不进 DO UPDATE SET：登录等高频路径都会全量覆盖写用户，
+    # 若纳入更新集，任何一处漏带字段都会把已设密码抹成空。改密码走 set_user_password。
+    # is_platform_admin/is_disabled 同理只在 INSERT 给默认 0（PG 迁移有 server_default、
+    # SQLite create_all 没有，显式写死让两边行为一致），管理后台改标志走 ORM 直写。
     await conn.execute(
         """
         INSERT INTO auth_users (
             user_id, openid, phone, phone_verified_at, wechat_openid_bound_at,
-            current_company_id, nickname, avatar, created_at, last_login_at, updated_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            current_company_id, nickname, avatar, password_hash, password_updated_at,
+            is_platform_admin, is_disabled, created_at, last_login_at, updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,FALSE,FALSE,?,?,?)
         ON CONFLICT(user_id) DO UPDATE SET
             openid=excluded.openid,
             phone=excluded.phone,
@@ -149,6 +158,8 @@ async def _persist_user(conn, user: Dict) -> None:
             user.get("current_company_id") or "",
             user.get("nickname") or "",
             user.get("avatar") or "",
+            user.get("password_hash") or "",
+            user.get("password_updated_at") or "",
             user.get("created_at") or _now_iso(),
             user.get("last_login_at") or _now_iso(),
             user.get("updated_at") or "",
@@ -190,12 +201,25 @@ async def _insert_company(conn, company: Dict) -> None:
     created = company.get("created_at") or now
     updated = company.get("updated_at") or ""
     payload = json.dumps(company, ensure_ascii=False)
+    # 非空口径列显式给模型默认值：PG 迁移有 server_default，SQLite create_all 没有
     await conn.execute(
         """
-        INSERT INTO auth_companies (company_id, owner_user_id, payload, created_at, updated_at)
-        VALUES (?,?,?,?,?)
+        INSERT INTO auth_companies (
+            company_id, owner_user_id, payload, base_currency, accounting_standard,
+            posting_policy, timezone, created_at, updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?)
         """,
-        (company["company_id"], company["owner_user_id"], payload, created, updated),
+        (
+            company["company_id"],
+            company["owner_user_id"],
+            payload,
+            company.get("base_currency") or "CNY",
+            company.get("accounting_standard") or "small_enterprise_cn",
+            company.get("posting_policy") or "owner_self_post",
+            company.get("timezone") or "Asia/Shanghai",
+            created,
+            updated,
+        ),
     )
 
 
@@ -346,6 +370,35 @@ async def bind_phone(user_id: str, phone: str) -> Dict:
         await conn.close()
 
 
+async def get_user_login_by_phone(phone: str) -> Dict | None:
+    """按手机号只读查用户（密码登录用；不自动建号）。"""
+    await _ensure_db_ready()
+    conn = await get_conn()
+    try:
+        cursor = await conn.execute("SELECT * FROM auth_users WHERE phone = ?", (phone,))
+        row = await cursor.fetchone()
+        return _row_to_user(row) if row else None
+    finally:
+        await conn.close()
+
+
+async def set_user_password(user_id: str, password_hash: str) -> None:
+    """写入密码哈希。密码列不参与 _persist_user 的覆盖更新，只能从这里改。"""
+    await _ensure_db_ready()
+    conn = await get_conn()
+    try:
+        cursor = await conn.execute(
+            "UPDATE auth_users SET password_hash = ?, password_updated_at = ?, updated_at = ? "
+            "WHERE user_id = ?",
+            (password_hash, _now_iso(), _now_iso(), user_id),
+        )
+        if cursor.rowcount == 0:
+            raise ValueError("用户不存在")
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
 async def save_privacy_consent(
     user_id: str,
     privacy_accepted_at: str,
@@ -475,8 +528,7 @@ async def update_company(user_id: str, company_id: str, updates: dict) -> Dict:
 
         for key in [
             "name", "type", "taxpayerType", "startDate", "taxId",
-            "smallMicroEnterprise", "restrictedIndustry", "employeeCount",
-            "citPrepaymentMethod",
+            "restrictedIndustry", "employeeCount",
         ]:
             if key in updates:
                 company[key] = updates[key]

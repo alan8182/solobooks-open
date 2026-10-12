@@ -173,7 +173,7 @@ def test_salary_accrual_requires_and_uses_project_timesheet(client, auth_headers
 
     blocked = client.post(f"/api/salary/sheets/{month}/accrue", headers=auth_headers)
     assert blocked.status_code == 400
-    assert "工时比例" in blocked.text
+    assert "必须登记研发项目工时" in blocked.text
 
     allocation = client.put(
         f"/api/salary/sheets/{month}/rd-allocations",

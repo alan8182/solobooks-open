@@ -21,3 +21,11 @@ export function importWechatBill(rows: Record<string, any>[]): Promise<{
 }> {
   return apiClient.post('/api/wechat-bill/import', { rows })
 }
+
+export function fetchWechatBillRecords(month: string): Promise<{
+  month: string
+  items: Record<string, any>[]
+  summary: { total: number; totalOrderAmount: number; totalFee: number; totalSettled: number }
+}> {
+  return apiClient.get('/api/wechat-bill/records', { params: { month } })
+}

@@ -4,6 +4,9 @@ import type {
   PhoneLoginRequest,
   PhoneSendCodeRequest,
   PhoneSendCodeResponse,
+  PasswordLoginRequest,
+  ResetPasswordRequest,
+  SetPasswordRequest,
   UserProfile,
   UpdateProfileRequest,
   CreateCompanyRequest,
@@ -17,6 +20,20 @@ export function sendPhoneCode(data: PhoneSendCodeRequest): Promise<PhoneSendCode
 
 export function loginByPhoneCode(data: PhoneLoginRequest): Promise<AuthResponse> {
   return apiClient.post('/api/auth/phone/login', data, { timeout: 90000 })
+}
+
+export function loginByPassword(data: PasswordLoginRequest): Promise<AuthResponse> {
+  return apiClient.post('/api/auth/password/login', data)
+}
+
+export function setPassword(
+  data: SetPasswordRequest,
+): Promise<{ success: boolean; has_password: boolean }> {
+  return apiClient.post('/api/auth/password/set', data)
+}
+
+export function resetPassword(data: ResetPasswordRequest): Promise<{ success: boolean }> {
+  return apiClient.post('/api/auth/password/reset', data)
 }
 
 export function bindPhone(data: PhoneLoginRequest): Promise<{ message: string }> {

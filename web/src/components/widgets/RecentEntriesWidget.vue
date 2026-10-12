@@ -3,9 +3,9 @@ import { computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { NButton } from 'naive-ui'
 import { useEntryStore } from '@/stores/entry'
-import { amountSignForDirection } from '@/utils/accounting'
+import { moneyPresentation } from '@/utils/accounting'
 import { getEntryNaturePresentation } from '@/utils/entryNature'
-import { formatMoney, formatDate } from '@/utils/format'
+import { formatDate } from '@/utils/format'
 
 const router = useRouter()
 const entryStore = useEntryStore()
@@ -15,6 +15,13 @@ const recentEntries = computed(() => entryStore.activeEntries.slice(0, 5))
 function directionLabel(dir: string, category = '') {
   const presentation = getEntryNaturePresentation(dir, category)
   return { ...presentation, bg: presentation.background }
+}
+
+// 金额展示：冲退类负金额按资金实际流向显示（+¥x 绿 / -¥x 红），色调跟随展示口径
+function moneyDisplay(dir: string, category: string, amount: number | string) {
+  const presentation = moneyPresentation(dir, category, amount)
+  const toneDir = presentation.tone === 'neutral' ? dir : presentation.tone
+  return { text: presentation.text, color: getEntryNaturePresentation(toneDir, category).color }
 }
 </script>
 
@@ -34,7 +41,7 @@ function directionLabel(dir: string, category = '') {
           <i class="ri-folder-open-line" />
         </div>
         <p class="empty-text">暂无记账记录</p>
-        <NButton size="small" type="primary" class="empty-btn" @click="router.push('/record/text')">立即开始</NButton>
+        <NButton size="small" type="primary" class="empty-btn" @click="router.push('/copilot')">立即开始</NButton>
       </div>
 
       <div v-else class="entry-list">
@@ -58,8 +65,8 @@ function directionLabel(dir: string, category = '') {
             </div>
           </div>
           <div class="entry-right">
-            <span class="entry-amount" :style="{ color: directionLabel(entry.direction, entry.category).color }">
-              {{ amountSignForDirection(entry.direction, entry.category, entry.amount) }}{{ formatMoney(entry.amount) }}
+            <span class="entry-amount" :style="{ color: moneyDisplay(entry.direction, entry.category, entry.amount).color }">
+              {{ moneyDisplay(entry.direction, entry.category, entry.amount).text }}
             </span>
             <i class="ri-arrow-right-s-line row-arrow" />
           </div>

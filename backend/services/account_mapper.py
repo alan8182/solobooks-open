@@ -154,8 +154,8 @@ CATEGORY_TO_ACCOUNT = {
         "defaultCounterparty": "1002"
     },
     "银行及金融手续费": {
-        "accountCode": "5608",
-        "accountName": "管理费用-银行及金融手续费",
+        "accountCode": "6602",
+        "accountName": "财务费用-手续费",
         "accountType": "损益-费用",
         "defaultCounterparty": "1002"
     },

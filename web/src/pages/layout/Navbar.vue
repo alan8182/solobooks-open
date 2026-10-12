@@ -95,10 +95,6 @@ function handleUserAction(key: string) {
     </div>
 
     <div class="navbar-right">
-      <button class="record-btn no-print" @click="router.push('/record/text')">
-        <i class="ri-add-line" />
-        记录一笔
-      </button>
       <NDropdown :options="userOptions" @select="handleUserAction">
         <div class="user-profile-btn">
           <div class="avatar-wrapper">
@@ -227,25 +223,6 @@ function handleUserAction(key: string) {
   align-items: center;
   gap: 12px;
 }
-.record-btn {
-  height: 36px;
-  padding: 0 14px;
-  border: 1px solid var(--solo-primary);
-  border-radius: 8px;
-  background: var(--solo-primary);
-  color: #fff;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 13px;
-  font-weight: 650;
-  cursor: pointer;
-  transition: background 0.2s, border-color 0.2s;
-}
-.record-btn:hover {
-  background: var(--solo-primary-light);
-  border-color: var(--solo-primary-light);
-}
 .user-profile-btn {
   display: flex;
   align-items: center;
@@ -306,9 +283,6 @@ function handleUserAction(key: string) {
   .user-arrow {
     display: none;
   }
-  .record-btn {
-    padding: 0 10px;
-  }
   .company-name {
     max-width: 180px;
     overflow: hidden;
@@ -317,15 +291,6 @@ function handleUserAction(key: string) {
   }
 }
 @media (max-width: 560px) {
-  .record-btn {
-    width: 36px;
-    padding: 0;
-    justify-content: center;
-    font-size: 0;
-  }
-  .record-btn i {
-    font-size: 16px;
-  }
   .company-name {
     max-width: 120px;
   }

@@ -335,9 +335,11 @@ onMounted(load)
 
 <style scoped>
 .asset-page {
-  max-width: 1080px;
+  max-width: 1240px;
   margin: 0 auto;
   padding: 16px 0 48px 0;
+  width: 100%;
+  box-sizing: border-box;
 }
 .page-header {
   display: flex;

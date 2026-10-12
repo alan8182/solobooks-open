@@ -180,6 +180,31 @@ def test_statement_maps_research_interest_capital_reserve_and_totals():
     assert balance["liability_equity_total"] == Decimal("99504.15")
 
 
+def test_export_fills_header_on_all_sheets(monkeypatch, tmp_path):
+    import xlrd
+
+    import services.tax_filing_export_service as service
+
+    monkeypatch.setattr(service, "EXPORT_DIR", tmp_path)
+    data = StatementData(
+        company_name="测试企业",
+        tax_id="91330000TEST000001",
+        period=parse_period("2026-06", "month"),
+    )
+    output_path = export_month_quarter_xls(data)
+    book = xlrd.open_workbook(str(output_path))
+
+    start_serial = xlrd.xldate.xldate_from_date_tuple((2026, 6, 1), book.datemode)
+    end_serial = xlrd.xldate.xldate_from_date_tuple((2026, 6, 30), book.datemode)
+    # 资产负债表名称/止期在 H 列，利润表与现金流量表在 F 列
+    for sheet_index, name_col in ((0, 7), (1, 5), (2, 5)):
+        sheet = book.sheet_by_index(sheet_index)
+        assert sheet.cell_value(2, 3) == "91330000TEST000001"
+        assert sheet.cell_value(2, name_col) == "测试企业"
+        assert sheet.cell_value(3, 3) == start_serial
+        assert sheet.cell_value(3, name_col) == end_serial
+
+
 def test_export_preserves_official_template_styles(monkeypatch, tmp_path):
     import xlrd
     import services.tax_filing_export_service as service

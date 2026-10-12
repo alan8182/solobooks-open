@@ -18,6 +18,7 @@ from services.bank_service import (
     build_group_reconciliation_check, ensure_bank_schema, get_reconciliation_health,
     _bank_effect_from_voucher, repair_matched_statement_effect,
     import_statements_core,
+    get_wechat_settlement_candidates,
 )
 from services.bank_llm_prompts import BANK_COLUMN_MAPPING_PROMPT
 from services.llm import safe_chat_text_json
@@ -27,6 +28,7 @@ from services.accounting_core_service import (
     get_idempotent_response,
     save_idempotent_response,
     sync_bank_reconciliation,
+    assert_bank_reconciliable,
 )
 
 router = APIRouter(prefix="/api/bank", tags=["bank"], dependencies=[Depends(require_auth)])
@@ -93,12 +95,21 @@ async def difference_report(month: str = Query(...), ctx: AuthContext = Depends(
 
 class RepairEffectRequest(BaseModel):
     statement_id: str
+    auto_post: bool = False
 
 
 @router.post("/repair-effect")
-async def repair_effect(req: RepairEffectRequest, ctx: AuthContext = Depends(require_auth)):
+async def repair_effect(req: RepairEffectRequest, ctx: AuthContext = Depends(require_auth),
+                        session: AsyncSession = Depends(get_db_session)):
     """修复已匹配流水与 1002 银行存款影响不一致的确定性问题。"""
     try:
+        if isinstance(session, AsyncSession):
+            from services.bank_settlement_service import confirm_statement_match
+            await ensure_bank_schema()
+            result = await confirm_statement_match(session, company_id=ctx.company_id,
+                user_id=ctx.user_id, statement_id=req.statement_id, entry_ids=None,
+                request_id=str(uuid4()), auto_post=bool(req.auto_post))
+            return {**result, "status": "repaired" if result["settlementCreated"] else "already_repaired"}
         return await repair_matched_statement_effect(
             ctx.company_id,
             ctx.user_id,
@@ -166,6 +177,9 @@ async def parse_bank_columns(req: ParseColumnsRequest, ctx: AuthContext = Depend
         prompt,
         fallback=fallback,
         max_retries=1,
+        scene="bank_statement",
+        user_id=ctx.user_id,
+        company_id=ctx.company_id,
     )
     return {"mappings": result}
 
@@ -190,6 +204,7 @@ class ConfirmSuggestionRequest(BaseModel):
     matched_entry_id: str = ""
     matched_entry_ids: List[str] = Field(default_factory=list)
     new_entry: Dict[str, Any] = {}
+    auto_post: bool = False
 
 
 @router.post("/confirm-suggestion")
@@ -247,8 +262,27 @@ async def confirm_suggestion(
             entry_id = str(raw_id or "").strip()
             if entry_id and entry_id not in requested_ids:
                 requested_ids.append(entry_id)
-        if len(requested_ids) > 20:
-            raise HTTPException(status_code=400, detail="一次最多合并 20 笔账目记录")
+        if len([entry_id for entry_id in requested_ids
+                if entry_id != f"bank-settlement-{req.statement_id}"]) > 500:
+            raise HTTPException(status_code=400, detail="一次最多合并 500 笔账目记录")
+
+        if isinstance(session, AsyncSession):
+            from services.accounting_core_service import get_journal, serialize_journal
+            from services.bank_settlement_service import confirm_statement_match
+            personal = False
+            for entry_id in requested_ids:
+                entry = await get_journal(session, entry_id, company_id=ctx.company_id)
+                payload = await serialize_journal(session, entry)
+                payer = str(payload.get("payer") or "")
+                if (payer in {"boss_personal", "employee_personal"} or payer.startswith("employee_personal:")) and \
+                        _bank_effect_from_voucher(payload.get("voucherLines") or {}) == ZERO:
+                    personal = True
+            if not personal:
+                return await respond(await confirm_statement_match(session,
+                    company_id=ctx.company_id, user_id=ctx.user_id, statement_id=req.statement_id,
+                    entry_ids=requested_ids,
+                    request_id=(request.headers.get("X-Request-ID") if request else None) or str(uuid4()),
+                    auto_post=bool(req.auto_post)))
 
         conn = await get_conn()
         try:
@@ -263,7 +297,7 @@ async def confirm_suggestion(
 
             cursor = await conn.execute(
                 "SELECT entry_id, previous_billing_status, previous_payment_date FROM bank_statement_matches "
-                "WHERE statement_id = ? AND company_id = ? ORDER BY created_at ASC, rowid ASC",
+                "WHERE statement_id = ? AND company_id = ? ORDER BY created_at ASC, entry_id ASC",
                 (req.statement_id, ctx.company_id),
             )
             existing_rows = [dict(row) for row in await cursor.fetchall()]
@@ -432,6 +466,8 @@ async def confirm_suggestion(
                     "source": "bank_import",
                 }
                 await save_entry(reim_data, user_id=ctx.user_id, company_id=ctx.company_id)
+                if isinstance(session, AsyncSession):
+                    await assert_bank_reconciliable(session, company_id=ctx.company_id, entry_ids=[reim_entry_id])
                 now = datetime.now(timezone.utc).isoformat()
                 await conn.execute(
                     "INSERT OR IGNORE INTO bank_statement_matches "
@@ -465,6 +501,8 @@ async def confirm_suggestion(
                 })
 
             if existing_ids and set(existing_ids) == set(requested_ids):
+                if isinstance(session, AsyncSession):
+                    await assert_bank_reconciliable(session, company_id=ctx.company_id, entry_ids=requested_ids)
                 await conn.execute(
                     f"UPDATE entries SET payload = json_set(payload, '$.billingStatus', 'reconciled') "
                     f"WHERE company_id = ? AND id IN ({placeholders})",
@@ -477,6 +515,8 @@ async def confirm_suggestion(
                     result["entryIds"] = requested_ids
                 return await respond(result)
 
+            if isinstance(session, AsyncSession):
+                await assert_bank_reconciliable(session, company_id=ctx.company_id, entry_ids=requested_ids)
             now = datetime.now(timezone.utc).isoformat()
             for entry_id, payload in zip(requested_ids, payloads):
                 await conn.execute(
@@ -531,6 +571,8 @@ async def confirm_suggestion(
 
             existing_match = str(stmt["matched_entry_id"] or "").strip()
             if existing_match:
+                if isinstance(session, AsyncSession):
+                    await assert_bank_reconciliable(session, company_id=ctx.company_id, entry_ids=[existing_match])
                 await conn.execute(
                     "UPDATE entries SET payload = json_set(payload, '$.billingStatus', 'reconciled') WHERE id = ? AND company_id = ?",
                     (existing_match, ctx.company_id),
@@ -540,6 +582,14 @@ async def confirm_suggestion(
                 return await respond({"status": "already_matched", "entryId": existing_match})
         finally:
             await conn.close()
+
+        settlement_candidates = await get_wechat_settlement_candidates(ctx.company_id, dict(stmt))
+        if settlement_candidates:
+            raise HTTPException(status_code=409, detail={
+                "code": "EXISTING_WECHAT_ENTRIES",
+                "message": "该微信结算已有收入及手续费账目，请合并核销原账目，不能再次记为收入或支出",
+                "candidateEntryGroups": [[entry["id"] for entry in group] for group in settlement_candidates],
+            })
 
         stmt_amount = money(stmt["amount"] or ZERO)
         direction = str(entry_data.get("direction") or "")
@@ -564,6 +614,8 @@ async def confirm_suggestion(
                 entry_data["amount"] = raw_amount
 
         await save_entry(entry_data, user_id=ctx.user_id, company_id=ctx.company_id)
+        if isinstance(session, AsyncSession):
+            await assert_bank_reconciliable(session, company_id=ctx.company_id, entry_ids=[entry_id])
 
         # Link statement to new entry
         conn = await get_conn()

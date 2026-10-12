@@ -251,6 +251,56 @@ class TestAuthoritativeAccountingApi:
         assert actual["unreconciledBankCount"] >= 1
 
 
+    def test_wechat_settlement_http_confirm_updates_original_entries_without_new_income(self, client, auth_headers):
+        imported = client.post('/api/wechat-bill/import', json={"rows": [{
+            "status": "SUCCESS", "date": "2034-07-14", "order_no": "wx-http-settlement",
+            "product_name": "微信核销测试", "order_amount": 5, "fee": 0.05,
+        }]}, headers=auth_headers)
+        assert imported.status_code == 200, imported.text
+        assert imported.json()["imported"] == 1  # 导入结果按订单计数，订单包含收入和手续费两笔账目。
+        entries_before = client.get('/api/record/entries', headers=auth_headers).json()["entries"]
+        originals = [entry for entry in entries_before if entry.get("wechat_order_no") == "wx-http-settlement"]
+        ids = {entry["id"] for entry in originals}
+        assert len(ids) == 2
+        bank = client.post('/api/bank/import-json', json={"statement_id": "wx-http-batch", "rows": [{
+            "transaction_date": "2034-07-15", "description": "财付通支付科技有限公司", "amount": 4.95,
+        }]}, headers=auth_headers)
+        assert bank.status_code == 200, bank.text
+        statement = client.get('/api/bank/statements?statement_id=wx-http-batch', headers=auth_headers).json()["items"][0]
+        blocked = client.post('/api/bank/confirm-suggestion', json={
+            "statement_id": statement["id"], "type": "new", "new_entry": {
+                "title": "银行重复收入", "amount": 4.95, "direction": "income",
+                "category": "主营业务收入", "occurDate": "2034-07-15",
+            },
+        }, headers=auth_headers)
+        assert blocked.status_code == 409, blocked.text
+        matched = client.post('/api/bank/confirm-suggestion', json={
+            "statement_id": statement["id"], "type": "match", "matched_entry_ids": sorted(ids),
+        }, headers=auth_headers)
+        assert matched.status_code == 200, matched.text
+        entries_after = client.get('/api/record/entries', headers=auth_headers).json()["entries"]
+        assert len(entries_after) == len(entries_before) + 1
+        settlement_id = matched.json()["settlementEntryId"]
+        settlement = next(entry for entry in entries_after if entry["id"] == settlement_id)
+        assert settlement["voucherStatus"] == "draft"
+        assert settlement["direction"] == "owner_transfer"
+        assert set(settlement["originalEntryIds"]) == ids
+        assert settlement["occurDate"] == "2034-07-15"
+        for entry in entries_after:
+            if entry["id"] in ids:
+                assert entry["billingStatus"] == "reconciled"
+                assert entry["paymentDate"] == "2034-07-15"
+        statement_after = client.get('/api/bank/statements?statement_id=wx-http-batch', headers=auth_headers).json()["items"][0]
+        assert set(statement_after["matched_entry_ids"]) == ids | {settlement_id}
+        repeat = client.post('/api/bank/confirm-suggestion', json={
+            "statement_id": statement["id"], "type": "match", "matched_entry_ids": sorted(ids),
+        }, headers=auth_headers)
+        assert repeat.status_code == 200 and not repeat.json()["settlementCreated"]
+        difference = client.get('/api/bank/difference?month=2034-07', headers=auth_headers).json()
+        assert not difference["balance_reconciliation"]["fully_reconciled"]
+        assert any(issue["type"] == "unposted_match" for issue in difference["matched_effect_issues"])
+
+
 class TestInvoice:
     def test_invoice_parse_direction_detection(self, client, auth_headers):
         rows = [
@@ -953,7 +1003,7 @@ class TestBankReconciliation:
             "occurDate": "2026-06-17",
             "billingStatus": "no_document",
             "voucherLines": {
-                "debit": [{"accountCode": "5608", "accountName": "管理费用-银行及金融手续费", "amount": 0.53}],
+                "debit": [{"accountCode": "6602", "accountName": "财务费用-手续费", "amount": 0.53}],
                 "credit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": 0.53}],
             },
         })
@@ -996,7 +1046,8 @@ class TestBankReconciliation:
         )
 
         assert undo_result["status"] == "unmatched"
-        assert undo_result["entryIds"] == [income_id, fee_id]
+        # 排序 tiebreaker 用 entry_id（PG 兼容），顺序不保证插入序
+        assert sorted(undo_result["entryIds"]) == sorted([income_id, fee_id])
         statements = await get_statements(company_id)
         assert statements[0]["matched_entry_id"] is None
         assert statements[0]["matched_entry_ids"] == []
@@ -1036,7 +1087,7 @@ class TestBankReconciliation:
             "title": "微信手续费",
             "occurDate": "2026-06-17",
             "voucherLines": {
-                "debit": [{"accountCode": "5608", "accountName": "手续费", "amount": 0.53}],
+                "debit": [{"accountCode": "6602", "accountName": "手续费", "amount": 0.53}],
                 "credit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": 0.53}],
             },
         })
@@ -1448,6 +1499,143 @@ class TestBankReconciliation:
         assert len(health["pending_confirmations"]) == 1
         assert health["summary"] == {"highRiskCount": 4, "warningCount": 1}
 
+    async def _insert_wechat_order(self, company_id, order_no, amount=5, fee=0.05, occur_date="2026-07-14"):
+        for suffix, direction, value, debit, credit in [
+            ("income", "income", amount, "1012", "6001"),
+            ("fee", "expense", fee, "6602", "1012"),
+        ]:
+            await self._insert_entry(company_id, {
+                "id": f"{order_no}-{suffix}", "source": "wechat_bill", "wechat_order_no": order_no,
+                "title": suffix, "category": "主营业务收入" if direction == "income" else "银行及金融手续费",
+                "direction": direction, "amount": value, "occurDate": occur_date,
+                "voucherLines": {"debit": [{"accountCode": debit, "amount": value}],
+                                 "credit": [{"accountCode": credit, "amount": value}]},
+            })
+
+    @pytest.mark.asyncio
+    async def test_wechat_settlement_suggests_group_without_llm_or_writes(self, temp_bank_db, monkeypatch):
+        from services.bank_service import ai_suggest_matches, import_statements_json
+        from services import llm
+
+        company_id = "c-wx-group-suggestion"
+        await self._insert_wechat_order(company_id, "wx-order")
+        # WeChat candidates must not depend on the most recent 100 journals.
+        for index in range(101):
+            await self._insert_entry(company_id, {"id": f"unrelated-{index}", "amount": 100,
+                "direction": "income", "occurDate": "2026-10-01"})
+        await import_statements_json(company_id, [{"transaction_date": "2026-07-15",
+            "description": "入账 | 财付通支付科技有限公司", "amount": 4.95}], "wx-suggest")
+
+        def unexpected_llm(*args, **kwargs):
+            raise AssertionError("A known settlement must not be classified as new revenue")
+        monkeypatch.setattr(llm, "safe_chat_text_json", unexpected_llm)
+        suggestions = await ai_suggest_matches(company_id)
+        assert len(suggestions) == 1
+        assert suggestions[0]["type"] == "match"
+        assert set(suggestions[0]["matchedEntryIds"]) == {"wx-order-income", "wx-order-fee"}
+        assert len(suggestions[0]["matchedEntries"]) == 2
+        assert (await self._statement_row("wx-suggest"))["matched_entry_id"] is None
+        assert "billingStatus" not in await self._entry_payload("wx-order-income")
+
+    @pytest.mark.asyncio
+    async def test_wechat_settlement_rejects_duplicate_new_entry_then_matches_originals(self, temp_bank_db):
+        from fastapi import HTTPException
+        from deps.auth import AuthContext
+        from routers.bank import ConfirmSuggestionRequest, confirm_suggestion
+        from services.bank_service import import_statements_json
+        from services import database
+
+        company_id = "c-wx-duplicate-guard"
+        await self._insert_wechat_order(company_id, "wx-original")
+        await import_statements_json(company_id, [{"transaction_date": "2026-07-15",
+            "description": "财付通支付科技有限公司", "amount": 4.95}], "wx-guard")
+        stmt = await self._statement_row("wx-guard")
+        ctx = AuthContext(user_id="u-bank-test", company_id=company_id)
+        with pytest.raises(HTTPException) as exc:
+            await confirm_suggestion(ConfirmSuggestionRequest(statement_id=stmt["id"], type="new",
+                new_entry={"title": "银行入账", "amount": 4.95, "direction": "income",
+                           "category": "主营业务收入", "occurDate": "2026-07-15"}), ctx)
+        assert exc.value.status_code == 409
+        assert exc.value.detail["code"] == "EXISTING_WECHAT_ENTRIES"
+        ids = exc.value.detail["candidateEntryGroups"][0]
+        conn = await database.get_conn()
+        try:
+            assert (await (await conn.execute("SELECT COUNT(*) FROM entries WHERE company_id = ?",
+                                             (company_id,))).fetchone())[0] == 2
+        finally:
+            await conn.close()
+        assert (await self._statement_row("wx-guard"))["matched_entry_id"] is None
+        await confirm_suggestion(ConfirmSuggestionRequest(statement_id=stmt["id"], type="match",
+                                                        matched_entry_ids=ids), ctx)
+        assert (await self._entry_payload("wx-original-income"))["billingStatus"] == "reconciled"
+        assert (await self._entry_payload("wx-original-fee"))["billingStatus"] == "reconciled"
+
+    @pytest.mark.asyncio
+    async def test_wechat_settlement_daily_batch_and_ambiguous_orders(self, temp_bank_db):
+        from services.bank_service import get_wechat_settlement_candidates, ai_suggest_matches, import_statements_json
+        company_id = "c-wx-daily-candidates"
+        await self._insert_wechat_order(company_id, "wx-a", amount=45, fee=0.41)
+        await self._insert_wechat_order(company_id, "wx-b", amount=19, fee=0.17)
+        statement = {"transaction_date": "2026-07-15", "description": "财付通", "amount": 63.42}
+        groups = await get_wechat_settlement_candidates(company_id, statement)
+        assert len(groups) == 1
+        assert {entry["id"] for entry in groups[0]} == {"wx-a-income", "wx-a-fee", "wx-b-income", "wx-b-fee"}
+        assert await get_wechat_settlement_candidates("other-company", statement) == []
+        assert await get_wechat_settlement_candidates(company_id, {**statement, "description": "其他客户收款"}) == []
+        assert await get_wechat_settlement_candidates(company_id, {**statement, "transaction_date": "2026-09-15"}) == []
+
+        await self._insert_wechat_order(company_id, "wx-same-1")
+        await self._insert_wechat_order(company_id, "wx-same-2")
+        await import_statements_json(company_id, [{**statement, "amount": 4.95}], "wx-ambiguous")
+        suggestion = (await ai_suggest_matches(company_id))[0]
+        assert suggestion["type"] == "existing"
+        assert "suggestedEntry" not in suggestion
+
+    @pytest.mark.asyncio
+    async def test_wechat_settlement_excludes_confirmed_partial_and_refunded_orders(self, temp_bank_db):
+        from services.bank_service import get_wechat_settlement_candidates
+        from services import database
+        company_id = "c-wx-ineligible"
+        await self._insert_wechat_order(company_id, "wx-done")
+        conn = await database.get_conn()
+        try:
+            await conn.execute("UPDATE entries SET payload = json_set(payload, '$.billingStatus', 'reconciled') WHERE id = ?",
+                               ("wx-done-income",))
+            await conn.commit()
+        finally:
+            await conn.close()
+        stmt = {"transaction_date": "2026-07-15", "description": "微信结算", "amount": 4.95}
+        assert await get_wechat_settlement_candidates(company_id, stmt) == []
+        await self._insert_wechat_order(company_id, "wx-refunded")
+        for suffix, amount, debit, credit in [("refund", 5, "6001", "1012"), ("fee-refund", 0.05, "1012", "6602")]:
+            await self._insert_entry(company_id, {"id": suffix, "source": "wechat_bill", "wechat_order_no": "wx-refunded",
+                "occurDate": "2026-07-14", "voucherLines": {
+                    "debit": [{"accountCode": debit, "amount": amount}],
+                    "credit": [{"accountCode": credit, "amount": amount}]}})
+        assert await get_wechat_settlement_candidates(company_id, stmt) == []
+
+    @pytest.mark.asyncio
+    async def test_wechat_large_settlement_is_not_classified_as_new_income(self, temp_bank_db):
+        from services.bank_service import ai_suggest_matches, import_statements_json
+        from routers.bank import ConfirmSuggestionRequest, confirm_suggestion
+        from deps.auth import AuthContext
+        from fastapi import HTTPException
+        company_id = "c-wx-large-settlement"
+        for index in range(11):
+            await self._insert_wechat_order(company_id, f"wx-large-{index}")
+        await import_statements_json(company_id, [{"transaction_date": "2026-07-15",
+            "description": "财付通结算", "amount": 54.45}], "wx-large-batch")
+        suggestion = (await ai_suggest_matches(company_id))[0]
+        assert suggestion["type"] == "match"
+        assert len(suggestion["matchedEntryIds"]) == 22
+        statement = await self._statement_row("wx-large-batch")
+        with pytest.raises(HTTPException) as exc:
+            await confirm_suggestion(ConfirmSuggestionRequest(statement_id=statement["id"], type="new",
+                new_entry={"amount": 54.45, "direction": "income", "category": "主营业务收入"}),
+                AuthContext(user_id="u-bank-test", company_id=company_id))
+        assert exc.value.status_code == 409
+
+
 class TestWechatBill:
     @pytest.mark.asyncio
     async def test_cross_batch_full_refund_closes_unsettled_historical_order(self, monkeypatch):
@@ -1510,6 +1698,57 @@ class TestWechatBill:
         assert all(entry["reconciliationType"] == "internal_refund" for entry in saved["entries"])
         assert {item["id"] for item in saved["updates"]} == {"old-income", "old-fee"}
         assert all(item["billingStatus"] == "reconciled" for item in saved["updates"])
+
+    @pytest.mark.asyncio
+    async def test_fee_entry_uses_distinct_source_key_end_to_end(self):
+        """回归：一笔交易生成的收入+手续费（及退款+手续费退还）条目在同一批次入库时，
+        不得因共享 wechat_transaction_key 触发会计核心来源唯一性校验自碰撞
+        （历史 bug：整批报"该来源业务已入账"）。走真实 create_entry 链路。"""
+        from db.base import Base
+        import db.models  # noqa: F401
+        from db.session import get_engine
+        from services import wechat_bill_service
+        from services.entry_service import list_entries
+
+        engine = get_engine()
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+
+        company_id = "c-wechat-fee-key"
+        user_id = "owner-1"
+        rows = [
+            {
+                "status": "SUCCESS", "date": "2026-08-07", "product_name": "签小抄积分充值-6积分",
+                "order_amount": 6, "fee": 0.05, "order_no": "wx-fee-key-1",
+                "wechat_transaction_key": "success:wx-fee-key-1",
+            },
+            {
+                "status": "REFUND", "date": "2026-08-20", "product_name": "签小抄积分充值-6积分",
+                "refund_amount": 6, "fee": 0.05, "order_no": "wx-fee-key-2",
+                "refund_order_no": "refund-fee-key-1",
+                "wechat_transaction_key": "refund:wx-fee-key-2:refund-fee-key-1",
+            },
+        ]
+
+        result = await wechat_bill_service.import_wechat_bill(company_id, user_id, rows)
+        assert result["imported"] == 2, result
+        assert result["failed"] == 0, result
+
+        entries = await list_entries(user_id, company_id)
+        keys = sorted(
+            e["wechat_transaction_key"] for e in entries if e.get("wechat_transaction_key")
+        )
+        assert keys == [
+            "refund:wx-fee-key-2:refund-fee-key-1",
+            "refund:wx-fee-key-2:refund-fee-key-1:fee",
+            "success:wx-fee-key-1",
+            "success:wx-fee-key-1:fee",
+        ]
+
+        # 重复导入同一账单：行级去重仍然生效，不会重复入账
+        result2 = await wechat_bill_service.import_wechat_bill(company_id, user_id, rows)
+        assert result2["imported"] == 0
+        assert result2["ignored_duplicates"] == 2
 
     @pytest.mark.asyncio
     async def test_cross_batch_refund_stays_open_after_original_order_reached_bank(self, monkeypatch):
@@ -1671,14 +1910,14 @@ class TestWechatBill:
         assert revenue_entry["voucherLines"]["credit"][0]["accountCode"] == "6001"
 
         fee_entry = saved_batches[0][1]
-        assert fee_entry["voucherLines"]["debit"][0]["accountCode"] == "5608"
+        assert fee_entry["voucherLines"]["debit"][0]["accountCode"] == "6602"
         assert fee_entry["voucherLines"]["credit"][0]["accountCode"] == "1012"
 
         fee_refund = next(e for e in saved_batches[0] if e.get("remark") == "退款手续费退还")
         assert fee_refund["amount"] == Decimal("-0.20")
         assert fee_refund["direction"] == "expense"
         assert fee_refund["voucherLines"]["debit"][0]["accountCode"] == "1012"
-        assert fee_refund["voucherLines"]["credit"][0]["accountCode"] == "5608"
+        assert fee_refund["voucherLines"]["credit"][0]["accountCode"] == "6602"
 
     @pytest.mark.asyncio
     async def test_wechat_bill_import_keeps_refund_with_same_order_no(self, monkeypatch):
@@ -1762,10 +2001,18 @@ class TestWechatBill:
         assert fee_refund["amount"] == Decimal("-0.05")
         assert fee_refund["direction"] == "expense"
         assert fee_refund["voucherLines"]["debit"][0]["accountCode"] == "1012"
-        assert fee_refund["voucherLines"]["credit"][0]["accountCode"] == "5608"
+        assert fee_refund["voucherLines"]["credit"][0]["accountCode"] == "6602"
 
         transaction_keys = {entry["wechat_transaction_key"] for entry in saved_batches[0]}
-        assert transaction_keys == {"success:wx-same-order", "refund:wx-same-order:refund-1"}
+        # 手续费/手续费退还条目使用 ":fee" 后缀 key，与同笔交易的收入/退款条目区分，
+        # 避免同一批次入库时触发会计核心来源唯一性校验自碰撞
+        assert transaction_keys == {
+            "success:wx-same-order",
+            "success:wx-same-order:fee",
+            "refund:wx-same-order:refund-1",
+            "refund:wx-same-order:refund-1:fee",
+        }
+
     def test_wechat_bill_entries_do_not_have_bank_effect_until_settlement(self):
         from services.bank_service import _bank_effect_from_voucher, build_group_reconciliation_check
 
@@ -1774,7 +2021,7 @@ class TestWechatBill:
             "credit": [{"accountCode": "6001", "accountName": "主营业务收入", "amount": 100}],
         }
         fee_voucher = {
-            "debit": [{"accountCode": "5608", "accountName": "管理费用-银行及金融手续费", "amount": 0.6}],
+            "debit": [{"accountCode": "6602", "accountName": "财务费用-手续费", "amount": 0.6}],
             "credit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": 0.6}],
         }
         settlement_voucher = {
@@ -1787,7 +2034,7 @@ class TestWechatBill:
         }
         refunded_fee_voucher = {
             "debit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": 0.05}],
-            "credit": [{"accountCode": "5608", "accountName": "管理费用-银行及金融手续费", "amount": 0.05}],
+            "credit": [{"accountCode": "6602", "accountName": "财务费用-手续费", "amount": 0.05}],
         }
 
         assert _bank_effect_from_voucher(revenue_voucher) == 0

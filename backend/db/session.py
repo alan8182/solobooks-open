@@ -17,6 +17,10 @@ def database_url() -> str:
         return "postgresql+asyncpg://" + raw[len("postgres://"):]
     if raw.startswith("postgresql://") and "+" not in raw.split("://", 1)[0]:
         return "postgresql+asyncpg://" + raw[len("postgresql://"):]
+    # 应用引擎统一用 asyncpg：psycopg3 异步连接在 Windows 默认事件循环（Proactor）上不可用，
+    # 避免环境变量误带 psycopg:// 时（如迁移脚本导出后启动服务）启动即崩。
+    if raw.startswith("postgresql+psycopg://"):
+        return "postgresql+asyncpg://" + raw[len("postgresql+psycopg://"):]
     return raw
 
 

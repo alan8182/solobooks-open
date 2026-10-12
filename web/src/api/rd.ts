@@ -1,5 +1,6 @@
 import apiClient from './client'
 import type { RdExpenseTypeOption, RdProject } from './types'
+import { makeIdempotencyKey } from './client'
 
 export interface RdProjectInput {
   code: string
@@ -134,7 +135,7 @@ export function correctRdUnallocated(
   data: { correctionDate: string; reason: string; allocations: RdCorrectionAllocation[] },
 ): Promise<{ originalEntryId: string; reversalEntryId?: string; correctedEntry: Record<string, unknown> }> {
   return apiClient.post(`/api/rd/unallocated/${entryId}/correct`, data, {
-    headers: { 'Idempotency-Key': crypto.randomUUID() },
+    headers: { 'Idempotency-Key': makeIdempotencyKey() },
   })
 }
 

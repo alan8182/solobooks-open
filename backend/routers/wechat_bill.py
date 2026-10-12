@@ -1,10 +1,10 @@
 """微信支付账单导入路由"""
-from fastapi import APIRouter, Depends, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from pydantic import BaseModel
 from typing import Any, Dict, List
 
 from deps.auth import AuthContext, require_auth
-from services.wechat_bill_service import parse_wechat_bill, import_wechat_bill
+from services.wechat_bill_service import parse_wechat_bill, import_wechat_bill, list_wechat_bill_records
 from services.audit_service import log_action
 
 router = APIRouter(prefix="/api/wechat-bill", tags=["wechat-bill"], dependencies=[Depends(require_auth)])
@@ -28,3 +28,12 @@ async def import_bill(req: ImportRowsRequest, ctx: AuthContext = Depends(require
     await log_action(ctx.company_id, ctx.user_id, "import", "wechat_bill", None,
                      {"imported": result["imported"], "failed": result["failed"], "ignored_duplicates": result.get("ignored_duplicates", 0)})
     return result
+
+
+@router.get("/records")
+async def list_records(month: str = Query(...), ctx: AuthContext = Depends(require_auth)):
+    """查看当月已导入的微信账单记录（只读，按订单聚合）。"""
+    try:
+        return await list_wechat_bill_records(ctx.company_id, month)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc

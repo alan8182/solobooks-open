@@ -14,10 +14,19 @@
 
 ## 2. 页面容器宽度规范 (Container Widths)
 
-系统通过全局样式表 [layout.css](file:///Users/ecarx/Documents/solobooks/web/src/assets/styles/layout.css) 对主内容区域的路由视图 `.content > *` 进行了强覆盖：
-*   **全站统一宽度**：全站所有页面的最大宽度统一设定为 `920px`。
-*   **对齐与居中**：使用 `margin: 0 auto` 实现自动水平居中，并设定统一的顶部内边距 `padding-top: 16px`。
-*   **用户体验效益**：标题位置和内容宽度 100% 相同。当用户在不同菜单（如账本、对账、报表、个人中心等）之间进行切换时，页面标题与主内容边缘完全重合，不会产生左右忽宽忽窄或标题忽上忽下的跳动感。
+系统通过全局样式表 [layout.css](file:///Users/ecarx/Documents/solobooks/web/src/assets/styles/layout.css) 与各模块专用样式定义了分层的响应式容器体系：
+*   **外层内容区基线**：主视图根容器 `.content > *` 统一设定上限 `max-width: 1440px`，居中排列并自适应屏幕空间。
+*   **多列宽表与财务核对页面（1200px ~ 1240px）**：
+    - 报表中心全景与 12 张子报表（资产负债表、利润表、现金流量表、明细账、总账、账龄等，`.report-container` / `.report-page`）
+    - 银行流水与智能对账（`.bank-page`）
+    - 发票导入向导与明细核验（`.invoice-import-page`）
+    - 经营账本与研发台账（`.ledger-page` / `.rd-page`）
+    - 薪酬个税、期初平衡表、会计科目（`.salary-page` / `.opening-page` / `.accounts-page`）
+    - 税务申报作业台与固定资产台账（`.tax-filing-page` / `.asset-page`）
+    > 以上宽表页面统一设定为 `max-width: 1200px ~ 1240px`，彻底解决过去 800px~920px 限制导致的横向拥挤、折行断流与水平滚动，并在大屏下提供开阔舒展的财务视图。
+*   **步骤向导与自适应过渡**：如月度结账向导（`.closing-wizard-container`），Step 1~3 保持 920px 步骤引导，Step 4~5 对账与核验自动平滑拓展为 1240px（`.closing-wizard--wide`）。
+*   **阅读型单据与表单页（640px ~ 720px）**：私账单据、凭证详情打印预览、新增主体与设置类表单，维持居中聚焦宽度，提升填写与阅读体验。
+*   **响应式防溢出保护**：各宽表卡片配置 `overflow-x: auto` 与 ≤768px 媒体查询间距，小屏幕下平滑包裹且不破坏主布局。
 
 ---
 

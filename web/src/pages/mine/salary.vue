@@ -12,8 +12,7 @@ import {
   getEmployees, addEmployee, updateEmployee, deleteEmployee,
   getSalarySheet, updateSalaryRecords, accrueSalarySheet, paySalarySheet,
   getRdSalaryAllocations, updateRdSalaryAllocations,
-  type Employee, type SalaryRecord, type SalarySheet, type RdSalaryAllocation
-} from '@/api/salary'
+  type Employee, type SalaryRecord, type SalarySheet, type RdSalaryAllocation, paySalarySocial, paySalaryTax } from '@/api/salary'
 import { getRdProjects } from '@/api/rd'
 import type { RdProject } from '@/api/types'
 import { useEntryStore } from '@/stores/entry'
@@ -290,7 +289,12 @@ async function accrueSheet() {
     sheetRecords.value = data.records || []
     // Sync entries store cache
     await entryStore.fetchEntries()
-    message.success('工资计提凭证生成成功，资金已计入研发/管理成本')
+    const accruedStatus = data.status
+    message.success(
+      accruedStatus === 'accrued'
+        ? '工资计提凭证生成成功，已列入当月研发/管理成本'
+        : '计提凭证已创建，待复核通过后计入成本（可在审核中心复核）',
+    )
   } catch (error: any) {
     message.error(error.response?.data?.detail || '计提失败')
   } finally {
@@ -310,6 +314,22 @@ async function paySheet() {
     message.success('工资发放记账成功，已生成银行存款划扣凭证')
   } catch (error: any) {
     message.error(error.response?.data?.detail || '发放失败')
+  } finally {
+    loading.value = false
+  }
+}
+
+async function payLiability(kind: 'social' | 'tax') {
+  if (!selectedMonth.value) return
+  loading.value = true
+  try {
+    const api = kind === 'social' ? paySalarySocial : paySalaryTax
+    const data: any = await api(selectedMonth.value)
+    sheet.value = data
+    await entryStore.fetchEntries()
+    message.success(kind === 'social' ? '社保公积金缴纳记账成功' : '个税缴纳记账成功')
+  } catch (error: any) {
+    message.error(error.response?.data?.detail || '操作失败')
   } finally {
     loading.value = false
   }
@@ -495,23 +515,46 @@ function viewVoucher(voucherId: string) {
                 <NButton type="primary" @click="accrueSheet">计提记账 (列入当月研发/福利成本)</NButton>
               </template>
 
-              <!-- ACCRUED STATE -->
-              <template v-if="sheet.status === 'accrued'">
+              <!-- ACCRUED / PAID STATE 共用：社保与个税缴纳 -->
+              <template v-if="sheet.status === 'accrued' || sheet.status === 'paid'">
                 <NButton secondary type="warning" @click="viewVoucher(sheet.accrual_voucher_id!)">
                   查看计提凭证
                 </NButton>
-                <NButton type="success" @click="paySheet">发放工资记账 (生成存款划扣凭证)</NButton>
-              </template>
+                <NButton
+                  v-if="sheet.status === 'accrued'"
+                  type="success"
+                  @click="paySheet"
+                >发放工资记账 (生成存款划扣凭证)</NButton>
+                <NButton
+                  v-if="sheet.status === 'paid' && sheet.payment_voucher_id"
+                  secondary
+                  type="success"
+                  @click="viewVoucher(sheet.payment_voucher_id!)"
+                >查看发放凭证</NButton>
 
-              <!-- PAID STATE -->
-              <template v-if="sheet.status === 'paid'">
-                <NButton secondary type="warning" @click="viewVoucher(sheet.accrual_voucher_id!)">
-                  查看计提凭证
+                <NButton
+                  v-if="!sheet.ss_paid_voucher_id"
+                  :disabled="sheet.status !== 'accrued' && sheet.status !== 'paid'"
+                  @click="payLiability('social')"
+                >缴纳社保公积金 (清偿挂账)</NButton>
+                <NButton v-else secondary type="warning" @click="viewVoucher(sheet.ss_paid_voucher_id!)">
+                  查看社保缴纳凭证
                 </NButton>
-                <NButton secondary type="success" @click="viewVoucher(sheet.payment_voucher_id!)">
-                  查看发放凭证
+
+                <NButton
+                  v-if="!sheet.tax_paid_voucher_id"
+                  @click="payLiability('tax')"
+                >缴纳个税 (清偿挂账)</NButton>
+                <NButton v-else secondary type="warning" @click="viewVoucher(sheet.tax_paid_voucher_id!)">
+                  查看个税缴纳凭证
                 </NButton>
-                <span class="paid-desc"><i class="ri-checkbox-circle-fill" /> 该月工资已结算并发放记账完毕。</span>
+
+                <span v-if="sheet.ss_paid_voucher_id && sheet.tax_paid_voucher_id" class="paid-desc">
+                  <i class="ri-checkbox-circle-fill" /> 工资、社保、个税均已记账完毕。
+                </span>
+                <span v-else-if="sheet.status === 'paid'" class="paid-desc">
+                  <i class="ri-information-line" /> 工资已发放；请完成社保与个税缴纳记账，避免挂账。
+                </span>
               </template>
             </NSpace>
           </div>
@@ -634,9 +677,11 @@ function viewVoucher(voucherId: string) {
 
 <style scoped>
 .salary-page {
-  max-width: 980px;
+  max-width: 1240px;
   margin: 0 auto;
   padding: 16px 0 32px 0;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .page-header {

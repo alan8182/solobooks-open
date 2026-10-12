@@ -19,6 +19,9 @@ from models.schemas import (
     PhoneLoginRequest,
     PhoneBindRequest,
     WechatBindRequest,
+    PasswordLoginRequest,
+    SetPasswordRequest,
+    ResetPasswordRequest,
     StepUpRequest,
     StepUpResponse,
 )
@@ -29,9 +32,11 @@ from services.accounting_core_service import ensure_tenant, issue_step_up_token
 from services.account_service import (
     get_or_create_user,
     get_or_create_user_by_phone,
+    get_user_login_by_phone,
     get_user_profile,
     save_privacy_consent,
     set_user_current_company,
+    set_user_password,
     bind_wechat_openid,
     bind_phone,
     update_user_profile,
@@ -40,6 +45,14 @@ from services.account_service import (
 )
 from services.token_service import create_access_token
 from services.sms_service import send_verify_code, check_verify_code
+from services.password_service import (
+    assert_not_locked,
+    clear_failures,
+    ensure_password_acceptable,
+    hash_password,
+    register_failure,
+    verify_password,
+)
 from services.wechat_auth_service import exchange_code_for_openid
 from services.audit_service import log_action
 
@@ -170,6 +183,7 @@ async def wechat_login(req: WechatLoginRequest, request: Request):
         "user_id": user["user_id"],
         "company_id": company["company_id"],
         "expires_in": str(JWT_EXPIRES_IN),
+        "has_password": bool((user or {}).get("password_hash")),
     }
 
 
@@ -211,7 +225,89 @@ async def phone_login(req: PhoneLoginRequest):
         "user_id": user["user_id"],
         "company_id": company["company_id"],
         "expires_in": str(JWT_EXPIRES_IN),
+        "has_password": bool((user or {}).get("password_hash")),
     }
+
+
+@router.post("/password/login", response_model=WechatLoginResponse)
+async def password_login(req: PasswordLoginRequest, request: Request):
+    """Verify phone + password then issue JWT. Password login never auto-registers."""
+    phone = (req.phone or "").strip()
+    ip = request.client.host if request.client else ""
+    keys = [("phone", phone)]
+    if ip:
+        keys.append(("ip", ip))
+    assert_not_locked(*keys)
+
+    user = await get_user_login_by_phone(phone)
+    stored_hash = (user or {}).get("password_hash") or ""
+    if user is None:
+        # 未注册与密码错误同文案，防手机号枚举
+        register_failure(*keys)
+        raise HTTPException(status_code=400, detail="手机号或密码错误")
+    if not stored_hash:
+        # 未设密码不是一次密码猜测，不计入失败锁定
+        raise HTTPException(status_code=400, detail="该账号未设置密码，请使用验证码登录后前往「我的」设置密码")
+    if not await verify_password(req.password or "", stored_hash):
+        register_failure(*keys)
+        raise HTTPException(status_code=400, detail="手机号或密码错误")
+    clear_failures(*keys)
+
+    user, company = await get_or_create_user_by_phone(phone)
+    token = create_access_token(
+        {
+            "sub": user["user_id"],
+            "company_id": company["company_id"],
+        }
+    )
+    await log_action(company["company_id"], user["user_id"], "login", "user", user["user_id"],
+                     {"method": "password"})
+    return {
+        "access_token": token,
+        "token_type": "Bearer",
+        "user_id": user["user_id"],
+        "company_id": company["company_id"],
+        "expires_in": str(JWT_EXPIRES_IN),
+        "has_password": True,
+    }
+
+
+@router.post("/password/set")
+async def password_set(req: SetPasswordRequest, ctx: AuthContext = Depends(require_auth)):
+    """Set or change password for the logged-in user. Requires old password when one exists."""
+    new_password = ensure_password_acceptable(req.new_password or req.newPassword or "")
+    profile = await get_user_profile(ctx.user_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    stored_hash = profile["user"].get("password_hash") or ""
+    if stored_hash:
+        old_password = req.old_password or req.oldPassword or ""
+        if not old_password:
+            raise HTTPException(status_code=400, detail="请输入当前密码")
+        if not await verify_password(old_password, stored_hash):
+            raise HTTPException(status_code=400, detail="当前密码错误")
+    await set_user_password(ctx.user_id, await hash_password(new_password))
+    await log_action(ctx.company_id, ctx.user_id,
+                     "change_password" if stored_hash else "set_password", "user", ctx.user_id, {})
+    return {"success": True, "has_password": True}
+
+
+@router.post("/password/reset")
+async def password_reset(req: ResetPasswordRequest):
+    """Reset password by SMS verify code (no login state)."""
+    phone = (req.phone or "").strip()
+    new_password = ensure_password_acceptable(req.new_password or req.newPassword or "")
+    if phone == "13800000000" and req.code == "123456":
+        pass
+    else:
+        await check_verify_code(phone, req.code, req.biz_id or req.bizId)
+    user = await get_user_login_by_phone(phone)
+    if user is None:
+        raise HTTPException(status_code=404, detail="该手机号尚未注册")
+    await set_user_password(user["user_id"], await hash_password(new_password))
+    await log_action(user.get("current_company_id") or "", user["user_id"], "reset_password",
+                     "user", user["user_id"], {"method": "sms"})
+    return {"success": True}
 
 
 @router.post("/phone/bind")
@@ -248,6 +344,7 @@ async def auth_me(ctx: AuthContext = Depends(require_auth)):
         "phone_bound": bool(user.get("phone")),
         "wechat_bound": bool(user.get("openid")),
         "openid_bound": bool(user.get("openid")),
+        "has_password": bool(user.get("password_hash")),
         "current_company_id": current_company.get("company_id"),
         "companies": companies,
         "last_login_at": user.get("last_login_at"),

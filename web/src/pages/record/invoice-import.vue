@@ -60,6 +60,14 @@ function isArchiveInvoice(invoice: any) {
   return Boolean(invoice.is_archive_only || invoice.isArchiveOnly)
 }
 
+function isPostedInvoice(invoice: any) {
+  return invoice.voucherStatus === 'posted'
+}
+
+function isReversedInvoice(invoice: any) {
+  return invoice.voucherStatus === 'reversed'
+}
+
 const filteredInvoices = computed(() => {
   const keyword = invoiceSearch.value.trim().toLowerCase()
   const startDate = invoiceDateRange.value ? invoiceDateKey(invoiceDateRange.value[0]) : ''
@@ -107,13 +115,19 @@ watch([invoiceSearch, invoiceDateRange, invoiceDirection, invoiceMatchStatus], (
   invoicePage.value = 1
 })
 
+function goVoucherDetail(invoice: any) {
+  router.push(`/ledger/${invoice.id}`)
+}
+
 async function handleDeleteInvoice(id: string) {
   loading.value = true
   try {
     await entryStore.removeEntry(id)
     message.success('发票已删除')
   } catch (err) {
-    message.error('删除发票失败')
+    const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail
+    const reason = typeof detail === 'string' ? detail : (detail as { message?: string } | undefined)?.message
+    message.error(reason || '删除发票失败')
   } finally {
     loading.value = false
   }
@@ -544,12 +558,16 @@ const importedInvoiceColumns = [
     title: '入账模式', key: 'is_archive_only', width: 130, align: 'center' as const,
     render: (row: any) => h(NCheckbox, {
       checked: !isArchiveInvoice(row),
+      disabled: isPostedInvoice(row) || isReversedInvoice(row) || row.billingStatus === 'reconciled',
       'onUpdate:checked': (checked: boolean) => toggleArchiveMode(row.id, !checked),
     }, () => isArchiveInvoice(row) ? '仅归档' : '参与记账'),
   },
   {
     title: '状态', key: 'billingStatus', width: 120, align: 'center' as const,
     render: (row: any) => {
+      if (isReversedInvoice(row)) {
+        return h(NTag, { size: 'small', type: 'default', bordered: false }, () => '已冲销')
+      }
       if (isArchiveInvoice(row)) {
         return h(NTag, { size: 'small', type: 'default', bordered: false }, () => '仅归档不入账')
       }
@@ -562,20 +580,28 @@ const importedInvoiceColumns = [
     title: '操作', key: 'actions', width: 190, align: 'center' as const,
     render: (row: any) => h(NSpace, { justify: 'center', size: 4, wrap: true }, () => [
       h(NButton, { size: 'tiny', secondary: true, onClick: () => openDetailModal(row) }, () => '明细'),
-      !isArchiveInvoice(row) ? h(NButton, {
-        size: 'tiny',
-        type: 'primary',
-        secondary: true,
-        disabled: row.billingStatus === 'reconciled',
-        onClick: () => openBookkeepingModal(row),
-      }, () => row.billingStatus === 'reconciled' ? '已对账' : (row.payer ? '编辑记账' : '去记账')) : null,
-      h(NButton, {
-        size: 'tiny', type: 'error', ghost: true,
-        onClick: () => confirmDelete({
-          content: `确定删除发票“${row.title || '未命名发票'}”吗？此操作不可撤销。`,
-          onConfirm: () => handleDeleteInvoice(row.id),
-        }),
-      }, () => '删除'),
+      // 操作按凭证生命周期收敛：已核销不可改删（保护核销关系）、已过账走冲销、
+      // 已冲销仅留痕，只有草稿未对账发票才可编辑/删除
+      isReversedInvoice(row) ? null
+        : row.billingStatus === 'reconciled'
+          ? h(NButton, { size: 'tiny', type: 'success', secondary: true, onClick: () => openDetailModal(row) }, () => '已对账·查看')
+          : isPostedInvoice(row)
+            ? h(NButton, { size: 'tiny', type: 'warning', secondary: true, onClick: () => goVoucherDetail(row) }, () => '已入账·去冲销')
+            : !isArchiveInvoice(row) ? h(NButton, {
+              size: 'tiny',
+              type: 'primary',
+              secondary: true,
+              onClick: () => openBookkeepingModal(row),
+            }, () => row.payer ? '编辑记账' : '去记账') : null,
+      (!isPostedInvoice(row) && !isReversedInvoice(row) && row.billingStatus !== 'reconciled')
+        ? h(NButton, {
+          size: 'tiny', type: 'error', ghost: true,
+          onClick: () => confirmDelete({
+            content: `确定删除发票“${row.title || '未命名发票'}”吗？此操作不可撤销。`,
+            onConfirm: () => handleDeleteInvoice(row.id),
+          }),
+        }, () => '删除')
+        : null,
     ]),
   },
 ]
@@ -660,7 +686,7 @@ const previewColumns = [
 <template>
   <div class="invoice-import-page">
     <div class="page-header">
-      <NButton text @click="router.push('/record/text')">← 返回</NButton>
+      <NButton text @click="router.push('/ledger')">← 返回账本</NButton>
       <h2>发票导入</h2>
     </div>
 
@@ -1060,8 +1086,10 @@ const previewColumns = [
 
 <style scoped>
 .invoice-import-page {
-  max-width: 800px;
+  max-width: 1240px;
   margin: 0 auto;
+  width: 100%;
+  box-sizing: border-box;
 }
 .page-header {
   margin-bottom: 16px;

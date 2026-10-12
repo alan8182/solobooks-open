@@ -88,20 +88,28 @@ export interface NavItem {
   path?: string
   label: string
   icon: string
-  group: '经营' | '财务' | '管理'
+  group: '日常' | '周期' | '管理'
   children?: NavChildItem[]
 }
 
+// ponytail: streamlined from 20+ scattered entries into 3 temporal groups: Daily, Periodic, Admin
 export const NAV_ITEMS: NavItem[] = [
-  { path: '/', label: '经营总览', icon: 'ri-home-5-line', group: '经营' },
-  { path: '/ledger', label: '经营账本', icon: 'ri-book-open-line', group: '经营' },
-  { path: '/todos', label: '待办事项', icon: 'ri-checkbox-circle-line', group: '经营' },
-  { path: '/copilot', label: 'AI 小秘', icon: 'ri-sparkling-line', group: '经营' },
-  { path: '/reports', label: '经营报表', icon: 'ri-bar-chart-box-line', group: '财务' },
+  // 日常协同（以 AI 会计为核心）
+  { path: '/', label: '工作台', icon: 'ri-dashboard-3-line', group: '日常' },
+  { path: '/copilot', label: 'AI 会计', icon: 'ri-sparkling-fill', group: '日常' },
+  { path: '/ledger', label: '经营账本', icon: 'ri-book-open-line', group: '日常' },
+  { path: '/todos', label: '待办事项', icon: 'ri-checkbox-circle-line', group: '日常' },
+
+  // 周期核算（月末结账与季末税报）
+  { path: '/closing-wizard', label: '月度结账', icon: 'ri-calendar-check-line', group: '周期' },
+  { path: '/tax-filing', label: '税务申报', icon: 'ri-file-shield-2-line', group: '周期' },
+  { path: '/reports', label: '经营报表', icon: 'ri-bar-chart-box-line', group: '周期' },
+
+  // 底层工具与设置（二级收纳，保持侧栏简约）
   {
     label: '财务工具',
     icon: 'ri-briefcase-4-line',
-    group: '财务',
+    group: '管理',
     children: [
       { path: '/record/invoice-import', label: '发票管理', icon: 'ri-receipt-line' },
       { path: '/bank', label: '银行流水', icon: 'ri-bank-line' },
@@ -122,6 +130,7 @@ export const NAV_ITEMS: NavItem[] = [
       { path: '/mine/categories', label: '分类管理', icon: 'ri-price-tag-3-line' },
       { path: '/mine/accounts', label: '会计科目', icon: 'ri-node-tree' },
       { path: '/mine/opening', label: '期初设置', icon: 'ri-calendar-check-line' },
+      { path: '/mine/mcp', label: 'AI 连接（MCP）', icon: 'ri-plug-line' },
       { path: '/mine/audit-log', label: '审计日志', icon: 'ri-file-history-line' },
     ],
   },

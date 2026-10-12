@@ -24,7 +24,15 @@ export function signedInvoiceAmount(invoice?: ClosingWizardEntryLike | null): nu
 }
 
 export function groupedEntryTotal(entries: ClosingWizardEntryLike[]): number {
-  return Number(entries.reduce((sum, entry) => sum + reconciliationEntryEffect(entry), 0).toFixed(2))
+  // Match the server: prefer the group's actual bank effect. Summing each
+  // entry's bank-or-clearing effect counts the same receipt twice after settlement.
+  const bankCents = entries.reduce((sum, entry) => sum + Math.round(100 * (
+    entry.voucherLines ? voucherAccountEffect(entry, '1002') : signedInvoiceAmount(entry)
+  )), 0)
+  if (bankCents !== 0) return bankCents / 100
+  return entries.reduce((sum, entry) => sum + Math.round(
+    100 * voucherAccountEffect(entry, '1012'),
+  ), 0) / 100
 }
 
 function voucherAccountEffect(entry: ClosingWizardEntryLike, accountCode: string): number {
@@ -108,4 +116,41 @@ export function isDirectionCompatible(direction?: string | null, amount?: number
   const bankDir = amt >= 0 ? 'income' : 'expense'
   if (direction === 'owner_transfer') return true
   return direction === bankDir
+}
+
+export function buildSuggestedMatchPair(suggestion: any, entries: ClosingWizardEntryLike[]) {
+  if (suggestion.type !== 'match') return null
+  const ids = getStatementMatchedEntryIds({
+    matched_entry_id: suggestion.matchedEntryId,
+    matched_entry_ids: suggestion.matchedEntryIds,
+  })
+  if (ids.length === 0) return null
+  const suggestedEntries = suggestion.matchedEntries || [suggestion.matchedEntry].filter(Boolean)
+  const pairEntries = ids.map((id) => entries.find((entry) => entry.id === id)
+    || suggestedEntries.find((entry: any) => entry.id === id))
+  if (pairEntries.some((entry) => !entry)) return null
+  const amount = Number(suggestion.statement?.amount) || 0
+  if (ids.length > 1) {
+    if (Math.abs(reconciliationDifference(amount, pairEntries)) > 0.01) return null
+  } else if (!isDirectionCompatible(pairEntries[0].direction, amount)) {
+    return null
+  }
+  return {
+    id: suggestion.statementId,
+    statementId: suggestion.statementId,
+    matchedEntryId: ids[0],
+    matchedEntryIds: ids,
+    entries: pairEntries,
+    invoice: pairEntries[0],
+    bank: {
+      id: suggestion.statementId,
+      title: suggestion.statement?.description || '未命名流水',
+      amount,
+    },
+    confidence: typeof suggestion.confidence === 'string' ? suggestion.confidence
+      : `${Math.round((suggestion.confidence || 0) * 100)}%`,
+    reason: suggestion.reason || '金额与日期匹配',
+    persisted: false,
+    status: 'pending',
+  }
 }

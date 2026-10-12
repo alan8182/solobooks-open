@@ -9,7 +9,7 @@ import re
 
 from services.database import get_conn
 from services.entry_service import save_entry
-from services.account_mapper import CATEGORY_TO_ACCOUNT
+from services.account_mapper import CATEGORY_TO_ACCOUNT, get_voucher_hint
 from services.invoice_llm_prompts import INVOICE_CLASSIFY_PROMPT
 from services.llm import safe_chat_text_json
 from core.money import ZERO, money, rate
@@ -265,6 +265,7 @@ async def classify_invoice(row: Dict[str, Any], company_name: str = "") -> Dict[
         prompt,
         fallback=fallback,
         max_retries=1,
+        scene="invoice",
     )
     if isinstance(result, dict):
         direction = default_direction
@@ -317,6 +318,15 @@ async def import_invoices(company_id: str, user_id: str, rows: List[Dict[str, An
             else:
                 suggestion = {"direction": row.get("direction", "expense"), "category": row.get("category", "其他支出")}
 
+        seller = str(row.get("seller_name") or "").strip()
+        item = str(row.get("item_name") or "").strip()
+        # ponytail: 支付平台手续费发票自动识别为仅归档底稿，避免重复计入手续费并虚增银行支出对账差额
+        is_platform_fee = bool(
+            re.search(r"财付通|微信支付|支付宝|连连支付|网银在线", seller)
+            or re.search(r"手续费|支付服务费|技术服务费", f"{item} {row.get('title', '')}")
+        )
+        is_archive = bool(row.get("is_archive_only") or row.get("isArchiveOnly") or is_platform_fee)
+
         entry_data = {
             "title": row.get("title", f"发票-{row.get('seller_name', '')}"),
             "amount": row.get("amount", 0),
@@ -327,6 +337,9 @@ async def import_invoices(company_id: str, user_id: str, rows: List[Dict[str, An
             "source": "invoice_import",
             "invoiceNumber": row.get("invoice_number", ""),
             "billingStatus": "has_invoice",
+            "is_archive_only": is_archive,
+            "isArchiveOnly": is_archive,
+            "payer": row.get("payer", "company_account"),
             # Set vatAmount and vatRate in the entry payload
             "vatAmount": safe_money(row.get("tax_amount")),
             "vatRate": parse_vat_rate(row.get("tax_rate", "")),
@@ -346,7 +359,7 @@ async def import_invoices(company_id: str, user_id: str, rows: List[Dict[str, An
             "invoice_type": row.get("invoice_type", ""),
             "invoice_status": row.get("invoice_status", ""),
             "drawer": row.get("drawer", ""),
-            "remark": row.get("remark", ""),
+            "remark": row.get("remark") or ("支付平台手续费发票（已自动归档为底稿，避免重复扣费与银行对账差额）" if is_platform_fee else ""),
             "rdProjectId": row.get("rdProjectId"),
             "rdExpenseType": row.get("rdExpenseType"),
             "rdOriginalAmount": row.get("rdOriginalAmount") or row.get("amount", 0),
@@ -354,6 +367,22 @@ async def import_invoices(company_id: str, user_id: str, rows: List[Dict[str, An
             "rdAllocationBasis": row.get("rdAllocationBasis"),
             "rdNotes": row.get("rdNotes"),
         }
+
+        # ponytail: 发票是原始凭证不是资金记录——导入时费用挂应付(2241)、销项挂应收(1122)，
+        # 与银行流水配对确认付款后才转资金科目，杜绝"直付1002"在配对前虚减银行存款。
+        if suggestion["direction"] in ("expense", "income"):
+            hint = get_voucher_hint(
+                suggestion["direction"],
+                suggestion["category"],
+                row.get("amount", 0),
+                payer=str(entry_data.get("payer") or "company_account"),
+            )
+            if suggestion["direction"] == "expense" and hint.get("credit"):
+                hint["credit"] = [dict(line, accountCode="2241", accountName="其他应付款-发票待付款") for line in hint["credit"]]
+            elif suggestion["direction"] == "income" and hint.get("debit"):
+                hint["debit"] = [dict(line, accountCode="1122", accountName="应收账款-发票待收") for line in hint["debit"]]
+            if hint.get("debit") and hint.get("credit"):
+                entry_data["voucherLines"] = hint
 
         try:
             if suggestion["category"] == "研发支出-费用化支出" and not (

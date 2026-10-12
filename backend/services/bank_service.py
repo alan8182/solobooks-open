@@ -5,6 +5,7 @@ import asyncio
 import csv
 import io
 import json
+import logging
 import re
 from datetime import date
 from datetime import datetime, timezone, timedelta
@@ -20,6 +21,8 @@ from services.audit_service import log_action
 from core.money import ZERO, money, money_text
 from services.json_utils import json_dumps
 from db.models import SourceTransaction
+
+logger = logging.getLogger(__name__)
 
 RECONCILIATION_AMOUNT_TOLERANCE = Decimal("0.01")
 
@@ -927,6 +930,9 @@ async def get_difference_report(company_id: str, month: str) -> dict:
         if payload_id:
             entries_by_id[payload_id] = payload
 
+        if payload.get("voucherStatus") in {"draft", "pending_review", "void"}:
+            continue
+
         voucher = payload.get("voucherLines", {})
         if not voucher:
             direction = payload.get("direction", "expense")
@@ -936,7 +942,7 @@ async def get_difference_report(company_id: str, month: str) -> dict:
             voucher = get_voucher_hint(direction, category, amount, payer)
 
         occur_date = payload.get("occurDate", "")
-        bank_date = str(payload.get("paymentDate") or occur_date)
+        bank_date = str(occur_date if payload.get("voucherStatus") else payload.get("paymentDate") or occur_date)
         if bank_date and bank_date[:7] <= month:
             book_bank_balance += _account_effect_from_voucher(voucher, "1002")
         if not occur_date.startswith(month):
@@ -969,6 +975,23 @@ async def get_difference_report(company_id: str, month: str) -> dict:
             entry_ids.insert(0, legacy_id)
         payloads = [entries_by_id[entry_id] for entry_id in entry_ids if entry_id in entries_by_id]
         if not payloads:
+            continue
+        unposted = [p for p in payloads if p.get("voucherStatus") in {"draft", "pending_review"}]
+        if unposted:
+            posted_effect = money(sum((_entry_bank_effect_from_payload(p) for p in payloads
+                if p.get("voucherStatus") not in {"draft", "pending_review"}), ZERO))
+            matched_effect_issues.append({
+                "type": "unposted_match", "statementId": statement_id,
+                "description": statement.get("description"), "date": statement.get("transaction_date"),
+                "statementAmount": safe_money(statement.get("amount")),
+                "entryIds": [p.get("id") for p in unposted], "repairable": False,
+                "entryTitles": [p.get("title") for p in unposted],
+                "bankEffect": posted_effect,
+                "difference": money(safe_money(statement.get("amount")) - posted_effect),
+                "reason": "关联凭证尚未过账，请到凭证页确认或提交复核",
+                "message": "关联凭证尚未过账，请到凭证页确认或提交复核",
+                "repairDescription": "关联凭证尚未过账，请到凭证页确认或提交复核",
+            })
             continue
         issue = diagnose_matched_statement_effect(statement, payloads)
         if issue:
@@ -1004,7 +1027,11 @@ async def repair_matched_statement_effect(
     user_id: str,
     statement_id: str,
 ) -> Dict[str, Any]:
-    """Apply one deterministic repair after re-diagnosing the current match."""
+    """Legacy projection fixture repair; HTTP repairs use bank_settlement_service.
+
+    Kept for isolated legacy compatibility tests only. Never call this helper
+    from a production financial write: it has no authoritative journal session.
+    """
     await _ensure_schema()
     conn = await get_conn()
     repair_entry_id = ""
@@ -1231,7 +1258,10 @@ async def get_reconciliation_health(company_id: str, month: str) -> dict:
             direction_mismatches.append(item)
         if abs(abs(stmt_amount) - abs(check["entryBankEffect"])) > RECONCILIATION_AMOUNT_TOLERANCE:
             amount_mismatches.append(item)
-        if any(entry.get("billingStatus") != "reconciled" for entry in entries):
+        if any(entry.get("billingStatus") != "reconciled" or
+               entry.get("voucherStatus") in {"draft", "pending_review"} for entry in entries):
+            item["unpostedEntryIds"] = [entry.get("id") for entry in entries
+                if entry.get("voucherStatus") in {"draft", "pending_review"}]
             pending_confirmations.append(item)
 
     for entry_id, statements in statements_by_entry.items():
@@ -1280,7 +1310,71 @@ async def get_statement_ids(company_id: str) -> List[str]:
         await conn.close()
 
 
-async def ai_suggest_matches(company_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+async def get_wechat_settlement_candidates(
+    company_id: str, statement: Dict[str, Any],
+) -> List[List[Dict[str, Any]]]:
+    """Read complete order/day groups; a candidate is never an automatic match."""
+    if not re.search(r"微信|财付通|WeChat|Tenpay", str(statement.get("description") or ""), re.I):
+        return []
+    try:
+        statement_date = date.fromisoformat(str(statement.get("transaction_date") or "")[:10])
+    except ValueError:
+        return []
+    matched_ids = await get_matched_entry_ids(company_id)
+    conn = await get_conn()
+    try:
+        rows = await (await conn.execute(
+            "SELECT id, payload FROM entries WHERE company_id = ? "
+            "AND json_extract(payload, '$.source') = 'wechat_bill' "
+            "AND json_extract(payload, '$.occurDate') >= ? "
+            "AND json_extract(payload, '$.occurDate') < ? ORDER BY id",
+            (company_id, (statement_date - timedelta(days=5)).isoformat(),
+             (statement_date + timedelta(days=1)).isoformat()),
+        )).fetchall()
+    finally:
+        await conn.close()
+
+    orders: Dict[tuple[str, str], List[Dict[str, Any]]] = {}
+    unavailable: set[tuple[str, str]] = set()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        payload = {**payload, "id": str(row["id"])}
+        key = (str(payload.get("occurDate") or "")[:10], str(payload.get("wechat_order_no") or ""))
+        orders.setdefault(key, []).append(payload)
+        if (payload["id"] in matched_ids or payload.get("billingStatus") == "reconciled"
+                or payload.get("is_archive_only") or payload.get("isArchiveOnly")):
+            unavailable.add(key)
+
+    days: Dict[str, List[Dict[str, Any]]] = {}
+    groups = []
+    for key, entries in orders.items():
+        if key in unavailable:
+            continue
+        # A same-day complete refund must not become part of a bank receipt.
+        if sum((_entry_group_reconciliation_effect(entry) for entry in entries), ZERO) == ZERO:
+            continue
+        groups.append(entries)
+        days.setdefault(key[0], []).extend(entries)
+    groups.extend(days.values())
+    candidates = []
+    seen = set()
+    for entries in groups:
+        ids = frozenset(entry["id"] for entry in entries)
+        if ids in seen:
+            continue
+        check = build_group_reconciliation_check(statement.get("amount"), entries)
+        if check["amountMatches"] and check["directionMatches"]:
+            seen.add(ids)
+            candidates.append(entries)
+    return candidates
+
+
+async def ai_suggest_matches(company_id: str, limit: int = 20, month: str | None = None) -> List[Dict[str, Any]]:
     """AI-powered matching suggestions for unmatched bank statements.
 
     Improvements:
@@ -1296,11 +1390,16 @@ async def ai_suggest_matches(company_id: str, limit: int = 20) -> List[Dict[str,
     # Get unmatched statements
     conn = await get_conn()
     try:
-        cursor = await conn.execute(
-            "SELECT * FROM bank_statements WHERE company_id = ? AND (matched_entry_id IS NULL OR matched_entry_id = '') "
-            "ORDER BY transaction_date DESC LIMIT ?",
-            (company_id, limit),
-        )
+        sql = "SELECT * FROM bank_statements WHERE company_id = ? AND (matched_entry_id IS NULL OR matched_entry_id = '') "
+        params: list[Any] = [company_id]
+        if month:
+            start = date.fromisoformat(f"{month}-01")
+            end = (start.replace(day=28) + timedelta(days=4)).replace(day=1)
+            sql += "AND transaction_date >= ? AND transaction_date < ? "
+            params.extend([start.isoformat(), end.isoformat()])
+        sql += "ORDER BY transaction_date DESC LIMIT ?"
+        params.append(limit)
+        cursor = await conn.execute(sql, tuple(params))
         statements = [dict(r) for r in await cursor.fetchall()]
     finally:
         await conn.close()
@@ -1366,6 +1465,36 @@ async def ai_suggest_matches(company_id: str, limit: int = 20) -> List[Dict[str,
     
     need_ai_statements = []
     for stmt in statements:
+        try:
+            settlement_candidates = await get_wechat_settlement_candidates(company_id, stmt)
+        except Exception:
+            # 候选失败只降级该流水（走规则/AI 路径），不能炸掉整批建议
+            logger.exception("get_wechat_settlement_candidates failed for %s", stmt.get("id"))
+            settlement_candidates = []
+        if settlement_candidates:
+            available_groups = [group for group in settlement_candidates
+                                if len(group) <= 500
+                                and not any(entry["id"] in used_suggested_entry_ids for entry in group)]
+            suggestion = {
+                "statementId": stmt["id"],
+                "statement": {"date": stmt["transaction_date"], "description": stmt["description"],
+                              "amount": stmt["amount"], "balance": stmt["balance"]},
+                "type": "existing",
+                "confidence": 0,
+                "reason": "已有微信账目，请核对原收入与手续费后合并对账，勿重复记账",
+            }
+            if len(available_groups) == 1:
+                group = available_groups[0]
+                ids = [entry["id"] for entry in group]
+                used_suggested_entry_ids.update(ids)
+                suggestion.update({
+                    "type": "match", "matchedEntryId": ids[0], "matchedEntryIds": ids,
+                    "matchedEntry": group[0], "matchedEntries": group,
+                    "confidence": 0.95,
+                    "reason": "微信原账目净额与到账金额一致，请核对订单后确认合并对账",
+                })
+            suggestions.append(suggestion)
+            continue
         # First try rule-based match (fast path)
         available_entries = [
             e for e in entries
@@ -1664,5 +1793,29 @@ async def classify_single_statement(company_id: str, statement_id: str, business
                   "title": stmt["description"],
                   "confidence": 0.3, "reason": "无法自动分类"},
         max_retries=1,
+        scene="bank_statement",
+        company_id=company_id,
     )
     return classify_result
+
+
+async def apply_statement_match(
+    company_id: str,
+    user_id: str,
+    statement_id: str,
+    entry_ids: List[str],
+    *,
+    session: AsyncSession,
+    request_id: str = "",
+) -> dict:
+    """Agent 对账建议的"简单匹配"应用器（仅覆盖常规正向匹配）。
+
+    与 HTTP 确认共用权威事务，同时创建结算草稿和原始业务关联。
+    垫付报销合并等特殊场景在此拒绝，指引用户走银行流水页手动确认（单一权威路径）。
+    """
+
+    from services.bank_settlement_service import confirm_statement_match
+    if not entry_ids:
+        raise ValueError("至少需要一笔要匹配的账目记录")
+    return await confirm_statement_match(session, company_id=company_id, user_id=user_id,
+        statement_id=statement_id, entry_ids=entry_ids, request_id=request_id or _now_iso())

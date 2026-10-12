@@ -2,6 +2,7 @@
  * 小企业会计准则（简化版）科目库与映射逻辑
  * 与后端 services/account_mapper.py 保持一致
  */
+import { formatMoney } from './format'
 
 export interface VoucherLine {
   code: string
@@ -159,6 +160,25 @@ export function amountSignForDirection(direction: string, category = '', amount?
     return ['股东取现', '股东垫付报销', '员工垫付报销'].includes(normalizedCategory) ? '-' : '+'
   }
   return ''
+}
+
+export type MoneyTone = 'income' | 'expense' | 'neutral'
+
+/**
+ * 条目金额的展示口径（符号 + 色调按资金实际流向）：
+ * 冲退类负金额（如手续费退还 借银行/贷费用、退款给客户）账面方向不变，
+ * 但资金流向相反—— expense 负显示 +¥x 绿色，income 负显示 -¥x 红色。
+ */
+export function moneyPresentation(direction: string, category: string, amount: number | string): { text: string; tone: MoneyTone } {
+  const value = Number(amount) || 0
+  const abs = formatMoney(Math.abs(value))
+  if (value < 0) {
+    if (direction === 'expense') return { text: `+${abs}`, tone: 'income' }
+    if (direction === 'income') return { text: `-${abs}`, tone: 'expense' }
+    return { text: `-${abs}`, tone: 'neutral' }
+  }
+  const tone: MoneyTone = direction === 'income' ? 'income' : direction === 'expense' ? 'expense' : 'neutral'
+  return { text: `${amountSignForDirection(direction, category, value)}${abs}`, tone }
 }
 
 export interface EntryForVoucher {

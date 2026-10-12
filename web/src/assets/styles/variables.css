@@ -1,11 +1,11 @@
 :root {
-  /* Quiet Operations: one stable brand blue */
-  --solo-primary: #165dff;
-  --solo-primary-light: #3d78ff;
-  --solo-primary-dark: #0f46cc;
-  --solo-primary-glow: rgba(22, 93, 255, 0.08);
-  --solo-ai: #165dff;
-  --solo-ai-glow: rgba(22, 93, 255, 0.08);
+  /* Quiet Operations: official brand blue #1747B0 */
+  --solo-primary: #1747b0;
+  --solo-primary-light: #2b66e2;
+  --solo-primary-dark: #0d3282;
+  --solo-primary-glow: rgba(23, 71, 176, 0.08);
+  --solo-ai: #1747b0;
+  --solo-ai-glow: rgba(23, 71, 176, 0.08);
 
   /* Backgrounds */
   --solo-bg-page: #f6f7f9;

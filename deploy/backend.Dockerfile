@@ -11,8 +11,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
+ARG PIP_INDEX_URL=https://pypi.org/simple
 COPY backend/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -i $PIP_INDEX_URL -r requirements.txt
 
 COPY backend/ .
 

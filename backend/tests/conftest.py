@@ -9,6 +9,8 @@ TEST_CORE_DB = Path(__file__).resolve().parent.parent / "data" / ".pytest_accoun
 if TEST_CORE_DB.exists():
     TEST_CORE_DB.unlink()
 os.environ.setdefault("ACCOUNTING_TEST_MODE", "1")
+# 测试用 test-token 兜底身份，与本地开发行为保持一致（生产 compose 显式关闭）
+os.environ.setdefault("AUTH_DEV_FALLBACK", "1")
 os.environ.setdefault("DATABASE_URL", f"sqlite+aiosqlite:///{TEST_CORE_DB.as_posix()}")
 sqlite3.register_adapter(Decimal, lambda value: format(value, "f"))
 

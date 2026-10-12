@@ -16,12 +16,14 @@ import {
 } from 'naive-ui'
 import { useEntryStore } from '@/stores/entry'
 import { formatDate, formatMoney } from '@/utils/format'
+import { moneyPresentation } from '@/utils/accounting'
 import { exportLedgerToExcel } from '@/utils/export'
 import {
   getEntryNaturePresentation,
   matchesEntryNature,
   type EntryNatureFilter,
 } from '@/utils/entryNature'
+import { normalizedPostingStatus, postingStatusPresentation } from '@/utils/postingStatus'
 import type { Entry } from '@/api/types'
 
 type TimeFilter = 'week' | 'month' | 'quarter' | 'year' | 'all'
@@ -35,6 +37,7 @@ const timeFilter = ref<TimeFilter>('month')
 const natureFilter = ref<EntryNatureFilter>('all')
 const categoryFilter = ref<string | null>(null)
 const billingStatusFilter = ref<string | null>(null)
+const postingStatusFilter = ref<string | null>(null)
 const sorter = ref<DataTableSortState | null>({
   columnKey: 'occurDate',
   order: 'descend',
@@ -53,14 +56,19 @@ const natureOptions = [
   { key: 'all' as const, label: '全部' },
   { key: 'income' as const, label: '收入' },
   { key: 'expense' as const, label: '支出' },
-  { key: 'current_account' as const, label: '往来' },
-  { key: 'capital' as const, label: '资本' },
+  { key: 'current_account' as const, label: '往来/垫付' },
+  { key: 'capital' as const, label: '股东投入' },
 ]
 
 const billingStatusOptions = [
   { label: '全部单据状态', value: 'all' },
-  { label: '待补单据', value: 'pending' },
-  { label: '已有单据', value: 'complete' },
+  { label: '待补发票/收据', value: 'pending' },
+  { label: '已有发票/收据', value: 'complete' },
+]
+
+const postingStatusOptions = [
+  { label: '已过账', value: 'posted' },
+  { label: '草稿', value: 'draft' },
 ]
 
 const pagination = reactive({
@@ -122,6 +130,7 @@ const filteredEntries = computed(() => entryStore.activeEntries.filter((entry) =
   if (categoryFilter.value && entry.category !== categoryFilter.value) return false
   if (billingStatusFilter.value === 'pending' && hasDocument(entry)) return false
   if (billingStatusFilter.value === 'complete' && !hasDocument(entry)) return false
+  if (postingStatusFilter.value && normalizedPostingStatus(entry.voucherStatus) !== postingStatusFilter.value) return false
   return true
 }))
 
@@ -145,7 +154,8 @@ const hasActiveFilters = computed(() => Boolean(
   || timeFilter.value !== 'month'
   || natureFilter.value !== 'all'
   || categoryFilter.value
-  || billingStatusFilter.value,
+  || billingStatusFilter.value
+  || postingStatusFilter.value,
 ))
 
 function dateLabel(entry: Entry): string {
@@ -211,15 +221,32 @@ const columns = computed<DataTableColumns<Entry>>(() => [
     }, { default: () => billingStatusLabel(row) }),
   },
   {
+    title: '状态',
+    key: 'postingStatus',
+    width: 84,
+    render: (row) => {
+      const presentation = postingStatusPresentation(row.voucherStatus)
+      if (!presentation) return null
+      return h(NTag, {
+        size: 'small',
+        bordered: false,
+        type: presentation.tagType,
+      }, { default: () => presentation.label })
+    },
+  },
+  {
     title: '金额',
     key: 'amount',
     width: 136,
     align: 'right',
     sorter: (a, b) => a.amount - b.amount,
     sortOrder: sorter.value?.columnKey === 'amount' ? sorter.value.order : false,
-    render: (row) => h('span', {
-      class: ['amount-cell', row.direction === 'income' ? 'income' : row.direction === 'expense' ? 'expense' : 'neutral'],
-    }, `${row.direction === 'income' ? '+' : row.direction === 'expense' ? '-' : ''}${formatMoney(row.amount)}`),
+    render: (row) => {
+      const presentation = moneyPresentation(row.direction, row.category, row.amount)
+      return h('span', {
+        class: ['amount-cell', presentation.tone],
+      }, presentation.text)
+    },
   },
   {
     title: '',
@@ -238,7 +265,7 @@ const columns = computed<DataTableColumns<Entry>>(() => [
 ])
 
 watch(
-  [keyword, timeFilter, natureFilter, categoryFilter, billingStatusFilter],
+  [keyword, timeFilter, natureFilter, categoryFilter, billingStatusFilter, postingStatusFilter],
   () => { pagination.page = 1 },
 )
 
@@ -261,6 +288,7 @@ function resetFilters() {
   natureFilter.value = 'all'
   categoryFilter.value = null
   billingStatusFilter.value = null
+  postingStatusFilter.value = null
 }
 
 function handleExportExcel() {
@@ -277,12 +305,18 @@ function handleExportExcel() {
   <div class="ledger-page">
     <div class="page-header">
       <div>
-        <h2>账本</h2>
-        <p>查询、核对和整理每一笔经营记录</p>
+        <h2>经营账本</h2>
+        <p>流水清晰可查，所有账目均由 AI 会计实时分类归集</p>
       </div>
       <NSpace>
-        <NButton :disabled="filteredEntries.length === 0" @click="handleExportExcel">导出 Excel</NButton>
-        <NButton type="primary" @click="router.push('/record/text')">记一笔</NButton>
+        <NButton :disabled="filteredEntries.length === 0" @click="handleExportExcel">
+          <template #icon><i class="ri-download-2-line" /></template>
+          导出 Excel
+        </NButton>
+        <NButton type="primary" @click="router.push('/copilot')">
+          <template #icon><i class="ri-sparkling-fill" /></template>
+          AI 记账
+        </NButton>
       </NSpace>
     </div>
 
@@ -335,6 +369,14 @@ function handleExportExcel() {
           placeholder="全部单据状态"
           :input-props="{ name: 'ledger-document-status' }"
           :options="billingStatusOptions.filter(option => option.value !== 'all')"
+        />
+        <NSelect
+          v-model:value="postingStatusFilter"
+          clearable
+          class="filter-select posting-status-select"
+          placeholder="全部过账状态"
+          :input-props="{ name: 'ledger-posting-status' }"
+          :options="postingStatusOptions"
         />
         <NButton v-if="hasActiveFilters" quaternary @click="resetFilters">重置</NButton>
       </div>
@@ -391,7 +433,10 @@ function handleExportExcel() {
           <NEmpty :description="hasActiveFilters ? '没有符合条件的记录' : '还没有账本记录'">
             <template #extra>
               <NButton v-if="hasActiveFilters" @click="resetFilters">清除筛选</NButton>
-              <NButton v-else type="primary" @click="router.push('/record/text')">记第一笔</NButton>
+              <NButton v-else type="primary" @click="router.push('/copilot')">
+                <template #icon><i class="ri-sparkling-fill" /></template>
+                AI 记第一笔
+              </NButton>
             </template>
           </NEmpty>
         </template>
@@ -510,6 +555,7 @@ function handleExportExcel() {
 .search-input { width: min(360px, 100%); }
 .filter-select { width: 168px; }
 .status-select { width: 156px; }
+.posting-status-select { width: 132px; }
 
 .quick-filters {
   display: flex;

@@ -1,11 +1,31 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import type { RouteRecordRaw } from 'vue-router'
+import { resolveAuthRedirect } from './guards'
 
-const routes: RouteRecordRaw[] = [
+export const routes: RouteRecordRaw[] = [
+  {
+    path: '/landing',
+    name: 'Landing',
+    component: () => import('@/pages/landing/index.vue'),
+    meta: { requiresAuth: false },
+  },
   {
     path: '/login',
     name: 'Login',
     component: () => import('@/pages/auth/login.vue'),
+    meta: { requiresAuth: false },
+  },
+  {
+    // 协议类公开页面：登录页与备案信息均可直达
+    path: '/agreement',
+    name: 'Agreement',
+    component: () => import('@/pages/agreement/service.vue'),
+    meta: { requiresAuth: false },
+  },
+  {
+    path: '/privacy',
+    name: 'Privacy',
+    component: () => import('@/pages/agreement/privacy.vue'),
     meta: { requiresAuth: false },
   },
   {
@@ -28,20 +48,21 @@ const routes: RouteRecordRaw[] = [
         name: 'LedgerDetail',
         component: () => import('@/pages/ledger/detail.vue'),
       },
+      // ponytail: consolidated scattered manual recording pages into the unified AI Agent workspace
       {
         path: 'record/text',
         name: 'RecordText',
-        component: () => import('@/pages/record/text.vue'),
+        redirect: '/copilot',
       },
       {
         path: 'record/receipt',
         name: 'RecordReceipt',
-        component: () => import('@/pages/record/receipt.vue'),
+        redirect: '/copilot?mode=receipt',
       },
       {
         path: 'record/batch',
         name: 'RecordBatch',
-        component: () => import('@/pages/record/batch.vue'),
+        redirect: '/copilot',
       },
       {
         path: 'record/invoice-import',
@@ -154,6 +175,11 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/pages/copilot/index.vue'),
       },
       {
+        path: 'tax-filing',
+        name: 'TaxFiling',
+        component: () => import('@/pages/tax-filing/index.vue'),
+      },
+      {
         path: 'mine',
         name: 'Mine',
         component: () => import('@/pages/mine/index.vue'),
@@ -219,6 +245,11 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/pages/mine/audit-log.vue'),
       },
       {
+        path: 'mine/mcp',
+        name: 'McpTokens',
+        component: () => import('@/pages/mine/mcp-tokens.vue'),
+      },
+      {
         path: 'bank',
         name: 'Bank',
         component: () => import('@/pages/bank/index.vue'),
@@ -235,17 +266,19 @@ const routes: RouteRecordRaw[] = [
 const router = createRouter({
   history: createWebHistory(),
   routes,
+  // 官网锚点导航平滑滚动，顶部预留吸顶导航高度
+  scrollBehavior(to) {
+    if (to.hash) return { el: to.hash, top: 72, behavior: 'smooth' }
+    return { top: 0 }
+  },
 })
 
 // Navigation guard
+// ponytail: unauthenticated root access directs to landing; deep protected routes to login; logged-in users go to home workbench
 router.beforeEach((to, _from, next) => {
-  const token = localStorage.getItem('auth_token')
-  if (to.meta.requiresAuth && !token) {
-    next('/login')
-    return
-  }
-  if (to.path === '/login' && token) {
-    next('/')
+  const redirect = resolveAuthRedirect(to, localStorage.getItem('auth_token'))
+  if (redirect) {
+    next(redirect)
     return
   }
   next()

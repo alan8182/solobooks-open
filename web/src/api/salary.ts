@@ -33,6 +33,8 @@ export interface SalarySheet {
   month: string
   status: 'draft' | 'accrued' | 'paid'
   accrual_voucher_id: string | null
+  ss_paid_voucher_id?: string | null
+  tax_paid_voucher_id?: string | null
   payment_voucher_id: string | null
   records: SalaryRecord[]
 }
@@ -76,6 +78,14 @@ export function accrueSalarySheet(month: string) {
 
 export function paySalarySheet(month: string) {
   return apiClient.post<SalarySheet>(`/api/salary/sheets/${month}/pay`)
+}
+
+export function paySalarySocial(month: string) {
+  return apiClient.post<SalarySheet>(`/api/salary/sheets/${month}/pay-social`)
+}
+
+export function paySalaryTax(month: string) {
+  return apiClient.post<SalarySheet>(`/api/salary/sheets/${month}/pay-tax`)
 }
 
 export function getRdSalaryAllocations(month: string): Promise<{ allocations: RdSalaryAllocation[] }> {

@@ -658,9 +658,11 @@ onMounted(loadTree)
 
 <style scoped>
 .accounts-page {
-  max-width: 800px;
+  max-width: 1200px;
   margin: 0 auto;
   padding: 16px 0 32px 0;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .page-header {

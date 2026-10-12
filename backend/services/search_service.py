@@ -51,8 +51,10 @@ async def _search_entries(company_id: str, q: str) -> List[Dict[str, Any]]:
 async def _search_accounts(company_id: str, q: str) -> List[Dict[str, Any]]:
     conn = await get_conn()
     try:
+        # chart_accounts 在生产 PG 是 boolean 列（categories/employees 是 integer，勿同改）；
+        # SQLite 下 TRUE 与 1 等价，两边通用。
         cursor = await conn.execute(
-            "SELECT * FROM chart_accounts WHERE company_id = ? AND (name LIKE ? OR code LIKE ?) AND is_active = 1 ORDER BY level ASC, code ASC LIMIT 20",
+            "SELECT * FROM chart_accounts WHERE company_id = ? AND (name LIKE ? OR code LIKE ?) AND is_active = TRUE ORDER BY level ASC, code ASC LIMIT 20",
             (company_id, f"%{q}%", f"%{q}%"),
         )
         rows = await cursor.fetchall()

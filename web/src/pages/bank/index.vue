@@ -254,11 +254,15 @@ function confirmEffectRepair(issue: any) {
       try {
         const result: any = await apiClient.post('/api/bank/repair-effect', {
           statement_id: issue.statementId,
+          auto_post: true,
         })
-        message.success(result.status === 'already_repaired' ? '该差异已经修复' : '修复完成，已重新核对余额')
+        message.success(result.settlementStatus && result.settlementStatus !== 'posted'
+          ? '已生成正式体系的结算凭证草稿，请前往凭证页过账'
+          : result.status === 'already_repaired' ? '该差异已经修复' : '修复完成，已重新核对余额')
         await loadDiff()
       } catch (error: any) {
-        message.error(error?.response?.data?.detail || '修复失败，请检查账目凭证')
+        const detail = error?.response?.data?.detail
+        message.error(typeof detail === 'string' ? detail : detail?.message || '修复失败，请检查账目凭证')
         throw error
       } finally {
         repairingEffects.value[issue.statementId] = false
@@ -353,6 +357,8 @@ async function confirmSuggestion(suggestion: any) {
     }
     if (suggestion.type === 'match') {
       payload.matched_entry_id = suggestion.matchedEntryId
+      payload.matched_entry_ids = suggestion.matchedEntryIds || [suggestion.matchedEntryId]
+      payload.auto_post = true
     } else {
       const rdSelection = rdSelectionFor(suggestion.statementId)
       payload.new_entry = {
@@ -367,8 +373,9 @@ async function confirmSuggestion(suggestion: any) {
         } : {}),
       }
     }
-    await apiClient.post('/api/bank/confirm-suggestion', payload)
-    message.success('确认成功')
+    const result: any = await apiClient.post('/api/bank/confirm-suggestion', payload)
+    message.success(result.settlementStatus && result.settlementStatus !== 'posted'
+      ? '已关联原收款与手续费，结算凭证待过账，请前往凭证页处理' : '确认成功')
     aiSuggestions.value = aiSuggestions.value.filter(s => s.statementId !== suggestion.statementId)
     await loadStatements()
   } catch {
@@ -1052,8 +1059,10 @@ onMounted(() => Promise.all([loadStatements(), loadRdOptions()]))
 
 <style scoped>
 .bank-page {
-  max-width: 800px;
+  max-width: 1240px;
   margin: 0 auto;
+  width: 100%;
+  box-sizing: border-box;
 }
 .page-header {
   margin-bottom: 16px;

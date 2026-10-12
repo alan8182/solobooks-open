@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { NCard, NButton, NModal, NForm, NFormItem, NInput, NInputNumber, NSelect, NTag, useMessage, NSpace, NEmpty } from 'naive-ui'
+import { NCard, NButton, NModal, NForm, NFormItem, NInput, NInputNumber, NSelect, NTag, useMessage, NSpace, NEmpty, NGrid, NGi } from 'naive-ui'
 import { useAuthStore } from '@/stores/auth'
 import { useCompanyStore } from '@/stores/company'
 import { updateCompany as apiUpdateCompany } from '@/api/auth'
@@ -22,8 +22,7 @@ const showEdit = ref(false)
 const editingId = ref('')
 const editForm = ref({
   name: '', type: '有限责任公司', taxpayerType: '小规模纳税人', startDate: '', taxId: '',
-  smallMicroEnterprise: 'yes', restrictedIndustry: 'no', employeeCount: 1,
-  citPrepaymentMethod: 'actual_profit',
+  restrictedIndustry: 'no', employeeCount: 1,
 })
 const saving = ref(false)
 
@@ -95,10 +94,8 @@ function openEdit(co: CompanyInfo) {
     taxpayerType: co.taxpayerType || '小规模纳税人',
     startDate: co.startDate || formatDate(new Date(), 'YYYY-MM-DD'),
     taxId: co.taxId || '',
-    smallMicroEnterprise: co.smallMicroEnterprise === false ? 'no' : 'yes',
     restrictedIndustry: co.restrictedIndustry === true ? 'yes' : 'no',
     employeeCount: co.employeeCount ?? 1,
-    citPrepaymentMethod: co.citPrepaymentMethod || 'actual_profit',
   }
   showEdit.value = true
 }
@@ -118,7 +115,6 @@ async function handleSaveEdit() {
     await apiUpdateCompany(editingId.value, {
       ...editForm.value,
       taxId: rawTaxId,
-      smallMicroEnterprise: editForm.value.smallMicroEnterprise === 'yes',
       restrictedIndustry: editForm.value.restrictedIndustry === 'yes',
     })
     // Refresh profile to get updated company list
@@ -196,35 +192,48 @@ async function handleSaveEdit() {
     </NModal>
 
     <!-- Edit Modal -->
-    <NModal v-model:show="showEdit" title="编辑主体" preset="card" style="width: 480px; max-width: 90vw;">
+    <NModal v-model:show="showEdit" title="编辑主体" preset="card" style="width: 720px; max-width: 92vw;">
       <NForm>
-        <NFormItem label="名称" required>
-          <NInput v-model:value="editForm.name" placeholder="账本或公司全称" />
-        </NFormItem>
-        <NFormItem label="主体类型">
-          <NSelect v-model:value="editForm.type" :options="companyTypes" />
-        </NFormItem>
-        <NFormItem label="纳税人类型">
-          <NSelect v-model:value="editForm.taxpayerType" :options="taxpayerTypes" />
-        </NFormItem>
-        <NFormItem label="启用日期">
-          <NInput v-model:value="editForm.startDate" placeholder="YYYY-MM-DD" />
-        </NFormItem>
-        <NFormItem label="纳税人识别号">
-          <NInput v-model:value="editForm.taxId" maxlength="20" placeholder="选填，15/17/18/20 位字母数字" />
-        </NFormItem>
-        <NFormItem label="企业所得税预缴方式">
-          <NSelect v-model:value="editForm.citPrepaymentMethod" :options="[{ label: '按照实际利润额预缴', value: 'actual_profit' }]" />
-        </NFormItem>
-        <NFormItem label="确认属于小型微利企业">
-          <NSelect v-model:value="editForm.smallMicroEnterprise" :options="yesNoOptions" />
-        </NFormItem>
-        <NFormItem label="属于国家限制或禁止行业">
-          <NSelect v-model:value="editForm.restrictedIndustry" :options="yesNoOptions" />
-        </NFormItem>
-        <NFormItem label="当前从业人数">
-          <NInputNumber v-model:value="editForm.employeeCount" :min="0" :precision="0" style="width: 100%" />
-        </NFormItem>
+        <NGrid :cols="2" :x-gap="16">
+          <NGi :span="2">
+            <NFormItem label="名称" required>
+              <NInput v-model:value="editForm.name" placeholder="账本或公司全称" />
+            </NFormItem>
+          </NGi>
+          <NGi>
+            <NFormItem label="主体类型">
+              <NSelect v-model:value="editForm.type" :options="companyTypes" />
+            </NFormItem>
+          </NGi>
+          <NGi>
+            <NFormItem label="纳税人类型">
+              <NSelect v-model:value="editForm.taxpayerType" :options="taxpayerTypes" />
+            </NFormItem>
+          </NGi>
+          <NGi>
+            <NFormItem label="启用日期">
+              <NInput v-model:value="editForm.startDate" placeholder="YYYY-MM-DD" />
+            </NFormItem>
+          </NGi>
+          <NGi>
+            <NFormItem label="纳税人识别号">
+              <NInput v-model:value="editForm.taxId" maxlength="20" placeholder="选填，15/17/18/20 位字母数字" />
+            </NFormItem>
+          </NGi>
+          <NGi :span="2">
+            <div class="form-section-label">税务信息</div>
+          </NGi>
+          <NGi>
+            <NFormItem label="当前从业人数">
+              <NInputNumber v-model:value="editForm.employeeCount" :min="0" :precision="0" style="width: 100%" />
+            </NFormItem>
+          </NGi>
+          <NGi>
+            <NFormItem label="属于国家限制或禁止行业">
+              <NSelect v-model:value="editForm.restrictedIndustry" :options="yesNoOptions" />
+            </NFormItem>
+          </NGi>
+        </NGrid>
       </NForm>
       <template #footer>
         <NSpace justify="end">
@@ -240,6 +249,13 @@ async function handleSaveEdit() {
 .companies-page {
   max-width: 720px;
   margin: 0 auto;
+}
+.form-section-label {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--solo-text-muted);
+  letter-spacing: 0.5px;
+  padding: 2px 0 0 2px;
 }
 .page-header {
   display: flex;

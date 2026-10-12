@@ -24,11 +24,16 @@ async def lifespan(_app: FastAPI):
             await connection.run_sync(Base.metadata.create_all)
         else:
             await connection.execute(text("SELECT 1"))
-    yield
+    # MCP 子应用（/mcp）的 session manager 生命周期必须显式接管：
+    # FastAPI 不会自动运行挂载子应用的 lifespan；lifespan(app) 返回异步上下文
+    from agent.mcp_server import mcp_app
+
+    async with mcp_app.lifespan(_app):
+        yield
     await dispose_engine()
 
 
-app = FastAPI(title="司理 API", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="梭罗记账 API", version="3.0.0", lifespan=lifespan)
 
 
 from core.errors import AccountingError
@@ -68,6 +73,9 @@ from routers.tax_report import router as tax_report_router
 from routers.wechat_bill import router as wechat_bill_router
 from routers.accounting import router as accounting_router
 from routers.rd import router as rd_router
+from routers.agent import router as agent_router
+from routers.tax_filing import router as tax_filing_router
+from routers.mcp_tokens import router as mcp_tokens_router
 
 app.include_router(record_router)
 app.include_router(copilot_router)
@@ -91,6 +99,9 @@ app.include_router(tax_report_router)
 app.include_router(wechat_bill_router)
 app.include_router(accounting_router)
 app.include_router(rd_router)
+app.include_router(agent_router)
+app.include_router(tax_filing_router)
+app.include_router(mcp_tokens_router)
 
 
 @app.get("/api/health")
@@ -105,3 +116,11 @@ async def health():
         "service": "SoloBooks",
         "database": "test" if os.getenv("ACCOUNTING_TEST_MODE") == "1" else "postgresql",
     }
+
+
+# MCP（Model Context Protocol）端点：PAT 鉴权由 agent/mcp_server.PatAuthMiddleware
+# 独立完成，不走 AUTH_DEV_FALLBACK 开发兜底。挂载在根路径，且必须位于全部业务
+# 路由（含 /api/health）之后——未命中 /api/* 的请求才落到 MCP 应用（内部路径 /mcp）
+from agent.mcp_server import app as mcp_asgi_app  # noqa: E402
+
+app.mount("/", mcp_asgi_app)

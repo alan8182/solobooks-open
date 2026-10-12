@@ -69,9 +69,14 @@
 }
 
 /* 2. Wizard Framework */
-.wizard-container {
+.wizard-container,
+.closing-wizard-container {
   max-width: 920px;
   margin: 0 auto;
+  transition: max-width 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.closing-wizard-container.closing-wizard--wide {
+  max-width: 1240px;
 }
 .steps-card {
   background: var(--solo-bg-card);
@@ -307,6 +312,135 @@
 .match-composer-hint.ready {
   color: var(--solo-income);
 }
+.match-composer-hint.zero-net {
+  color: var(--solo-warning);
+}
+
+/* 第四步左侧语义分组标题 */
+.entry-group-title {
+  margin: 6px 0 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--solo-text-muted);
+}
+
+.entry-group-title + .canvas-card {
+  margin-top: 0;
+}
+
+.entry-group-title:not(:first-child) {
+  margin-top: 14px;
+}
+
+/* ── 第五步：结账待办任务队列 ── */
+.closing-task-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.closing-task-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--solo-border-light);
+  border-radius: var(--solo-radius, 10px);
+  background: var(--solo-bg-card, #fff);
+}
+
+.closing-task-card.blocked {
+  border-left: 3px solid var(--solo-expense, #c74444);
+}
+
+.closing-task-card.needs_review {
+  border-left: 3px solid var(--solo-warning, #b46b17);
+}
+
+.task-index {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  color: #fff;
+}
+
+.task-index.blocked {
+  background: var(--solo-expense, #c74444);
+}
+
+.task-index.needs_review {
+  background: var(--solo-warning, #b46b17);
+}
+
+.task-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.task-body h4 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--solo-text-primary);
+}
+
+.task-body p {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--solo-text-secondary);
+}
+
+.task-body small {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--solo-text-muted);
+}
+
+.task-details-collapse {
+  margin-top: 8px;
+}
+
+.task-detail-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0;
+  font-size: 12px;
+  border-top: 1px dashed var(--solo-border-light);
+}
+
+.task-detail-date {
+  flex: none;
+  color: var(--solo-text-muted);
+  font-family: 'Outfit', 'Inter', sans-serif;
+}
+
+.task-detail-desc {
+  flex: 1;
+  min-width: 0;
+  color: var(--solo-text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.task-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: stretch;
+}
+
+.readiness-detail-collapse {
+  border-top: 1px dashed var(--solo-border-light);
+}
 .card-amount {
   font-weight: 700;
   font-size: 13.5px;
@@ -500,4 +634,80 @@
   font-weight: 800;
   font-family: 'Outfit', sans-serif;
   color: var(--solo-text-primary);
+}
+
+/* 7. Smart Reconciliation Candidate Match */
+.canvas-card.candidate-match {
+  border-color: rgba(16, 185, 129, 0.45);
+  background: rgba(16, 185, 129, 0.04);
+}
+.canvas-card.candidate-match:hover {
+  border-color: var(--solo-income);
+  background: rgba(16, 185, 129, 0.08);
+}
+.match-candidate-tag {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 0 4px;
+}
+
+/* 8. In-place Voucher Modal */
+.voucher-modal-card {
+  max-width: 620px;
+  width: 95vw;
+}
+.voucher-meta-box {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
+  padding: 12px 14px;
+  background: var(--solo-bg-soft, #f8fafc);
+  border: 1px solid var(--solo-border-light);
+  border-radius: var(--solo-radius);
+  margin-bottom: 16px;
+  font-size: 12.5px;
+}
+.voucher-meta-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--solo-text-secondary);
+}
+.voucher-meta-item strong {
+  color: var(--solo-text-primary);
+  font-weight: 600;
+}
+.voucher-table-wrapper {
+  border: 1px solid var(--solo-border-light);
+  border-radius: var(--solo-radius);
+  overflow: hidden;
+  margin-bottom: 16px;
+}
+.voucher-table-wrapper table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+.voucher-table-wrapper th,
+.voucher-table-wrapper td {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--solo-border-light);
+}
+.voucher-table-wrapper th {
+  background: var(--solo-bg-soft, #f8fafc);
+  color: var(--solo-text-secondary);
+  font-weight: 600;
+  text-align: left;
+}
+.voucher-table-wrapper tfoot td {
+  border-top: 2px solid var(--solo-border);
+  font-weight: 700;
+  background: var(--solo-bg-soft, #f8fafc);
+}
+.voucher-modal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 8px;
 }

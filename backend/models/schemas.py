@@ -195,6 +195,26 @@ class JournalReverseRequest(BaseModel):
     reversalDate: Optional[str] = None
 
 
+class BatchPostRequest(BaseModel):
+    entryIds: Optional[List[str]] = None
+    month: Optional[str] = None
+
+
+class BatchPostFailedItem(BaseModel):
+    entryId: str
+    title: str
+    code: str
+    reason: str
+
+
+class BatchPostResponse(BaseModel):
+    total: int
+    postedCount: int
+    failedCount: int
+    postedEntryIds: List[str]
+    failedEntries: List[BatchPostFailedItem]
+
+
 class PeriodCloseRequest(BaseModel):
     pass
 
@@ -246,6 +266,7 @@ class WechatLoginResponse(BaseModel):
     user_id: str
     company_id: str
     expires_in: str
+    has_password: bool = False
 
 
 class SwitchCompanyRequest(BaseModel):
@@ -290,6 +311,33 @@ class WechatBindRequest(BaseModel):
     """登录后绑定微信请求。"""
 
     code: str
+
+
+class PasswordLoginRequest(BaseModel):
+    """手机号 + 密码登录请求。"""
+
+    phone: str
+    password: str
+
+
+class SetPasswordRequest(BaseModel):
+    """设置/修改密码请求（登录态）。已设密码时必须携带 old_password。"""
+
+    old_password: Optional[str] = None
+    oldPassword: Optional[str] = None
+    new_password: str
+    newPassword: Optional[str] = None
+
+
+class ResetPasswordRequest(BaseModel):
+    """忘记密码：短信验证码 + 新密码（无登录态）。"""
+
+    phone: str
+    code: str
+    biz_id: Optional[str] = None
+    bizId: Optional[str] = None
+    new_password: str
+    newPassword: Optional[str] = None
 
 
 # ── Copilot ──

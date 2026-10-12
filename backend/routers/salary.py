@@ -130,10 +130,36 @@ async def accrue_sheet(month: str, ctx: AuthContext = Depends(require_auth)):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+class SheetPayRequest(BaseModel):
+    """实际发薪日（YYYY-MM-DD），缺省取操作当天；真实发薪多在工资所属期次月。"""
+    payDate: Optional[str] = None
+
+
 @router.post("/sheets/{month}/pay")
-async def pay_sheet(month: str, ctx: AuthContext = Depends(require_auth)):
+async def pay_sheet(month: str, req: Optional[SheetPayRequest] = None, ctx: AuthContext = Depends(require_auth)):
     """Pay salary sheet and generate cash outflow voucher."""
     try:
-        return await service.pay_salary_sheet(ctx.company_id, ctx.user_id, month)
+        return await service.pay_salary_sheet(
+            ctx.company_id, ctx.user_id, month,
+            pay_date=req.payDate if req else None,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/sheets/{month}/pay-social")
+async def pay_social(month: str, ctx: AuthContext = Depends(require_auth)):
+    """缴纳本月社保公积金（单位+个人部分），生成清偿 2211 挂账的凭证。"""
+    try:
+        return await service.pay_payroll_liability(ctx.company_id, ctx.user_id, month, "social_security")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/sheets/{month}/pay-tax")
+async def pay_tax(month: str, ctx: AuthContext = Depends(require_auth)):
+    """缴纳本月个税，生成清偿 2221 挂账的凭证。"""
+    try:
+        return await service.pay_payroll_liability(ctx.company_id, ctx.user_id, month, "tax")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

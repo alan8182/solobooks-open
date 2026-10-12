@@ -4,10 +4,10 @@ import { useRouter } from 'vue-router'
 const router = useRouter()
 
 const quickActions = [
-  { label: '记录一笔', desc: '快速记录收入与支出', path: '/record/text', icon: 'ri-add-line', color: 'var(--solo-primary)', bg: 'var(--solo-bg-blue-soft)' },
-  { label: '拍单据', desc: '识别发票与收据', path: '/record/receipt', icon: 'ri-camera-line', color: 'var(--solo-primary)', bg: 'var(--solo-bg-blue-soft)' },
-  { label: '批量导入', desc: '导入多笔经营记录', path: '/record/batch', icon: 'ri-file-upload-line', color: 'var(--solo-warning)', bg: 'var(--solo-warning-bg)' },
-  { label: '问问小秘', desc: '分析经营和财税问题', path: '/copilot', icon: 'ri-sparkling-line', color: 'var(--solo-primary)', bg: 'var(--solo-bg-blue-soft)' },
+  { label: 'AI 记账', desc: '一句话交代收支情况', path: '/copilot', icon: 'ri-sparkling-fill', color: 'var(--solo-primary)', bg: 'var(--solo-bg-blue-soft)' },
+  { label: '拍单据', desc: '识别发票与收据图片', path: '/copilot?mode=receipt', icon: 'ri-camera-line', color: 'var(--solo-primary)', bg: 'var(--solo-bg-blue-soft)' },
+  { label: '发票管理', desc: '税局发票池与核销', path: '/record/invoice-import', icon: 'ri-receipt-line', color: 'var(--solo-warning)', bg: 'var(--solo-warning-bg)' },
+  { label: 'AI 咨询', desc: '查账与税务合规分析', path: '/copilot', icon: 'ri-robot-2-line', color: 'var(--solo-primary)', bg: 'var(--solo-bg-blue-soft)' },
 ]
 </script>
 

@@ -40,6 +40,12 @@ services:
       - MIGRATION_DATABASE_URL=postgresql+psycopg://${POSTGRES_USER:-solobooks_owner}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-solobooks}
       - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:?DASHSCOPE_API_KEY is required}
       - ZHIPU_API_KEY=${ZHIPU_API_KEY:-}
+      # LLM 供应商（OpenAI 兼容协议）：默认回落到百炼端点，切换 DeepSeek 等在宿主 .env 配置
+      - LLM_BASE_URL=${LLM_BASE_URL:-}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_SEND_ENABLE_THINKING=${LLM_SEND_ENABLE_THINKING:-1}
+      - QWEN_TEXT_MODEL=${QWEN_TEXT_MODEL:-}
+      - QWEN_VL_MODEL=${QWEN_VL_MODEL:-}
       - JWT_SECRET=${JWT_SECRET:?JWT_SECRET is required}
       - WECHAT_APPID=${WECHAT_APPID:-}
       - WECHAT_SECRET=${WECHAT_SECRET:-}
@@ -47,6 +53,8 @@ services:
       - ALIYUN_ACCESS_KEY_SECRET=${ALIYUN_ACCESS_KEY_SECRET:-}
       - ALIYUN_SMS_SIGN_NAME=${ALIYUN_SMS_SIGN_NAME:-}
       - ALIYUN_SMS_TEMPLATE_CODE=${ALIYUN_SMS_TEMPLATE_CODE:-}
+      # 管理后台安全前提：生产环境必须关闭开发兜底 token（否则垃圾 token 按 test_user_001 放行）
+      - AUTH_DEV_FALLBACK=0
       - ACCOUNTING_TIMEZONE=Asia/Shanghai
     depends_on:
       postgres:

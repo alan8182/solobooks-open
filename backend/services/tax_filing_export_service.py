@@ -19,9 +19,10 @@ from services.accounting_core_service import ensure_tenant, posted_entries_for_r
 
 PeriodType = Literal["month", "quarter"]
 
-ROOT_DIR = Path(__file__).resolve().parents[2]
-MONTH_QUARTER_TEMPLATE = ROOT_DIR / "原始税务表格" / "财务报表报送与信息采集（小企业会计准则）月季报.xls"
-EXPORT_DIR = ROOT_DIR / "backend" / "data" / "tax_exports"
+# 锚定 backend/ 目录：本地为 <仓库>/backend，容器内 COPY backend/ . 后为 /app，两种布局一致
+BACKEND_DIR = Path(__file__).resolve().parents[1]
+MONTH_QUARTER_TEMPLATE = BACKEND_DIR / "assets" / "tax" / "财务报表报送与信息采集（小企业会计准则）月季报.xls"
+EXPORT_DIR = BACKEND_DIR / "data" / "tax_exports"
 
 CREDIT_NATURE_CODES = {"1602", "6001", "6051", "6111", "6301"}
 CASH_ACCOUNT_CODES = {"1001", "1002", "1012"}
@@ -185,12 +186,12 @@ def _profit_map(movements: Dict[str, dict[str, Any]]) -> Dict[str, Decimal]:
     balances = {code: _normal_balance(code, info["debit"], info["credit"]) for code, info in movements.items()}
     research = _sum_codes(balances, ["5301"])
     management = _sum_prefix(balances, "56") - _sum_codes(balances, ["5608"]) + research
-    finance = _sum_codes(balances, ["5608", "6603"])
+    finance = _sum_codes(balances, ["5608", "6602", "6603"])
     out = {
         "revenue": _sum_codes(balances, ["6001", "6051"]),
         "cost": _sum_codes(balances, ["5001", "5101"]),
         "tax_surcharge": _sum_codes(balances, ["6401"]),
-        "sales_expense": _sum_prefix(balances, "66") - _sum_codes(balances, ["6603"]),
+        "sales_expense": _sum_prefix(balances, "66") - _sum_codes(balances, ["6602", "6603"]),
         "advertising": _sum_codes(balances, ["6601"]),
         "management_expense": _d2(management),
         "entertainment": _sum_codes(balances, ["5603"]),
@@ -411,6 +412,11 @@ async def build_statement_data(user_id: str, company_id: str, period: str, perio
             period_range.start.year,
             session=session,
         )
+    return build_statement_data_from_entries(entries, opening_items, period_range, company)
+
+
+def build_statement_data_from_entries(entries: list[dict], opening_items: list[dict], period_range: PeriodRange, company: dict) -> StatementData:
+    """Use the same report mapping for exports and transactional close checks."""
     opening = _opening_balance_map(opening_items)
     movements_current = _account_movements(entries, period_range.start, period_range.end)
     movements_ytd = _account_movements(entries, period_range.fiscal_year_start, period_range.end)
@@ -446,7 +452,7 @@ async def build_statement_data(user_id: str, company_id: str, period: str, perio
 
 def _build_checks(data: StatementData, opening_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     checks = [
-        {"level": "ok" if data.tax_id else "error", "message": "纳税人识别号已填写" if data.tax_id else "缺少纳税人识别号，请先在公司设置中填写 taxId"},
+        {"level": "ok" if data.tax_id else "error", "message": "纳税人识别号已填写" if data.tax_id else "缺少纳税人识别号，请先在公司设置中填写纳税人识别号"},
         {"level": "ok" if data.company_name else "error", "message": "纳税人名称已填写" if data.company_name else "缺少纳税人名称，请先在公司设置中填写公司名称"},
     ]
     opening_debit = sum((money(i.get("debit_balance") or ZERO) for i in opening_items), ZERO)
@@ -545,10 +551,16 @@ def export_month_quarter_xls(data: StatementData) -> Path:
     def w(sheet_idx: int, cell_ref: str, value: Any) -> None:
         _write_cell(in_book, out_book, sheets[sheet_idx], sheet_idx, cell_ref, value)
 
+    # 头部布局差异：资产负债表名称/止期在 H 列，利润表与现金流量表在 F 列
     w(0, "D3", data.tax_id)
     w(0, "H3", data.company_name)
     w(0, "D4", data.period.start)
     w(0, "H4", data.period.end)
+    for sheet_idx in (1, 2):
+        w(sheet_idx, "D3", data.tax_id)
+        w(sheet_idx, "F3", data.company_name)
+        w(sheet_idx, "D4", data.period.start)
+        w(sheet_idx, "F4", data.period.end)
 
     balance_cells = {
         "D7": "cash", "E7": "cash", "D8": "short_investment", "E8": "short_investment",
@@ -619,4 +631,3 @@ def export_month_quarter_xls(data: StatementData) -> Path:
     output_path = EXPORT_DIR / filename
     out_book.save(str(output_path))
     return output_path
-

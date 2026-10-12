@@ -346,7 +346,11 @@ async def monthly_report(
         breakdown[cat] = breakdown.get(cat, 0) + e.get("amount", 0)
 
     # 税务汇总（只用已有 vatAmount 字段，避免重复计算）
-    total_vat = sum(e.get("vatAmount", 0) or 0 for e in entries if e.get("direction") == "income")
+    # vatAmount 在元数据里可能是字符串（api_money=False 路径只转换 amount），统一用 d2 强转
+    total_vat = sum(
+        (d2(e.get("vatAmount", 0) or 0) for e in entries if e.get("direction") == "income"),
+        Decimal("0"),
+    )
     # #9 CIT 估算加注说明：小微企业所得税实际税负为5%（20% × 25%计入应纳税所得额），实际以年度汇算为准
     net_profit = income - expense
     estimated_cit = d2(max(Decimal("0"), net_profit) * Decimal("0.05"))
@@ -361,6 +365,9 @@ async def monthly_report(
             system_prompt="你是经营助手，生成月度总结。只输出JSON: {\"summary\": \"...\"}",
             user_message=f"月份:{req.month}, 收入:{income}, 支出:{expense}, 净利润:{net_profit}, 分类:{breakdown}",
             max_tokens=512,
+            scene="report",
+            user_id=ctx.user_id,
+            company_id=ctx.company_id,
         )
         summary = result.get("summary", "月度报表已生成")
     except Exception:
@@ -411,7 +418,14 @@ async def health_score(
 - 含风险标签的分类:{list(set(risk_categories))}"""
 
     try:
-        result = chat_text_json(HEALTH_SCORE_V3_PROMPT, prompt, max_tokens=1024)
+        result = chat_text_json(
+        HEALTH_SCORE_V3_PROMPT,
+        prompt,
+        max_tokens=1024,
+        scene="report",
+        user_id=ctx.user_id,
+        company_id=ctx.company_id,
+    )
         return HealthScoreResponse(
             totalScore=result.get("totalScore", 70),
             level=result.get("level", "一般"),
@@ -478,32 +492,31 @@ async def cit_assist(
 
     asset_total_start = d2(statement.balance_period_opening.get("asset_total", 0) / Decimal("10000"))
     asset_total_end = d2(statement.balance_current.get("asset_total", 0) / Decimal("10000"))
+    # 小型微利资格由客观条件组合判定（非限制行业/从业人数/资产总额/应纳税所得额），
+    # 不再单独要求用户"确认属于小型微利企业"。
     company_tax_profile_complete = all(
         company.get(key) is not None
-        for key in ("smallMicroEnterprise", "restrictedIndustry", "employeeCount")
+        for key in ("restrictedIndustry", "employeeCount")
     )
 
     if company_tax_profile_complete:
         employee_average = d2(company.get("employeeCount", 0))
         asset_average = d2((asset_total_start + asset_total_end) / 2)
         restricted_industry = bool(company.get("restrictedIndustry"))
-        small_micro_confirmed = bool(company.get("smallMicroEnterprise"))
     else:
         employee_average = None
         if req.employeeCountStart is not None and req.employeeCountEnd is not None:
             employee_average = d2((Decimal(req.employeeCountStart) + Decimal(req.employeeCountEnd)) / 2)
         asset_average = None
         if req.assetTotalStart is not None and req.assetTotalEnd is not None:
-            asset_average = d2((req.assetTotalStart + req.assetTotalEnd) / 2)
+            asset_average = d2((Decimal(req.assetTotalStart) + Decimal(req.assetTotalEnd)) / 2)
         restricted_industry = req.restrictedIndustry
-        small_micro_confirmed = True
 
     eligibility_known = employee_average is not None and asset_average is not None and restricted_industry is not None
     if not eligibility_known:
         eligibility = "undetermined"
     elif (
-        small_micro_confirmed
-        and restricted_industry is False
+        restricted_industry is False
         and employee_average <= Decimal("300")
         and asset_average <= Decimal("5000")
         and taxable_base <= Decimal("3000000")

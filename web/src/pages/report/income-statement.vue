@@ -55,6 +55,38 @@ function rowPadding(row: IncomeStatementRow) {
   return `${row.level * 18}px`
 }
 
+const ROW_ACCOUNT_MAP: Record<string, { code: string; name: string }> = {
+  operating_revenue: { code: '6001', name: '主营业务收入' },
+  operating_cost: { code: '5001', name: '主营业务成本' },
+  tax_surcharges: { code: '2221', name: '应交税费/税金附加' },
+  selling_expenses: { code: '6601', name: '销售费用-推广费' },
+  advertising_expense: { code: '6601', name: '广告费和宣传费' },
+  admin_expenses: { code: '5699', name: '管理费用' },
+  business_entertainment: { code: '5603', name: '业务招待费' },
+  research_expense: { code: '5301', name: '研发支出' },
+  finance_expenses: { code: '6602', name: '财务费用' },
+  interest_expense: { code: '6603', name: '利息费用/手续费' },
+  nonoperating_income: { code: '6301', name: '营业外收入' },
+}
+
+function getDrillDownAccount(row: IncomeStatementRow) {
+  return ROW_ACCOUNT_MAP[row.key]
+}
+
+function drillDown(row: IncomeStatementRow) {
+  const acc = getDrillDownAccount(row)
+  if (!acc) return
+  router.push({
+    path: '/reports/sub-ledger',
+    query: {
+      account_code: acc.code,
+      account_name: acc.name,
+      month: month.value,
+      from: 'income-statement',
+    },
+  })
+}
+
 function amountClass(value: number, row?: IncomeStatementRow) {
   if (value < 0) return 'expense'
   if (row?.isSubtotal || row?.key === 'operating_revenue') return 'income'
@@ -161,10 +193,12 @@ onMounted(load)
                 <tr
                   v-for="row in result.rows"
                   :key="row.key"
-                  :class="{ 'subtotal-row': row.isSubtotal }"
+                  :class="{ 'subtotal-row': row.isSubtotal, 'clickable-row': Boolean(getDrillDownAccount(row)) }"
+                  @click="getDrillDownAccount(row) ? drillDown(row) : undefined"
                 >
                   <td class="item-cell" :style="{ paddingLeft: rowPadding(row) }">
-                    {{ rowLabel(row) }}
+                    <span :class="{ 'account-link': Boolean(getDrillDownAccount(row)) }">{{ rowLabel(row) }}</span>
+                    <span v-if="getDrillDownAccount(row)" class="drill-tag">明细账 ↗</span>
                   </td>
                   <td
                     v-for="column in result.columns"
@@ -238,6 +272,27 @@ onMounted(load)
 }
 .income { color: var(--solo-income); }
 .expense { color: var(--solo-expense); }
+
+.clickable-row {
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+.clickable-row:hover {
+  background: rgba(22, 93, 255, 0.05);
+}
+.account-link {
+  font-weight: 500;
+}
+.drill-tag {
+  margin-left: 8px;
+  font-size: 11px;
+  color: var(--solo-primary, #165dff);
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+.clickable-row:hover .drill-tag {
+  opacity: 1;
+}
 
 @media (max-width: 720px) {
   .income-header-actions {

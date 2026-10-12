@@ -10,7 +10,7 @@ const route = useRoute()
 const router = useRouter()
 const expandedMenus = ref<string[]>([])
 const navGroups = computed(() => {
-  return ['经营', '财务', '管理'].map((label) => ({
+  return ['日常', '周期', '管理'].map((label) => ({
     label,
     items: NAV_ITEMS.filter((item) => item.group === label),
   }))
@@ -56,10 +56,10 @@ watch(
     <div class="sidebar-header">
       <div class="logo-area" @click="router.push('/')">
         <div class="logo-icon">
-          <i class="ri-line-chart-line" />
+          <img src="/solo-logo.png" alt="梭罗记账" />
         </div>
         <div v-if="!collapsed" class="logo-copy">
-          <span class="logo-text">司理</span>
+          <span class="logo-text">梭罗记账</span>
           <span class="logo-sub">SoloBooks</span>
         </div>
       </div>
@@ -139,11 +139,6 @@ watch(
       </div>
     </nav>
 
-    <div v-if="!collapsed" class="sidebar-foot">
-      <span class="foot-kicker">本月账务状态</span>
-      <strong>记录完整</strong>
-      <span>继续保持及时记录</span>
-    </div>
   </aside>
 </template>
 
@@ -184,14 +179,15 @@ watch(
 .logo-icon {
   width: 34px;
   height: 34px;
-  border-radius: 10px;
-  background: var(--solo-primary);
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #fff;
-  font-size: 18px;
-  box-shadow: none;
+}
+
+.logo-icon img {
+  width: 100%;
+  height: 100%;
+  display: block;
 }
 .logo-copy {
   display: flex;
@@ -391,27 +387,6 @@ watch(
   padding: 4px 8px 7px;
   color: var(--solo-text-muted);
   font-size: 11px;
-  font-weight: 650;
-}
-.sidebar-foot {
-  margin: 0 14px 18px;
-  padding: 14px;
-  border: 1px solid var(--solo-border);
-  border-radius: 12px;
-  background: var(--solo-bg-soft);
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  color: var(--solo-text-muted);
-  font-size: 11px;
-}
-.sidebar-foot strong {
-  color: var(--solo-text-primary);
-  font-size: 13px;
-}
-.foot-kicker {
-  color: var(--solo-primary);
-  font-size: 10px;
   font-weight: 650;
 }
 @media (max-width: 1024px) {

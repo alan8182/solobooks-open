@@ -19,6 +19,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -47,6 +48,13 @@ class AuthUser(Base):
     current_company_id: Mapped[str] = mapped_column(String(128), nullable=False, default="")
     nickname: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     avatar: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # 密码登录：PBKDF2 自描述串（pbkdf2_sha256$iter$salt$hash），空串表示未设置密码。
+    # server_default 必须给：create_all 出的 SQLite 测试表靠它容忍省列的裸 SQL 插入
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
+    password_updated_at: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    # 平台级标记（管理后台）：管理员校验每次查库，不进 JWT claim，避免禁用后的旧 token 窗口期
+    is_platform_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
+    is_disabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
     created_at: Mapped[str] = mapped_column(Text, nullable=False)
     last_login_at: Mapped[str] = mapped_column(Text, nullable=False)
     updated_at: Mapped[str] = mapped_column(Text, nullable=False, default="")
@@ -499,3 +507,161 @@ class StepUpToken(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class AgentAction(Base):
+    """Agent 产生的"待确认动作"——agent 写操作不直接落库，人确认后才执行。"""
+
+    __tablename__ = "agent_actions"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True, default=new_id)
+    company_id: Mapped[str] = mapped_column(String(128), ForeignKey("auth_companies.company_id", ondelete="CASCADE"), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    conversation_id: Mapped[str | None] = mapped_column(String(128))
+    action_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    payload: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False, default=dict)
+    evidence: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False, default=dict)
+    result: Mapped[dict | None] = mapped_column(JSON_VALUE)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_by: Mapped[str | None] = mapped_column(String(128))
+
+    __table_args__ = (
+        CheckConstraint("status IN ('pending','approved','rejected','expired')", name="ck_agent_action_status"),
+        CheckConstraint(
+            "action_type IN ('propose_voucher','propose_vouchers','propose_match','propose_accrual')",
+            name="ck_agent_action_type",
+        ),
+        Index("ix_agent_actions_company_status", "company_id", "status"),
+    )
+
+
+class CompanyProfile(Base):
+    """公司画像：agent 的长期记忆（行业、科目习惯、往来名单、修正历史）。"""
+
+    __tablename__ = "company_profiles"
+
+    company_id: Mapped[str] = mapped_column(String(128), ForeignKey("auth_companies.company_id", ondelete="CASCADE"), primary_key=True)
+    profile: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class LlmUsage(Base):
+    """LLM 调用用量明细（管理后台统计用，M1 埋点）。
+
+    每行一次逻辑调用（含重试后的最终结果）；OCR/ASR 无 token 数记 0。
+    写入路径 fire-and-forget，失败只打日志，绝不影响业务请求。
+    """
+
+    __tablename__ = "llm_usage"
+
+    # BigInteger PK 在 SQLite（测试模式）下不会成为 rowid 别名，用 Integer 变体
+    id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer(), "sqlite"), primary_key=True, autoincrement=True)
+    user_id: Mapped[str | None] = mapped_column(String(128))
+    company_id: Mapped[str | None] = mapped_column(String(128))
+    scene: Mapped[str] = mapped_column(String(64), nullable=False, default="other")
+    model: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    prompt_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    duration_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="ok")
+    error_type: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("status IN ('ok','error','circuit_open')", name="ck_llm_usage_status"),
+        Index("ix_llm_usage_created_at", "created_at"),
+        Index("ix_llm_usage_company_created", "company_id", "created_at"),
+        Index("ix_llm_usage_user_created", "user_id", "created_at"),
+    )
+
+
+class AdminAuditLog(Base):
+    """管理后台操作留痕（M2）：谁在何时对什么目标做了什么。"""
+
+    __tablename__ = "admin_audit_logs"
+
+    id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer(), "sqlite"), primary_key=True, autoincrement=True)
+    operator_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_type: Mapped[str] = mapped_column(String(32), nullable=False, default="user")
+    target_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    detail: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (Index("ix_admin_audit_created", "created_at"),)
+
+
+class FilingDeadline(Base):
+    """征期日历：每个公司/税种/期间的申报截止与状态。"""
+
+    __tablename__ = "filing_deadlines"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True, default=new_id)
+    company_id: Mapped[str] = mapped_column(String(128), ForeignKey("auth_companies.company_id", ondelete="CASCADE"), nullable=False)
+    tax_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    period: Mapped[str] = mapped_column(String(16), nullable=False)
+    due_date: Mapped[date] = mapped_column(Date, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    filed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    filed_evidence: Mapped[dict | None] = mapped_column(JSON_VALUE)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("company_id", "tax_kind", "period", name="uq_filing_deadline"),
+        CheckConstraint(
+            "status IN ('pending','filed','waived')",
+            name="ck_filing_deadline_status",
+        ),
+        Index("ix_filing_deadlines_company_due", "company_id", "due_date"),
+    )
+
+
+class MCPAccessToken(Base):
+    """MCP 个人访问令牌（PAT）：外部 AI 客户端以 Bearer sbk_* 访问 /mcp。
+
+    库里只存 sha256(token_hash)；明文仅签发时返回一次。
+    token 绑定单一公司作用域；scopes 控制 read / write:draft（M0 仅 read）。
+    """
+
+    __tablename__ = "mcp_tokens"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    company_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    scopes: Mapped[str] = mapped_column(String(255), nullable=False, default="read", server_default="read")
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_mcp_tokens_user", "user_id"),
+    )
+
+
+class MCPCallLog(Base):
+    """MCP 工具调用留痕（M1）：每次外部客户端工具执行记一行，便于审计与排查。"""
+
+    __tablename__ = "mcp_call_logs"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True, default=new_id)
+    token_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    company_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    tool: Mapped[str] = mapped_column(String(128), nullable=False)
+    arguments_digest: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    duration_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    success: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_mcp_call_logs_token_created", "token_id", "created_at"),
+        Index("ix_mcp_call_logs_company_created", "company_id", "created_at"),
+    )

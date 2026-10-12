@@ -69,3 +69,15 @@ opc_llm记账工具_prd_v_2.md
 页面原型设计.md
 每个页面的组件清单.md
 月度结账体验升级设计方案.md
+
+# 本地工具产物
+.v2c/
+.video_agent/
+.codegraph/
+
+# 本地运行产物
+backend/data/*.db.*
+backend/uvicorn.log
+
+# ZCode 本地配置（含 MCP token，勿提交）
+.zcode/

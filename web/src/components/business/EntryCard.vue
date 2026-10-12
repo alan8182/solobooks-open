@@ -2,9 +2,9 @@
 import { computed } from 'vue'
 import { NTag } from 'naive-ui'
 import type { Entry } from '@/api/types'
-import { amountSignForDirection } from '@/utils/accounting'
+import { moneyPresentation } from '@/utils/accounting'
 import { getEntryNaturePresentation } from '@/utils/entryNature'
-import { formatMoney, formatDate } from '@/utils/format'
+import { formatDate } from '@/utils/format'
 
 const props = defineProps<{
   entry: Entry
@@ -17,6 +17,13 @@ const emit = defineEmits<{
 const config = computed(() => {
   const presentation = getEntryNaturePresentation(props.entry.direction, props.entry.category)
   return { ...presentation, bg: presentation.background }
+})
+
+// 金额展示：冲退类负金额按资金实际流向显示（+¥x 绿 / -¥x 红），色调跟随展示口径
+const money = computed(() => {
+  const presentation = moneyPresentation(props.entry.direction, props.entry.category, props.entry.amount)
+  const toneDir = presentation.tone === 'neutral' ? props.entry.direction : presentation.tone
+  return { text: presentation.text, color: getEntryNaturePresentation(toneDir, props.entry.category).color }
 })
 
 const categoryIcon = computed(() => {
@@ -41,8 +48,8 @@ const categoryIcon = computed(() => {
       </div>
     </div>
 
-    <div class="entry-amount" :style="{ color: config.color }">
-      {{ amountSignForDirection(entry.direction, entry.category, entry.amount) }}{{ formatMoney(entry.amount) }}
+    <div class="entry-amount" :style="{ color: money.color }">
+      {{ money.text }}
     </div>
   </div>
 </template>

@@ -1,4 +1,5 @@
 """V3 记账路由：文字/语音/拍单据/确认"""
+import base64
 import httpx
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Header, Request
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,9 +15,9 @@ from models.schemas import (
 )
 from config import ZHIPU_API_KEY
 from services.asr import transcribe_uploaded_audio
-from services.llm import _uid, chat_text_json
+from services.llm import _uid, chat_text_json, chat_vision_json
 from services.classifier import CLASSIFIER_V3_PROMPT, BATCH_SPLIT_V3_PROMPT
-from services.ocr import RECEIPT_FROM_OCR_V3_PROMPT
+from services.ocr import RECEIPT_FROM_OCR_V3_PROMPT, RECEIPT_VL_V3_PROMPT
 from services.zhipu_ocr import (
     resolve_receipt_image_mime,
     validate_receipt_image_bytes,
@@ -116,7 +117,9 @@ async def _fetch_cloud_file(file_url: str) -> tuple[bytes, str]:
 
 from typing import Optional
 
-async def _parse_receipt_from_bytes(content: bytes, filename: str, content_type: Optional[str]) -> RecordReceiptResponse:
+async def _parse_receipt_from_bytes(
+    content: bytes, filename: str, content_type: Optional[str], ctx: AuthContext
+) -> RecordReceiptResponse:
     """复用拍单据识别主流程，支持 uploadFile 与云存储 URL 两种入口。"""
     raw_ct = (content_type or "").strip().lower()
     main_ct = raw_ct.split(";")[0] if raw_ct else ""
@@ -134,31 +137,58 @@ async def _parse_receipt_from_bytes(content: bytes, filename: str, content_type:
         code = 413 if ("超过" in msg or "最大" in msg) else 415
         raise HTTPException(status_code=code, detail=msg) from e
 
-    try:
-        ocr_out = await zhipu_handwriting_ocr_bytes(content, filename, mime)
-    except RuntimeError as e:
-        raise HTTPException(status_code=502, detail=str(e)) from e
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"智谱 OCR 网络错误：{e}") from e
-
-    ocr_text = (ocr_out.get("ocr_text") or "").strip()
-    if not ocr_text:
-        raise HTTPException(status_code=422, detail="智谱 OCR 未识别到有效文字，请换一张更清晰的照片。")
-
-    ocr_for_llm = ocr_text if len(ocr_text) <= _MAX_OCR_TEXT_FOR_LLM else ocr_text[:_MAX_OCR_TEXT_FOR_LLM]
-    user_msg = f"【文件名】{filename}\n【OCR原始文本】\n{ocr_for_llm}"
-
+    # ── 主路径：多模态模型直读图片（OpenAI 协议，qwen3.8-flash 等）────────
+    data_url = f"data:{mime};base64,{base64.b64encode(content).decode('ascii')}"
     try:
         result = _ensure_receipt_dict(
-            chat_text_json(
-                RECEIPT_FROM_OCR_V3_PROMPT,
-                user_msg,
-                max_tokens=1536,
-                temperature=0.2,
+            chat_vision_json(
+                RECEIPT_VL_V3_PROMPT,
+                data_url,
+                # 4096：DeepSeek 输出偏长，2048 会截断 JSON 导致误入 OCR 降级路径
+                max_tokens=4096,
+                scene="invoice_ocr",
+                user_id=ctx.user_id,
+                company_id=ctx.company_id,
             )
         )
-    except (ValueError, RuntimeError) as e:
-        raise HTTPException(status_code=502, detail=f"记账模型解析失败：{e}") from e
+        ocr_text = str(result.get("rawText") or "") or result.get("explanation") or ""
+    except Exception:
+        # ── 降级路径：智谱 OCR 提取文字 + 文本模型结构化 ─────────────────
+        try:
+            ocr_out = await zhipu_handwriting_ocr_bytes(
+                content,
+                filename,
+                mime,
+                scene="invoice_ocr",
+                user_id=ctx.user_id,
+                company_id=ctx.company_id,
+            )
+        except RuntimeError as e:
+            raise HTTPException(status_code=502, detail=str(e)) from e
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"智谱 OCR 网络错误：{e}") from e
+
+        ocr_text = (ocr_out.get("ocr_text") or "").strip()
+        if not ocr_text:
+            raise HTTPException(status_code=422, detail="未能识别图片内容，请换一张更清晰的照片。")
+
+        ocr_for_llm = ocr_text if len(ocr_text) <= _MAX_OCR_TEXT_FOR_LLM else ocr_text[:_MAX_OCR_TEXT_FOR_LLM]
+        user_msg = f"【文件名】{filename}\n【OCR原始文本】\n{ocr_for_llm}"
+
+        try:
+            result = _ensure_receipt_dict(
+                chat_text_json(
+                    RECEIPT_FROM_OCR_V3_PROMPT,
+                    user_msg,
+                    max_tokens=1536,
+                    temperature=0.2,
+                    scene="invoice_ocr",
+                    user_id=ctx.user_id,
+                    company_id=ctx.company_id,
+                )
+            )
+        except (ValueError, RuntimeError) as e:
+            raise HTTPException(status_code=502, detail=f"记账模型解析失败：{e}") from e
 
     raw_out = ocr_text if len(ocr_text) <= _MAX_RAW_TEXT_RESPONSE else ocr_text[:_MAX_RAW_TEXT_RESPONSE]
     return RecordReceiptResponse(
@@ -191,13 +221,36 @@ async def _parse_receipt_from_bytes(content: bytes, filename: str, content_type:
 
 
 @router.post("/text", response_model=RecordTextResponse)
-async def record_text(req: RecordTextRequest):
-    """文字/语音记账 — LLM 分类 + 科目映射 + 税务标签"""
+async def record_text(req: RecordTextRequest, ctx: AuthContext = Depends(require_auth)):
+    """文字/语音记账 — LLM 分类 + 科目映射 + 税务标签（注入公司画像 top-K 分类习惯）"""
     user_msg = req.text
     if req.client_time:
         user_msg = f"【上下文 - 手机时间：{req.client_time}】\n用户输入：{user_msg}"
-    
-    result = chat_text_json(CLASSIFIER_V3_PROMPT, user_msg)
+
+    try:
+        from agent.memory import get_profile
+
+        profile = await get_profile(ctx.company_id)
+        prefs = profile.get("categoryPreferences") or {}
+        if isinstance(prefs, dict) and prefs:
+            ranked = sorted(
+                prefs.items(),
+                key=lambda kv: int((kv[1] or {}).get("count") if isinstance(kv[1], dict) else 0),
+                reverse=True,
+            )[:8]
+            hints = "；".join(f"{k}→{v.get('category')}" for k, v in ranked if isinstance(v, dict))
+            if hints:
+                user_msg += f"\n【本公司分类习惯（优先参考）】{hints}"
+    except Exception:
+        pass  # 画像注入失败不阻塞记账主路径
+
+    result = chat_text_json(
+        CLASSIFIER_V3_PROMPT,
+        user_msg,
+        scene="classify",
+        user_id=ctx.user_id,
+        company_id=ctx.company_id,
+    )
     return RecordTextResponse(
         id=_uid(),
         direction=result["direction"],
@@ -220,7 +273,7 @@ async def record_text(req: RecordTextRequest):
 
 
 @router.post("/receipt", response_model=RecordReceiptResponse)
-async def record_receipt(image: UploadFile = File(...)):
+async def record_receipt(image: UploadFile = File(...), ctx: AuthContext = Depends(require_auth)):
     """
     拍单据 — 智谱 OCR 提取文字 + 通义文本模型结构化（科目/发票字段与 VL 版一致）。
 
@@ -234,11 +287,11 @@ async def record_receipt(image: UploadFile = File(...)):
 
     content = await image.read()
     filename = image.filename or "receipt.jpg"
-    return await _parse_receipt_from_bytes(content, filename, image.content_type)
+    return await _parse_receipt_from_bytes(content, filename, image.content_type, ctx)
 
 
 @router.post("/receipt-url", response_model=RecordReceiptResponse)
-async def record_receipt_url(req: CloudFileRequest):
+async def record_receipt_url(req: CloudFileRequest, ctx: AuthContext = Depends(require_auth)):
     """拍单据（云存储 URL 版）：下载临时文件后复用 OCR 流程。"""
     if not (ZHIPU_API_KEY and ZHIPU_API_KEY.strip()):
         raise HTTPException(
@@ -248,40 +301,58 @@ async def record_receipt_url(req: CloudFileRequest):
     content, resp_ct = await _fetch_cloud_file(req.fileUrl)
     filename = req.filename or "receipt.jpg"
     content_type = req.contentType or resp_ct
-    return await _parse_receipt_from_bytes(content, filename, content_type)
+    return await _parse_receipt_from_bytes(content, filename, content_type, ctx)
 
 
 @router.post("/speech", response_model=SpeechTextResponse)
-async def record_speech(audio: UploadFile = File(...)):
+async def record_speech(audio: UploadFile = File(...), ctx: AuthContext = Depends(require_auth)):
     """
     语音转文字：接收小程序 RecorderManager 等上传的短音频，调用 DashScope Paraformer。
     个人主体小程序无需微信同声传译插件。
     """
     content = await audio.read()
     try:
-        text = transcribe_uploaded_audio(content, audio.filename, audio.content_type)
+        text = transcribe_uploaded_audio(
+            content,
+            audio.filename,
+            audio.content_type,
+            user_id=ctx.user_id,
+            company_id=ctx.company_id,
+        )
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return SpeechTextResponse(text=text)
 
 
 @router.post("/speech-url", response_model=SpeechTextResponse)
-async def record_speech_url(req: CloudFileRequest):
+async def record_speech_url(req: CloudFileRequest, ctx: AuthContext = Depends(require_auth)):
     """语音转文字（云存储 URL 版）：下载临时文件后调用 ASR。"""
     content, resp_ct = await _fetch_cloud_file(req.fileUrl)
     filename = req.filename or "speech.wav"
     content_type = req.contentType or resp_ct
     try:
-        text = transcribe_uploaded_audio(content, filename, content_type)
+        text = transcribe_uploaded_audio(
+            content,
+            filename,
+            content_type,
+            user_id=ctx.user_id,
+            company_id=ctx.company_id,
+        )
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return SpeechTextResponse(text=text)
 
 
 @router.post("/batch", response_model=RecordBatchResponse)
-async def record_batch(req: RecordBatchRequest):
+async def record_batch(req: RecordBatchRequest, ctx: AuthContext = Depends(require_auth)):
     """连续日志拆分"""
-    result = chat_text_json(BATCH_SPLIT_V3_PROMPT, req.text)
+    result = chat_text_json(
+        BATCH_SPLIT_V3_PROMPT,
+        req.text,
+        scene="batch_split",
+        user_id=ctx.user_id,
+        company_id=ctx.company_id,
+    )
     from models.schemas import BatchEntry
     return RecordBatchResponse(
         entries=[BatchEntry(**_clean_entry_payload(e)) for e in result.get("entries", [])]

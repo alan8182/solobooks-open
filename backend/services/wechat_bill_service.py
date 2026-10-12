@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Set
@@ -16,8 +17,8 @@ WECHAT_CLEARING_CODE = "1012"
 WECHAT_CLEARING_NAME = "微信支付待结算"
 REVENUE_CODE = "6001"
 REVENUE_NAME = "主营业务收入"
-FEE_CODE = "5608"
-FEE_NAME = "管理费用-银行及金融手续费"
+FEE_CODE = "6602"
+FEE_NAME = "财务费用-手续费"
 
 
 def _strip_backtick(s: str) -> str:
@@ -67,6 +68,12 @@ def _wechat_transaction_key(row: Dict[str, Any]) -> str:
     if status == "SUCCESS":
         return f"success:{base_order}"
     return f"{status.lower()}:{base_order}"
+
+
+def _fee_transaction_key(transaction_key: str) -> str:
+    """手续费条目的来源 key：一笔交易会产生收入+手续费两条凭证，
+    必须使用不同 external_key，否则同一批次内会计核心的来源唯一性校验会自碰撞。"""
+    return f"{transaction_key}:fee"
 
 
 def _legacy_wechat_transaction_key(order_no: Any, title: Any, amount: Any) -> str:
@@ -427,7 +434,7 @@ async def import_wechat_bill(
                         "source": "wechat_bill",
                         "voucherAuthority": "system",
                         "wechat_order_no": order_no,
-                        "wechat_transaction_key": transaction_key,
+                        "wechat_transaction_key": _fee_transaction_key(transaction_key),
                         "refund_order_no": row.get("refund_order_no", ""),
                         "merchant_refund_no": row.get("merchant_refund_no", ""),
                         "remark": f"手续费率 {row.get('fee_rate','')}",
@@ -475,7 +482,7 @@ async def import_wechat_bill(
                         "source": "wechat_bill",
                         "voucherAuthority": "system",
                         "wechat_order_no": order_no,
-                        "wechat_transaction_key": transaction_key,
+                        "wechat_transaction_key": _fee_transaction_key(transaction_key),
                         "refund_order_no": row.get("refund_order_no", ""),
                         "merchant_refund_no": row.get("merchant_refund_no", ""),
                         "remark": "退款手续费退还",
@@ -513,3 +520,85 @@ async def import_wechat_bill(
             ])
 
     return {"imported": imported, "failed": failed, "ignored_duplicates": ignored_duplicates, "results": results}
+
+
+async def list_wechat_bill_records(company_id: str, month: str) -> Dict[str, Any]:
+    """当月已导入微信账单的只读记录，按订单号聚合收入、退款与手续费条目。
+
+    导入时每笔交易拆成收入+手续费（或退款+手续费退还）多条 entry，
+    这里聚合回 CSV 视图：订单金额、手续费、到账净额（1012 清算净额）。
+    """
+    month = str(month or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}", month):
+        raise ValueError("month 格式必须为 YYYY-MM")
+    empty_summary = {"total": 0, "totalOrderAmount": 0.0, "totalFee": 0.0, "totalSettled": 0.0}
+    if not company_id:
+        return {"month": month, "items": [], "summary": empty_summary}
+
+    conn = await get_conn()
+    try:
+        cursor = await conn.execute(
+            "SELECT payload FROM entries "
+            "WHERE company_id = ? "
+            "AND json_extract(payload, '$.source') = 'wechat_bill' "
+            "AND json_extract(payload, '$.occurDate') LIKE ?",
+            (company_id, f"{month}-%"),
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+    finally:
+        await conn.close()
+
+    orders: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        payload = row.get("payload")
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(payload, dict):
+            continue
+        order_no = str(payload.get("wechat_order_no") or "").strip()
+        if not order_no:
+            continue
+        occur_date = str(payload.get("occurDate") or "")[:10]
+        amount = _money(payload.get("amount"))
+        category = str(payload.get("category") or "")
+        title = str(payload.get("title") or "")
+        bucket = orders.get(order_no)
+        if bucket is None:
+            bucket = {
+                "orderNo": order_no,
+                "date": occur_date,
+                "title": "",
+                "status": "SUCCESS",
+                "orderAmount": ZERO,
+                "fee": ZERO,
+            }
+            orders[order_no] = bucket
+        if occur_date and (not bucket["date"] or occur_date < bucket["date"]):
+            bucket["date"] = occur_date
+        if category == FEE_NAME or "手续费" in category:
+            bucket["fee"] += amount
+            if not bucket["title"]:
+                bucket["title"] = title.removeprefix("微信手续费退还-").removeprefix("微信手续费-")
+        elif amount < ZERO or category == REVENUE_NAME:
+            bucket["orderAmount"] += amount
+            if not bucket["title"]:
+                bucket["title"] = title.removeprefix("退款-")
+            if amount < ZERO:
+                bucket["status"] = "REFUND"
+
+    summary = {
+        "total": len(orders),
+        "totalOrderAmount": float(sum((item["orderAmount"] for item in orders.values()), ZERO)),
+        "totalFee": float(sum((item["fee"] for item in orders.values()), ZERO)),
+        "totalSettled": float(sum((item["orderAmount"] - item["fee"] for item in orders.values()), ZERO)),
+    }
+    items = sorted(orders.values(), key=lambda item: (item["date"], item["orderNo"]))
+    for item in items:
+        settled = item["orderAmount"] - item["fee"]
+        item["orderAmount"] = float(item["orderAmount"])
+        item["fee"] = float(item["fee"])
+        item["settledAmount"] = float(settled)
+    return {"month": month, "items": items, "summary": summary}

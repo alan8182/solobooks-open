@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -139,6 +140,9 @@ async def zhipu_handwriting_ocr_bytes(
     *,
     language_type: str = "CHN_ENG",
     probability: bool = False,
+    scene: str = "invoice_ocr",
+    user_id: str | None = None,
+    company_id: str | None = None,
 ) -> dict[str, Any]:
     """
     调用智谱 ``/files/ocr`` 手写/印刷识别接口，返回 OCR 文本与原始元数据。
@@ -163,16 +167,34 @@ async def zhipu_handwriting_ocr_bytes(
         "probability": "true" if probability else "false",
     }
 
+    # 用量统计（M1）：OCR 接口无 token 数，记调用次数与耗时；与 LLM 埋点同一出口
+    from services.llm import _record_usage
+
+    _ocr_started = time.monotonic()
+
+    def _record_ocr(status: str, error_type: str | None = None) -> None:
+        _record_usage(
+            model="zhipu-ocr",
+            scene=scene,
+            user_id=user_id,
+            company_id=company_id,
+            duration_ms=int((time.monotonic() - _ocr_started) * 1000),
+            status=status,
+            error_type=error_type,
+        )
+
     async with httpx.AsyncClient(timeout=httpx.Timeout(90.0)) as client:
         resp = await client.post(ZHIPU_OCR_URL, headers=headers, files=files, data=data)
 
     try:
         body: dict[str, Any] = resp.json()
     except json.JSONDecodeError as exc:
+        _record_ocr("error", error_type="BadOcrResponse")
         raise RuntimeError(f"智谱 OCR 响应非 JSON：HTTP {resp.status_code}") from exc
 
     if resp.status_code != 200:
         msg = body.get("error", body.get("message", resp.text[:300]))
+        _record_ocr("error", error_type=f"http_{resp.status_code}")
         raise RuntimeError(f"智谱 OCR HTTP {resp.status_code}：{msg}")
 
     status = body.get("status")
@@ -181,11 +203,13 @@ async def zhipu_handwriting_ocr_bytes(
 
     if status != "succeeded":
         logger.warning("智谱 OCR 未成功: status=%s message=%s task_id=%s", status, message, task_id)
+        _record_ocr("error", error_type=f"ocr_{status}")
         raise RuntimeError(message or "智谱 OCR 识别失败")
 
     words_result = body.get("words_result") or []
     ocr_text = _words_result_to_text(words_result if isinstance(words_result, list) else [])
 
+    _record_ocr("ok")
     return {
         "ocr_text": ocr_text,
         "task_id": task_id,

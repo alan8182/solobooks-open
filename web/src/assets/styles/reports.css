@@ -1,9 +1,17 @@
 /* Global styles for unified report/statistics pages */
 
 .report-container {
-  max-width: 920px;
+  max-width: 1240px;
   margin: 0 auto;
-  padding: 16px 0 48px 0;
+  padding: 16px 20px 48px 20px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+@media (max-width: 768px) {
+  .report-container {
+    padding: 12px 12px 32px 12px;
+  }
 }
 
 /* Report Header */
@@ -67,6 +75,7 @@
   margin-bottom: 16px;
   transition: all 0.2s ease;
   padding: 4px; /* Default inner Naive UI Padding handles content */
+  overflow-x: auto;
 }
 .report-card:hover {
   border-color: var(--solo-primary-light);

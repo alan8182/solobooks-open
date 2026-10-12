@@ -1,205 +1,724 @@
 <script setup lang="ts">
-import { ref } from 'vue'
-import { NCard, NButton, NInput, NSpin, useMessage, NSelect } from 'naive-ui'
-import { copilotChat } from '@/api/copilot'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { NButton, NCard, NInput, NSpin, useMessage } from 'naive-ui'
+import {
+  chatAgentStream,
+  listAgentActions,
+  type AgentActionItem,
+  type AgentStreamEvent,
+} from '@/api/agent'
+import { recordReceipt, recordSpeech } from '@/api/record'
+import { useEntryStore } from '@/stores/entry'
+import AgentActionCard from '@/components/business/AgentActionCard.vue'
+import { renderMarkdown } from '@/utils/markdown'
+import { copyToClipboard } from '@/utils/clipboard'
+import CopilotEvidenceBoard from '@/components/business/CopilotEvidenceBoard.vue'
 
+const route = useRoute()
+const router = useRouter()
 const message = useMessage()
+const entryStore = useEntryStore()
 
-interface Message {
+interface ToolStep {
+  name: string
+  label: string
+  argsSummary: string
+  status: 'running' | 'ok' | 'fail'
+  summary?: string
+}
+
+interface ChatMessage {
   role: 'user' | 'assistant'
   content: string
+  steps?: ToolStep[]
+  actions?: AgentActionItem[]
+  streaming?: boolean
+  failed?: boolean
+  imageUrl?: string
 }
 
-const messages = ref<Message[]>([])
+const TOOL_LABELS: Record<string, string> = {
+  get_month_summary: '查询月度汇总',
+  list_entries: '查询账目',
+  list_invoice_entries: '查询发票',
+  list_bank_statements: '查询银行流水',
+  get_aging: '查询应收应付账龄',
+  list_todos: '查询待办事项',
+  search_books: '全局搜索',
+  get_company_profile: '读取公司画像',
+  propose_voucher: '创建记账草稿',
+}
+
+const messages = ref<ChatMessage[]>([])
 const input = ref('')
-const loading = ref(false)
-const mode = ref<'agent' | 'tax_advisor' | 'secretary' | 'coach'>('agent')
+const streaming = ref(false)
+const pendingActions = ref<AgentActionItem[]>([])
+const showRightBoard = ref(true)
+const lastReceiptImage = ref<{ url: string; name: string; receipt?: Record<string, unknown> } | null>(null)
+const chatCardRef = ref<InstanceType<typeof NCard> | null>(null)
+let abortController: AbortController | null = null
+const conversationId = ref(`copilot-${Date.now().toString(36)}`)
+const STORAGE_KEY = 'solobooks:copilot_last_chat'
 
-const modeOptions = [
-  { label: 'Agent', value: 'agent' as const },
-  { label: '税务顾问', value: 'tax_advisor' as const },
-  { label: '秘书', value: 'secretary' as const },
-  { label: '教练', value: 'coach' as const },
-]
+const copiedMessageIndex = ref<number | null>(null)
+let copyTimer: ReturnType<typeof setTimeout> | null = null
 
-const modeDescriptions: Record<string, string> = {
-  agent: '通用智能助手，回答财税问题',
-  tax_advisor: '专业税务顾问，提供税务建议',
-  secretary: '行政秘书，处理日常事务',
-  coach: '经营教练，提供管理建议',
-}
-
-async function send() {
-  const text = input.value.trim()
-  if (!text || loading.value) return
-
-  messages.value.push({ role: 'user', content: text })
-  input.value = ''
-  loading.value = true
-
-  try {
-    const resp = await copilotChat({
-      messages: messages.value.map((m) => ({ role: m.role, content: m.content })),
-      mode: mode.value,
-    })
-    messages.value.push({ role: 'assistant', content: resp.reply })
-    if (resp.disclaimer) {
-      messages.value.push({ role: 'assistant', content: `> ${resp.disclaimer}` })
-    }
-  } catch {
-    message.error('发送失败')
-  } finally {
-    loading.value = false
+async function copyContent(content: string, index: number) {
+  const ok = await copyToClipboard(content)
+  if (ok) {
+    copiedMessageIndex.value = index
+    if (copyTimer) clearTimeout(copyTimer)
+    copyTimer = setTimeout(() => {
+      copiedMessageIndex.value = null
+    }, 2000)
   }
 }
 
-function clearChat() {
-  messages.value = []
+
+const canSend = computed(() => !streaming.value && input.value.trim().length > 0)
+
+// 已在当前对话中展示过的动作不再重复进"待确认"条，避免两处实例状态不同步
+const stripActions = computed(() => {
+  const inConversation = new Set(
+    messages.value.flatMap((m) => m.actions?.map((a) => a.id) ?? []),
+  )
+  return pendingActions.value.filter((a) => !inConversation.has(a.id))
+})
+
+const EXAMPLE_PROMPTS = [
+  '这个月的收入和支出情况怎么样？',
+  '帮我记几笔：1) 9月25日买电脑椅 499 元对公；2) 9月26日打车 32 元私账；3) 9月28日收到咨询服务费 3000 元',
+  '目前有哪些待办和风险事项？',
+]
+
+// ── 图片附件（发票/单据识别 → 交给 agent 起草）─────────────────────
+const imageInput = ref<HTMLInputElement | null>(null)
+const attaching = ref(false)
+
+function pickImage() {
+  if (streaming.value || attaching.value) return
+  imageInput.value?.click()
 }
+
+function receiptMessage(r: Record<string, unknown>): string {
+  const lines = ['记一笔（来自发票图片识别）：']
+  if (r.sellerName || r.merchant) lines.push(`- 商户/销售方：${r.sellerName || r.merchant}`)
+  if (r.amount != null) lines.push(`- 金额：${r.amount}`)
+  if (r.date) lines.push(`- 日期：${r.date}`)
+  if (r.suggestedCategory) lines.push(`- 建议分类：${r.suggestedCategory}`)
+  if (r.invoiceType) lines.push(`- 发票类型：${r.invoiceType}`)
+  return lines.join('\n')
+}
+
+async function onImagePicked(event: Event) {
+  const picker = event.target as HTMLInputElement
+  const file = picker.files?.[0]
+  picker.value = ''
+  if (!file || streaming.value) return
+  attaching.value = true
+  const previewUrl = URL.createObjectURL(file)
+  lastReceiptImage.value = { url: previewUrl, name: file.name }
+  try {
+    const receipt = (await recordReceipt(file)) as unknown as Record<string, unknown>
+    lastReceiptImage.value.receipt = receipt
+    input.value = receiptMessage(receipt)
+    await send(previewUrl)
+  } catch (err) {
+    message.error(err instanceof Error ? err.message : '发票识别失败，请重试')
+  } finally {
+    attaching.value = false
+  }
+}
+
+// ── 语音输入（ASR 转写后自动发送）──────────────────────────────────
+const recording = ref(false)
+const transcribing = ref(false)
+let mediaRecorder: MediaRecorder | null = null
+let audioChunks: Blob[] = []
+
+async function toggleRecording() {
+  if (recording.value) {
+    mediaRecorder?.stop()
+    return
+  }
+  if (streaming.value || transcribing.value) return
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    audioChunks = []
+    mediaRecorder = new MediaRecorder(stream)
+    mediaRecorder.ondataavailable = (ev) => {
+      if (ev.data.size > 0) audioChunks.push(ev.data)
+    }
+    mediaRecorder.onstop = async () => {
+      stream.getTracks().forEach((t) => t.stop())
+      recording.value = false
+      const blob = new Blob(audioChunks, { type: mediaRecorder?.mimeType || 'audio/webm' })
+      if (blob.size < 2000) return // 过短视为误触
+      transcribing.value = true
+      try {
+        const { text } = await recordSpeech(blob)
+        const cleaned = text.trim()
+        if (!cleaned) {
+          message.warning('没有听清，请再说一次')
+          return
+        }
+        input.value = cleaned
+        await send()
+      } catch (err) {
+        message.error(err instanceof Error ? err.message : '语音识别失败')
+      } finally {
+        transcribing.value = false
+      }
+    }
+    mediaRecorder.start()
+    recording.value = true
+  } catch {
+    message.error('无法使用麦克风，请检查浏览器权限')
+  }
+}
+
+onBeforeUnmount(() => {
+  if (recording.value) mediaRecorder?.stop()
+})
+
+function scrollBottom() {
+  nextTick(() => {
+    const el = chatCardRef.value?.$el as HTMLElement | undefined
+    if (el) el.scrollTop = el.scrollHeight
+  })
+}
+
+async function refreshPending() {
+  try {
+    pendingActions.value = await listAgentActions('pending')
+  } catch {
+    /* 静默：待办加载失败不阻塞对话 */
+  }
+}
+
+function argsSummary(args: Record<string, unknown>): string {
+  const keys = ['month', 'keyword', 'query', 'status', 'kind']
+  const parts: string[] = []
+  for (const k of keys) {
+    if (args[k] != null && args[k] !== '') parts.push(String(args[k]))
+  }
+  if (args.title) parts.push(String(args.title))
+  return parts.join(' · ')
+}
+
+function handleEvent(ev: AgentStreamEvent, target: ChatMessage) {
+  switch (ev.type) {
+    case 'token':
+      target.content += ev.content || ''
+      scrollBottom()
+      break
+    case 'tool_call': {
+      target.steps = target.steps || []
+      target.steps.push({
+        name: ev.name || '',
+        label: TOOL_LABELS[ev.name || ''] || ev.name || '工具调用',
+        argsSummary: argsSummary(ev.arguments || {}),
+        status: 'running',
+      })
+      scrollBottom()
+      break
+    }
+    case 'tool_result': {
+      const step = target.steps?.[target.steps.length - 1]
+      if (step && step.status === 'running') {
+        step.status = ev.ok ? 'ok' : 'fail'
+        step.summary = ev.summary || ''
+      }
+      break
+    }
+    case 'action':
+      if (ev.action) {
+        target.actions = target.actions || []
+        target.actions.push(ev.action)
+        scrollBottom()
+      }
+      break
+    case 'final':
+      if (ev.content && !target.content) target.content = ev.content
+      break
+    case 'error':
+      target.failed = true
+      target.content += (target.content ? '\n\n' : '') + `⚠ ${ev.message || 'Agent 处理失败'}`
+      break
+  }
+}
+
+async function send(imageUrl?: string) {
+  const text = input.value.trim()
+  if (!text || streaming.value) return
+
+  messages.value.push({ role: 'user', content: text, imageUrl })
+  input.value = ''
+  streaming.value = true
+
+  const assistant: ChatMessage = { role: 'assistant', content: '', steps: [], streaming: true }
+  messages.value.push(assistant)
+  scrollBottom()
+
+  abortController = new AbortController()
+  try {
+    await chatAgentStream(
+      messages.value
+        .filter((m) => m.content)
+        .map((m) => ({ role: m.role, content: m.content })),
+      (ev) => handleEvent(ev, assistant),
+      abortController.signal,
+      conversationId.value,
+    )
+  } catch (err) {
+    if ((err as Error)?.name !== 'AbortError') {
+      assistant.failed = true
+      assistant.content +=
+        (assistant.content ? '\n\n' : '') + '⚠ 连接中断，请稍后重试。'
+    }
+  } finally {
+    assistant.streaming = false
+    streaming.value = false
+    abortController = null
+    saveChatToStorage()
+    await refreshPending()
+    scrollBottom()
+  }
+}
+
+function handleQuickAsk(prompt: string) {
+  input.value = prompt
+  send()
+}
+
+function saveChatToStorage() {
+  try {
+    const serializable = messages.value.slice(-30).map((m) => ({
+      role: m.role,
+      content: m.content,
+      imageUrl: m.imageUrl,
+      actions: m.actions,
+    }))
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(serializable))
+  } catch {
+    /* 静默 */
+  }
+}
+
+function loadChatFromStorage() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (raw) {
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        messages.value = parsed
+      }
+    }
+  } catch {
+    /* 静默 */
+  }
+}
+
+function retryLast() {
+  if (streaming.value) return
+  const lastUserMsg = [...messages.value].reverse().find((m) => m.role === 'user')
+  if (lastUserMsg) {
+    if (messages.value.length > 0 && messages.value[messages.value.length - 1].role === 'assistant') {
+      messages.value.pop()
+    }
+    input.value = lastUserMsg.content
+    send(lastUserMsg.imageUrl)
+  }
+}
+
+function stopStream() {
+  abortController?.abort()
+}
+
+async function onPendingResolved() {
+  await Promise.all([refreshPending(), entryStore.fetchEntries()])
+}
+
+function clearChat() {
+  if (streaming.value) return
+  messages.value = []
+  lastReceiptImage.value = null
+  try {
+    localStorage.removeItem(STORAGE_KEY)
+  } catch {
+    /* 静默 */
+  }
+  conversationId.value = `copilot-${Date.now().toString(36)}`
+}
+
+async function consumeRouteQuery() {
+  const mode = route.query.mode
+  const q = route.query.q
+  const autoSend = route.query.autoSend
+
+  if (!mode && !q && !autoSend) return
+
+  // 消费完后立即清除 URL 参数，避免刷新页面时重复提问或反复弹出附件选择器
+  await router.replace({ path: route.path, query: {} })
+
+  if (mode === 'receipt') {
+    nextTick(() => {
+      pickImage()
+    })
+  }
+
+  if (typeof q === 'string' && q.trim()) {
+    input.value = q.trim()
+    if (autoSend === '1') {
+      send()
+    }
+  }
+}
+
+onMounted(async () => {
+  if (typeof window !== 'undefined') {
+    showRightBoard.value = window.innerWidth >= 1024
+  }
+  loadChatFromStorage()
+  await Promise.all([refreshPending(), entryStore.fetchEntries()])
+  await consumeRouteQuery()
+})
+
+watch(
+  () => route.query,
+  async (newQuery) => {
+    if (newQuery.q || newQuery.mode || newQuery.autoSend) {
+      await consumeRouteQuery()
+    }
+  },
+)
 </script>
 
 <template>
   <div class="copilot-page">
     <div class="page-header">
-      <h2>AI 助手</h2>
-      <NButton size="tiny" text @click="clearChat" v-if="messages.length > 0">清空对话</NButton>
-    </div>
-
-    <!-- Mode selector -->
-    <div class="mode-bar mb-4">
-      <NSelect
-        v-model:value="mode"
-        :options="modeOptions"
-        size="small"
-        style="width: 160px;"
-      />
-      <span class="mode-desc">{{ modeDescriptions[mode] }}</span>
-    </div>
-
-    <!-- Chat messages -->
-    <NCard :bordered="false" class="chat-card">
-      <div class="chat-messages" v-if="messages.length > 0">
-        <div
-          v-for="(msg, i) in messages"
-          :key="i"
-          class="message"
-          :class="msg.role"
+      <div class="header-titles">
+        <h2>AI 会计 · 交互工作台</h2>
+        <span class="header-badge-tag">数字员工 · 安全确认</span>
+      </div>
+      <div class="header-actions">
+        <NButton
+          size="tiny"
+          quaternary
+          class="toggle-board-btn"
+          :title="showRightBoard ? '收起右侧工作板' : '展开业务工作板'"
+          @click="showRightBoard = !showRightBoard"
         >
-          <div class="msg-avatar">{{ msg.role === 'user' ? '我' : 'AI' }}</div>
-          <div class="msg-bubble">{{ msg.content }}</div>
+          <i :class="showRightBoard ? 'ri-layout-right-line' : 'ri-layout-right-fill'" />
+          <span>{{ showRightBoard ? '收起工作板' : '业务工作板' }}</span>
+          <span v-if="stripActions.length > 0" class="header-badge">{{ stripActions.length }}</span>
+        </NButton>
+        <NButton size="tiny" text @click="clearChat" v-if="messages.length > 0 && !streaming">
+          <i class="ri-delete-bin-line" /> 清空
+        </NButton>
+      </div>
+    </div>
+
+    <div class="workbench-grid" :class="{ 'board-hidden': !showRightBoard }">
+      <!-- 左栏：AI 会话与交互工作流 -->
+      <section class="workbench-main">
+        <!-- 对话区 -->
+        <NCard :bordered="false" class="chat-card" ref="chatCardRef">
+          <div class="chat-messages" v-if="messages.length > 0">
+            <div v-for="(msg, i) in messages" :key="i" class="message" :class="msg.role">
+              <div class="msg-avatar" :title="msg.role === 'user' ? '我' : '梭罗 · AI 会计'">
+                <i v-if="msg.role === 'user'" class="ri-user-3-fill" />
+                <i v-else class="ri-sparkling-fill" />
+              </div>
+              <div class="msg-main">
+                <!-- 单据图片缩略图 -->
+                <div v-if="msg.imageUrl" class="msg-image-thumb">
+                  <img :src="msg.imageUrl" alt="单据图片" />
+                </div>
+
+                <!-- 工具调用过程 -->
+                <div class="tool-steps" v-if="msg.steps && msg.steps.length > 0">
+                  <div class="tool-step" v-for="(step, j) in msg.steps" :key="j">
+                    <NSpin v-if="step.status === 'running'" :size="10" />
+                    <span class="step-icon" :class="step.status" v-else>{{ step.status === 'ok' ? '✓' : '✕' }}</span>
+                    <span class="step-label">{{ step.label }}</span>
+                    <span class="step-args" v-if="step.argsSummary">{{ step.argsSummary }}</span>
+                  </div>
+                </div>
+
+                <div class="msg-bubble-wrap" v-if="msg.content || msg.role === 'user' || msg.streaming === false">
+                  <div class="msg-bubble" :class="{ 'is-error': msg.failed }">
+                    <template v-if="msg.role === 'user'">{{ msg.content }}</template>
+                    <div v-else class="md-body" v-html="renderMarkdown(msg.content)"></div>
+                    <span class="cursor" v-if="msg.streaming && msg.content">▍</span>
+                    <div v-if="msg.failed && !streaming" class="retry-hint">
+                      <button type="button" class="retry-inline-btn" @click="retryLast">
+                        <i class="ri-refresh-line" /> 点击重试
+                      </button>
+                    </div>
+                  </div>
+                  <button
+                    v-if="msg.content && !msg.streaming"
+                    type="button"
+                    class="bubble-copy-btn"
+                    :class="{ copied: copiedMessageIndex === i }"
+                    :title="copiedMessageIndex === i ? '已复制' : '复制内容'"
+                    @click="copyContent(msg.content, i)"
+                  >
+                    <i :class="copiedMessageIndex === i ? 'ri-check-line' : 'ri-file-copy-line'" />
+                  </button>
+                </div>
+
+                <!-- 待确认动作卡片 -->
+                <div class="msg-actions" v-if="msg.actions && msg.actions.length > 0">
+                  <AgentActionCard
+                    v-for="action in msg.actions"
+                    :key="action.id"
+                    :action="action"
+                    @resolved="onPendingResolved"
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div v-else class="chat-empty">
+            <div class="empty-icon"><i class="ri-sparkling-2-fill"></i></div>
+            <p>你好，我是梭罗，你的 AI 会计。可以试着问我：</p>
+            <div class="prompt-list">
+              <button
+                v-for="prompt in EXAMPLE_PROMPTS"
+                :key="prompt"
+                class="prompt-chip"
+                @click="input = prompt"
+              >
+                {{ prompt }}
+              </button>
+            </div>
+            <p class="empty-note">查账、记账、找发票、看风险，直接说人话就行。</p>
+          </div>
+
+          <div v-if="streaming" class="loading-indicator">
+            <NSpin size="small" />
+            <span>AI 正在处理…</span>
+          </div>
+        </NCard>
+
+        <!-- 输入区 -->
+        <div class="input-bar">
+          <input
+            ref="imageInput"
+            type="file"
+            accept="image/png,image/jpeg,image/jpg,image/bmp"
+            style="display: none"
+            @change="onImagePicked"
+          />
+          <NButton
+            size="small"
+            quaternary
+            title="拍发票/单据给 AI 识别记账"
+            :disabled="streaming || attaching"
+            :loading="attaching"
+            @click="pickImage"
+          >
+            <i class="ri-attachment-2" />
+          </NButton>
+          <NButton
+            size="small"
+            quaternary
+            :type="recording ? 'error' : 'default'"
+            :title="recording ? '点击结束录音' : '语音记账：点击开始/结束'"
+            :disabled="streaming || transcribing"
+            :loading="transcribing"
+            @click="toggleRecording"
+          >
+            <i :class="recording ? 'ri-stop-circle-fill' : 'ri-mic-line'" />
+            <span v-if="recording" class="recording-text">录音中</span>
+          </NButton>
+          <NInput
+            v-model:value="input"
+            type="textarea"
+            :autosize="{ minRows: 1, maxRows: 6 }"
+            placeholder="例如：记一笔 昨天打车 58 元；这个月支出多少？（支持语音/发票图片）"
+            :disabled="streaming"
+            @keydown.enter.prevent="(!($event as KeyboardEvent).shiftKey && send())"
+          />
+          <NButton v-if="streaming" type="warning" secondary @click="stopStream">停止</NButton>
+          <NButton v-else type="primary" :disabled="!canSend" @click="() => send()">发送</NButton>
         </div>
-      </div>
+        <p class="disclaimer">AI 生成内容仅供参考；所有入账以人工确认为准，申报以税务局口径为准。</p>
+      </section>
 
-      <div v-else class="chat-empty">
-        <div class="empty-icon">🤖</div>
-        <p>你好！我是司理 AI 助手，可以帮你：</p>
-        <ul class="hint-list">
-          <li>回答财税问题</li>
-          <li>分析经营数据</li>
-          <li>提供税务建议</li>
-          <li>解答记账疑问</li>
-        </ul>
-      </div>
-
-      <div v-if="loading" class="loading-indicator">
-        <NSpin size="small" />
-        <span>AI 思考中...</span>
-      </div>
-    </NCard>
-
-    <!-- Input -->
-    <div class="input-bar">
-      <NInput
-        v-model:value="input"
-        type="textarea"
-        :rows="2"
-        placeholder="输入您的问题..."
-        :disabled="loading"
-        @keydown.enter.prevent="send"
-      />
-      <NButton type="primary" :loading="loading" @click="send">发送</NButton>
+      <!-- 右栏：业务工作板（单据原件核对 + 待确认草稿池 + 财务脉搏） -->
+      <aside class="workbench-aside" v-show="showRightBoard">
+        <CopilotEvidenceBoard
+          :actions="stripActions"
+          :active-receipt="lastReceiptImage"
+          :monthly-income="entryStore.monthlyIncome"
+          :monthly-expense="entryStore.monthlyExpense"
+          :net-profit="entryStore.netProfit"
+          @resolved="onPendingResolved"
+          @quick-ask="handleQuickAsk"
+          @close="showRightBoard = false"
+        />
+      </aside>
     </div>
   </div>
 </template>
 
 <style scoped>
 .copilot-page {
-  max-width: 640px;
+  max-width: 1400px;
   margin: 0 auto;
   display: flex;
   flex-direction: column;
-  height: calc(100vh - var(--navbar-height) - 48px);
+  height: calc(100vh - var(--navbar-height) - 52px);
 }
 .page-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
   margin-bottom: 8px;
+  height: 32px;
+  flex-shrink: 0;
 }
-.page-header h2 {
+.header-titles {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.header-titles h2 {
   margin: 0;
-  font-size: 20px;
+  font-size: 15px;
   font-weight: 600;
+  color: var(--solo-text-primary, #182230);
+  line-height: 1;
 }
-.mb-4 { margin-bottom: 12px; }
-.mode-bar {
+.header-badge-tag {
+  font-size: 11px;
+  color: var(--solo-text-muted, #8a95a3);
+  background: var(--solo-bg-soft, #f1f4f8);
+  border: 1px solid var(--solo-border, #dde3ea);
+  padding: 1px 6px;
+  border-radius: 4px;
+  line-height: 16px;
+}
+.header-actions {
   display: flex;
   align-items: center;
   gap: 10px;
 }
-.mode-desc {
+.toggle-board-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   font-size: 12px;
-  color: var(--solo-text-muted);
+}
+.header-badge {
+  background: var(--solo-primary, #165dff);
+  color: #fff;
+  font-size: 10.5px;
+  padding: 0 5px;
+  border-radius: 9px;
+  font-weight: 600;
+  line-height: 16px;
+  height: 16px;
 }
 
-/* Chat */
+/* 工作台栅格 */
+.workbench-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(360px, 1fr);
+  gap: 16px;
+  flex: 1;
+  min-height: 0;
+}
+.workbench-grid.board-hidden {
+  grid-template-columns: 1fr;
+}
+.workbench-main {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.workbench-aside {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+/* 对话 */
 .chat-card {
-  border-radius: var(--solo-radius-lg);
+  border-radius: var(--solo-radius-lg, 12px);
+  border: 1px solid var(--solo-border, #dde3ea);
   flex: 1;
   overflow-y: auto;
-  margin-bottom: 12px;
+  margin-bottom: 10px;
+  background: var(--solo-bg-card, #ffffff);
+}
+.msg-image-thumb {
+  margin-bottom: 6px;
+  border-radius: 6px;
+  overflow: hidden;
+  max-width: 200px;
+  max-height: 140px;
+  background: rgba(0, 0, 0, 0.05);
+}
+.msg-image-thumb img {
+  width: 100%;
+  height: auto;
+  display: block;
 }
 .chat-messages {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 14px;
 }
 .message {
   display: flex;
   gap: 10px;
 }
-.message.assistant {
-  flex-direction: row;
-}
 .message.user {
   flex-direction: row-reverse;
 }
 .msg-avatar {
-  width: 32px;
-  height: 32px;
+  width: 28px;
+  height: 28px;
   border-radius: 50%;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 12px;
-  font-weight: 600;
+  font-size: 13.5px;
   flex-shrink: 0;
 }
 .message.user .msg-avatar {
-  background: var(--solo-primary);
+  background: var(--solo-primary, #165dff);
   color: #fff;
+  box-shadow: 0 1px 3px rgba(22, 93, 255, 0.2);
 }
 .message.assistant .msg-avatar {
-  background: var(--solo-bg-page);
-  color: var(--solo-text-secondary);
+  background: var(--solo-bg-blue-soft, #edf3ff);
+  color: var(--solo-primary, #165dff);
+  border: 1px solid rgba(22, 93, 255, 0.15);
+  box-shadow: 0 1px 3px rgba(22, 93, 255, 0.05);
+}
+.msg-main {
+  max-width: 82%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
 }
 .msg-bubble {
-  max-width: 80%;
   padding: 10px 14px;
   border-radius: 12px;
   font-size: 14px;
   line-height: 1.6;
   white-space: pre-wrap;
+  word-break: break-word;
 }
 .message.user .msg-bubble {
   background: var(--solo-primary);
@@ -211,8 +730,166 @@ function clearChat() {
   color: var(--solo-text-primary);
   border-bottom-left-radius: 4px;
 }
+/* markdown 渲染内容：取消 pre-wrap，按块级排版 */
+.message.assistant .msg-bubble :deep(.md-body) {
+  white-space: normal;
+}
+.message.assistant .msg-bubble :deep(.md-body > *:first-child) {
+  margin-top: 0;
+}
+.message.assistant .msg-bubble :deep(.md-body > *:last-child) {
+  margin-bottom: 0;
+}
+.message.assistant .msg-bubble :deep(.md-body h1),
+.message.assistant .msg-bubble :deep(.md-body h2),
+.message.assistant .msg-bubble :deep(.md-body h3) {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 12px 0 6px;
+}
+.message.assistant .msg-bubble :deep(.md-body p) {
+  margin: 6px 0;
+}
+.message.assistant .msg-bubble :deep(.md-body ul),
+.message.assistant .msg-bubble :deep(.md-body ol) {
+  margin: 6px 0;
+  padding-left: 20px;
+}
+.message.assistant .msg-bubble :deep(.md-body li) {
+  margin: 2px 0;
+}
+.message.assistant .msg-bubble :deep(.md-body code) {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.06);
+  font-size: 13px;
+}
+.message.assistant .msg-bubble :deep(.md-body table) {
+  border-collapse: collapse;
+  margin: 8px 0;
+}
+.message.assistant .msg-bubble :deep(.md-body th),
+.message.assistant .msg-bubble :deep(.md-body td) {
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  padding: 4px 8px;
+}
+.cursor {
+  animation: blink 1s steps(1) infinite;
+  color: var(--solo-ai, var(--solo-primary));
+}
+@keyframes blink {
+  50% { opacity: 0; }
+}
 
-/* Empty */
+/* 工具步骤 */
+.tool-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.tool-step {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--solo-text-muted);
+}
+.step-icon {
+  width: 14px;
+  text-align: center;
+}
+.step-icon.ok {
+  color: #18a058;
+}
+.step-icon.fail {
+  color: #d03050;
+}
+.step-args {
+  color: var(--solo-text-muted);
+  opacity: 0.8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.msg-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.msg-bubble-wrap {
+  position: relative;
+  display: inline-flex;
+  max-width: 100%;
+}
+.message.user .msg-bubble-wrap {
+  align-self: flex-end;
+}
+.message.assistant .msg-bubble-wrap {
+  align-self: flex-start;
+}
+.bubble-copy-btn {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  border: none;
+  background: transparent;
+  color: var(--solo-text-muted, #8a95a3);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  cursor: pointer;
+  opacity: 0;
+  transition: all 0.15s ease;
+}
+.message.assistant .bubble-copy-btn {
+  right: -26px;
+}
+.message.user .bubble-copy-btn {
+  left: -26px;
+}
+.msg-bubble-wrap:hover .bubble-copy-btn {
+  opacity: 0.8;
+}
+.bubble-copy-btn:hover {
+  opacity: 1;
+  background: rgba(0, 0, 0, 0.05);
+  color: var(--solo-text-primary, #182230);
+}
+.bubble-copy-btn.copied {
+  opacity: 1;
+  color: var(--solo-income, #12805c) !important;
+}
+
+.msg-bubble.is-error {
+  background: #fff5f5 !important;
+  color: var(--solo-expense, #c74444) !important;
+  border: 1px solid rgba(199, 68, 68, 0.2);
+}
+.retry-hint {
+  margin-top: 6px;
+  padding-top: 4px;
+  border-top: 1px dashed rgba(199, 68, 68, 0.2);
+}
+.retry-inline-btn {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: var(--solo-primary, #165dff);
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+}
+.retry-inline-btn:hover {
+  text-decoration: underline;
+}
+
+/* 空态 */
 .chat-empty {
   display: flex;
   flex-direction: column;
@@ -221,17 +898,49 @@ function clearChat() {
   color: var(--solo-text-secondary);
 }
 .empty-icon {
-  font-size: 48px;
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   margin-bottom: 16px;
+  background: radial-gradient(circle, var(--solo-ai-glow) 0%, transparent 75%);
+  box-shadow: inset 0 0 0 1px rgba(22, 93, 255, 0.15);
 }
-.hint-list {
-  margin: 8px 0 0;
-  padding-left: 20px;
+.empty-icon i {
+  font-size: 36px;
+  color: var(--solo-ai);
+}
+.prompt-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+  width: 100%;
+  max-width: 360px;
+}
+.prompt-chip {
+  border: 1px solid var(--solo-border, #e5e6eb);
+  background: #fff;
+  border-radius: 8px;
+  padding: 8px 12px;
   font-size: 13px;
-  line-height: 2;
+  color: var(--solo-text-primary);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.2s;
+}
+.prompt-chip:hover {
+  border-color: var(--solo-ai, var(--solo-primary));
+  color: var(--solo-ai, var(--solo-primary));
+}
+.empty-note {
+  margin-top: 14px;
+  font-size: 12px;
+  color: var(--solo-text-muted);
 }
 
-/* Loading */
 .loading-indicator {
   display: flex;
   align-items: center;
@@ -241,7 +950,7 @@ function clearChat() {
   color: var(--solo-text-muted);
 }
 
-/* Input */
+/* 输入 */
 .input-bar {
   display: flex;
   gap: 8px;
@@ -249,5 +958,48 @@ function clearChat() {
 }
 .input-bar .n-input {
   flex: 1;
+}
+.disclaimer {
+  margin: 6px 0 0;
+  font-size: 11px;
+  color: var(--solo-text-muted);
+  text-align: center;
+}
+.input-bar .n-button i {
+  font-size: 16px;
+  line-height: 1;
+}
+.recording-text {
+  margin-left: 4px;
+  font-size: 12px;
+  animation: blink 1.2s ease-in-out infinite;
+}
+
+@media (max-width: 1099px) {
+  .workbench-grid {
+    grid-template-columns: 1fr;
+    position: relative;
+  }
+  .workbench-aside {
+    position: absolute;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    width: 380px;
+    max-width: 90vw;
+    z-index: 10;
+    box-shadow: -4px 0 16px rgba(0, 0, 0, 0.08);
+  }
+}
+@media (max-width: 768px) {
+  .copilot-page {
+    height: calc(100vh - var(--navbar-height) - 24px);
+  }
+  .page-header h2 {
+    font-size: 17px;
+  }
+  .msg-main {
+    max-width: 90%;
+  }
 }
 </style>

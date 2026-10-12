@@ -93,7 +93,7 @@ onMounted(load)
         </section>
 
         <NCard v-if="!result.companyTaxProfileComplete" :bordered="false" class="profile-card mb-4">
-          <div><strong>企业税务信息还没完善</strong><p>请在主体管理中确认小型微利企业、限制行业和从业人数，之后每季度无需重复填写。</p></div>
+          <div><strong>企业税务信息还没完善</strong><p>请在主体管理中确认限制行业和从业人数，之后每季度无需重复填写。</p></div>
           <NButton type="primary" secondary @click="router.push('/mine/companies')">前往主体管理</NButton>
         </NCard>
 

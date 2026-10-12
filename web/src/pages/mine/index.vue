@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { NCard, NButton, useMessage } from 'naive-ui'
+import { NCard, NButton, NModal, NForm, NFormItem, NInput, useMessage } from 'naive-ui'
 import { useAuthStore } from '@/stores/auth'
 import { useEntryStore } from '@/stores/entry'
 import { formatMoney } from '@/utils/format'
+import { setPassword, updateProfile } from '@/api/auth'
 
 const router = useRouter()
 const message = useMessage()
@@ -17,6 +18,77 @@ async function handleLogout() {
   authStore.logout()
   message.success('已退出登录')
   router.push('/login')
+}
+
+// ── 编辑资料（昵称） ──
+const profileVisible = ref(false)
+const nicknameInput = ref('')
+const profileSaving = ref(false)
+
+function openProfileModal() {
+  nicknameInput.value = authStore.user?.nickname || ''
+  profileVisible.value = true
+}
+
+async function handleSaveProfile() {
+  const nickname = nicknameInput.value.trim()
+  if (nickname.length > 20) {
+    message.warning('昵称不能超过 20 个字')
+    return
+  }
+  profileSaving.value = true
+  try {
+    await updateProfile({ nickname })
+    message.success('资料已保存')
+    profileVisible.value = false
+    await authStore.fetchProfile()
+    user.value = authStore.user
+  } catch (err: unknown) {
+    const resp = err as { response?: { data?: { detail?: string } } }
+    message.error(resp?.response?.data?.detail || '保存失败，请重试')
+  } finally {
+    profileSaving.value = false
+  }
+}
+
+// ── 设置密码 ──
+const pwdVisible = ref(false)
+const pwdOld = ref('')
+const pwdNew = ref('')
+const pwdSaving = ref(false)
+const hasPassword = computed(() => !!authStore.user?.has_password)
+
+function openPwdModal() {
+  pwdOld.value = ''
+  pwdNew.value = ''
+  pwdVisible.value = true
+}
+
+async function handleSavePassword() {
+  if (hasPassword.value && !pwdOld.value) {
+    message.warning('请输入当前密码')
+    return
+  }
+  if (pwdNew.value.length < 8) {
+    message.warning('密码长度至少 8 位')
+    return
+  }
+  pwdSaving.value = true
+  try {
+    await setPassword({
+      old_password: hasPassword.value ? pwdOld.value : undefined,
+      new_password: pwdNew.value,
+    })
+    message.success(hasPassword.value ? '密码已修改' : '密码已设置')
+    pwdVisible.value = false
+    await authStore.fetchProfile()
+    user.value = authStore.user
+  } catch (err: unknown) {
+    const resp = err as { response?: { data?: { detail?: string } } }
+    message.error(resp?.response?.data?.detail || '保存失败，请重试')
+  } finally {
+    pwdSaving.value = false
+  }
 }
 
 onMounted(async () => {
@@ -45,6 +117,10 @@ onMounted(async () => {
           <div class="user-name">{{ user?.nickname || '用户' }}</div>
           <div class="user-phone">{{ user?.phone || '' }}</div>
         </div>
+        <NButton text size="small" class="edit-profile-btn" @click="openProfileModal">
+          <template #icon><i class="ri-edit-line" /></template>
+          编辑
+        </NButton>
       </div>
     </NCard>
 
@@ -68,56 +144,131 @@ onMounted(async () => {
 
     <!-- Menu list -->
     <NCard :bordered="false" class="menu-card mb-4">
+      <div class="menu-item" @click="openPwdModal">
+        <span class="menu-icon"><i class="ri-lock-password-line" /></span>
+        <span class="menu-label">设置密码</span>
+        <span class="menu-extra">{{ hasPassword ? '已设置' : '未设置' }}</span>
+        <span class="menu-arrow">→</span>
+      </div>
+      <div class="menu-divider" />
       <div class="menu-item" @click="router.push('/mine/companies')">
-        <span class="menu-icon">🏢</span>
+        <span class="menu-icon"><i class="ri-building-2-line" /></span>
         <span class="menu-label">公司管理</span>
         <span class="menu-arrow">→</span>
       </div>
       <div class="menu-divider" />
       <div class="menu-item" @click="router.push('/mine/categories')">
-        <span class="menu-icon">📂</span>
+        <span class="menu-icon"><i class="ri-folder-2-line" /></span>
         <span class="menu-label">分类管理</span>
         <span class="menu-arrow">→</span>
       </div>
       <div class="menu-divider" />
       <div class="menu-item" @click="router.push('/mine/accounts')">
-        <span class="menu-icon">📊</span>
+        <span class="menu-icon"><i class="ri-book-2-line" /></span>
         <span class="menu-label">科目表</span>
         <span class="menu-arrow">→</span>
       </div>
       <div class="menu-divider" />
       <div class="menu-item" @click="router.push('/mine/salary')">
-        <span class="menu-icon">💵</span>
+        <span class="menu-icon"><i class="ri-money-cny-circle-line" /></span>
         <span class="menu-label">薪酬社保</span>
         <span class="menu-arrow">→</span>
       </div>
       <div class="menu-divider" />
       <div class="menu-item" @click="router.push('/mine/opening')">
-        <span class="menu-icon">⚖️</span>
+        <span class="menu-icon"><i class="ri-scales-3-line" /></span>
         <span class="menu-label">期初余额</span>
         <span class="menu-arrow">→</span>
       </div>
       <div class="menu-divider" />
       <div class="menu-item" @click="router.push('/recurring')">
-        <span class="menu-icon">🔄</span>
+        <span class="menu-icon"><i class="ri-repeat-2-line" /></span>
         <span class="menu-label">周期性模板</span>
         <span class="menu-arrow">→</span>
       </div>
       <div class="menu-divider" />
       <div class="menu-item" @click="router.push('/bank')">
-        <span class="menu-icon">🏦</span>
+        <span class="menu-icon"><i class="ri-bank-line" /></span>
         <span class="menu-label">银行对账</span>
         <span class="menu-arrow">→</span>
       </div>
       <div class="menu-divider" />
       <div class="menu-item" @click="router.push('/mine/audit-log')">
-        <span class="menu-icon">📋</span>
+        <span class="menu-icon"><i class="ri-file-list-3-line" /></span>
         <span class="menu-label">审计日志</span>
         <span class="menu-arrow">→</span>
       </div>
     </NCard>
 
     <NButton block @click="handleLogout">退出登录</NButton>
+
+    <NModal
+      v-model:show="pwdVisible"
+      preset="card"
+      :title="hasPassword ? '修改密码' : '设置密码'"
+      style="max-width: 400px; border-radius: var(--solo-radius-lg);"
+    >
+      <NForm style="margin-top: 8px;">
+        <NFormItem v-if="hasPassword" label="当前密码">
+          <NInput
+            v-model:value="pwdOld"
+            type="password"
+            show-password-on="click"
+            placeholder="请输入当前密码"
+          >
+            <template #prefix>
+              <i class="ri-lock-password-line input-icon" />
+            </template>
+          </NInput>
+        </NFormItem>
+        <NFormItem label="新密码">
+          <NInput
+            v-model:value="pwdNew"
+            type="password"
+            show-password-on="click"
+            placeholder="至少 8 位"
+          >
+            <template #prefix>
+              <i class="ri-lock-password-line input-icon" />
+            </template>
+          </NInput>
+        </NFormItem>
+      </NForm>
+      <template #footer>
+        <div style="display: flex; justify-content: flex-end; gap: 8px;">
+          <NButton :disabled="pwdSaving" @click="pwdVisible = false">取消</NButton>
+          <NButton type="primary" :loading="pwdSaving" @click="handleSavePassword">保存</NButton>
+        </div>
+      </template>
+    </NModal>
+
+    <NModal
+      v-model:show="profileVisible"
+      preset="card"
+      title="编辑资料"
+      style="max-width: 400px; border-radius: var(--solo-radius-lg);"
+    >
+      <NForm style="margin-top: 8px;">
+        <NFormItem label="昵称">
+          <NInput
+            v-model:value="nicknameInput"
+            maxlength="20"
+            show-count
+            placeholder="如：杨会计"
+          />
+        </NFormItem>
+      </NForm>
+      <div class="profile-hint">
+        <i class="ri-information-line" />
+        凭证署名（制单人/审核人/记账人）优先显示昵称；未设置时显示掩码手机号。
+      </div>
+      <template #footer>
+        <div style="display: flex; justify-content: flex-end; gap: 8px;">
+          <NButton :disabled="profileSaving" @click="profileVisible = false">取消</NButton>
+          <NButton type="primary" :loading="profileSaving" @click="handleSaveProfile">保存</NButton>
+        </div>
+      </template>
+    </NModal>
   </div>
 </template>
 
@@ -144,6 +295,22 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 16px;
+}
+.edit-profile-btn {
+  margin-left: auto;
+  color: var(--solo-primary);
+}
+.profile-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  font-size: 12.5px;
+  color: var(--solo-text-muted);
+  background: var(--solo-border-light, #f3f4f6);
+  border-radius: var(--solo-radius, 8px);
+  padding: 8px 10px;
+  line-height: 1.5;
 }
 .user-avatar {
   width: 52px;
@@ -206,6 +373,14 @@ onMounted(async () => {
 }
 .menu-icon {
   font-size: 18px;
+  color: var(--solo-text-secondary);
+  display: flex;
+  align-items: center;
+}
+.menu-extra {
+  font-size: 12px;
+  color: var(--solo-text-muted);
+  margin-right: 8px;
 }
 .menu-label {
   flex: 1;

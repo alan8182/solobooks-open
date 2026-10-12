@@ -3,13 +3,13 @@ from fastapi import APIRouter, Depends
 from models.schemas import CopilotChatRequest, CopilotChatResponse
 from services.llm import chat_text_json
 from services.classifier import COPILOT_V3_PROMPT, TAX_ADVISOR_PROMPT, SECRETARY_PROMPT, COACH_PROMPT
-from deps.auth import require_auth
+from deps.auth import AuthContext, require_auth
 
 router = APIRouter(prefix="/api/copilot", tags=["copilot"], dependencies=[Depends(require_auth)])
 
 
 @router.post("/chat", response_model=CopilotChatResponse)
-async def copilot_chat(req: CopilotChatRequest):
+async def copilot_chat(req: CopilotChatRequest, ctx: AuthContext = Depends(require_auth)):
     """AI 经营助手 / 税务顾问"""
     # 选择系统提示词
     if req.mode == "tax_advisor":
@@ -55,7 +55,13 @@ async def copilot_chat(req: CopilotChatRequest):
     user_msg = f"对话:\n{history}\n\n经营数据: {context_text or '暂无'}\n请用中文回复，只输出 JSON。"
 
     try:
-        result = chat_text_json(system_prompt, user_msg)
+        result = chat_text_json(
+            system_prompt,
+            user_msg,
+            scene="copilot",
+            user_id=ctx.user_id,
+            company_id=ctx.company_id,
+        )
     except Exception:
         return CopilotChatResponse(
             reply="抱歉，暂时无法回复，请稍后再试。",

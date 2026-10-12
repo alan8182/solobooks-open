@@ -18,6 +18,7 @@ export interface AuthResponse {
   user_id: string
   company_id: string
   expires_in: number
+  has_password?: boolean
 }
 
 export interface PhoneSendCodeRequest {
@@ -35,6 +36,23 @@ export interface PhoneLoginRequest {
   biz_id?: string
 }
 
+export interface PasswordLoginRequest {
+  phone: string
+  password: string
+}
+
+export interface SetPasswordRequest {
+  old_password?: string
+  new_password: string
+}
+
+export interface ResetPasswordRequest {
+  phone: string
+  code: string
+  biz_id?: string
+  new_password: string
+}
+
 export interface UserProfile {
   user_id: string
   nickname: string
@@ -42,6 +60,7 @@ export interface UserProfile {
   phone: string
   phone_bound: boolean
   wechat_bound: boolean
+  has_password?: boolean
   companies: CompanyInfo[]
   current_company_id: string
   server_time: string
@@ -54,10 +73,8 @@ export interface CompanyInfo {
   taxpayerType?: string
   startDate?: string
   taxId?: string
-  smallMicroEnterprise?: boolean
   restrictedIndustry?: boolean
   employeeCount?: number
-  citPrepaymentMethod?: string
   created_at: string
 }
 
@@ -72,10 +89,8 @@ export interface CreateCompanyRequest {
   taxpayerType?: string
   startDate?: string
   taxId?: string
-  smallMicroEnterprise?: boolean
   restrictedIndustry?: boolean
   employeeCount?: number
-  citPrepaymentMethod?: string
 }
 
 export interface SwitchCompanyRequest {
@@ -238,6 +253,10 @@ export interface Entry {
   voucherStatus?: string
   voucherRef?: string
   voucherLines?: unknown
+  /** 凭证署名（真实操作留痕）：制单人/审核人/记账人的显示名，空串表示未发生（如未复核） */
+  createdByName?: string
+  reviewedByName?: string
+  postedByName?: string
   created_at?: string
   updated_at?: string
   remark?: string
@@ -278,6 +297,8 @@ export interface TodoItem {
   id: string
   key: string
   type: string
+  /** 事项分类：filing/match/receipt/reimburse/billing/risk/other，后端派生；旧后端缺省时前端按 ruleId 兜底 */
+  category?: string
   title: string
   description?: string
   desc?: string

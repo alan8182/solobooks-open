@@ -92,10 +92,15 @@ def _coerce_param(value: Any) -> Any:
 
 _JSON_EXTRACT = re.compile(r"json_extract\(payload,\s*'\$\.([A-Za-z0-9_]+)'\)", re.IGNORECASE)
 _JSON_SET = re.compile(r"json_set\(payload,\s*([^)]*)\)", re.IGNORECASE)
+_JSON_REMOVE = re.compile(r"json_remove\(payload,\s*([^)]*)\)", re.IGNORECASE)
+
+
+def _split_json_args(raw: str) -> list[str]:
+    return [token.strip() for token in re.split(r",\s*(?=(?:[^']*'[^']*')*[^']*$)", raw)]
 
 
 def _translate_json_set(match: re.Match[str]) -> str:
-    tokens = [token.strip() for token in re.split(r",\s*(?=(?:[^']*'[^']*')*[^']*$)", match.group(1))]
+    tokens = _split_json_args(match.group(1))
     if len(tokens) % 2:
         return match.group(0)
     expression = "payload::jsonb"
@@ -106,10 +111,19 @@ def _translate_json_set(match: re.Match[str]) -> str:
     return f"({expression})::text"
 
 
+def _translate_json_remove(match: re.Match[str]) -> str:
+    expression = "payload::jsonb"
+    for token in _split_json_args(match.group(1)):
+        path = token.strip("'").removeprefix("$.")
+        expression = f"({expression} - '{path}')"
+    return f"{expression}::text"
+
+
 def _translate_postgres(sql: str) -> str:
     statement = sql.strip()
     statement = _JSON_EXTRACT.sub(lambda match: f"jsonb_extract_path_text(payload::jsonb, '{match.group(1)}')", statement)
     statement = _JSON_SET.sub(_translate_json_set, statement)
+    statement = _JSON_REMOVE.sub(_translate_json_remove, statement)
     if re.match(r"^INSERT\s+OR\s+IGNORE\s+INTO\s+", statement, re.IGNORECASE):
         statement = re.sub(r"^INSERT\s+OR\s+IGNORE\s+INTO\s+", "INSERT INTO ", statement, flags=re.IGNORECASE)
         if " ON CONFLICT " not in statement.upper():

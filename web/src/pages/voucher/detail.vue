@@ -158,15 +158,15 @@ onMounted(async () => {
       <div class="voucher-footer">
         <div class="footer-row">
           <span>制单人：</span>
-          <span class="footer-line"></span>
+          <span class="footer-name">{{ entry.createdByName || '—' }}</span>
         </div>
         <div class="footer-row">
           <span>审核人：</span>
-          <span class="footer-line"></span>
+          <span class="footer-name">{{ entry.reviewedByName || '—' }}</span>
         </div>
         <div class="footer-row">
           <span>记账人：</span>
-          <span class="footer-line"></span>
+          <span class="footer-name">{{ entry.postedByName || '—' }}</span>
         </div>
       </div>
     </div>
@@ -302,10 +302,13 @@ onMounted(async () => {
   font-size: 13px;
   color: var(--solo-text-muted);
 }
-.footer-line {
+.footer-name {
   display: inline-block;
-  width: 80px;
+  min-width: 80px;
   border-bottom: 1px solid #d1d5db;
+  text-align: center;
+  font-weight: 500;
+  color: var(--solo-text-primary, #182230);
 }
 
 /* Print styles */

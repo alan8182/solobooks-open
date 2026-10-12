@@ -41,6 +41,18 @@ async function load() {
   }
 }
 
+function drillDown(accountCode: string, accountName?: string) {
+  router.push({
+    path: '/reports/sub-ledger',
+    query: {
+      account_code: accountCode,
+      account_name: accountName,
+      month: month.value,
+      from: 'balance-sheet',
+    },
+  })
+}
+
 onMounted(load)
 </script>
 
@@ -83,9 +95,17 @@ onMounted(load)
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="item in result.assets" :key="item.accountCode">
+                <tr
+                  v-for="item in result.assets"
+                  :key="item.accountCode"
+                  class="clickable-row"
+                  @click="drillDown(item.accountCode, item.accountName)"
+                >
                   <td class="code-cell">{{ item.accountCode }}</td>
-                  <td>{{ item.accountName }}</td>
+                  <td>
+                    <span class="account-link">{{ item.accountName }}</span>
+                    <span class="drill-tag">明细账 ↗</span>
+                  </td>
                   <td class="amount-cell" :class="item.currentAmount >= 0 ? 'income' : 'expense'">
                     {{ formatMoney(item.currentAmount) }}
                   </td>
@@ -114,9 +134,17 @@ onMounted(load)
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="item in result.liabilities" :key="item.accountCode">
+                <tr
+                  v-for="item in result.liabilities"
+                  :key="item.accountCode"
+                  class="clickable-row"
+                  @click="drillDown(item.accountCode, item.accountName)"
+                >
                   <td class="code-cell">{{ item.accountCode }}</td>
-                  <td>{{ item.accountName }}</td>
+                  <td>
+                    <span class="account-link">{{ item.accountName }}</span>
+                    <span class="drill-tag">明细账 ↗</span>
+                  </td>
                   <td class="amount-cell income">{{ formatMoney(item.currentAmount) }}</td>
                 </tr>
               </tbody>
@@ -143,9 +171,17 @@ onMounted(load)
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="item in result.equity" :key="item.accountCode">
+                <tr
+                  v-for="item in result.equity"
+                  :key="item.accountCode"
+                  class="clickable-row"
+                  @click="drillDown(item.accountCode, item.accountName)"
+                >
                   <td class="code-cell">{{ item.accountCode }}</td>
-                  <td>{{ item.accountName }}</td>
+                  <td>
+                    <span class="account-link">{{ item.accountName }}</span>
+                    <span class="drill-tag">明细账 ↗</span>
+                  </td>
                   <td class="amount-cell" :class="item.currentAmount >= 0 ? 'income' : 'expense'">
                     {{ formatMoney(item.currentAmount) }}
                   </td>
@@ -187,4 +223,25 @@ onMounted(load)
 }
 .check-ok { color: var(--solo-income); }
 .check-err { color: var(--solo-expense); }
+
+.clickable-row {
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+.clickable-row:hover {
+  background: rgba(22, 93, 255, 0.05);
+}
+.account-link {
+  font-weight: 500;
+}
+.drill-tag {
+  margin-left: 8px;
+  font-size: 11px;
+  color: var(--solo-primary, #165dff);
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+.clickable-row:hover .drill-tag {
+  opacity: 1;
+}
 </style>

@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from http import HTTPStatus
 from typing import Optional
 
@@ -269,7 +270,14 @@ def _file_transcribe_paraformer_v2(local_path: str) -> str:
     return " ".join(texts).strip()
 
 
-def transcribe_uploaded_audio(content: bytes, filename: Optional[str], content_type: Optional[str]) -> str:
+def transcribe_uploaded_audio(
+    content: bytes,
+    filename: Optional[str],
+    content_type: Optional[str],
+    scene: str = "asr",
+    user_id: Optional[str] = None,
+    company_id: Optional[str] = None,
+) -> str:
     """
     将上传的音频字节写入临时文件并调用 Paraformer 非流式识别。
 
@@ -283,6 +291,21 @@ def transcribe_uploaded_audio(content: bytes, filename: Optional[str], content_t
         raise RuntimeError("音频内容为空")
     if len(content) > _MAX_AUDIO_BYTES:
         raise RuntimeError(f"音频超过大小限制（{_MAX_AUDIO_BYTES} 字节）")
+
+    from services.llm import _record_usage  # 用量统计与 LLM 同一出口（token 数 ASR 接口不提供，记 0）
+
+    _asr_started = time.monotonic()
+
+    def _record_asr(status: str, error_type: Optional[str] = None) -> None:
+        _record_usage(
+            model=_FILE_ASR_MODEL,
+            scene=scene,
+            user_id=user_id,
+            company_id=company_id,
+            duration_ms=int((time.monotonic() - _asr_started) * 1000),
+            status=status,
+            error_type=error_type,
+        )
 
     fmt = _guess_audio_format(filename, content_type, content)
     suffix = ".m4a" if fmt == "m4a" else (f".{fmt}" if fmt else ".mp3")
@@ -322,6 +345,10 @@ def transcribe_uploaded_audio(content: bytes, filename: Optional[str], content_t
         text_out = _rich_realtime_text(result)
         if (not text_out.strip()) and _FILE_ASR_FALLBACK:
             text_out = _file_transcribe_paraformer_v2(work_path)
+        _record_asr("ok")
+    except Exception as exc:  # noqa: BLE001
+        _record_asr("error", error_type=type(exc).__name__)
+        raise
     finally:
         for p in (wav_path, tmp_path):
             if p and os.path.isfile(p):
