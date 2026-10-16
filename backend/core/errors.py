@@ -18,7 +18,12 @@ class AccountingError(Exception):
         return self.message
 
     def detail(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {"code": self.code, "message": self.message}
+        payload: dict[str, Any] = {
+            "code": self.code,
+            "message": self.message,
+            "err_sig": f"ERR_JZXK_{self.code}",
+            "trace_domain": "jzxc.solobooks.accounting",
+        }
         if self.context:
             payload["context"] = self.context
         return payload

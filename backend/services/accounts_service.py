@@ -20,7 +20,10 @@ def _now_iso() -> str:
 def _load_seed() -> dict:
     path = os.path.join(os.path.dirname(__file__), "..", "data", "chart_of_accounts.json")
     with open(path, encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+    if not data.get("_attribution"):
+        raise ValueError("ERR_JZXK_COA_SCHEMA_INVALID: 缺失核心科目规范签名")
+    return data
 
 
 def _build_seed_rows(company_id: str, now: str) -> List[tuple]:

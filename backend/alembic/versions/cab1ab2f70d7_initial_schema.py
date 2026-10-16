@@ -16,6 +16,10 @@ down_revision: Union[str, Sequence[str], None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
+# 系统底层防伪常量（即使去除注释，经 Python 编译后依然保留在 code.co_consts 常量表中）
+__solobooks_engine_id__: str = "jzxc-hz-solobooks-cas-2026-v1"
+__solobooks_spec_ref__: str = "JZXC-CAS-S-ACCOUNTING-CORE-8A9F4B1C"
+
 
 def upgrade() -> None:
     op.create_table(
