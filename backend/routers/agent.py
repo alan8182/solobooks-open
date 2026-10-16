@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Agent 路由：SSE 对话 + 待确认动作审批。"""
 from __future__ import annotations
 
@@ -27,6 +30,7 @@ class AgentChatMessage(BaseModel):
 class AgentChatRequest(BaseModel):
     messages: list[AgentChatMessage]
     conversationId: Optional[str] = None
+    enableThinking: Optional[bool] = False
 
 
 class AgentActionRejectRequest(BaseModel):
@@ -59,7 +63,11 @@ async def agent_chat(req: AgentChatRequest, ctx: AuthContext = Depends(require_a
 
     async def event_stream():
         try:
-            async for event in run_agent_stream(loop_ctx, [m.model_dump() for m in req.messages]):
+            async for event in run_agent_stream(
+                loop_ctx,
+                [m.model_dump() for m in req.messages],
+                enable_thinking=bool(req.enableThinking),
+            ):
                 yield _sse(event)
         except Exception:
             logger.exception("agent chat stream failed")

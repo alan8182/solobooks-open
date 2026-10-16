@@ -1,3 +1,4 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, computed, onMounted, watch, h } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -167,7 +168,7 @@ watch(targetMonth, loadEntries)
     </div>
 
     <NSpin :show="loading">
-      <p>逐笔查看来源和分录后确认过账，亦可全选或批量过账。已对账不代表已过账。</p>
+      <p class="page-hint">逐笔查看来源和分录后确认过账，亦可全选或批量过账。已对账不代表已过账。</p>
       <div v-if="issues.length" class="section mb-4">
         <div class="section-label">{{ targetMonth }} 结账待处理记录 ({{ issues.length }})</div>
         <NCard v-for="issue in issues" :key="issue.entryId" :bordered="false" class="entry-card" @click="openEntry(issue.entryId)">
@@ -211,54 +212,50 @@ watch(targetMonth, loadEntries)
             </NButton>
           </div>
         </div>
-        <NCard
+        <div
           v-for="entry in unvoucheredEntries"
           :key="entry.id"
-          :bordered="false"
-          class="entry-card"
+          class="voucher-row"
           @click="openEntry(entry.id)"
         >
-          <div class="card-with-checkbox">
-            <div class="checkbox-col" @click.stop>
-              <NCheckbox
-                :checked="selectedEntryIds.includes(entry.id)"
-                @update:checked="toggleSelect(entry.id, $event)"
-              />
-            </div>
-            <div class="card-main-col">
-              <div class="entry-info">
-                <span class="entry-title">{{ entry.title }}</span>
-                <span class="entry-amount">{{ formatMoney(entry.amount) }}</span>
-              </div>
-              <div class="entry-meta">
-                <NTag size="tiny" :bordered="false">{{ entry.category }}</NTag>
-                <span>{{ formatDate(entry.occurDate || entry.created_at || '') }}</span>
-                <NTag size="tiny" type="warning">{{ statusLabel(entry.voucherStatus) }}</NTag>
-              </div>
-            </div>
+          <div class="checkbox-col" @click.stop>
+            <NCheckbox
+              :checked="selectedEntryIds.includes(entry.id)"
+              @update:checked="toggleSelect(entry.id, $event)"
+            />
           </div>
-        </NCard>
+          <div class="entry-main">
+            <span class="entry-title">{{ entry.title }}</span>
+            <span class="entry-sub">{{ entry.category }} · {{ formatDate(entry.occurDate || entry.created_at || '') }} · {{ statusLabel(entry.voucherStatus) }}</span>
+          </div>
+          <div class="entry-right">
+            <span class="entry-amount">{{ formatMoney(entry.amount) }}</span>
+          </div>
+        </div>
       </div>
 
       <!-- Vouchered entries -->
       <div v-if="voucheredEntries.length > 0" class="section">
         <div class="section-label">已过账 / 已冲销凭证 ({{ voucheredEntries.length }})</div>
-        <NCard
+        <div
           v-for="entry in voucheredEntries"
           :key="entry.id"
-          :bordered="false"
-          class="entry-card"
+          class="voucher-row"
+          :class="{ 'is-reversed': entry.voucherStatus === 'reversed' }"
           @click="router.push(`/vouchers/${entry.id}`)"
         >
-          <div class="entry-info">
+          <div class="entry-main">
             <span class="entry-title">{{ entry.title }}</span>
+            <span class="entry-sub">
+              {{ entry.category }} · {{ formatDate(entry.occurDate || entry.created_at || '') }}
+              <template v-if="entry.voucherStatus === 'reversed'"> · 已冲销</template>
+            </span>
+          </div>
+          <div class="entry-right">
+            <span class="entry-amount">{{ formatMoney(entry.amount) }}</span>
             <span class="voucher-ref">{{ entry.voucherRef }}</span>
           </div>
-          <div class="entry-meta">
-            <NTag size="tiny" :bordered="false">{{ entry.category }}</NTag>
-            <span class="entry-amount">{{ formatMoney(entry.amount) }}</span>
-          </div>
-        </NCard>
+        </div>
       </div>
 
       <div v-if="scopedEntries.length === 0 && !loading" class="empty-section">
@@ -285,6 +282,11 @@ watch(targetMonth, loadEntries)
   font-weight: 600;
 }
 .mb-4 { margin-bottom: 16px; }
+.page-hint {
+  margin: 0 0 16px;
+  font-size: 13px;
+  color: var(--solo-text-muted);
+}
 .section {
   display: flex;
   flex-direction: column;
@@ -327,41 +329,77 @@ watch(targetMonth, loadEntries)
 .entry-card:hover {
   box-shadow: var(--solo-shadow);
 }
-.card-with-checkbox {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
 .checkbox-col {
   display: flex;
   align-items: center;
   justify-content: center;
   padding: 4px;
+  flex-shrink: 0;
 }
-.card-main-col {
+
+/* 紧凑行式凭证行：左标题/摘要行 + 右金额列（两区块统一结构） */
+.voucher-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  background: #fff;
+  border: 1px solid var(--solo-border-light);
+  border-radius: var(--solo-radius-lg);
+  cursor: pointer;
+  transition: box-shadow 0.15s ease;
+}
+.voucher-row:hover {
+  box-shadow: var(--solo-shadow);
+}
+.entry-main {
   flex: 1;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.entry-title {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--solo-text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.entry-sub {
+  font-size: 12px;
+  color: var(--solo-text-muted);
+}
+.entry-right {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.entry-amount {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--solo-text-primary);
+  font-variant-numeric: tabular-nums;
+}
+.voucher-ref {
+  font-size: 11px;
+  color: var(--solo-primary);
+  font-family: 'Inter', monospace;
+}
+.is-reversed {
+  opacity: 0.55;
+}
+.is-reversed .entry-amount {
+  text-decoration: line-through;
 }
 .entry-info {
   display: flex;
   justify-content: space-between;
   align-items: center;
   gap: 12px;
-}
-.entry-title {
-  font-size: 14px;
-  font-weight: 500;
-  color: var(--solo-text-primary);
-}
-.voucher-ref {
-  font-size: 12px;
-  color: var(--solo-primary);
-  font-family: 'Inter', monospace;
-}
-.entry-amount {
-  font-size: 14px;
-  font-weight: 700;
-  color: var(--solo-text-primary);
 }
 .entry-meta {
   display: flex;

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Tests for account_mapper.py — pure function tests, no DB, no mock."""
 from decimal import Decimal
 
@@ -9,20 +12,20 @@ class TestLookup:
     def test_known_category_returns_account(self):
         result = lookup("办公费")
         assert result is not None
-        assert result["accountCode"] == "5602"
+        assert result["accountCode"] == "5602004"
         assert result["accountName"] == "管理费用-办公费"
         assert result["accountType"] == "损益-费用"
 
     @pytest.mark.parametrize(
         ("category", "account_code", "account_name"),
         [
-            ("餐饮", "5603", "管理费用-业务招待费"),
-            ("交通", "5601", "管理费用-差旅费"),
-            ("办公", "5602", "管理费用-办公费"),
-            ("业务招待", "5603", "管理费用-业务招待费"),
-            ("差旅", "5601", "管理费用-差旅费"),
-            ("房租物业", "5604", "管理费用-租赁物业"),
-            ("员工福利", "5609", "管理费用-职工福利费"),
+            ("餐饮", "5602002", "管理费用-业务招待费"),
+            ("交通", "5602006", "管理费用-差旅费"),
+            ("办公", "5602004", "管理费用-办公费"),
+            ("业务招待", "5602002", "管理费用-业务招待费"),
+            ("差旅", "5602006", "管理费用-差旅费"),
+            ("房租物业", "5602013", "管理费用-租赁费"),
+            ("员工福利", "5602014", "管理费用-职工福利费"),
         ],
     )
     def test_ui_category_aliases_return_specific_accounts(self, category, account_code, account_name):
@@ -33,13 +36,13 @@ class TestLookup:
     def test_income_category(self):
         result = lookup("主营业务收入")
         assert result is not None
-        assert result["accountCode"] == "6001"
+        assert result["accountCode"] == "5001"
         assert result["accountType"] == "损益-收入"
 
     def test_owner_transfer(self):
         result = lookup("老板投入")
         assert result is not None
-        assert result["accountCode"] == "4001"
+        assert result["accountCode"] == "3001"
 
     def test_unknown_category_returns_none(self):
         assert lookup("不存在的分类") is None
@@ -67,17 +70,17 @@ class TestGetVoucherHint:
 
         assert debit["accountCode"] == "1002"  # 银行存款
         assert debit["amount"] == 1000
-        assert credit["accountCode"] == "6001"  # 主营业务收入
+        assert credit["accountCode"] == "5001"  # 主营业务收入
         assert credit["amount"] == 1000
 
     def test_interest_income_uses_financial_expense_account(self):
         hint = get_voucher_hint("income", "利息收入", 4.15)
         assert hint["debit"][0]["accountCode"] == "1002"
-        assert hint["credit"][0]["accountCode"] == "6603"
+        assert hint["credit"][0]["accountCode"] == "5603005"
         assert hint["credit"][0]["accountName"] == "财务费用-利息收入"
     def test_expense_direction(self):
         hint = get_voucher_hint("expense", "办公费", 500)
-        assert hint["debit"][0]["accountCode"] == "5602"
+        assert hint["debit"][0]["accountCode"] == "5602004"
         assert hint["credit"][0]["accountCode"] == "1002"
 
     def test_expense_boss_personal(self):
@@ -99,7 +102,7 @@ class TestGetVoucherHint:
             "expense", "员工垫付报销", 300, payer="employee_personal:杨云飞",
         )
 
-        assert hint["debit"][0]["accountCode"] == "5699"
+        assert hint["debit"][0]["accountCode"] == "5602999"
         assert hint["credit"][0]["accountCode"] == "2241"
         assert hint["credit"][0]["accountName"] == "其他应付款-员工往来(杨云飞)"
 
@@ -119,12 +122,12 @@ class TestGetVoucherHint:
     def test_owner_transfer_investment(self):
         hint = get_voucher_hint("owner_transfer", "股东投入", 10000)
         assert hint["debit"][0]["accountCode"] == "1002"
-        assert hint["credit"][0]["accountCode"] == "4001"
+        assert hint["credit"][0]["accountCode"] == "3001"
 
     def test_owner_transfer_investment_legacy_alias(self):
         hint = get_voucher_hint("owner_transfer", "老板投入", 10000)
         assert hint["debit"][0]["accountCode"] == "1002"
-        assert hint["credit"][0]["accountCode"] == "4001"
+        assert hint["credit"][0]["accountCode"] == "3001"
 
     def test_owner_transfer_withdrawal(self):
         hint = get_voucher_hint("owner_transfer", "股东取现", 2000)
@@ -145,5 +148,5 @@ class TestGetVoucherHint:
 
     def test_unknown_category_uses_default(self):
         hint = get_voucher_hint("expense", "不存在的分类", 100)
-        assert hint["debit"][0]["accountCode"] == "5699"  # 管理费用-其他
+        assert hint["debit"][0]["accountCode"] == "5602999"  # 管理费用-其他
         assert hint["credit"][0]["accountCode"] == "1002"

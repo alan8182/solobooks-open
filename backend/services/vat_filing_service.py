@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Deterministic small-scale VAT filing assistance for 2026-2027."""
 from __future__ import annotations
 
@@ -16,7 +19,7 @@ REDUCED_RATE = Decimal("0.01")
 STATUTORY_RATE = Decimal("0.03")
 MONTH_THRESHOLD = Decimal("100000.00")
 QUARTER_THRESHOLD = Decimal("300000.00")
-VAT_REVENUE_ACCOUNTS = {"6001", "6051"}
+VAT_REVENUE_ACCOUNTS = {"5001", "5051"}
 GOODS_KEYWORDS = ("货物", "商品", "材料", "加工", "修理", "修配")
 
 

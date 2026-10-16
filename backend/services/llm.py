@@ -1,7 +1,10 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """LLM 服务门面（供应商无关）。
 
 所有 LLM 调用（文本、视觉/多模态、agent 工具循环）统一走 OpenAI 兼容协议：
-  - 端点  config.LLM_BASE_URL      （qwen: dashscope.aliyuncs.com/compatible-mode/v1）
+  - 端点  config.LLM_BASE_URL      （qwen: maas.qianwenaiapi.com/compatible-mode/v1）
   - 密钥  config.LLM_API_KEY       （默认复用 DASHSCOPE_API_KEY）
   - 模型  config.QWEN_TEXT_MODEL / config.QWEN_VL_MODEL
 
@@ -448,9 +451,12 @@ async def chat_tools_stream_async(
         # 用量采集（M1）：OpenAI 兼容协议标准字段，从最后一个 chunk 读 usage
         "stream_options": {"include_usage": True},
     }
-    # Qwen 思考开关；DeepSeek 等供应商不发送该参数（LLM_SEND_ENABLE_THINKING=0）
+    # Qwen 思考开关；优先使用传入参数，未传则回退到配置；DeepSeek 等不需要时置 0
+    enable_thinking = kwargs.get("enable_thinking")
+    if enable_thinking is None:
+        enable_thinking = QWEN_ENABLE_THINKING
     if LLM_SEND_ENABLE_THINKING:
-        payload["extra_body"] = {"enable_thinking": QWEN_ENABLE_THINKING}
+        payload["extra_body"] = {"enable_thinking": bool(enable_thinking)}
     if tools:
         payload["tools"] = tools
 

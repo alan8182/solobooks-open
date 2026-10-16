@@ -1,9 +1,19 @@
+/**
+ * Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+ * Licensed under the SoloBooks License v2.0.
+ */
+
 import { describe, expect, it } from 'vitest'
 import {
   calculateDeadlineSummary,
   calculateExemptionGauge,
   formatCopyAmount,
   generateTaxCopilotInsight,
+  isFilingCardPending,
+  periodToQuarter,
+  quarterLabel,
+  resolveNextPendingCard,
+  summarizeOtherTaxes,
 } from '@/utils/taxFiling'
 
 describe('tax filing calculation & intelligence copilot utilities', () => {
@@ -130,7 +140,6 @@ describe('tax filing calculation & intelligence copilot utilities', () => {
     })
 
     it('prioritizes upcoming unexpired deadline when some historical items are overdue', () => {
-      // 场景：增值税和所得税剩 11 天，即使个税等辅助项因误算导致 -26，主看板应优先展示即将到期的 11 天，同时识别 1 项逾期
       const vatDeadline = { deadlineId: 'd1', status: 'pending', daysLeft: 11 }
       const citDeadline = { deadlineId: 'd2', status: 'pending', daysLeft: 11 }
       const iitWithholding = { deadlineId: 'd3', status: 'pending', daysLeft: -26 }
@@ -148,7 +157,6 @@ describe('tax filing calculation & intelligence copilot utilities', () => {
       const summary = calculateDeadlineSummary([item1, item2])
       expect(summary.pendingCount).toBe(2)
       expect(summary.overdueCount).toBe(2)
-      // -5 比 -12 更接近当前日期
       expect(summary.nearestDaysLeft).toBe(-5)
     })
 
@@ -161,6 +169,122 @@ describe('tax filing calculation & intelligence copilot utilities', () => {
       expect(summary.overdueCount).toBe(0)
       expect(summary.isAllFiled).toBe(true)
       expect(summary.nearestDaysLeft).toBeNull()
+    })
+  })
+
+  describe('periodToQuarter', () => {
+    it('maps monthly period (e.g. IIT withholding) to its containing quarter', () => {
+      expect(periodToQuarter('2026-01')).toBe('2026-Q1')
+      expect(periodToQuarter('2026-03')).toBe('2026-Q1')
+      expect(periodToQuarter('2026-04')).toBe('2026-Q2')
+      expect(periodToQuarter('2026-09')).toBe('2026-Q3')
+      expect(periodToQuarter('2026-12')).toBe('2026-Q4')
+    })
+
+    it('passes quarter and other formats through unchanged', () => {
+      expect(periodToQuarter('2026-Q1')).toBe('2026-Q1')
+      expect(periodToQuarter('2026')).toBe('2026')
+      expect(periodToQuarter('')).toBe('')
+      expect(periodToQuarter(' 2026-01 ')).toBe('2026-Q1')
+    })
+
+    it('keeps malformed month values untouched', () => {
+      expect(periodToQuarter('2026-13')).toBe('2026-13')
+      expect(periodToQuarter('2026-00')).toBe('2026-00')
+    })
+  })
+
+  describe('quarterLabel', () => {
+    it('formats quarter period as Chinese label', () => {
+      expect(quarterLabel('2026-Q1')).toBe('2026 年第 1 季度')
+      expect(quarterLabel('2024-Q4')).toBe('2024 年第 4 季度')
+    })
+
+    it('returns non-quarter period as-is', () => {
+      expect(quarterLabel('2026-01')).toBe('2026-01')
+      expect(quarterLabel('')).toBe('')
+    })
+  })
+
+  describe('summarizeOtherTaxes & switchable cards flow', () => {
+    it('summarizes other taxes excluding fin_statements', () => {
+      const checklist = [
+        { taxKind: 'fin_statements', status: 'pending' },
+        { taxKind: 'stamp_duty', status: 'pending' },
+        { taxKind: 'iit_withholding', status: 'filed' },
+      ]
+      const summary = summarizeOtherTaxes(checklist)
+      expect(summary.status).toBe('pending')
+      expect(summary.totalCount).toBe(2)
+      expect(summary.pendingCount).toBe(1)
+      expect(summary.resolvedCount).toBe(1)
+    })
+
+    it('marks other taxes as filed when all non-fin items are filed or waived', () => {
+      const checklist = [
+        { taxKind: 'fin_statements', status: 'pending' },
+        { taxKind: 'stamp_duty', status: 'filed' },
+        { taxKind: 'iit_withholding', status: 'waived' },
+      ]
+      const summary = summarizeOtherTaxes(checklist)
+      expect(summary.status).toBe('filed')
+      expect(summary.pendingCount).toBe(0)
+      expect(summary.resolvedCount).toBe(2)
+    })
+
+    it('resolves the next pending card sequentially and wraps around when needed', () => {
+      const pkg = {
+        vat: { deadline: { status: 'filed' } },
+        cit: { deadline: { status: 'pending' } },
+        checklist: [
+          { taxKind: 'fin_statements', status: 'pending' },
+          { taxKind: 'stamp_duty', status: 'pending' },
+        ],
+      }
+
+      // 从总览出发应跳往首个待申报卡片 (cit)
+      expect(resolveNextPendingCard(pkg, 'overview')).toBe('cit')
+      // 刚办结 vat 后自动切到下一张待申报卡片 (cit)
+      expect(resolveNextPendingCard(pkg, 'vat')).toBe('cit')
+
+      // 假设用户在 fin_statements 办结后，下一张是 other_taxes
+      const pkgAfterFin = {
+        vat: { deadline: { status: 'pending' } },
+        cit: { deadline: { status: 'filed' } },
+        checklist: [
+          { taxKind: 'fin_statements', status: 'filed' },
+          { taxKind: 'stamp_duty', status: 'filed' },
+        ],
+      }
+      // other_taxes 已办结，环绕回前面还未办结的 vat
+      expect(resolveNextPendingCard(pkgAfterFin, 'fin_statements')).toBe('vat')
+    })
+
+    it('stays on other_taxes if there are still remaining pending items in other_taxes', () => {
+      const pkg = {
+        vat: { deadline: { status: 'filed' } },
+        cit: { deadline: { status: 'filed' } },
+        checklist: [
+          { taxKind: 'fin_statements', status: 'filed' },
+          { taxKind: 'stamp_duty', status: 'filed' },
+          { taxKind: 'iit_withholding', status: 'pending' },
+        ],
+      }
+      expect(isFilingCardPending(pkg, 'other_taxes')).toBe(true)
+      expect(resolveNextPendingCard(pkg, 'other_taxes')).toBe('other_taxes')
+    })
+
+    it('returns null when all 4 filing cards are resolved', () => {
+      const pkg = {
+        vat: { deadline: { status: 'filed' } },
+        cit: { deadline: { status: 'waived' } },
+        checklist: [
+          { taxKind: 'fin_statements', status: 'filed' },
+          { taxKind: 'stamp_duty', status: 'filed' },
+          { taxKind: 'iit_withholding', status: 'waived' },
+        ],
+      }
+      expect(resolveNextPendingCard(pkg, 'other_taxes')).toBeNull()
     })
   })
 })

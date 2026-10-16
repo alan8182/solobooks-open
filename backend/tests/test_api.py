@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """API integration tests using FastAPI TestClient.
 
 Uses the test-token bypass mechanism (no JWT required).
@@ -27,6 +30,7 @@ class TestHealth:
 
 class TestAuthoritativeAccountingApi:
     month = "2031-06"
+    next_month = "2031-07"
 
     @staticmethod
     def _row_value(data, key, column):
@@ -199,6 +203,19 @@ class TestAuthoritativeAccountingApi:
         ).json()
         assert summary["isBalanced"] is True
         assert summary["totalDebit"] == summary["totalCredit"]
+        bank_row = next(item for item in summary["items"] if item["accountCode"] == "1002")
+        # 首月无期初，期末 = 期初 + 本期净额；1002 本期净额 6500.00
+        assert bank_row["openingBalance"] == "0.00"
+        assert bank_row["closingBalance"] == "6500.00"
+        # 次月查询：期初结转上月期末
+        next_month = client.get(
+            "/api/ledger/balance-summary",
+            params={"month": self.next_month},
+            headers=auth_headers,
+        ).json()
+        next_bank = next(item for item in next_month["items"] if item["accountCode"] == "1002")
+        assert next_bank["openingBalance"] == "6500.00"
+        assert next_bank["closingBalance"] == next_bank["openingBalance"]
 
         vouchers = client.post(
             "/api/ledger/voucher", json={"entryIds": created_ids}, headers=auth_headers
@@ -699,7 +716,7 @@ class TestBankReconciliation:
         result = await classify_single_statement(company_id, stmt["id"], "这笔技术服务费用于研发项目")
 
         assert result["category"] == "研发支出-费用化支出"
-        assert result["accountCode"] == "5301"
+        assert result["accountCode"] == "4301"
         assert "研发" in result["reason"]
 
     @pytest.mark.asyncio
@@ -728,7 +745,7 @@ class TestBankReconciliation:
             return {
                 "direction": "expense",
                 "category": "其他支出",
-                "accountCode": "5699",
+                "accountCode": "5602999",
                 "accountName": "管理费用-其他",
                 "title": "wrong expense suggestion",
                 "confidence": 0.95,
@@ -741,7 +758,7 @@ class TestBankReconciliation:
 
         assert suggestions[0]["type"] == "new"
         assert suggestions[0]["suggestedEntry"]["direction"] == "income"
-        assert suggestions[0]["suggestedEntry"]["accountCode"] == "6051"
+        assert suggestions[0]["suggestedEntry"]["accountCode"] == "5051"
 
     @pytest.mark.asyncio
     async def test_confirm_new_owner_transfer_income_is_idempotent(self, temp_bank_db):
@@ -767,7 +784,7 @@ class TestBankReconciliation:
                 "amount": 20000,
                 "direction": "owner_transfer",
                 "category": "股东投入",
-                "accountCode": "4001",
+                "accountCode": "3001",
                 "accountName": "实收资本",
                 "occurDate": "2026-05-22",
                 "remark": "何静谷 实缴注册资本",
@@ -817,12 +834,12 @@ class TestBankReconciliation:
                     "amount": 4.15,
                     "direction": "income",
                     "category": "利息收入",
-                    "accountCode": "6603",
+                    "accountCode": "5603005",
                     "accountName": "财务费用-利息收入",
                     "occurDate": "2026-06-21",
                     "voucherLines": {
                         "debit": [{"accountCode": "1002", "accountName": "银行存款", "amount": 4.15}],
-                        "credit": [{"accountCode": "6001", "accountName": "主营业务收入", "amount": 4.15}],
+                        "credit": [{"accountCode": "5001", "accountName": "主营业务收入", "amount": 4.15}],
                     },
                 },
             ),
@@ -833,7 +850,7 @@ class TestBankReconciliation:
         payload = await self._entry_payload(result["entryId"])
         assert payload["category"] == "利息收入"
         assert payload["voucherLines"]["debit"][0]["accountCode"] == "1002"
-        assert payload["voucherLines"]["credit"][0]["accountCode"] == "6603"
+        assert payload["voucherLines"]["credit"][0]["accountCode"] == "5603005"
         assert payload["voucherLines"]["credit"][0]["accountName"] == "财务费用-利息收入"
 
     @pytest.mark.asyncio
@@ -899,7 +916,7 @@ class TestBankReconciliation:
             "payer": "company_account",
             "billingStatus": "has_invoice",
             "voucherLines": {
-                "debit": [{"accountCode": "5602", "accountName": "管理费用-信息技术服务费", "amount": 500}],
+                "debit": [{"accountCode": "5602004", "accountName": "管理费用-信息技术服务费", "amount": 500}],
                 "credit": [{"accountCode": "1002", "accountName": "银行存款", "amount": 500}],
             },
         })
@@ -990,8 +1007,8 @@ class TestBankReconciliation:
             "occurDate": "2026-06-17",
             "billingStatus": "has_invoice",
             "voucherLines": {
-                "debit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": 59}],
-                "credit": [{"accountCode": "6001", "accountName": "主营业务收入", "amount": 59}],
+                "debit": [{"accountCode": "1012001", "accountName": "微信支付待结算", "amount": 59}],
+                "credit": [{"accountCode": "5001", "accountName": "主营业务收入", "amount": 59}],
             },
         })
         await self._insert_entry(company_id, {
@@ -1003,8 +1020,8 @@ class TestBankReconciliation:
             "occurDate": "2026-06-17",
             "billingStatus": "no_document",
             "voucherLines": {
-                "debit": [{"accountCode": "6602", "accountName": "财务费用-手续费", "amount": 0.53}],
-                "credit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": 0.53}],
+                "debit": [{"accountCode": "5603002", "accountName": "财务费用-手续费", "amount": 0.53}],
+                "credit": [{"accountCode": "1012001", "accountName": "微信支付待结算", "amount": 0.53}],
             },
         })
         await import_statements_json(company_id, [{
@@ -1076,8 +1093,8 @@ class TestBankReconciliation:
             "title": "销售收入",
             "occurDate": "2026-06-17",
             "voucherLines": {
-                "debit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": 59}],
-                "credit": [{"accountCode": "6001", "accountName": "主营业务收入", "amount": 59}],
+                "debit": [{"accountCode": "1012001", "accountName": "微信支付待结算", "amount": 59}],
+                "credit": [{"accountCode": "5001", "accountName": "主营业务收入", "amount": 59}],
             },
         })
         await self._insert_entry(company_id, {
@@ -1087,8 +1104,8 @@ class TestBankReconciliation:
             "title": "微信手续费",
             "occurDate": "2026-06-17",
             "voucherLines": {
-                "debit": [{"accountCode": "6602", "accountName": "手续费", "amount": 0.53}],
-                "credit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": 0.53}],
+                "debit": [{"accountCode": "5603002", "accountName": "手续费", "amount": 0.53}],
+                "credit": [{"accountCode": "1012001", "accountName": "微信支付待结算", "amount": 0.53}],
             },
         })
         await import_statements_json(company_id, [{
@@ -1117,7 +1134,7 @@ class TestBankReconciliation:
         repair_payload = await self._entry_payload(repaired["entryId"])
         assert repair_payload["voucherLines"] == {
             "debit": [{"accountCode": "1002", "accountName": "银行存款", "amount": "58.47"}],
-            "credit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": "58.47"}],
+            "credit": [{"accountCode": "1012001", "accountName": "微信支付待结算", "amount": "58.47"}],
         }
 
         after = await get_difference_report(company_id, "2026-06")
@@ -1501,8 +1518,8 @@ class TestBankReconciliation:
 
     async def _insert_wechat_order(self, company_id, order_no, amount=5, fee=0.05, occur_date="2026-07-14"):
         for suffix, direction, value, debit, credit in [
-            ("income", "income", amount, "1012", "6001"),
-            ("fee", "expense", fee, "6602", "1012"),
+            ("income", "income", amount, "1012001", "5001"),
+            ("fee", "expense", fee, "5603002", "1012001"),
         ]:
             await self._insert_entry(company_id, {
                 "id": f"{order_no}-{suffix}", "source": "wechat_bill", "wechat_order_no": order_no,
@@ -1607,7 +1624,7 @@ class TestBankReconciliation:
         stmt = {"transaction_date": "2026-07-15", "description": "微信结算", "amount": 4.95}
         assert await get_wechat_settlement_candidates(company_id, stmt) == []
         await self._insert_wechat_order(company_id, "wx-refunded")
-        for suffix, amount, debit, credit in [("refund", 5, "6001", "1012"), ("fee-refund", 0.05, "1012", "6602")]:
+        for suffix, amount, debit, credit in [("refund", 5, "5001", "1012001"), ("fee-refund", 0.05, "1012001", "5603002")]:
             await self._insert_entry(company_id, {"id": suffix, "source": "wechat_bill", "wechat_order_no": "wx-refunded",
                 "occurDate": "2026-07-14", "voucherLines": {
                     "debit": [{"accountCode": debit, "amount": amount}],
@@ -1906,18 +1923,18 @@ class TestWechatBill:
         assert refund_entry["direction"] == "income"
 
         revenue_entry = saved_batches[0][0]
-        assert revenue_entry["voucherLines"]["debit"][0]["accountCode"] == "1012"
-        assert revenue_entry["voucherLines"]["credit"][0]["accountCode"] == "6001"
+        assert revenue_entry["voucherLines"]["debit"][0]["accountCode"] == "1012001"
+        assert revenue_entry["voucherLines"]["credit"][0]["accountCode"] == "5001"
 
         fee_entry = saved_batches[0][1]
-        assert fee_entry["voucherLines"]["debit"][0]["accountCode"] == "6602"
-        assert fee_entry["voucherLines"]["credit"][0]["accountCode"] == "1012"
+        assert fee_entry["voucherLines"]["debit"][0]["accountCode"] == "5603002"
+        assert fee_entry["voucherLines"]["credit"][0]["accountCode"] == "1012001"
 
         fee_refund = next(e for e in saved_batches[0] if e.get("remark") == "退款手续费退还")
         assert fee_refund["amount"] == Decimal("-0.20")
         assert fee_refund["direction"] == "expense"
-        assert fee_refund["voucherLines"]["debit"][0]["accountCode"] == "1012"
-        assert fee_refund["voucherLines"]["credit"][0]["accountCode"] == "6602"
+        assert fee_refund["voucherLines"]["debit"][0]["accountCode"] == "1012001"
+        assert fee_refund["voucherLines"]["credit"][0]["accountCode"] == "5603002"
 
     @pytest.mark.asyncio
     async def test_wechat_bill_import_keeps_refund_with_same_order_no(self, monkeypatch):
@@ -2000,8 +2017,8 @@ class TestWechatBill:
         fee_refund = next(entry for entry in saved_batches[0] if entry.get("remark") == "退款手续费退还")
         assert fee_refund["amount"] == Decimal("-0.05")
         assert fee_refund["direction"] == "expense"
-        assert fee_refund["voucherLines"]["debit"][0]["accountCode"] == "1012"
-        assert fee_refund["voucherLines"]["credit"][0]["accountCode"] == "6602"
+        assert fee_refund["voucherLines"]["debit"][0]["accountCode"] == "1012001"
+        assert fee_refund["voucherLines"]["credit"][0]["accountCode"] == "5603002"
 
         transaction_keys = {entry["wechat_transaction_key"] for entry in saved_batches[0]}
         # 手续费/手续费退还条目使用 ":fee" 后缀 key，与同笔交易的收入/退款条目区分，
@@ -2017,24 +2034,24 @@ class TestWechatBill:
         from services.bank_service import _bank_effect_from_voucher, build_group_reconciliation_check
 
         revenue_voucher = {
-            "debit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": 100}],
-            "credit": [{"accountCode": "6001", "accountName": "主营业务收入", "amount": 100}],
+            "debit": [{"accountCode": "1012001", "accountName": "微信支付待结算", "amount": 100}],
+            "credit": [{"accountCode": "5001", "accountName": "主营业务收入", "amount": 100}],
         }
         fee_voucher = {
-            "debit": [{"accountCode": "6602", "accountName": "财务费用-手续费", "amount": 0.6}],
-            "credit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": 0.6}],
+            "debit": [{"accountCode": "5603002", "accountName": "财务费用-手续费", "amount": 0.6}],
+            "credit": [{"accountCode": "1012001", "accountName": "微信支付待结算", "amount": 0.6}],
         }
         settlement_voucher = {
             "debit": [{"accountCode": "1002", "accountName": "银行存款", "amount": 99.4}],
-            "credit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": 99.4}],
+            "credit": [{"accountCode": "1012001", "accountName": "微信支付待结算", "amount": 99.4}],
         }
         refund_voucher = {
-            "debit": [{"accountCode": "6001", "accountName": "主营业务收入", "amount": 5}],
-            "credit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": 5}],
+            "debit": [{"accountCode": "5001", "accountName": "主营业务收入", "amount": 5}],
+            "credit": [{"accountCode": "1012001", "accountName": "微信支付待结算", "amount": 5}],
         }
         refunded_fee_voucher = {
-            "debit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": 0.05}],
-            "credit": [{"accountCode": "6602", "accountName": "财务费用-手续费", "amount": 0.05}],
+            "debit": [{"accountCode": "1012001", "accountName": "微信支付待结算", "amount": 0.05}],
+            "credit": [{"accountCode": "5603002", "accountName": "财务费用-手续费", "amount": 0.05}],
         }
 
         assert _bank_effect_from_voucher(revenue_voucher) == 0

@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+ * Licensed under the SoloBooks License v2.0.
+ */
+
 export const DIRECTIONS = [
   { value: 'income', label: '收入' },
   { value: 'expense', label: '支出' },
@@ -114,6 +119,7 @@ export const NAV_ITEMS: NavItem[] = [
       { path: '/record/invoice-import', label: '发票管理', icon: 'ri-receipt-line' },
       { path: '/bank', label: '银行流水', icon: 'ri-bank-line' },
       { path: '/vouchers', label: '记账凭证', icon: 'ri-file-list-3-line' },
+      { path: '/recurring', label: '周期性模板', icon: 'ri-repeat-2-line' },
       { path: '/assets', label: '固定资产', icon: 'ri-archive-line' },
       { path: '/rd-expenses', label: '研发费用', icon: 'ri-flask-line' },
       { path: '/mine/salary', label: '薪酬管理', icon: 'ri-coins-line' },
@@ -125,9 +131,8 @@ export const NAV_ITEMS: NavItem[] = [
     icon: 'ri-settings-4-line',
     group: '管理',
     children: [
-      { path: '/mine', label: '设置总览', icon: 'ri-dashboard-line' },
+      { path: '/mine', label: '个人设置', icon: 'ri-user-settings-line' },
       { path: '/mine/companies', label: '公司信息', icon: 'ri-building-line' },
-      { path: '/mine/categories', label: '分类管理', icon: 'ri-price-tag-3-line' },
       { path: '/mine/accounts', label: '会计科目', icon: 'ri-node-tree' },
       { path: '/mine/opening', label: '期初设置', icon: 'ri-calendar-check-line' },
       { path: '/mine/mcp', label: 'AI 连接（MCP）', icon: 'ri-plug-line' },

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 import pytest
 
 
@@ -27,7 +30,7 @@ async def test_save_entry_generates_owner_transfer_voucher_lines(temp_entry_db):
     )
 
     assert saved["voucherLines"]["debit"][0]["accountCode"] == "1002"
-    assert saved["voucherLines"]["credit"][0]["accountCode"] == "4001"
+    assert saved["voucherLines"]["credit"][0]["accountCode"] == "3001"
 
 
 @pytest.mark.asyncio
@@ -48,7 +51,7 @@ async def test_save_entry_maps_interest_income_to_financial_expense(temp_entry_d
     )
 
     assert saved["voucherLines"]["debit"][0]["accountCode"] == "1002"
-    assert saved["voucherLines"]["credit"][0]["accountCode"] == "6603"
+    assert saved["voucherLines"]["credit"][0]["accountCode"] == "5603005"
     assert saved["voucherLines"]["credit"][0]["accountName"] == "财务费用-利息收入"
 
 
@@ -66,14 +69,14 @@ async def test_save_entry_repairs_stale_interest_income_voucher_lines(temp_entry
             "payer": "company_account",
             "voucherLines": {
                 "debit": [{"accountCode": "1002", "accountName": "银行存款", "amount": 4.15}],
-                "credit": [{"accountCode": "6001", "accountName": "主营业务收入", "amount": 4.15}],
+                "credit": [{"accountCode": "5001", "accountName": "主营业务收入", "amount": 4.15}],
             },
         },
         user_id="u-entry-test",
         company_id="c-entry-test",
     )
 
-    assert saved["voucherLines"]["credit"][0]["accountCode"] == "6603"
+    assert saved["voucherLines"]["credit"][0]["accountCode"] == "5603005"
     assert saved["voucherLines"]["credit"][0]["accountName"] == "财务费用-利息收入"
 
 
@@ -90,7 +93,7 @@ async def test_save_entry_repairs_stale_known_category_voucher_lines(temp_entry_
             "title": "办公用品",
             "payer": "company_account",
             "voucherLines": {
-                "debit": [{"accountCode": "5699", "accountName": "管理费用-其他", "amount": 88}],
+                "debit": [{"accountCode": "5602999", "accountName": "管理费用-其他", "amount": 88}],
                 "credit": [{"accountCode": "1002", "accountName": "银行存款", "amount": 88}],
             },
         },
@@ -98,8 +101,8 @@ async def test_save_entry_repairs_stale_known_category_voucher_lines(temp_entry_
         company_id="c-entry-test",
     )
 
-    assert saved["voucherLines"]["debit"][0]["accountCode"] == "5602"
-    assert saved["voucherLines"]["debit"][0]["accountName"] == "管理费用-办公费"
+    assert saved["voucherLines"]["debit"][0]["accountCode"] == "5602004"
+    assert saved["voucherLines"]["debit"][0]["accountName"] == "办公费"
     assert saved["voucherLines"]["credit"][0]["accountCode"] == "1002"
 @pytest.mark.asyncio
 async def test_update_entry_persists_direction_and_recomputes_voucher_lines(temp_entry_db):
@@ -136,7 +139,7 @@ async def test_update_entry_persists_direction_and_recomputes_voucher_lines(temp
     assert updated["category"] == "股东投入"
     assert updated["payer"] == "company_account"
     assert updated["voucherLines"]["debit"][0]["accountCode"] == "1002"
-    assert updated["voucherLines"]["credit"][0]["accountCode"] == "4001"
+    assert updated["voucherLines"]["credit"][0]["accountCode"] == "3001"
 
 @pytest.mark.asyncio
 async def test_generate_entry_vouchers_persists_status_ref_and_is_idempotent(temp_entry_db):
@@ -164,7 +167,7 @@ async def test_generate_entry_vouchers_persists_status_ref_and_is_idempotent(tem
     assert len(generated) == 1
     assert generated[0]["voucherStatus"] == "draft"
     assert generated[0]["voucherRef"] is None
-    assert generated[0]["voucherLines"]["debit"][0]["accountCode"] == "5602"
+    assert generated[0]["voucherLines"]["debit"][0]["accountCode"] == "5602004"
 
     stored = next(e for e in await list_entries("u-entry-test", "c-entry-test") if e["id"] == "voucher-target")
     first_ref = stored["voucherRef"]

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Server-derived todo list with persisted handling state (async SQLite)."""
 from __future__ import annotations
 
@@ -114,7 +117,11 @@ def _derive_entry_todos(entries: List[Dict[str, Any]], matched_entry_ids: Set[st
         entry_id = str(entry.get("id") or "")
         if not entry_id:
             continue
-        if str(entry.get("entryType") or "") == "reversal" or entry_id in reversed_ids:
+        if (
+            str(entry.get("entryType") or "") in ("reversal", "opening", "closing")
+            or entry.get("isClosingTransfer")
+            or entry_id in reversed_ids
+        ):
             continue
         title = str(entry.get("title") or entry.get("merchant") or "这笔业务")
         category = str(entry.get("category") or "")

@@ -3,7 +3,7 @@
 Revision ID: cab1ab2f70d7
 Revises:
 Create Date: 2026-06-09 00:19:40.659094
-
+Fingerprint: JZXK-FINGERPRINT: 736f6c6f626f6f6b732d6a7a7863-2026-core (芥子星辰智能科技)
 """
 from typing import Sequence, Union
 

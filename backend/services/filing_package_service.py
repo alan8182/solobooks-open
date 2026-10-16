@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """申报作业包服务（M3，小规模纳税人）。
 
 把已有的测算资产编排成"应报尽报 + 数字一致 + 应享尽享"的作业包：

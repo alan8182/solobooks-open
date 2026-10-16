@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Bank matching and WeChat settlement in the authoritative journal transaction."""
 from __future__ import annotations
 
@@ -14,6 +17,7 @@ from services.accounting_core_service import (
     WRITE_ROLES, _advisory_lock, assert_bank_reconciliable, create_entry, delete_draft, get_journal,
     record_audit, require_role, serialize_journal, sync_bank_reconciliation,
 )
+from services.wechat_bill_service import WECHAT_CLEARING_CODE
 from services.bank_service import (
     _account_effect_from_voucher, _entry_bank_effect_from_payload,
     build_group_reconciliation_check,
@@ -246,7 +250,7 @@ async def confirm_statement_match(
     if not check["amountMatches"] or not check["directionMatches"]:
         raise AccountingError("AMOUNT_MISMATCH", "所选账目净额与银行流水金额或方向不一致")
     bank_net = money(sum((_entry_bank_effect_from_payload(p) for p in payloads), ZERO))
-    clearing_net = money(sum((_account_effect_from_voucher(p.get("voucherLines") or {}, "1012") for p in payloads), ZERO))
+    clearing_net = money(sum((_account_effect_from_voucher(p.get("voucherLines") or {}, WECHAT_CLEARING_CODE) for p in payloads), ZERO))
     created = False
     if bank_net == ZERO and clearing_net != ZERO:
         if amount == ZERO:
@@ -263,15 +267,15 @@ async def confirm_statement_match(
                 "originalEntryIds": requested, "settlementNetAmount": money_text(amount),
                 "voucherAuthority": "system", "billingStatus": "reconciled",
                 "voucherLines": {
-                    "debit": [{"accountCode": "1002" if amount > ZERO else "1012", "amount": value}],
-                    "credit": [{"accountCode": "1012" if amount > ZERO else "1002", "amount": value}],
+                    "debit": [{"accountCode": "1002" if amount > ZERO else WECHAT_CLEARING_CODE, "amount": value}],
+                    "credit": [{"accountCode": WECHAT_CLEARING_CODE if amount > ZERO else "1002", "amount": value}],
                 },
             }, company_id=company_id, user_id=user_id, request_id=request_id, confirm=auto_post)
             created = True
         settlement_payload = await serialize_journal(session, settlement)
         if settlement.status not in {"draft", "pending_review", "posted"} or \
                 _entry_bank_effect_from_payload(settlement_payload) != amount or \
-                _account_effect_from_voucher(settlement_payload.get("voucherLines") or {}, "1012") != -amount:
+                _account_effect_from_voucher(settlement_payload.get("voucherLines") or {}, WECHAT_CLEARING_CODE) != -amount:
             raise AccountingError("SETTLEMENT_CONFLICT", "已有结算凭证与银行净额不一致，请人工核对", 409)
     elif settlement:
         raise AccountingError("SETTLEMENT_CONFLICT", "原凭证已有银行影响，不能重复生成结算凭证", 409)

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """密码登录：auth_users 增加 password_hash / password_updated_at。
 
 Revision ID: b8e2f4c6a9d1

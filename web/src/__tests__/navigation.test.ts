@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+ * Licensed under the SoloBooks License v2.0.
+ */
+
 import { describe, expect, it } from 'vitest'
 import { NAV_ITEMS } from '@/utils/constants'
 import { resolveAuthRedirect } from '@/router/guards'
@@ -32,6 +37,7 @@ describe('sidebar navigation structure', () => {
       '/record/invoice-import',
       '/bank',
       '/vouchers',
+      '/recurring',
       '/assets',
       '/rd-expenses',
       '/mine/salary',
@@ -40,7 +46,6 @@ describe('sidebar navigation structure', () => {
     expect(settings?.children?.map((item) => item.path)).toEqual([
       '/mine',
       '/mine/companies',
-      '/mine/categories',
       '/mine/accounts',
       '/mine/opening',
       '/mine/mcp',

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """MCP 个人访问令牌（PAT）签发与校验。
 
 安全模型（见《MCP接入方案.md》§3.2）：

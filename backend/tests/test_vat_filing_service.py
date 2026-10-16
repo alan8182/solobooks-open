@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 from decimal import Decimal
 
 from services.vat_filing_service import build_small_scale_vat_assist
@@ -19,10 +22,10 @@ def entry(entry_id, occurred_on, debit_code, credit_code, amount, **extra):
 
 def test_vat_assist_uses_posted_revenue_accounts_and_excludes_cash_transfers_and_interest():
     entries = [
-        entry("sale", "2026-06-10", "1012", "6001", "78.00"),
+        entry("sale", "2026-06-10", "1012", "5001", "78.00"),
         entry("settlement", "2026-06-18", "1002", "1012", "77.30", category="微信支付结算"),
-        entry("interest", "2026-06-21", "1002", "6603", "4.15", category="利息收入"),
-        entry("verification", "2026-06-06", "1002", "6301", "0.01", category="营业外收入"),
+        entry("interest", "2026-06-21", "1002", "5603004", "4.15", category="利息收入"),
+        entry("verification", "2026-06-06", "1002", "5301", "0.01", category="营业外收入"),
     ]
 
     result = build_small_scale_vat_assist(entries, "2026-Q2", "quarter")
@@ -46,7 +49,7 @@ def test_vat_assist_uses_posted_revenue_accounts_and_excludes_cash_transfers_and
 
 def test_vat_assist_marks_complete_below_threshold_sales_ready_for_review():
     entries = [entry(
-        "sale", "2026-06-10", "1012", "6001", "78.00",
+        "sale", "2026-06-10", "1012", "5001", "78.00",
         invoiceType="增值税普通发票", invoiceNumber="INV-001", vatSalesCategory="services",
     )]
 
@@ -59,7 +62,7 @@ def test_vat_assist_marks_complete_below_threshold_sales_ready_for_review():
 
 def test_vat_assist_applies_one_percent_rate_above_threshold():
     entries = [entry(
-        "sale", "2026-06-10", "1002", "6001", "101000.00",
+        "sale", "2026-06-10", "1002", "5001", "101000.00",
         invoiceType="增值税普通发票", invoiceNumber="INV-002", vatSalesCategory="services",
     )]
 

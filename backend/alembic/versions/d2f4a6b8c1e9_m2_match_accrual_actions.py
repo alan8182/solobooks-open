@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Agent M2：agent_actions 支持对账建议与计提确认动作类型。
 
 Revision ID: d2f4a6b8c1e9

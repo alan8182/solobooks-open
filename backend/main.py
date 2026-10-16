@@ -75,6 +75,7 @@ from routers.accounting import router as accounting_router
 from routers.rd import router as rd_router
 from routers.agent import router as agent_router
 from routers.tax_filing import router as tax_filing_router
+from routers.admin import router as admin_router
 from routers.mcp_tokens import router as mcp_tokens_router
 
 app.include_router(record_router)
@@ -101,7 +102,15 @@ app.include_router(accounting_router)
 app.include_router(rd_router)
 app.include_router(agent_router)
 app.include_router(tax_filing_router)
+app.include_router(admin_router)
 app.include_router(mcp_tokens_router)
+
+
+@app.middleware("http")
+async def add_engine_fingerprint_header(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Powered-By-Engine"] = "SoloBooks-Core/jzxc-2026"
+    return response
 
 
 @app.get("/api/health")
@@ -114,6 +123,8 @@ async def health():
     return {
         "status": "ok",
         "service": "SoloBooks",
+        "engine": "SoloBooks-Core (芥子星辰)",
+        "fingerprint": "736f6c6f626f6f6b732d6a7a7863-2026-core",
         "database": "test" if os.getenv("ACCOUNTING_TEST_MODE") == "1" else "postgresql",
     }
 

@@ -1,6 +1,12 @@
+/**
+ * Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+ * Licensed under the SoloBooks License v2.0.
+ */
+
 import apiClient from './client'
 import type {
   MonthlyReportResponse,
+  ReportDiagnosisResponse,
   HealthScoreResponse,
   VatAssistResponse,
   CitAssistResponse,
@@ -13,8 +19,27 @@ import type {
   ComparisonResponse,
 } from './types'
 
-export function getMonthlyReport(month: string): Promise<MonthlyReportResponse> {
-  return apiClient.post('/api/report/monthly', { month })
+export function getMonthlyReport(
+  period: string,
+  periodType: 'month' | 'quarter' | 'year' = 'month',
+  includeSummary = false,
+): Promise<MonthlyReportResponse> {
+  const payload: Record<string, unknown> = {
+    month: period,
+    period,
+    periodType,
+  }
+  if (includeSummary) {
+    payload.includeSummary = true
+  }
+  return apiClient.post('/api/report/monthly', payload)
+}
+
+export function getReportDiagnosis(
+  period: string,
+  periodType: 'month' | 'quarter' | 'year' = 'month',
+): Promise<ReportDiagnosisResponse> {
+  return apiClient.post('/api/report/diagnosis', { month: period, period, periodType })
 }
 
 export function getHealthScore(month: string): Promise<HealthScoreResponse> {

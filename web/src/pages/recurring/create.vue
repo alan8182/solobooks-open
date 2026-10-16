@@ -1,3 +1,4 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
@@ -135,7 +136,7 @@ async function handleSave() {
   "amount": 5000,
   "direction": "expense",
   "category": "办公费用",
-  "accountCode": "6602"
+  "accountCode": "5603002"
 }'
             />
           </NFormItem>

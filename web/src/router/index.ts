@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+ * Licensed under the SoloBooks License v2.0.
+ */
+
 import { createRouter, createWebHistory } from 'vue-router'
 import type { RouteRecordRaw } from 'vue-router'
 import { resolveAuthRedirect } from './guards'
@@ -27,6 +32,49 @@ export const routes: RouteRecordRaw[] = [
     name: 'Privacy',
     component: () => import('@/pages/agreement/privacy.vue'),
     meta: { requiresAuth: false },
+  },
+  {
+    // 平台管理后台：独立于业务布局；管理员身份由 AdminLayout 调 /api/admin/overview 探测（403 拒绝），不落 localStorage
+    path: '/admin',
+    component: () => import('@/pages/admin/AdminLayout.vue'),
+    meta: { requiresAuth: true },
+    children: [
+      {
+        path: '',
+        name: 'AdminOverview',
+        component: () => import('@/pages/admin/AdminOverview.vue'),
+      },
+      {
+        path: 'usage',
+        name: 'AdminUsage',
+        component: () => import('@/pages/admin/AdminUsage.vue'),
+      },
+      {
+        path: 'users',
+        name: 'AdminUsers',
+        component: () => import('@/pages/admin/AdminUsers.vue'),
+      },
+      {
+        path: 'companies',
+        name: 'AdminCompanies',
+        component: () => import('@/pages/admin/AdminCompanies.vue'),
+      },
+      {
+        path: 'audit-logs',
+        name: 'AdminAuditLogs',
+        component: () => import('@/pages/admin/AdminAuditLogs.vue'),
+      },
+      {
+        path: 'agent-audit',
+        name: 'AdminAgentAudit',
+        component: () => import('@/pages/admin/AdminAgentAudit.vue'),
+      },
+      {
+        path: 'data-ops',
+        name: 'AdminDataOps',
+        component: () => import('@/pages/admin/AdminDataOps.vue'),
+      },
+    ],
   },
   {
     path: '/',
@@ -192,7 +240,7 @@ export const routes: RouteRecordRaw[] = [
       {
         path: 'mine/categories',
         name: 'Categories',
-        component: () => import('@/pages/mine/categories.vue'),
+        redirect: '/mine/accounts',
       },
       {
         path: 'mine/accounts',

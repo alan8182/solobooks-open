@@ -1,9 +1,10 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NCard, NButton, NTag, NSpace, useMessage,
-  NSelect, NSpin, NInput, NFormItem
+  NSelect, NSpin, NDatePicker, NFormItem
 } from 'naive-ui'
 import apiClient from '@/api/client'
 import { formatMoney, formatDate, getCurrentMonth } from '@/utils/format'
@@ -41,33 +42,47 @@ const accountOptions = [
   { label: '1012 微信支付待结算', value: '1012' },
   { label: '1122 应收账款', value: '1122' },
   { label: '1221 其他应收款', value: '1221' },
+  { label: '1403 原材料', value: '1403' },
+  { label: '1405 库存商品', value: '1405' },
   { label: '1601 固定资产', value: '1601' },
   { label: '2202 应付账款', value: '2202' },
+  { label: '2203 预收账款', value: '2203' },
+  { label: '2211 应付职工薪酬', value: '2211' },
   { label: '2221 应交税费', value: '2221' },
   { label: '2241 其他应付款', value: '2241' },
   { label: '3001 实收资本', value: '3001' },
-  { label: '5001 主营业务成本-人力', value: '5001' },
-  { label: '5301 研发支出-费用化支出（待归集）', value: '5301' },
-  { label: '530101 研发支出-人员人工', value: '530101' },
-  { label: '530102 研发支出-直接投入', value: '530102' },
-  { label: '530103 研发支出-折旧与摊销', value: '530103' },
-  { label: '530104 研发支出-设计费', value: '530104' },
-  { label: '530105 研发支出-试验费', value: '530105' },
-  { label: '530106 研发支出-委外研发费', value: '530106' },
-  { label: '530199 研发支出-其他研发费用', value: '530199' },
-  { label: '5601 管理费用-差旅费', value: '5601' },
-  { label: '5602 管理费用-办公费', value: '5602' },
-  { label: '5603 管理费用-业务招待费', value: '5603' },
-  { label: '5604 管理费用-租赁物业', value: '5604' },
-  { label: '5605 管理费用-信息技术服务费', value: '5605' },
-  { label: '5606 管理费用-运费及物流', value: '5606' },
-  { label: '5607 管理费用-水电通讯费', value: '5607' },
-  { label: '5608 管理费用-银行手续费', value: '5608' },
-  { label: '5699 管理费用-其他', value: '5699' },
-  { label: '6001 主营业务收入', value: '6001' },
-  { label: '6051 其他业务收入', value: '6051' },
-  { label: '6301 营业外收入', value: '6301' },
-  { label: '6601 销售费用-推广费', value: '6601' },
+  { label: '3002 资本公积', value: '3002' },
+  { label: '5001 主营业务收入', value: '5001' },
+  { label: '5051 其他业务收入', value: '5051' },
+  { label: '5301 营业外收入', value: '5301' },
+  { label: '5401001 主营业务成本-人力', value: '5401001' },
+  { label: '5401002 主营业务成本-生产', value: '5401002' },
+  { label: '5403 税金及附加', value: '5403' },
+  { label: '4301 研发支出-费用化支出', value: '4301' },
+  { label: '430100101 研发支出-人员人工', value: '430100101' },
+  { label: '430100102 研发支出-直接投入', value: '430100102' },
+  { label: '430100103 研发支出-折旧与摊销', value: '430100103' },
+  { label: '430100104 研发支出-设计费', value: '430100104' },
+  { label: '430100105 研发支出-试验费', value: '430100105' },
+  { label: '430100106 研发支出-委外研发费', value: '430100106' },
+  { label: '430100199 研发支出-其他研发费用', value: '430100199' },
+  { label: '5601 销售费用', value: '5601' },
+  { label: '5601011 销售费用-运输费', value: '5601011' },
+  { label: '5601016 销售费用-业务宣传费', value: '5601016' },
+  { label: '5602 管理费用', value: '5602' },
+  { label: '5602002 管理费用-业务招待费', value: '5602002' },
+  { label: '5602004 管理费用-办公费', value: '5602004' },
+  { label: '5602005 管理费用-水电费', value: '5602005' },
+  { label: '5602006 管理费用-差旅费', value: '5602006' },
+  { label: '5602007 管理费用-折旧费', value: '5602007' },
+  { label: '5602013 管理费用-租赁费', value: '5602013' },
+  { label: '5602014 管理费用-职工福利费', value: '5602014' },
+  { label: '5602015 管理费用-信息技术服务费', value: '5602015' },
+  { label: '5602999 管理费用-其他', value: '5602999' },
+  { label: '5603002 财务费用-手续费', value: '5603002' },
+  { label: '5603004 财务费用-利息收入', value: '5603004' },
+  { label: '5711 营业外支出', value: '5711' },
+  { label: '5801 所得税费用', value: '5801' },
 ]
 
 if (initialCode && !accountOptions.some(o => o.value === initialCode)) {
@@ -87,9 +102,9 @@ const backButtonLabel = computed(() => {
 
 function handleBack() {
   if (route.query.from) {
-    router.push(`/reports/${route.query.from}`)
+    router.push({ path: `/reports/${route.query.from}`, query: { month: month.value } })
   } else {
-    router.push('/reports')
+    router.push({ path: '/reports', query: { month: month.value } })
   }
 }
 
@@ -142,23 +157,16 @@ onMounted(query)
       </div>
     </div>
 
-    <!-- Filter Card -->
-    <NCard :bordered="false" class="report-card mb-4">
-      <NSpace align="center" wrap size="large">
-        <NFormItem label="明细科目" style="margin-bottom: 0;">
-          <NSelect
-            v-model:value="accountCode"
-            :options="accountOptions"
-            style="width: 240px;"
-            filterable
-          />
-        </NFormItem>
-        <NFormItem label="会计月份" style="margin-bottom: 0;">
-          <NInput v-model:value="month" placeholder="YYYY-MM" style="width: 130px;" />
-        </NFormItem>
-        <NButton type="primary" @click="query" style="margin-top: 24px;">查询账页</NButton>
-      </NSpace>
-    </NCard>
+    <!-- Filter Bar -->
+    <div class="filter-bar mb-4">
+      <NFormItem label="明细科目" label-placement="left" :show-feedback="false">
+        <NSelect v-model:value="accountCode" :options="accountOptions" style="width: 220px;" filterable />
+      </NFormItem>
+      <NFormItem label="会计月份" label-placement="left" :show-feedback="false">
+        <NDatePicker v-model:formatted-value="month" type="month" value-format="yyyy-MM" format="yyyy-MM" style="width: 150px;" />
+      </NFormItem>
+      <NButton type="primary" @click="query">查询账页</NButton>
+    </div>
 
     <!-- Summary Stats Card -->
     <NCard :bordered="false" class="report-card mb-4">
@@ -227,7 +235,26 @@ onMounted(query)
 <style scoped>
 .mb-4 { margin-bottom: 16px; }
 .col-date { width: 110px; }
-.col-summary { }
+.report-table-wrapper { overflow-x: auto; }
+.report-table th { white-space: nowrap; }
+.report-table td.col-cp { white-space: normal; }
+.col-summary { min-width: 200px; }
 .col-cp { width: 190px; }
 .balance { font-weight: 700; color: var(--solo-primary); }
+/* Filter Bar：紧凑单行筛选 */
+.filter-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding: 10px 16px;
+  background: #ffffff;
+  border: 1px solid #e5e9ef;
+  border-radius: 8px;
+}
+.filter-bar :deep(.n-form-item) {
+  margin-bottom: 0;
+  width: auto;
+  flex: 0 0 auto;
+}
 </style>

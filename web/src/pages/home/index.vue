@@ -1,3 +1,4 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
@@ -9,6 +10,7 @@ import { listAgentActions, type AgentActionItem } from '@/api/agent'
 import { recordReceipt } from '@/api/record'
 import { getPeriodCloseChecks } from '@/api/accounting'
 import { firstActionableReadinessItem, getClosingReadiness, canBatchPostDrafts } from '@/utils/closingReadiness'
+import { periodToQuarter } from '@/utils/taxFiling'
 import AgentActionCard from '@/components/business/AgentActionCard.vue'
 import StatsWidget from '@/components/widgets/StatsWidget.vue'
 import RecentEntriesWidget from '@/components/widgets/RecentEntriesWidget.vue'
@@ -82,17 +84,18 @@ async function loadTaxDeadlines() {
 
 const primaryTaxDeadline = computed(() => {
   if (!taxDeadlines.value.length) return null
-  const pending = taxDeadlines.value.filter(d => d.status !== 'filed')
+  // 已办结与已豁免（不适用）都是终态，不作为催办对象
+  const pending = taxDeadlines.value.filter(d => d.status !== 'filed' && d.status !== 'waived')
   if (pending.length) {
     return [...pending].sort((a, b) => (a.daysLeft ?? 999) - (b.daysLeft ?? 999))[0]
   }
-  return taxDeadlines.value[0]
+  return taxDeadlines.value.find(d => d.status !== 'waived') ?? null
 })
 
 const taxDeadlineCardStatus = computed(() => {
   const d = primaryTaxDeadline.value
   if (!d) return 'is-ready'
-  if (d.status === 'filed') return 'is-ready'
+  if (d.status === 'filed' || d.status === 'waived') return 'is-ready'
   if (d.daysLeft != null && d.daysLeft < 0) return 'is-overdue'
   if (d.daysLeft != null && d.daysLeft <= 3) return 'is-urgent'
   return ''
@@ -336,7 +339,7 @@ onMounted(async () => {
           :type="taxDeadlineCardStatus === 'is-overdue' || taxDeadlineCardStatus === 'is-urgent' ? 'warning' : 'primary'"
           secondary
           class="wizard-go-btn"
-          @click="router.push(primaryTaxDeadline ? `/tax-filing?period=${primaryTaxDeadline.period}` : '/tax-filing')"
+          @click="router.push(primaryTaxDeadline ? `/tax-filing?period=${periodToQuarter(primaryTaxDeadline.period)}` : '/tax-filing')"
         >
           {{ primaryTaxDeadline && primaryTaxDeadline.status !== 'filed' ? '去申报' : '作业包' }}
           <template #icon><i class="ri-arrow-right-line" /></template>

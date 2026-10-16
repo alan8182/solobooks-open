@@ -1,14 +1,19 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { NCard, NSpin, useMessage, NSelect, NButton, NTag } from 'naive-ui'
 import { getCashFlow } from '@/api/report'
 import { formatMoney, getCurrentMonth } from '@/utils/format'
 import type { CashFlowResponse } from '@/api/types'
 
+const route = useRoute()
 const router = useRouter()
 const message = useMessage()
-const month = ref(getCurrentMonth())
+
+const requestedMonth = String(route.query.month || '')
+const hasRequestedMonth = /^\d{4}-(0[1-9]|1[0-2])$/.test(requestedMonth)
+const month = ref(hasRequestedMonth ? requestedMonth : getCurrentMonth())
 const loading = ref(false)
 const result = ref<CashFlowResponse | null>(null)
 
@@ -23,6 +28,15 @@ const monthOptions = computed(() => {
   }
   return options
 })
+
+function handleMonthChange() {
+  router.replace({ query: { ...route.query, month: month.value } })
+  load()
+}
+
+function handleBack() {
+  router.push({ path: '/reports', query: { month: month.value } })
+}
 
 async function load() {
   loading.value = true
@@ -42,9 +56,9 @@ onMounted(load)
   <div class="report-container">
     <div class="report-header">
       <div class="report-header-left">
-        <NButton text class="report-back-btn" @click="router.push('/reports')">
+        <NButton text class="report-back-btn" @click="handleBack">
           <template #icon><i class="ri-arrow-left-line" /></template>
-          返回
+          返回报表中心
         </NButton>
         <div class="report-title-section">
           <h2>现金流量表</h2>
@@ -57,7 +71,7 @@ onMounted(load)
           :options="monthOptions"
           size="small"
           style="width: 140px;"
-          @update:value="load"
+          @update:value="handleMonthChange"
         />
       </div>
     </div>

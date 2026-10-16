@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """密码登录：PBKDF2-SHA256 哈希（标准库，零三方依赖）与失败锁定。
 
 存储格式为自描述串 `pbkdf2_sha256$<iterations>$<salt_hex>$<hash_hex>`，

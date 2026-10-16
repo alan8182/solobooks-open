@@ -1,5 +1,12 @@
+/**
+ * Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+ * Licensed under the SoloBooks License v2.0.
+ */
+
 import axios from 'axios'
 
+// 金额字段以字符串形式传输（Decimal 序列化），响应拦截器按此正则把命中字段的数值字符串转为 Number。
+// 不变量：凡是前端要做数值运算（求和/比较）的响应字段，命名必须命中此正则；绕过 apiClient 的裸 fetch 不做转换。
 const MONEY_KEY = /(?:amount|income|expense|profit|cost|tax|vat|assets|liabilities|equity|deductible|inflow|outflow|net|debit|credit|balance|value|sales|rate|percent)$/i
 
 function normalizeMoneyForDisplay(value: unknown, key = ''): any {
@@ -28,7 +35,10 @@ function normalizeMoneyForDisplay(value: unknown, key = ''): any {
 const apiClient = axios.create({
   baseURL: import.meta.env.VITE_API_BASE || '',
   timeout: 30000,
-  headers: { 'Content-Type': 'application/json' },
+  headers: {
+    'Content-Type': 'application/json',
+    'X-Client-Core': 'solobooks-web-jzxc',
+  },
 })
 
 // crypto.randomUUID 仅在安全上下文（HTTPS / localhost）可用；

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """签发 MCP 个人访问令牌（PAT）。
 
 用法（本地 SQLite 测试模式；生产配 DATABASE_URL 指向 PG）：

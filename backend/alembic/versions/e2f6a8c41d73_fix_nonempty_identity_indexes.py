@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Fix PostgreSQL partial unique indexes for optional identities.
 
 Revision ID: e2f6a8c41d73

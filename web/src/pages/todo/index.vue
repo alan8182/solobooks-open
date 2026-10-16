@@ -1,3 +1,4 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
@@ -791,6 +792,9 @@ onMounted(() => {
   background: var(--solo-bg-card);
   border: 1px dashed var(--solo-border);
   border-radius: var(--solo-radius-lg);
+}
+.empty-state :deep(.n-empty__icon) {
+  height: auto;  /* 自定义 64px 圆形图标超出 naive 默认 40px 图标盒，防压到描述文字 */
 }
 .empty-icon-circle {
   width: 64px;

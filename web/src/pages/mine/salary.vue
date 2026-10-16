@@ -1,10 +1,11 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
-  NCard, NButton, NSpace, useMessage, NInput, NModal, NForm,
-  NFormItem, NSpin, NTabs, NTabPane, NTable, NSelect, NInputNumber,
-  NDatePicker, NGrid, NGridItem, NTag
+  NButton, NSpace, useMessage, NInput, NModal, NForm,
+  NFormItem, NSpin, NSelect, NInputNumber,
+  NDatePicker, NTag
 } from 'naive-ui'
 import dayjs from 'dayjs'
 import { formatMoney } from '@/utils/format'
@@ -342,308 +343,486 @@ function viewVoucher(voucherId: string) {
 
 <template>
   <div class="salary-page">
+    <!-- 顶部导航与工作台抬头（遵循 layout.css .page-header-left / .page-header-right 规范） -->
     <div class="page-header">
-      <NButton text class="back-btn" @click="router.push('/mine')">
-        <template #icon><i class="ri-arrow-left-line" /></template>
-        返回设置
-      </NButton>
-      <div class="header-row">
+      <div class="page-header-left">
+        <button type="button" class="back-btn" @click="router.push('/mine')">
+          <i class="ri-arrow-left-line" />
+          <span>返回账套与设置</span>
+        </button>
         <div class="title-section">
-          <h2>薪酬与社保管理</h2>
-          <p class="subtitle">管理在职员工花名册，分摊计提月度人工及社保费用</p>
+          <div class="title-with-badge">
+            <h2>薪酬与社保管理</h2>
+            <span
+              v-if="sheet"
+              class="status-pill"
+              :class="{
+                'pill-paid': sheet.status === 'paid',
+                'pill-accrued': sheet.status === 'accrued',
+                'pill-draft': sheet.status !== 'paid' && sheet.status !== 'accrued',
+              }"
+            >
+              <i
+                :class="
+                  sheet.status === 'paid'
+                    ? 'ri-checkbox-circle-line'
+                    : sheet.status === 'accrued'
+                      ? 'ri-time-line'
+                      : 'ri-draft-line'
+                "
+              />
+              {{
+                sheet.status === 'paid'
+                  ? '已发放记账'
+                  : sheet.status === 'accrued'
+                    ? '已计提记账'
+                    : '草稿（待计提）'
+              }}
+            </span>
+          </div>
+          <p class="subtitle">
+            管理在职员工花名册，按月核算计提工资、社保公积金及个税并自动生成记账凭证。
+          </p>
         </div>
+      </div>
+
+      <div class="page-header-right">
+        <div class="month-selector-wrap">
+          <span class="control-label">结算月份</span>
+          <NDatePicker
+            v-model:formatted-value="selectedMonth"
+            value-format="yyyy-MM"
+            type="month"
+            :clearable="false"
+            size="medium"
+            class="month-picker"
+          />
+        </div>
+
+        <div class="header-divider" />
+
+        <NButton type="primary" size="medium" @click="openAddEmployeeModal">
+          <template #icon><i class="ri-user-add-line" /></template>
+          新增员工
+        </NButton>
       </div>
     </div>
 
-    <NTabs v-model:value="activeTab" type="line" class="salary-tabs">
-      
-      <!-- TAB 1: Salary sheet settlement -->
-      <NTabPane name="sheet" tab="工资表结算">
-        <NCard :bordered="false" class="main-card">
-          <div class="sheet-controls">
-            <NSpace align="center" size="large">
-              <span class="control-label">结算月份：</span>
-              <NDatePicker
-                v-model:formatted-value="selectedMonth"
-                value-format="yyyy-MM"
-                type="month"
-                :clearable="false"
-                class="month-picker"
-              />
-            </NSpace>
-            
-            <NSpace v-if="sheet">
-              <NTag :type="sheet.status === 'paid' ? 'success' : sheet.status === 'accrued' ? 'warning' : 'default'" size="medium" round>
-                {{ sheet.status === 'paid' ? '已发放记账' : sheet.status === 'accrued' ? '已计提记账' : '草稿 (待计提)' }}
-              </NTag>
-            </NSpace>
+    <!-- 薪酬汇总监控栏 -->
+    <div class="salary-summary-bar">
+      <div class="summary-metrics">
+        <div class="metric-item">
+          <span class="metric-label">本月应发在职人数</span>
+          <span class="metric-value">
+            {{ sheetTotals.count }}
+            <small class="metric-unit">人（花名册共 {{ employees.length }} 人）</small>
+          </span>
+        </div>
+        <div class="metric-divider" />
+        <div class="metric-item">
+          <span class="metric-label">本月实发工资总额</span>
+          <span class="metric-value text-income">{{ formatMoney(sheetTotals.net) }}</span>
+        </div>
+        <div class="metric-divider" />
+        <div class="metric-item">
+          <span class="metric-label">企业总人工成本（含单位社保）</span>
+          <span class="metric-value text-primary">{{ formatMoney(sheetTotals.cost) }}</span>
+        </div>
+      </div>
+
+      <div class="summary-right">
+        <span v-if="sheet?.status === 'paid' && sheet.ss_paid_voucher_id && sheet.tax_paid_voucher_id" class="verdict-badge badge-paid">
+          <i class="ri-shield-check-line" />
+          本月工资、社保、个税均已记账完毕
+        </span>
+        <span v-else-if="sheet?.status === 'paid'" class="verdict-badge badge-accrued">
+          <i class="ri-information-line" />
+          工资已发放 · 待完成社保与个税缴纳记账
+        </span>
+        <span v-else-if="sheet?.status === 'accrued'" class="verdict-badge badge-accrued">
+          <i class="ri-time-line" />
+          人工成本已计提 · 待发放实发工资
+        </span>
+        <span v-else class="verdict-badge badge-draft">
+          <i class="ri-edit-circle-line" />
+          {{ sheetRecords.length > 0 ? '草稿可编辑 · 核对无误后点击底部「计提记账」' : '请先录入在职员工以生成本月工资表' }}
+        </span>
+      </div>
+    </div>
+
+    <!-- 主工作台卡片 -->
+    <NSpin :show="loading">
+      <div class="surface-card salary-workspace-card">
+        <!-- 顶层切换栏 -->
+        <div class="sheet-tabs-bar">
+          <div class="sheet-tabs">
+            <button
+              type="button"
+              class="sheet-tab-btn"
+              :class="{ active: activeTab === 'sheet' }"
+              @click="activeTab = 'sheet'"
+            >
+              <i class="ri-file-list-3-line" />
+              <span>工资表结算（{{ selectedMonth }}）</span>
+              <span class="tab-count">{{ sheetRecords.length }}</span>
+            </button>
+
+            <button
+              type="button"
+              class="sheet-tab-btn"
+              :class="{ active: activeTab === 'roster' }"
+              @click="activeTab = 'roster'"
+            >
+              <i class="ri-team-line" />
+              <span>员工花名册</span>
+              <span class="tab-count">{{ employees.length }}</span>
+            </button>
           </div>
 
-          <!-- Total metrics grid -->
-          <NGrid :cols="3" :x-gap="16" class="totals-grid" v-if="sheetRecords.length > 0">
-            <NGridItem>
-              <div class="total-box">
-                <span class="box-label">在职应发人数</span>
-                <span class="box-value">{{ sheetTotals.count }} <span class="box-unit">人</span></span>
-              </div>
-            </NGridItem>
-            <NGridItem>
-              <div class="total-box">
-                <span class="box-label">实发工资总额</span>
-                <span class="box-value money-color">{{ formatMoney(sheetTotals.net) }}</span>
-              </div>
-            </NGridItem>
-            <NGridItem>
-              <div class="total-box">
-                <span class="box-label">企业总人工成本</span>
-                <span class="box-value cost-color">{{ formatMoney(sheetTotals.cost) }}</span>
-              </div>
-            </NGridItem>
-          </NGrid>
+          <div class="toolbar-right">
+            <span v-if="activeTab === 'sheet'" class="rule-hint">
+              <i class="ri-information-line" />
+              企业成本 = 应发工资 + 单位承担社保公积金；研发部人员可分配研发项目工时
+            </span>
+            <span v-else class="rule-hint">
+              <i class="ri-information-line" />
+              花名册变更将自动同步至未锁定的月度工资表草稿
+            </span>
+          </div>
+        </div>
 
-          <NSpin :show="loading">
-            <div class="table-container" v-if="sheetRecords.length > 0">
-              <NTable :bordered="false" :single-line="false" class="records-table">
-                <thead>
-                  <tr>
-                    <th style="min-width: 70px;">姓名</th>
-                    <th style="min-width: 70px;">部门</th>
-                    <th style="min-width: 130px;">研发项目工时</th>
-                    <th style="min-width: 80px;">基本工资</th>
-                    <th style="min-width: 80px;">奖金</th>
-                    <th style="min-width: 80px;">补助/津贴</th>
-                    <th style="min-width: 80px;">考勤扣款</th>
-                    <th style="min-width: 90px;">个人社保公积金</th>
-                    <th style="min-width: 80px;">个税代扣</th>
-                    <th style="min-width: 90px;">单位社保公积金</th>
-                    <th style="min-width: 90px;">实发工资</th>
-                    <th style="min-width: 90px;">企业成本</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr v-for="row in sheetRecords" :key="row.id">
-                    <td class="emp-name">{{ row.employee_name }}</td>
-                    <td><NTag size="small" :type="row.employee_id && employees.find(e => e.id === row.employee_id)?.department === '研发部' ? 'primary' : 'default'">{{ employees.find(e => e.id === row.employee_id)?.department || '行政部' }}</NTag></td>
-                    <td>
-                      <NButton size="tiny" :type="employeeRdAllocations(row.employee_id).length ? 'primary' : 'default'" :disabled="sheet?.status !== 'draft'" @click="openRdAllocation(row)">
-                        {{ rdAllocationSummary(row.employee_id) }}
-                      </NButton>
-                    </td>
-                    <td>{{ formatMoney(row.base_salary) }}</td>
-                    
-                    <!-- Editable Fields for draft sheet -->
-                    <td>
-                      <NInputNumber
-                        v-model:value="row.bonus"
-                        :min="0"
-                        :show-button="false"
-                        size="small"
-                        :disabled="sheet?.status !== 'draft'"
-                        @update:value="handleRecordAmountChange(row)"
-                      />
-                    </td>
-                    <td>
-                      <NInputNumber
-                        v-model:value="row.allowance"
-                        :min="0"
-                        :show-button="false"
-                        size="small"
-                        :disabled="sheet?.status !== 'draft'"
-                        @update:value="handleRecordAmountChange(row)"
-                      />
-                    </td>
-                    <td>
-                      <NInputNumber
-                        v-model:value="row.deduction"
-                        :min="0"
-                        :show-button="false"
-                        size="small"
-                        :disabled="sheet?.status !== 'draft'"
-                        @update:value="handleRecordAmountChange(row)"
-                      />
-                    </td>
-                    <td>
-                      <NInputNumber
-                        v-model:value="row.personal_social_security"
-                        :min="0"
-                        :show-button="false"
-                        size="small"
-                        :disabled="sheet?.status !== 'draft'"
-                        @update:value="handleRecordAmountChange(row)"
-                      />
-                    </td>
-                    <td>
-                      <NInputNumber
-                        v-model:value="row.personal_tax"
-                        :min="0"
-                        :show-button="false"
-                        size="small"
-                        :disabled="sheet?.status !== 'draft'"
-                        @update:value="handleRecordAmountChange(row)"
-                      />
-                    </td>
-                    <td>
-                      <NInputNumber
-                        v-model:value="row.company_social_security"
-                        :min="0"
-                        :show-button="false"
-                        size="small"
-                        :disabled="sheet?.status !== 'draft'"
-                        @update:value="handleRecordAmountChange(row)"
-                      />
-                    </td>
-                    
-                    <!-- Calculated Outputs -->
-                    <td class="net-salary">{{ formatMoney(row.net_salary) }}</td>
-                    <td class="total-cost">{{ formatMoney(row.total_cost) }}</td>
-                  </tr>
-                </tbody>
-              </NTable>
-            </div>
-            <div class="empty-state" v-else>
-              <i class="ri-user-unfollow-line empty-icon" />
-              <p>当月无在职员工记录，请先到「员工花名册」添加员工</p>
-            </div>
-          </NSpin>
+        <!-- 视图 1：工资表结算 -->
+        <div v-if="activeTab === 'sheet'" class="workspace-body">
+          <div v-if="sheetRecords.length > 0" class="table-container">
+            <table class="salary-table">
+              <thead>
+                <tr>
+                  <th style="min-width: 84px">姓名</th>
+                  <th style="min-width: 84px">部门</th>
+                  <th style="min-width: 136px">研发项目工时</th>
+                  <th class="col-amount" style="min-width: 96px">基本工资</th>
+                  <th class="col-amount" style="min-width: 100px">奖金</th>
+                  <th class="col-amount" style="min-width: 100px">补助/津贴</th>
+                  <th class="col-amount" style="min-width: 100px">考勤扣款</th>
+                  <th class="col-amount" style="min-width: 112px">个人社保公积金</th>
+                  <th class="col-amount" style="min-width: 96px">个税代扣</th>
+                  <th class="col-amount" style="min-width: 112px">单位社保公积金</th>
+                  <th class="col-amount" style="min-width: 104px">实发工资</th>
+                  <th class="col-amount" style="min-width: 104px">企业总成本</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in sheetRecords" :key="row.id">
+                  <td class="emp-name">{{ row.employee_name }}</td>
+                  <td>
+                    <NTag
+                      size="small"
+                      :bordered="false"
+                      :type="
+                        row.employee_id && employees.find(e => e.id === row.employee_id)?.department === '研发部'
+                          ? 'info'
+                          : 'default'
+                      "
+                    >
+                      {{ employees.find(e => e.id === row.employee_id)?.department || '行政部' }}
+                    </NTag>
+                  </td>
+                  <td>
+                    <NButton
+                      size="tiny"
+                      :type="employeeRdAllocations(row.employee_id).length ? 'primary' : 'default'"
+                      :secondary="!employeeRdAllocations(row.employee_id).length"
+                      :disabled="sheet?.status !== 'draft'"
+                      @click="openRdAllocation(row)"
+                    >
+                      <template #icon><i class="ri-flask-line" /></template>
+                      {{ rdAllocationSummary(row.employee_id) }}
+                    </NButton>
+                  </td>
+                  <td class="col-amount num-cell">{{ formatMoney(row.base_salary) }}</td>
 
-          <!-- Action Footer Section -->
-          <div class="sheet-footer" v-if="sheet && sheetRecords.length > 0">
-            <NSpace size="medium">
+                  <!-- 草稿状态下可编辑字段 -->
+                  <td class="col-amount">
+                    <NInputNumber
+                      v-model:value="row.bonus"
+                      :min="0"
+                      :precision="2"
+                      :show-button="false"
+                      size="small"
+                      class="amount-input"
+                      :disabled="sheet?.status !== 'draft'"
+                      @update:value="handleRecordAmountChange(row)"
+                    />
+                  </td>
+                  <td class="col-amount">
+                    <NInputNumber
+                      v-model:value="row.allowance"
+                      :min="0"
+                      :precision="2"
+                      :show-button="false"
+                      size="small"
+                      class="amount-input"
+                      :disabled="sheet?.status !== 'draft'"
+                      @update:value="handleRecordAmountChange(row)"
+                    />
+                  </td>
+                  <td class="col-amount">
+                    <NInputNumber
+                      v-model:value="row.deduction"
+                      :min="0"
+                      :precision="2"
+                      :show-button="false"
+                      size="small"
+                      class="amount-input"
+                      :disabled="sheet?.status !== 'draft'"
+                      @update:value="handleRecordAmountChange(row)"
+                    />
+                  </td>
+                  <td class="col-amount">
+                    <NInputNumber
+                      v-model:value="row.personal_social_security"
+                      :min="0"
+                      :precision="2"
+                      :show-button="false"
+                      size="small"
+                      class="amount-input"
+                      :disabled="sheet?.status !== 'draft'"
+                      @update:value="handleRecordAmountChange(row)"
+                    />
+                  </td>
+                  <td class="col-amount">
+                    <NInputNumber
+                      v-model:value="row.personal_tax"
+                      :min="0"
+                      :precision="2"
+                      :show-button="false"
+                      size="small"
+                      class="amount-input"
+                      :disabled="sheet?.status !== 'draft'"
+                      @update:value="handleRecordAmountChange(row)"
+                    />
+                  </td>
+                  <td class="col-amount">
+                    <NInputNumber
+                      v-model:value="row.company_social_security"
+                      :min="0"
+                      :precision="2"
+                      :show-button="false"
+                      size="small"
+                      class="amount-input"
+                      :disabled="sheet?.status !== 'draft'"
+                      @update:value="handleRecordAmountChange(row)"
+                    />
+                  </td>
+
+                  <!-- 自动核算结果 -->
+                  <td class="col-amount net-salary">{{ formatMoney(row.net_salary) }}</td>
+                  <td class="col-amount total-cost">{{ formatMoney(row.total_cost) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div v-else class="empty-state">
+            <div class="empty-icon-box">
+              <i class="ri-user-add-line" />
+            </div>
+            <h4 class="empty-title">当月暂无在职员工工资记录</h4>
+            <p class="empty-desc">
+              请先在「员工花名册」中录入员工姓名、部门、基本工资与社保基数，系统将自动生成月度工资结算表。
+            </p>
+            <div class="empty-actions">
+              <NButton type="primary" size="medium" @click="openAddEmployeeModal">
+                <template #icon><i class="ri-user-add-line" /></template>
+                立即添加首位员工
+              </NButton>
+              <NButton secondary size="medium" @click="activeTab = 'roster'">
+                查看员工花名册
+              </NButton>
+            </div>
+          </div>
+
+          <!-- 底部结算动作栏 -->
+          <div v-if="sheet && sheetRecords.length > 0" class="sheet-footer">
+            <div class="footer-left-hint">
+              <span v-if="sheet.status === 'draft'" class="hint-text">
+                <i class="ri-information-line" />
+                步骤 1/2：确认工资与社保明细后点击「计提记账」，系统将自动生成应付职工薪酬凭证。
+              </span>
+              <span v-else-if="sheet.ss_paid_voucher_id && sheet.tax_paid_voucher_id" class="paid-desc">
+                <i class="ri-checkbox-circle-fill" />
+                本月工资、社保公积金及个税均已完成记账。
+              </span>
+              <span v-else class="hint-text">
+                <i class="ri-information-line" />
+                步骤 2/2：请依次完成实发工资发放、社保公积金及个税缴纳记账，清理挂账余额。
+              </span>
+            </div>
+
+            <NSpace size="small">
               <!-- DRAFT STATE -->
               <template v-if="sheet.status === 'draft'">
-                <NButton secondary type="primary" @click="saveRecords">保存工资单修改</NButton>
-                <NButton type="primary" @click="accrueSheet">计提记账 (列入当月研发/福利成本)</NButton>
+                <NButton secondary @click="saveRecords">
+                  <template #icon><i class="ri-save-line" /></template>
+                  保存草稿修改
+                </NButton>
+                <NButton type="primary" @click="accrueSheet">
+                  <template #icon><i class="ri-check-double-line" /></template>
+                  计提记账（列入当月成本）
+                </NButton>
               </template>
 
-              <!-- ACCRUED / PAID STATE 共用：社保与个税缴纳 -->
+              <!-- ACCRUED / PAID STATE -->
               <template v-if="sheet.status === 'accrued' || sheet.status === 'paid'">
-                <NButton secondary type="warning" @click="viewVoucher(sheet.accrual_voucher_id!)">
+                <NButton secondary @click="viewVoucher(sheet.accrual_voucher_id!)">
                   查看计提凭证
                 </NButton>
                 <NButton
                   v-if="sheet.status === 'accrued'"
-                  type="success"
+                  type="primary"
                   @click="paySheet"
-                >发放工资记账 (生成存款划扣凭证)</NButton>
+                >
+                  发放工资记账（生成划扣凭证）
+                </NButton>
                 <NButton
                   v-if="sheet.status === 'paid' && sheet.payment_voucher_id"
                   secondary
-                  type="success"
                   @click="viewVoucher(sheet.payment_voucher_id!)"
-                >查看发放凭证</NButton>
+                >
+                  查看发放凭证
+                </NButton>
 
                 <NButton
                   v-if="!sheet.ss_paid_voucher_id"
+                  secondary
+                  type="primary"
                   :disabled="sheet.status !== 'accrued' && sheet.status !== 'paid'"
                   @click="payLiability('social')"
-                >缴纳社保公积金 (清偿挂账)</NButton>
-                <NButton v-else secondary type="warning" @click="viewVoucher(sheet.ss_paid_voucher_id!)">
-                  查看社保缴纳凭证
+                >
+                  缴纳社保公积金
+                </NButton>
+                <NButton v-else secondary @click="viewVoucher(sheet.ss_paid_voucher_id!)">
+                  查看社保凭证
                 </NButton>
 
                 <NButton
                   v-if="!sheet.tax_paid_voucher_id"
+                  secondary
+                  type="primary"
                   @click="payLiability('tax')"
-                >缴纳个税 (清偿挂账)</NButton>
-                <NButton v-else secondary type="warning" @click="viewVoucher(sheet.tax_paid_voucher_id!)">
-                  查看个税缴纳凭证
+                >
+                  缴纳个税
                 </NButton>
-
-                <span v-if="sheet.ss_paid_voucher_id && sheet.tax_paid_voucher_id" class="paid-desc">
-                  <i class="ri-checkbox-circle-fill" /> 工资、社保、个税均已记账完毕。
-                </span>
-                <span v-else-if="sheet.status === 'paid'" class="paid-desc">
-                  <i class="ri-information-line" /> 工资已发放；请完成社保与个税缴纳记账，避免挂账。
-                </span>
+                <NButton v-else secondary @click="viewVoucher(sheet.tax_paid_voucher_id!)">
+                  查看个税凭证
+                </NButton>
               </template>
             </NSpace>
           </div>
+        </div>
 
-          <NModal v-model:show="showRdAllocationModal" preset="card" :title="`${rdAllocationEmployee?.employee_name || ''} · 研发项目工时分配`" style="width:min(760px,92vw)">
-            <div v-for="(allocation, index) in rdAllocationDraft" :key="index" class="rd-allocation-row">
-              <NSelect v-model:value="allocation.projectId" :options="rdProjectOptions" filterable placeholder="研发项目" />
-              <NInputNumber v-model:value="allocation.allocationRate" :min="0.01" :max="1" :step="0.1" placeholder="比例0-1" />
-              <NInput v-model:value="allocation.allocationBasis" placeholder="工时表或分配依据" />
-              <NButton text type="error" @click="removeRdAllocationRow(index)">删除</NButton>
-            </div>
-            <NSpace justify="space-between" class="mt-4">
-              <NButton @click="addRdAllocationRow">增加项目</NButton>
-              <NSpace><NButton @click="showRdAllocationModal = false">取消</NButton><NButton type="primary" @click="saveRdAllocation">保存</NButton></NSpace>
-            </NSpace>
-          </NModal>
-        </NCard>
-      </NTabPane>
-
-      <!-- TAB 2: Employee Roster -->
-      <NTabPane name="roster" tab="员工花名册">
-        <NCard :bordered="false" class="main-card">
-          <div class="roster-header">
-            <span class="roster-title">花名册成员 (在职员工)</span>
-            <NButton type="primary" @click="openAddEmployeeModal">
-              <template #icon><i class="ri-user-add-line" /></template>
-              新增员工
-            </NButton>
-          </div>
-
-          <NSpin :show="loading">
-            <NTable :bordered="false" :single-line="false" class="roster-table" v-if="employees.length > 0">
+        <!-- 视图 2：员工花名册 -->
+        <div v-else class="workspace-body">
+          <div v-if="employees.length > 0" class="table-container">
+            <table class="salary-table roster-table">
               <thead>
                 <tr>
-                  <th>姓名</th>
+                  <th>员工姓名</th>
                   <th>所属部门</th>
-                  <th>每月基本工资</th>
-                  <th>社保缴纳基数</th>
-                  <th style="width: 150px; text-align: center;">操作</th>
+                  <th class="col-amount">每月基本工资（元）</th>
+                  <th class="col-amount">社保缴纳基数（元）</th>
+                  <th style="width: 160px; text-align: center">操作</th>
                 </tr>
               </thead>
               <tbody>
                 <tr v-for="emp in employees" :key="emp.id">
                   <td class="emp-name">{{ emp.name }}</td>
                   <td>
-                    <NTag size="small" :type="emp.department === '研发部' ? 'primary' : 'default'">
+                    <NTag
+                      size="small"
+                      :bordered="false"
+                      :type="emp.department === '研发部' ? 'info' : 'default'"
+                    >
                       {{ emp.department }}
                     </NTag>
                   </td>
-                  <td>{{ formatMoney(emp.base_salary) }}</td>
-                  <td>{{ formatMoney(emp.social_security_base) }}</td>
+                  <td class="col-amount num-cell">{{ formatMoney(emp.base_salary) }}</td>
+                  <td class="col-amount num-cell">{{ formatMoney(emp.social_security_base) }}</td>
                   <td class="action-cell">
-                    <NSpace justify="center">
+                    <NSpace justify="center" size="medium">
                       <NButton text type="primary" @click="openEditEmployeeModal(emp)">编辑</NButton>
                       <NButton
                         text
                         type="error"
-                        @click="confirmDelete({
-                          title: '确认离职归档',
-                          content: `确定将员工“${emp.name}”设为离职归档吗？归档后将不再参与后续薪酬计算。`,
-                          positiveText: '确认归档',
-                          onConfirm: () => archiveEmp(emp.id!),
-                        })"
-                      >离职归档</NButton>
+                        @click="
+                          confirmDelete({
+                            title: '确认离职归档',
+                            content: `确定将员工“${emp.name}”设为离职归档吗？归档后将不再参与后续薪酬计算。`,
+                            positiveText: '确认归档',
+                            onConfirm: () => archiveEmp(emp.id!),
+                          })
+                        "
+                      >
+                        离职归档
+                      </NButton>
                     </NSpace>
                   </td>
                 </tr>
               </tbody>
-            </NTable>
-            <div class="empty-state" v-else>
-              <i class="ri-user-add-line empty-icon" />
-              <p>企业花名册为空，点击右上角「新增员工」录入首位成员</p>
+            </table>
+          </div>
+
+          <div v-else class="empty-state">
+            <div class="empty-icon-box">
+              <i class="ri-team-line" />
             </div>
-          </NSpin>
-        </NCard>
-      </NTabPane>
+            <h4 class="empty-title">企业花名册尚无在职员工</h4>
+            <p class="empty-desc">
+              录入员工的基本工资与社保基数后，系统每个月将自动为您预填工资结算表与社保分摊。
+            </p>
+            <div class="empty-actions">
+              <NButton type="primary" size="medium" @click="openAddEmployeeModal">
+                <template #icon><i class="ri-user-add-line" /></template>
+                录入首位员工
+              </NButton>
+            </div>
+          </div>
+        </div>
+      </div>
+    </NSpin>
 
-    </NTabs>
+    <!-- 研发项目工时分配弹窗 -->
+    <NModal
+      v-model:show="showRdAllocationModal"
+      preset="card"
+      :title="`${rdAllocationEmployee?.employee_name || ''} · 研发项目工时分配`"
+      style="width: min(760px, 92vw)"
+    >
+      <div v-for="(allocation, index) in rdAllocationDraft" :key="index" class="rd-allocation-row">
+        <NSelect v-model:value="allocation.projectId" :options="rdProjectOptions" filterable placeholder="研发项目" />
+        <NInputNumber v-model:value="allocation.allocationRate" :min="0.01" :max="1" :step="0.1" placeholder="比例0-1" />
+        <NInput v-model:value="allocation.allocationBasis" placeholder="工时表或分配依据" />
+        <NButton text type="error" @click="removeRdAllocationRow(index)">删除</NButton>
+      </div>
+      <NSpace justify="space-between" class="mt-4">
+        <NButton @click="addRdAllocationRow">增加项目</NButton>
+        <NSpace>
+          <NButton @click="showRdAllocationModal = false">取消</NButton>
+          <NButton type="primary" @click="saveRdAllocation">保存</NButton>
+        </NSpace>
+      </NSpace>
+    </NModal>
 
-    <!-- Add/Edit Employee Modal -->
+    <!-- 新增/编辑员工弹窗 -->
     <NModal
       v-model:show="showEmployeeModal"
       :title="isEditingEmployee ? '编辑员工信息' : '录入新员工'"
       preset="card"
-      style="width: 400px; border-radius: var(--solo-radius-lg);"
+      style="width: 420px; border-radius: 14px"
     >
-      <NForm label-placement="left" label-width="84" style="margin-top: 10px;">
+      <NForm label-placement="left" label-width="84" style="margin-top: 10px">
         <NFormItem label="员工姓名">
-          <NInput v-model:value="employeeForm.name" placeholder="请输入姓名..." />
+          <NInput v-model:value="employeeForm.name" placeholder="请输入员工姓名" />
         </NFormItem>
         <NFormItem label="所属部门">
           <NSelect v-model:value="employeeForm.department" :options="departmentOptions" />
@@ -652,17 +831,23 @@ function viewVoucher(voucherId: string) {
           <NInputNumber
             v-model:value="employeeForm.base_salary"
             :min="0"
+            :precision="2"
             :step="100"
             style="width: 100%"
-          />
+          >
+            <template #prefix>¥</template>
+          </NInputNumber>
         </NFormItem>
         <NFormItem label="社保基数">
           <NInputNumber
             v-model:value="employeeForm.social_security_base"
             :min="0"
+            :precision="2"
             :step="100"
             style="width: 100%"
-          />
+          >
+            <template #prefix>¥</template>
+          </NInputNumber>
         </NFormItem>
       </NForm>
       <template #footer>
@@ -677,206 +862,332 @@ function viewVoucher(voucherId: string) {
 
 <style scoped>
 .salary-page {
-  max-width: 1240px;
-  margin: 0 auto;
-  padding: 16px 0 32px 0;
   width: 100%;
   box-sizing: border-box;
+  padding-bottom: 40px;
 }
 
+/* 顶部导航与主标题栏（对齐全局 layout.css .page-header 规范） */
 .page-header {
-  margin-bottom: 20px;
+  flex-wrap: wrap;
 }
-
 .back-btn {
-  font-weight: 500;
-  color: var(--solo-text-secondary);
-  transition: color 0.2s ease;
-  margin-bottom: 8px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
 }
-
-.back-btn:hover {
-  color: var(--solo-primary);
-}
-
-.title-section h2 {
-  margin: 0;
-  font-size: 24px;
-  font-weight: 700;
-  color: var(--solo-text-primary);
-  letter-spacing: -0.5px;
-}
-
-.subtitle {
-  margin: 4px 0 0 0;
-  font-size: 13px;
-  color: var(--solo-text-secondary);
-}
-
-.salary-tabs {
-  margin-top: 16px;
-}
-
-/* Main Cards */
-.main-card {
-  background: var(--solo-bg-card);
-  backdrop-filter: blur(12px);
-  border: 1px solid var(--solo-border);
-  border-radius: var(--solo-radius-lg);
-  box-shadow: var(--solo-shadow-lg);
-  padding: 8px;
-}
-
-/* Sheet Tab Styling */
-.sheet-controls {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 20px;
-}
-
-.control-label {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--solo-text-primary);
-}
-
-.month-picker {
-  width: 140px;
-}
-
-/* Totals Panel */
-.totals-grid {
-  margin-bottom: 24px;
-}
-
-.total-box {
-  background: rgba(255, 255, 255, 0.5);
-  border: 1px solid var(--solo-border-light);
-  border-radius: var(--solo-radius);
-  padding: 14px 16px;
+.title-section {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  box-shadow: var(--solo-shadow-sm);
 }
-
-.box-label {
+.title-with-badge {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border-radius: 999px;
   font-size: 12px;
-  color: var(--solo-text-secondary);
   font-weight: 500;
 }
-
-.box-value {
-  font-size: 20px;
-  font-weight: 800;
-  color: var(--solo-text-primary);
-  font-family: 'Outfit', 'Inter', sans-serif;
+.pill-paid {
+  background: #eaf7f1;
+  color: #12805c;
+}
+.pill-accrued {
+  background: #fff5e8;
+  color: #b46b17;
+}
+.pill-draft {
+  background: #f1f4f8;
+  color: #586474;
 }
 
-.box-unit {
+.page-header-right {
+  flex-wrap: wrap;
+}
+.month-selector-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.control-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: #586474;
+  white-space: nowrap;
+}
+.month-picker {
+  width: 144px;
+}
+.header-divider {
+  width: 1px;
+  height: 22px;
+  background: #dde3ea;
+  margin: 0 2px;
+}
+
+/* 顶部汇总指标卡片栏 */
+.salary-summary-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 14px 20px;
+  border-radius: 14px;
+  margin-bottom: 16px;
+  background: #ffffff;
+  border: 1px solid #dde3ea;
+}
+.summary-metrics {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  flex-wrap: wrap;
+}
+.metric-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.metric-label {
   font-size: 12px;
-  color: var(--solo-text-muted);
+  color: #586474;
+}
+.metric-value {
+  font-size: 18px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: #182230;
+}
+.metric-unit {
+  font-size: 12px;
+  font-weight: 400;
+  color: #8a95a3;
+  margin-left: 2px;
+}
+.metric-divider {
+  width: 1px;
+  height: 28px;
+  background: #edf0f4;
+}
+.text-income {
+  color: #12805c !important;
+}
+.text-primary {
+  color: #165dff !important;
 }
 
-.money-color {
-  color: var(--solo-income);
+.verdict-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.badge-paid {
+  background: #eaf7f1;
+  color: #12805c;
+}
+.badge-accrued {
+  background: #fff5e8;
+  color: #b46b17;
+}
+.badge-draft {
+  background: #f1f4f8;
+  color: #586474;
 }
 
-.cost-color {
-  color: var(--solo-primary);
+/* 主工作台平面卡片（遵循 DESIGN.md Flat-at-Rest 规范） */
+.surface-card {
+  background: #ffffff;
+  border: 1px solid #dde3ea;
+  border-radius: 14px;
+  overflow: hidden;
+}
+.sheet-tabs-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 20px;
+  border-bottom: 1px solid #edf0f4;
+  flex-wrap: wrap;
+}
+.sheet-tabs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.sheet-tab-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: #f1f4f8;
+  color: #586474;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.sheet-tab-btn.active {
+  background: #edf3ff;
+  color: #165dff;
+  border-color: rgba(22, 93, 255, 0.25);
+}
+.tab-count {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(24, 34, 48, 0.06);
+  font-variant-numeric: tabular-nums;
+}
+.sheet-tab-btn.active .tab-count {
+  background: rgba(22, 93, 255, 0.14);
+  color: #165dff;
+}
+.rule-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: #8a95a3;
 }
 
-/* Tables Section */
+/* 表格区域 */
 .table-container {
   overflow-x: auto;
-  border: 1px solid var(--solo-border-light);
-  border-radius: var(--solo-radius);
 }
-
-.records-table th {
-  background-color: var(--solo-border-light) !important;
-  font-weight: 700;
+.salary-table {
+  width: 100%;
+  border-collapse: collapse;
   font-size: 13px;
-  color: var(--solo-text-secondary);
+}
+.salary-table th {
   text-align: left;
+  padding: 10px 14px;
+  font-weight: 600;
+  color: #586474;
+  background: #f6f7f9;
+  border-bottom: 1px solid #dde3ea;
+  white-space: nowrap;
 }
-
-.records-table td {
-  font-size: 13px;
+.salary-table td {
+  padding: 8px 14px;
+  border-bottom: 1px solid #edf0f4;
+  vertical-align: middle;
 }
-
+.salary-table tbody tr:hover {
+  background: #f6f7f9;
+}
+.col-amount {
+  text-align: right !important;
+  font-variant-numeric: tabular-nums;
+}
+.num-cell {
+  font-variant-numeric: tabular-nums;
+  color: #182230;
+}
 .emp-name {
-  font-weight: 700;
-  color: var(--solo-text-primary);
+  font-weight: 600;
+  color: #182230;
 }
-
 .net-salary {
   font-weight: 700;
-  color: var(--solo-income);
+  color: #12805c;
+  font-variant-numeric: tabular-nums;
 }
-
 .total-cost {
   font-weight: 700;
-  color: var(--solo-primary);
+  color: #165dff;
+  font-variant-numeric: tabular-nums;
 }
-
 .action-cell {
   text-align: center;
 }
 
-/* Empty State */
+.amount-input {
+  width: 100%;
+}
+.amount-input :deep(.n-input__input-el) {
+  text-align: right !important;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 空状态引导区 */
 .empty-state {
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 48px 0;
-  color: var(--solo-text-muted);
+  padding: 52px 24px;
+  text-align: center;
+}
+.empty-icon-box {
+  width: 48px;
+  height: 48px;
+  border-radius: 12px;
+  background: #edf3ff;
+  color: #165dff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 22px;
+  margin-bottom: 14px;
+}
+.empty-title {
+  margin: 0 0 6px;
+  font-size: 15px;
+  font-weight: 600;
+  color: #182230;
+}
+.empty-desc {
+  margin: 0 0 20px;
+  font-size: 13px;
+  color: #8a95a3;
+  max-width: 440px;
+  line-height: 1.5;
+}
+.empty-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
-.empty-icon {
-  font-size: 40px;
-  margin-bottom: 12px;
-  color: var(--solo-text-muted);
-  opacity: 0.6;
-}
-
-.empty-state p {
-  font-size: 14px;
-}
-
-/* Roster Section */
-.roster-header {
+/* 底部动作条 */
+.sheet-footer {
+  padding: 14px 20px;
+  background: #f6f7f9;
+  border-top: 1px solid #edf0f4;
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 20px;
+  gap: 16px;
+  flex-wrap: wrap;
 }
-
-.roster-title {
-  font-size: 16px;
-  font-weight: 700;
-  color: var(--solo-text-primary);
+.hint-text {
+  font-size: 12px;
+  color: #586474;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
-
-.roster-table th {
-  background-color: var(--solo-border-light) !important;
-  font-weight: 700;
-  font-size: 13px;
-}
-
-.sheet-footer {
-  margin-top: 24px;
-  padding-top: 16px;
-  border-top: 1px dashed var(--solo-border-light);
-  display: flex;
-  justify-content: flex-end;
-}
-
 .paid-desc {
   font-size: 13px;
-  color: var(--solo-income);
+  color: #12805c;
   display: inline-flex;
   align-items: center;
   gap: 4px;
@@ -890,10 +1201,13 @@ function viewVoucher(voucherId: string) {
   align-items: center;
   margin-bottom: 10px;
 }
-
-.mt-4 { margin-top: 16px; }
+.mt-4 {
+  margin-top: 16px;
+}
 
 @media (max-width: 720px) {
-  .rd-allocation-row { grid-template-columns: 1fr; }
+  .rd-allocation-row {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

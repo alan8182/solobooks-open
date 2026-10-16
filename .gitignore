@@ -81,3 +81,12 @@ backend/uvicorn.log
 
 # ZCode 本地配置（含 MCP token，勿提交）
 .zcode/
+
+# 本地工具与临时文件
+.workbuddy/
+*.docx.tmp
+.slidep/
+.workbuddy-ai/
+
+# Office 锁文件（Word/WPS 打开时的 ~$ 临时文件）
+~$*

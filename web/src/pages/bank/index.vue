@@ -1,3 +1,4 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { computed, ref, h, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
@@ -686,10 +687,6 @@ onMounted(() => Promise.all([loadStatements(), loadRdOptions()]))
   <div class="bank-page">
     <div class="page-header">
       <div class="header-left">
-        <NButton text class="back-btn" @click="router.push('/mine')">
-          <template #icon><i class="ri-arrow-left-line" /></template>
-          返回
-        </NButton>
         <div class="title-section">
           <h2>银行对账</h2>
           <p class="subtitle">核对银行流水并匹配系统记账凭证，所有匹配都需手动确认</p>

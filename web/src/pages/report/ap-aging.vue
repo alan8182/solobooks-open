@@ -1,6 +1,7 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { ref, computed, onMounted } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { NCard, NButton, NTag, useMessage, NSpin, NRadioGroup, NRadioButton } from 'naive-ui'
 import apiClient from '@/api/client'
 import { formatMoney, formatDate } from '@/utils/format'
@@ -29,8 +30,14 @@ interface AgingResult {
   count: number
 }
 
+const route = useRoute()
 const router = useRouter()
 const message = useMessage()
+const month = computed(() => String(route.query.month || ''))
+
+function handleBack() {
+  router.push({ path: '/reports', query: month.value ? { month: month.value } : {} })
+}
 
 const loading = ref(false)
 const data = ref<AgingResult | null>(null)
@@ -61,9 +68,9 @@ onMounted(load)
   <div class="report-container">
     <div class="report-header">
       <div class="report-header-left">
-        <NButton text class="report-back-btn" @click="router.push('/reports')">
+        <NButton text class="report-back-btn" @click="handleBack">
           <template #icon><i class="ri-arrow-left-line" /></template>
-          返回
+          返回报表中心
         </NButton>
         <div class="report-title-section">
           <h2>应付账龄</h2>
@@ -72,7 +79,7 @@ onMounted(load)
       </div>
       <div class="report-header-right">
         <!-- ponytail: toggle between AR and AP aging without duplicating navigation items -->
-        <NRadioGroup value="ap" size="small" @update:value="(val: string) => val === 'ar' && router.push('/reports/ar-aging')">
+        <NRadioGroup value="ap" size="small" @update:value="(val: string) => val === 'ar' && router.push({ path: '/reports/ar-aging', query: month ? { month } : {} })">
           <NRadioButton value="ar">应收账款 (客户欠款)</NRadioButton>
           <NRadioButton value="ap">应付账款 (待付款项)</NRadioButton>
         </NRadioGroup>

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """存量发票"直付"模式迁移（P2 一次性）。
 
 背景：发票导入曾直接生成 贷1002（银行直付）凭证，配对前虚减银行存款；

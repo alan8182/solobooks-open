@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """MCP Server：把 agent 工具层开放为 MCP 协议端点。
 
 复用 `agent/tools.py` 的 Tool 四件套与 `execute_tool` 统一入口：

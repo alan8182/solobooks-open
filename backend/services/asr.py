@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """通义（DashScope）Paraformer 语音转文字 — 短录音文件识别"""
 import os
 import shutil

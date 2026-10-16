@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Category persistence service (async SQLite)."""
 from __future__ import annotations
 
@@ -51,9 +54,9 @@ def _cat_sort(name: str, base: int) -> int:
         "原材料采购", "商品采购", "生产成本", "研发支出-费用化支出", "人力成本", "员工福利费",
         "差旅费", "办公费", "业务招待费", "推广费",
         "租金物业", "运费及物流", "水电通讯费", "信息技术服务费",
-        "银行及金融手续费", "税费缴纳",
+        "银行及金融手续费", "税费缴纳", "所得税费用",
         "固定资产", "设备采购", "预付账款",
-        "其他支出",
+        "营业外支出", "其他支出",
     ]
     try:
         return base + order.index(name)

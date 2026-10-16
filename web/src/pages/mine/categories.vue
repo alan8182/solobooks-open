@@ -1,13 +1,12 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
 import { NCard, NButton, NTag, NSpace, useMessage, NInput, NModal, NForm, NFormItem, NSelect, NSpin } from 'naive-ui'
 import { useEntryStore } from '@/stores/entry'
 import { getCategories, createCategory, updateCategory, deleteCategory } from '@/api/category'
 import type { CategoryItem } from '@/api/category'
 import { useDeleteConfirm } from '@/composables/useDeleteConfirm'
 
-const router = useRouter()
 const message = useMessage()
 const entryStore = useEntryStore()
 const { confirmDelete } = useDeleteConfirm()
@@ -137,7 +136,6 @@ onMounted(load)
 <template>
   <div class="categories-page">
     <div class="page-header">
-      <NButton text @click="router.push('/mine')">← 返回</NButton>
       <div class="header-row">
         <h2>分类管理</h2>
         <NButton size="small" @click="showAddModal = true">新增分类</NButton>

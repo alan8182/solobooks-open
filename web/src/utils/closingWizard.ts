@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+ * Licensed under the SoloBooks License v2.0.
+ */
+
 export interface ClosingWizardEntryLike {
   id?: string
   direction?: string
@@ -23,6 +28,12 @@ export function signedInvoiceAmount(invoice?: ClosingWizardEntryLike | null): nu
   return Number(invoice.amount) || 0
 }
 
+// 展示用：发票原始金额（正常发票为正，红字发票保留负号），负号只表示真实红冲，
+// 与全站金额展示口径一致。配对与差额计算仍需用 signedInvoiceAmount 的对账符号。
+export function invoiceDisplayAmount(invoice?: ClosingWizardEntryLike | null): number {
+  return invoice ? (Number(invoice.amount) || 0) : 0
+}
+
 export function groupedEntryTotal(entries: ClosingWizardEntryLike[]): number {
   // Match the server: prefer the group's actual bank effect. Summing each
   // entry's bank-or-clearing effect counts the same receipt twice after settlement.
@@ -31,7 +42,7 @@ export function groupedEntryTotal(entries: ClosingWizardEntryLike[]): number {
   )), 0)
   if (bankCents !== 0) return bankCents / 100
   return entries.reduce((sum, entry) => sum + Math.round(
-    100 * voucherAccountEffect(entry, '1012'),
+    100 * (voucherAccountEffect(entry, '1012001') + voucherAccountEffect(entry, '1012')),
   ), 0) / 100
 }
 
@@ -56,7 +67,7 @@ export function reconciliationEntryEffect(entry: ClosingWizardEntryLike): number
   if (!entry.voucherLines) return signedInvoiceAmount(entry)
   const bankEffect = voucherAccountEffect(entry, '1002')
   if (Math.abs(bankEffect) > 1e-9) return bankEffect
-  const settlementEffect = voucherAccountEffect(entry, '1012')
+  const settlementEffect = voucherAccountEffect(entry, '1012001') + voucherAccountEffect(entry, '1012')
   if (Math.abs(settlementEffect) > 1e-9) return settlementEffect
   return bankEffect
 }

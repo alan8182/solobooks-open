@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """工资/社保/个税模块回归测试（2026-09-30 修复验证）。
 
 覆盖：
@@ -241,8 +244,8 @@ async def test_partial_rd_allocation_goes_to_admin():
     accrued = await accrue_salary_sheet("c-sal-partial", "owner-1", "2027-08")
     entry = await get_entry(accrued["accrual_voucher_id"], user_id="owner-1", company_id="c-sal-partial")
     lines = entry["voucherLines"]
-    rd_total = sum(Decimal(str(l["amount"])) for l in lines["debit"] if l["accountCode"] == "530101")
-    admin_total = sum(Decimal(str(l["amount"])) for l in lines["debit"] if l["accountCode"] == "5609")
+    rd_total = sum(Decimal(str(l["amount"])) for l in lines["debit"] if l["accountCode"] == "430100101")
+    admin_total = sum(Decimal(str(l["amount"])) for l in lines["debit"] if l["accountCode"] == "5602014")
     gross = Decimal("10000.00")
     company_ss = (gross * Decimal("0.33")).quantize(Decimal("0.01"))  # 25% 社保 + 8% 公积金
     r_cost = gross + company_ss

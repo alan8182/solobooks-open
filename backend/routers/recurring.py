@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """周期性交易模板路由"""
 from fastapi import APIRouter, Depends, HTTPException
 from deps.auth import AuthContext, require_auth

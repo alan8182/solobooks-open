@@ -1,32 +1,35 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """
 会计科目映射表（硬编码）
 用户分类 → 会计科目代码/名称/类型
-基于《小企业会计准则》简化版
+编码对齐《小企业会计准则》（4位总账+7位明细+9位二级明细）
 """
 
 # 科目映射（按用户分类索引）
 CATEGORY_TO_ACCOUNT = {
     # ── 收入类 ──
     "主营业务收入": {
-        "accountCode": "6001",
+        "accountCode": "5001",
         "accountName": "主营业务收入",
         "accountType": "损益-收入",
         "defaultCounterparty": "1002"  # 银行存款
     },
     "其他业务收入": {
-        "accountCode": "6051",
+        "accountCode": "5051",
         "accountName": "其他业务收入",
         "accountType": "损益-收入",
         "defaultCounterparty": "1002"
     },
     "营业外收入": {
-        "accountCode": "6301",
+        "accountCode": "5301",
         "accountName": "营业外收入",
         "accountType": "损益-收入",
         "defaultCounterparty": "1002"
     },
     "利息收入": {
-        "accountCode": "6603",
+        "accountCode": "5603005",
         "accountName": "财务费用-利息收入",
         "accountType": "损益-费用",
         "defaultCounterparty": "1002"
@@ -34,7 +37,7 @@ CATEGORY_TO_ACCOUNT = {
 
     # ── 支出类 ──
     "研发支出-费用化支出": {
-        "accountCode": "5301",
+        "accountCode": "4301",
         "accountName": "研发支出-费用化支出",
         "accountType": "损益-成本",
         "defaultCounterparty": "1002"
@@ -46,55 +49,55 @@ CATEGORY_TO_ACCOUNT = {
         "defaultCounterparty": "1002"
     },
     "生产成本": {
-        "accountCode": "5101",
+        "accountCode": "5401002",
         "accountName": "主营业务成本-生产",
         "accountType": "损益-成本",
         "defaultCounterparty": "1002"
     },
     "差旅费": {
-        "accountCode": "5601",
+        "accountCode": "5602006",
         "accountName": "管理费用-差旅费",
         "accountType": "损益-费用",
         "defaultCounterparty": "1002"
     },
     "差旅": {
-        "accountCode": "5601",
+        "accountCode": "5602006",
         "accountName": "管理费用-差旅费",
         "accountType": "损益-费用",
         "defaultCounterparty": "1002"
     },
     "交通": {
-        "accountCode": "5601",
+        "accountCode": "5602006",
         "accountName": "管理费用-差旅费",
         "accountType": "损益-费用",
         "defaultCounterparty": "1002"
     },
     "办公费": {
-        "accountCode": "5602",
+        "accountCode": "5602004",
         "accountName": "管理费用-办公费",
         "accountType": "损益-费用",
         "defaultCounterparty": "1002"
     },
     "办公": {
-        "accountCode": "5602",
+        "accountCode": "5602004",
         "accountName": "管理费用-办公费",
         "accountType": "损益-费用",
         "defaultCounterparty": "1002"
     },
     "业务招待费": {
-        "accountCode": "5603",
+        "accountCode": "5602002",
         "accountName": "管理费用-业务招待费",
         "accountType": "损益-费用",
         "defaultCounterparty": "1002"
     },
     "业务招待": {
-        "accountCode": "5603",
+        "accountCode": "5602002",
         "accountName": "管理费用-业务招待费",
         "accountType": "损益-费用",
         "defaultCounterparty": "1002"
     },
     "餐饮": {
-        "accountCode": "5603",
+        "accountCode": "5602002",
         "accountName": "管理费用-业务招待费",
         "accountType": "损益-费用",
         "defaultCounterparty": "1002"
@@ -106,55 +109,55 @@ CATEGORY_TO_ACCOUNT = {
         "defaultCounterparty": "1002"
     },
     "人力成本": {
-        "accountCode": "5001",
+        "accountCode": "5401001",
         "accountName": "主营业务成本-人力",
         "accountType": "损益-成本",
         "defaultCounterparty": "1002"
     },
     "员工福利": {
-        "accountCode": "5609",
+        "accountCode": "5602014",
         "accountName": "管理费用-职工福利费",
         "accountType": "损益-费用",
         "defaultCounterparty": "1002"
     },
     "员工福利费": {
-        "accountCode": "5609",
+        "accountCode": "5602014",
         "accountName": "管理费用-职工福利费",
         "accountType": "损益-费用",
         "defaultCounterparty": "1002"
     },
     "租金物业": {
-        "accountCode": "5604",
-        "accountName": "管理费用-租赁物业",
+        "accountCode": "5602013",
+        "accountName": "管理费用-租赁费",
         "accountType": "损益-费用",
         "defaultCounterparty": "1002"
     },
     "房租物业": {
-        "accountCode": "5604",
-        "accountName": "管理费用-租赁物业",
+        "accountCode": "5602013",
+        "accountName": "管理费用-租赁费",
         "accountType": "损益-费用",
         "defaultCounterparty": "1002"
     },
     "信息技术服务费": {
-        "accountCode": "5605",
+        "accountCode": "5602015",
         "accountName": "管理费用-信息技术服务费",
         "accountType": "损益-费用",
         "defaultCounterparty": "1002"
     },
     "运费及物流": {
-        "accountCode": "5606",
-        "accountName": "管理费用-运费及物流",
+        "accountCode": "5601011",
+        "accountName": "销售费用-运输费",
         "accountType": "损益-费用",
         "defaultCounterparty": "1002"
     },
     "水电通讯费": {
-        "accountCode": "5607",
-        "accountName": "管理费用-水电通讯费",
+        "accountCode": "5602005",
+        "accountName": "管理费用-水电费",
         "accountType": "损益-费用",
         "defaultCounterparty": "1002"
     },
     "银行及金融手续费": {
-        "accountCode": "6602",
+        "accountCode": "5603002",
         "accountName": "财务费用-手续费",
         "accountType": "损益-费用",
         "defaultCounterparty": "1002"
@@ -172,13 +175,13 @@ CATEGORY_TO_ACCOUNT = {
         "defaultCounterparty": "1002"
     },
     "推广费": {
-        "accountCode": "6601",
-        "accountName": "销售费用-推广费",
+        "accountCode": "5601016",
+        "accountName": "销售费用-业务宣传费",
         "accountType": "损益-费用",
         "defaultCounterparty": "1002"
     },
     "其他支出": {
-        "accountCode": "5699",
+        "accountCode": "5602999",
         "accountName": "管理费用-其他",
         "accountType": "损益-费用",
         "defaultCounterparty": "1002"
@@ -195,17 +198,29 @@ CATEGORY_TO_ACCOUNT = {
         "accountType": "资产",
         "defaultCounterparty": "1002"
     },
+    "营业外支出": {
+        "accountCode": "5711",
+        "accountName": "营业外支出",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "所得税费用": {
+        "accountCode": "5801",
+        "accountName": "所得税费用",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "2221006"  # 应交所得税
+    },
 
     # ── 资本与往来 ──
     "股东投入": {
-        "accountCode": "4001",
+        "accountCode": "3001",
         "accountName": "实收资本",
         "accountType": "权益",
         "defaultCounterparty": "1002"
     },
     "资本公积": {
-        "accountCode": "4002",
-        "accountName": "资本公积-股本溢价",
+        "accountCode": "3002",
+        "accountName": "资本公积",
         "accountType": "权益",
         "defaultCounterparty": "1002"
     },
@@ -256,7 +271,8 @@ CATEGORY_TO_ACCOUNT = {
 # 银行/现金科目
 COUNTERPARTY_ACCOUNTS = {
     "1002": {"accountName": "银行存款", "accountType": "资产"},
-    "1012": {"accountName": "微信支付待结算", "accountType": "资产"},
+    "1012": {"accountName": "其他货币资金", "accountType": "资产"},
+    "1012001": {"accountName": "微信支付待结算", "accountType": "资产"},
     "1001": {"accountName": "库存现金", "accountType": "资产"},
     "1122": {"accountName": "应收账款", "accountType": "资产"},
     "1221": {"accountName": "其他应收款", "accountType": "资产"},
@@ -303,7 +319,7 @@ def get_voucher_hint(direction: str, category: str, amount: Any, payer: str = "c
         category = "其他支出"
 
     acct = CATEGORY_TO_ACCOUNT.get(category, {})
-    acct_code = acct.get("accountCode", "5699")
+    acct_code = acct.get("accountCode", "5602999")
     acct_name = acct.get("accountName", "管理费用-其他")
     counterparty = acct.get("defaultCounterparty", "1002")
 
@@ -321,7 +337,7 @@ def get_voucher_hint(direction: str, category: str, amount: Any, payer: str = "c
     if direction == "expense":
         if payer == "boss_personal" or (payer and (payer == "employee_personal" or payer.startswith("employee_personal:"))):
             counterparty = "2241"
-    
+
     cp_name = COUNTERPARTY_ACCOUNTS.get(counterparty, {}).get("accountName", "银行存款")
     if counterparty == "2241":
         cp_name = payable_name

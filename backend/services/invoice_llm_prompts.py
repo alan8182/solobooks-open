@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """发票导入 LLM 提示词"""
 
 INVOICE_COLUMN_MAPPING_PROMPT = """你是一个发票Excel导入助手。用户上传了一个发票Excel文件，包含以下列名：

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """待办生成规则测试：冲销排除、被冲销原条目排除、小额豁免。"""
 from __future__ import annotations
 

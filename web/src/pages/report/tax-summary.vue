@@ -1,17 +1,32 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { NCard, NTag, NSpin, useMessage, NSelect, NButton, NGrid, NGridItem } from 'naive-ui'
 import { getTaxSummary } from '@/api/report'
 import { formatMoney, formatDate } from '@/utils/format'
 import type { TaxSummaryResponse } from '@/api/types'
 
+const route = useRoute()
 const router = useRouter()
 const message = useMessage()
+const requestedMonth = String(route.query.month || '')
+const hasRequestedMonth = /^\d{4}-(0[1-9]|1[0-2])$/.test(requestedMonth)
+
 function previousCompletedQuarter(): string {
+  if (hasRequestedMonth) {
+    const year = requestedMonth.slice(0, 4)
+    const m = parseInt(requestedMonth.slice(5, 7), 10)
+    const q = Math.ceil(m / 3)
+    return `${year}-Q${q}`
+  }
   const now = new Date()
   const currentQuarter = Math.floor(now.getMonth() / 3) + 1
   return currentQuarter === 1 ? `${now.getFullYear() - 1}-Q4` : `${now.getFullYear()}-Q${currentQuarter - 1}`
+}
+
+function handleBack() {
+  router.push({ path: '/reports', query: hasRequestedMonth ? { month: requestedMonth } : {} })
 }
 
 const period = ref(previousCompletedQuarter())
@@ -54,9 +69,9 @@ onMounted(load)
   <div class="report-container">
     <div class="report-header">
       <div class="report-header-left">
-        <NButton text class="report-back-btn" @click="router.push('/reports')">
+        <NButton text class="report-back-btn" @click="handleBack">
           <template #icon><i class="ri-arrow-left-line" /></template>
-          返回
+          返回报表中心
         </NButton>
         <div class="report-title-section">
           <h2>税务汇总及申报提醒</h2>

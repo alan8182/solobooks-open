@@ -1,6 +1,6 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, computed, h, onMounted, watch } from 'vue'
-import { useRouter } from 'vue-router'
 import {
   NCard, NButton, NSpace, useMessage,
   NInput, NModal, NForm, NFormItem, NSpin, NTree,
@@ -26,7 +26,6 @@ interface AccountNode {
   children: AccountNode[]
 }
 
-const router = useRouter()
 const message = useMessage()
 
 // Reference components to satisfy strict TS unused imports checker
@@ -462,15 +461,13 @@ onMounted(loadTree)
 <template>
   <div class="accounts-page">
     <div class="page-header">
-      <NButton text class="back-btn" @click="router.push('/mine')">
-        <template #icon><i class="ri-arrow-left-line" /></template>
-        返回设置
-      </NButton>
-      <div class="header-row">
+      <div class="header-left">
         <div class="title-section">
           <h2>科目表</h2>
           <p class="subtitle">管理您的企业级科目体系，支持两级科目架构与自定义扩展</p>
         </div>
+      </div>
+      <div class="header-right">
         <NButton type="primary" class="add-main-btn" @click="openAddModal()">
           <template #icon><i class="ri-add-line" /></template>
           新增科目
@@ -673,17 +670,10 @@ onMounted(loadTree)
   font-weight: 500;
   color: var(--solo-text-secondary);
   transition: color 0.2s ease;
-  margin-bottom: 8px;
 }
 
 .back-btn:hover {
   color: var(--solo-primary);
-}
-
-.header-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
 }
 
 .title-section h2 {

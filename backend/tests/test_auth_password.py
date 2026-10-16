@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """密码登录：设置/修改/重置、防爆破、以及 _persist_user 不覆盖密码的回归。
 
 覆盖验收点：

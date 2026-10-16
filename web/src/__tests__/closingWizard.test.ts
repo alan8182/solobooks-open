@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+ * Licensed under the SoloBooks License v2.0.
+ */
+
 import { describe, expect, it } from 'vitest'
 import {
   amountClassForDirection,
@@ -5,6 +10,7 @@ import {
   getStatementMatchedEntryIds,
   getMatchedEntryIdSets,
   groupedEntryTotal,
+  invoiceDisplayAmount,
   isReconciledEntry,
   reconciliationDifference,
   signedInvoiceAmount,
@@ -33,7 +39,7 @@ describe('closing wizard invoice display helpers', () => {
     }, entries)).toBeNull()
   })
 
-  it('shows expense invoices as negative amounts', () => {
+  it('signs expense invoices negative for reconciliation math only', () => {
     expect(signedInvoiceAmount({ direction: 'expense', amount: 500 })).toBe(-500)
     expect(amountClassForDirection('expense', 500)).toBe('expense')
   })
@@ -45,6 +51,13 @@ describe('closing wizard invoice display helpers', () => {
 
   it('preserves negative income amounts for refunds', () => {
     expect(signedInvoiceAmount({ direction: 'income', amount: -5 })).toBe(-5)
+  })
+
+  it('displays invoices with their raw amount so only red-letter ones read negative', () => {
+    expect(invoiceDisplayAmount({ direction: 'expense', amount: 431.25 })).toBe(431.25)
+    expect(invoiceDisplayAmount({ direction: 'income', amount: 300 })).toBe(300)
+    expect(invoiceDisplayAmount({ direction: 'expense', amount: -5 })).toBe(-5)
+    expect(invoiceDisplayAmount(null)).toBe(0)
   })
 
   it('only treats linked statements as confirmed when the entry is reconciled', () => {
@@ -81,20 +94,20 @@ describe('closing wizard invoice display helpers', () => {
     expect(reconciliationDifference(58.5, entries)).toBe(0.03)
   })
 
-  it('uses the WeChat 1012 clearing effect for a net settlement', () => {
+  it('uses the WeChat clearing effect for a net settlement', () => {
     const entries = [
       {
         id: 'sale', direction: 'income', amount: 59,
         voucherLines: {
-          debit: [{ accountCode: '1012', amount: 59 }],
-          credit: [{ accountCode: '6001', amount: 59 }],
+          debit: [{ accountCode: '1012001', amount: 59 }],
+          credit: [{ accountCode: '5001', amount: 59 }],
         },
       },
       {
         id: 'fee', direction: 'expense', amount: 0.53,
         voucherLines: {
-          debit: [{ accountCode: '5608', amount: 0.53 }],
-          credit: [{ accountCode: '1012', amount: 0.53 }],
+          debit: [{ accountCode: '5603002', amount: 0.53 }],
+          credit: [{ accountCode: '1012001', amount: 0.53 }],
         },
       },
     ]
@@ -184,9 +197,9 @@ describe('closing wizard invoice display helpers', () => {
 
 it('counts bank settlement once alongside original receipts and fees', () => {
   const entries = [
-    { voucherLines: { debit: [{ accountCode: '1012', amount: '100.00' }], credit: [{ accountCode: '6001', amount: '100.00' }] } },
-    { voucherLines: { debit: [{ accountCode: '5608', amount: '0.60' }], credit: [{ accountCode: '1012', amount: '0.60' }] } },
-    { voucherLines: { debit: [{ accountCode: '1002', amount: '99.40' }], credit: [{ accountCode: '1012', amount: '99.40' }] } },
+    { voucherLines: { debit: [{ accountCode: '1012001', amount: '100.00' }], credit: [{ accountCode: '5001', amount: '100.00' }] } },
+    { voucherLines: { debit: [{ accountCode: '5603002', amount: '0.60' }], credit: [{ accountCode: '1012001', amount: '0.60' }] } },
+    { voucherLines: { debit: [{ accountCode: '1002', amount: '99.40' }], credit: [{ accountCode: '1012001', amount: '99.40' }] } },
   ]
   expect(groupedEntryTotal(entries.slice(0, 2))).toBe(99.4)
   expect(groupedEntryTotal(entries)).toBe(99.4)

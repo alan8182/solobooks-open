@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """M3 申报作业包路由：征期日历 + 作业包 + 闭环。"""
 from __future__ import annotations
 
@@ -14,6 +17,10 @@ router = APIRouter(prefix="/api/tax-filing", tags=["tax-filing"], dependencies=[
 
 class MarkFiledRequest(BaseModel):
     evidence: Optional[Dict[str, Any]] = None
+
+
+class WaiveRequest(BaseModel):
+    reason: Optional[str] = None
 
 
 @router.post("/deadlines/refresh")
@@ -57,6 +64,24 @@ async def mark_item_filed(
             ctx.company_id,
             deadline_id,
             evidence=req.evidence if req else None,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+
+@router.post("/items/{deadline_id}/waive")
+async def waive_item(
+    deadline_id: str,
+    req: Optional[WaiveRequest] = None,
+    ctx: AuthContext = Depends(require_auth),
+):
+    """把某申报事项标记为本期不适用（豁免），不参与逾期统计与催办。"""
+    try:
+        return await filing_deadline_service.waive_deadline(
+            ctx.company_id,
+            ctx.user_id,
+            deadline_id,
+            reason=req.reason if req else None,
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e

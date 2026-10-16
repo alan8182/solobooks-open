@@ -1,3 +1,4 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useRouter } from 'vue-router'
@@ -30,7 +31,7 @@ const companyOptions = computed<DropdownOption[]>(() => {
 })
 
 const userOptions: DropdownOption[] = [
-  { label: '个人中心', key: 'mine' },
+  { label: '个人设置', key: 'mine' },
   { label: '公司管理', key: 'companies' },
   { type: 'divider' as const },
   { label: '退出登录', key: 'logout' },

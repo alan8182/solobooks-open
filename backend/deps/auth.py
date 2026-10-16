@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Authentication dependencies."""
 from __future__ import annotations
 
@@ -126,8 +129,22 @@ async def _load_user_flags(user_id: str) -> Optional[tuple[bool, bool]]:
 async def require_auth(authorization: Optional[str] = Header(default=None)) -> AuthContext:
     """Validate bearer token and return auth context.
 
+    支持两类令牌：
+    1. 外部/插件长效 PAT (sbk_...)：查 mcp_tokens 表并校验
+    2. Web 前端短效 JWT (或开发兜底 test-token)
     每次请求顺路查库校验 is_disabled，禁用即时生效（返回 401）。
     """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="未登录或缺少 Authorization")
+
+    raw_token = _normalize_token(authorization.split(" ", 1)[1])
+    if raw_token.startswith("sbk_"):
+        from services.mcp_token_service import validate_token
+        pat = await validate_token(raw_token)
+        if not pat:
+            raise HTTPException(status_code=401, detail="PAT 令牌无效或已过期")
+        return pat.context
+
     ctx = _parse_identity(authorization)
     flags = await _load_user_flags(ctx.user_id)
     if flags and flags[1]:

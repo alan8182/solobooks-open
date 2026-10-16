@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """V3 记账路由：文字/语音/拍单据/确认"""
 import base64
 import httpx

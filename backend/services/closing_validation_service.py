@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Close checks against authoritative journals, in the caller's transaction."""
 from __future__ import annotations
 
@@ -28,7 +31,7 @@ async def possible_duplicate_wechat_income(session: AsyncSession, entry: Journal
     ))).scalars().all()
     bank_effect = sum((money(line.amount) * (1 if line.direction == "debit" else -1)
                        for line in own_lines if line.account_code == "1002"), ZERO)
-    if bank_effect <= ZERO or not any(line.account_code in {"6001", "6051"} for line in own_lines):
+    if bank_effect <= ZERO or not any(line.account_code in {"5001", "5051"} for line in own_lines):
         return []
     candidates = (await session.execute(select(JournalEntry, JournalLine).join(
         JournalLine, JournalLine.journal_entry_id == JournalEntry.id,
@@ -38,7 +41,7 @@ async def possible_duplicate_wechat_income(session: AsyncSession, entry: Journal
         JournalEntry.occurred_on >= entry.occurred_on - timedelta(days=5),
         JournalEntry.occurred_on <= entry.occurred_on,
         JournalEntry.status.in_(("draft", "pending_review", "posted")),
-        JournalLine.account_code == "1012",
+        JournalLine.account_code.in_(("1012001", "1012")),
     ))).all()
     groups: dict[tuple, dict[str, Any]] = {}
     days: dict[date, dict[str, Any]] = {}

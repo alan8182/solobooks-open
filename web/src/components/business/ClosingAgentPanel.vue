@@ -1,3 +1,4 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { computed, nextTick, ref } from 'vue'
 import { NButton, NCard, NInput, NSpin } from 'naive-ui'
@@ -207,8 +208,11 @@ function stopStream() {
       <div v-if="messages.length === 0" class="panel-empty">
         点击上方快捷按钮或直接输入，比如"帮我结 {{ month }} 的账"。
       </div>
-      <div v-for="(msg, i) in messages" :key="i" class="msg" :class="msg.role">
-        <div class="msg-avatar">{{ msg.role === 'user' ? '我' : 'AI' }}</div>
+      <div v-for="(msg, i) in messages" :key="i" class="msg" :class="[msg.role, { streaming: msg.streaming }]">
+        <div class="msg-avatar" :class="{ 'is-streaming': msg.streaming }">
+          <i v-if="msg.role === 'user'" class="ri-user-3-fill" />
+          <img v-else src="/solo-logo.png" alt="梭罗" class="avatar-logo" />
+        </div>
         <div class="msg-main">
           <div class="tool-steps" v-if="msg.steps && msg.steps.length">
             <div class="tool-step" v-for="(step, j) in msg.steps" :key="j">
@@ -218,10 +222,18 @@ function stopStream() {
               <span class="step-args" v-if="step.argsSummary">{{ step.argsSummary }}</span>
             </div>
           </div>
-          <div class="msg-bubble" v-if="msg.content || msg.streaming === false">
+          <div class="msg-bubble" v-if="msg.content || msg.streaming || msg.streaming === false">
             <template v-if="msg.role === 'user'">{{ msg.content }}</template>
-            <div v-else class="md-body" v-html="renderMarkdown(msg.content)"></div>
-            <span class="cursor" v-if="msg.streaming && msg.content">▍</span>
+            <template v-else>
+              <!-- 等待首字时的流体打字波 -->
+              <div class="typing-wave" v-if="msg.streaming && !msg.content && (!msg.steps || !msg.steps.length)">
+                <span></span>
+                <span></span>
+                <span></span>
+              </div>
+              <div v-if="msg.content" class="md-body" v-html="renderMarkdown(msg.content)"></div>
+              <span class="cursor-caret" v-if="msg.streaming && msg.content" />
+            </template>
             <div class="msg-tools" v-if="msg.content && !msg.streaming">
               <button
                 type="button"
@@ -324,23 +336,44 @@ function stopStream() {
   flex-direction: row-reverse;
 }
 .msg-avatar {
-  width: 26px;
-  height: 26px;
-  border-radius: 50%;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 11px;
-  font-weight: 600;
+  font-size: 13px;
   flex-shrink: 0;
+  transition: all 0.3s ease;
+  overflow: hidden;
 }
 .msg.user .msg-avatar {
   background: var(--solo-primary);
   color: #fff;
+  border-radius: 8px;
 }
 .msg.assistant .msg-avatar {
-  background: var(--solo-bg-page);
-  color: var(--solo-text-secondary);
+  background: #ffffff;
+  border: 1px solid rgba(22, 93, 255, 0.16);
+  padding: 2px;
+}
+.avatar-logo {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+.msg.assistant .msg-avatar.is-streaming {
+  border-color: rgba(22, 93, 255, 0.45);
+  animation: avatar-breathe 2s infinite ease-in-out;
+}
+@keyframes avatar-breathe {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(22, 93, 255, 0.25);
+  }
+  50% {
+    box-shadow: 0 0 0 3px rgba(22, 93, 255, 0.15), 0 2px 8px rgba(22, 93, 255, 0.2);
+  }
 }
 .msg-main {
   max-width: 88%;
@@ -408,12 +441,44 @@ function stopStream() {
   border: 1px solid rgba(0, 0, 0, 0.1);
   padding: 3px 7px;
 }
-.cursor {
-  animation: blink 1s steps(1) infinite;
-  color: var(--solo-ai, #165dff);
+/* 流光打字光标 */
+.cursor-caret {
+  display: inline-block;
+  width: 2px;
+  height: 13px;
+  margin-left: 2px;
+  vertical-align: -1.5px;
+  background: var(--solo-primary, #165dff);
+  border-radius: 1px;
+  box-shadow: 0 0 6px rgba(22, 93, 255, 0.5);
+  animation: caret-pulse 0.9s infinite ease-in-out;
 }
-@keyframes blink {
-  50% { opacity: 0; }
+@keyframes caret-pulse {
+  0%, 100% { opacity: 0.2; }
+  50% { opacity: 1; }
+}
+
+/* 气泡内三点流体打字波（Typing Wave） */
+.typing-wave {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 4px;
+  min-height: 20px;
+}
+.typing-wave span {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background-color: var(--solo-primary, #165dff);
+  opacity: 0.35;
+  animation: typing-bounce 1.4s infinite ease-in-out both;
+}
+.typing-wave span:nth-child(1) { animation-delay: -0.32s; }
+.typing-wave span:nth-child(2) { animation-delay: -0.16s; }
+@keyframes typing-bounce {
+  0%, 80%, 100% { transform: translateY(0); opacity: 0.35; }
+  40% { transform: translateY(-4px); opacity: 1; }
 }
 .tool-steps {
   display: flex;

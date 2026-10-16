@@ -1,16 +1,15 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { NCard, NButton, NModal, NForm, NFormItem, NInput, useMessage } from 'naive-ui'
+import { NCard, NButton, NModal, NForm, NFormItem, NInput, NTag, useMessage } from 'naive-ui'
 import { useAuthStore } from '@/stores/auth'
-import { useEntryStore } from '@/stores/entry'
-import { formatMoney } from '@/utils/format'
 import { setPassword, updateProfile } from '@/api/auth'
 
+// ponytail: streamlined mine page from messy duplicate feature hub into clean user profile & account security
 const router = useRouter()
 const message = useMessage()
 const authStore = useAuthStore()
-const entryStore = useEntryStore()
 
 const user = ref(authStore.user)
 
@@ -106,102 +105,106 @@ onMounted(async () => {
 <template>
   <div class="mine-page">
     <div class="page-header">
-      <h2>个人中心</h2>
+      <div class="page-header-left">
+        <div class="title-section">
+          <h2>个人设置</h2>
+          <p class="subtitle">管理您的个人资料、账号安全与登录凭证</p>
+        </div>
+      </div>
     </div>
 
-    <!-- User info -->
-    <NCard :bordered="false" class="user-card mb-4">
-      <div class="user-info">
+    <!-- 个人基本资料 -->
+    <NCard :bordered="false" class="settings-card mb-4">
+      <div class="card-section-title">基本资料</div>
+      <div class="user-info-row">
         <div class="user-avatar">{{ user?.nickname?.[0] || '?' }}</div>
         <div class="user-detail">
-          <div class="user-name">{{ user?.nickname || '用户' }}</div>
-          <div class="user-phone">{{ user?.phone || '' }}</div>
+          <div class="user-name-line">
+            <span class="user-name">{{ user?.nickname || '未设置昵称' }}</span>
+            <NTag size="tiny" type="info" :bordered="false">管理员</NTag>
+          </div>
+          <div class="user-phone">绑定手机：{{ user?.phone || '未绑定' }}</div>
         </div>
-        <NButton text size="small" class="edit-profile-btn" @click="openProfileModal">
+        <NButton secondary size="small" class="action-btn" @click="openProfileModal">
           <template #icon><i class="ri-edit-line" /></template>
-          编辑
+          修改昵称
+        </NButton>
+      </div>
+      <div class="profile-tip">
+        <i class="ri-information-line" />
+        凭证署名（制单人/审核人/记账人）优先显示此昵称；未设置时显示掩码手机号。
+      </div>
+    </NCard>
+
+    <!-- 安全与登录 -->
+    <NCard :bordered="false" class="settings-card mb-4">
+      <div class="card-section-title">账号与安全</div>
+      <div class="setting-item-row">
+        <div class="item-icon-box">
+          <i class="ri-lock-password-line" />
+        </div>
+        <div class="item-info">
+          <div class="item-title">
+            <span>登录密码</span>
+            <NTag size="tiny" :type="hasPassword ? 'success' : 'warning'" :bordered="false">
+              {{ hasPassword ? '已设置' : '未设置' }}
+            </NTag>
+          </div>
+          <div class="item-desc">设置后支持使用手机号与密码直接登录</div>
+        </div>
+        <NButton secondary size="small" class="action-btn" @click="openPwdModal">
+          {{ hasPassword ? '修改密码' : '设置密码' }}
+        </NButton>
+      </div>
+
+      <div class="item-divider" />
+
+      <div class="setting-item-row">
+        <div class="item-icon-box">
+          <i class="ri-smartphone-line" />
+        </div>
+        <div class="item-info">
+          <div class="item-title">
+            <span>登录手机号</span>
+            <NTag size="tiny" type="success" :bordered="false">已绑定</NTag>
+          </div>
+          <div class="item-desc">{{ user?.phone || '暂无手机号' }}</div>
+        </div>
+      </div>
+    </NCard>
+
+    <!-- 开放接入与令牌 -->
+    <NCard :bordered="false" class="settings-card mb-4">
+      <div class="card-section-title">开发者与 AI 接入</div>
+      <div class="setting-item-row">
+        <div class="item-icon-box mcp-icon">
+          <i class="ri-plug-line" />
+        </div>
+        <div class="item-info">
+          <div class="item-title">AI 连接（MCP 访问令牌）</div>
+          <div class="item-desc">签发用于 Claude Desktop 或外部 Agent 的个人访问令牌</div>
+        </div>
+        <NButton secondary size="small" class="action-btn" @click="router.push('/mine/mcp')">
+          管理令牌
         </NButton>
       </div>
     </NCard>
 
-    <!-- Stats -->
-    <NCard :bordered="false" class="stats-card mb-4">
-      <div class="stats-grid">
-        <div class="stat-item">
-          <span class="stat-number">{{ entryStore.activeEntries.length }}</span>
-          <span class="stat-label">记账笔数</span>
+    <!-- 退出登录 -->
+    <NCard :bordered="false" class="settings-card logout-card">
+      <div class="logout-row">
+        <div>
+          <div class="logout-title">退出当前账号</div>
+          <div class="logout-desc">退出后需要重新通过手机短信或密码登录系统</div>
         </div>
-        <div class="stat-item">
-          <span class="stat-number income">{{ formatMoney(entryStore.monthlyIncome) }}</span>
-          <span class="stat-label">本月收入</span>
-        </div>
-        <div class="stat-item">
-          <span class="stat-number expense">{{ formatMoney(entryStore.monthlyExpense) }}</span>
-          <span class="stat-label">本月支出</span>
-        </div>
+        <NButton quaternary type="error" size="small" @click="handleLogout">
+          <template #icon><i class="ri-logout-box-r-line" /></template>
+          退出登录
+        </NButton>
       </div>
     </NCard>
 
-    <!-- Menu list -->
-    <NCard :bordered="false" class="menu-card mb-4">
-      <div class="menu-item" @click="openPwdModal">
-        <span class="menu-icon"><i class="ri-lock-password-line" /></span>
-        <span class="menu-label">设置密码</span>
-        <span class="menu-extra">{{ hasPassword ? '已设置' : '未设置' }}</span>
-        <span class="menu-arrow">→</span>
-      </div>
-      <div class="menu-divider" />
-      <div class="menu-item" @click="router.push('/mine/companies')">
-        <span class="menu-icon"><i class="ri-building-2-line" /></span>
-        <span class="menu-label">公司管理</span>
-        <span class="menu-arrow">→</span>
-      </div>
-      <div class="menu-divider" />
-      <div class="menu-item" @click="router.push('/mine/categories')">
-        <span class="menu-icon"><i class="ri-folder-2-line" /></span>
-        <span class="menu-label">分类管理</span>
-        <span class="menu-arrow">→</span>
-      </div>
-      <div class="menu-divider" />
-      <div class="menu-item" @click="router.push('/mine/accounts')">
-        <span class="menu-icon"><i class="ri-book-2-line" /></span>
-        <span class="menu-label">科目表</span>
-        <span class="menu-arrow">→</span>
-      </div>
-      <div class="menu-divider" />
-      <div class="menu-item" @click="router.push('/mine/salary')">
-        <span class="menu-icon"><i class="ri-money-cny-circle-line" /></span>
-        <span class="menu-label">薪酬社保</span>
-        <span class="menu-arrow">→</span>
-      </div>
-      <div class="menu-divider" />
-      <div class="menu-item" @click="router.push('/mine/opening')">
-        <span class="menu-icon"><i class="ri-scales-3-line" /></span>
-        <span class="menu-label">期初余额</span>
-        <span class="menu-arrow">→</span>
-      </div>
-      <div class="menu-divider" />
-      <div class="menu-item" @click="router.push('/recurring')">
-        <span class="menu-icon"><i class="ri-repeat-2-line" /></span>
-        <span class="menu-label">周期性模板</span>
-        <span class="menu-arrow">→</span>
-      </div>
-      <div class="menu-divider" />
-      <div class="menu-item" @click="router.push('/bank')">
-        <span class="menu-icon"><i class="ri-bank-line" /></span>
-        <span class="menu-label">银行对账</span>
-        <span class="menu-arrow">→</span>
-      </div>
-      <div class="menu-divider" />
-      <div class="menu-item" @click="router.push('/mine/audit-log')">
-        <span class="menu-icon"><i class="ri-file-list-3-line" /></span>
-        <span class="menu-label">审计日志</span>
-        <span class="menu-arrow">→</span>
-      </div>
-    </NCard>
-
-    <NButton block @click="handleLogout">退出登录</NButton>
-
+    <!-- 弹窗：设置/修改密码 -->
     <NModal
       v-model:show="pwdVisible"
       preset="card"
@@ -242,10 +245,11 @@ onMounted(async () => {
       </template>
     </NModal>
 
+    <!-- 弹窗：修改昵称 -->
     <NModal
       v-model:show="profileVisible"
       preset="card"
-      title="编辑资料"
+      title="修改昵称"
       style="max-width: 400px; border-radius: var(--solo-radius-lg);"
     >
       <NForm style="margin-top: 8px;">
@@ -274,32 +278,159 @@ onMounted(async () => {
 
 <style scoped>
 .mine-page {
-  max-width: 640px;
+  max-width: 680px;
   margin: 0 auto;
 }
 .page-header {
-  margin-bottom: 20px;
+  margin-bottom: 24px;
 }
 .page-header h2 {
   margin: 0;
-  font-size: 20px;
-  font-weight: 600;
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--solo-text-primary);
+}
+.page-header .subtitle {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: var(--solo-text-muted);
 }
 .mb-4 { margin-bottom: 16px; }
 
-/* User */
-.user-card {
+.settings-card {
   border-radius: var(--solo-radius-lg);
+  padding: 4px;
 }
-.user-info {
+.card-section-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--solo-text-secondary);
+  margin-bottom: 16px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+/* User Info Row */
+.user-info-row {
   display: flex;
   align-items: center;
   gap: 16px;
 }
-.edit-profile-btn {
-  margin-left: auto;
-  color: var(--solo-primary);
+.user-avatar {
+  width: 54px;
+  height: 54px;
+  border-radius: 50%;
+  background: var(--solo-primary);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 22px;
+  font-weight: 700;
+  flex-shrink: 0;
 }
+.user-detail {
+  flex: 1;
+  min-width: 0;
+}
+.user-name-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.user-name {
+  font-size: 17px;
+  font-weight: 650;
+  color: var(--solo-text-primary);
+}
+.user-phone {
+  font-size: 13px;
+  color: var(--solo-text-muted);
+  margin-top: 4px;
+}
+.profile-tip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 14px;
+  font-size: 12px;
+  color: var(--solo-text-muted);
+  background: var(--solo-border-light, #f8fafc);
+  border-radius: var(--solo-radius, 8px);
+  padding: 8px 12px;
+  line-height: 1.4;
+}
+
+/* Setting Item Row */
+.setting-item-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 4px 0;
+}
+.item-icon-box {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  background: var(--solo-bg-blue-soft, #eff6ff);
+  color: var(--solo-primary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  flex-shrink: 0;
+}
+.item-icon-box.mcp-icon {
+  background: #f5f3ff;
+  color: #7c3aed;
+}
+.item-info {
+  flex: 1;
+  min-width: 0;
+}
+.item-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--solo-text-primary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.item-desc {
+  font-size: 12.5px;
+  color: var(--solo-text-muted);
+  margin-top: 2px;
+}
+.item-divider {
+  height: 1px;
+  background: var(--solo-border-light, #f1f5f9);
+  margin: 14px 0;
+}
+.action-btn {
+  flex-shrink: 0;
+}
+
+/* Logout Row */
+.logout-card {
+  border: 1px dashed var(--solo-border, #e2e8f0);
+}
+.logout-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.logout-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--solo-text-primary);
+}
+.logout-desc {
+  font-size: 12.5px;
+  color: var(--solo-text-muted);
+  margin-top: 2px;
+}
+
 .profile-hint {
   display: flex;
   align-items: center;
@@ -312,88 +443,8 @@ onMounted(async () => {
   padding: 8px 10px;
   line-height: 1.5;
 }
-.user-avatar {
-  width: 52px;
-  height: 52px;
-  border-radius: 50%;
-  background: var(--solo-primary);
-  color: #fff;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 22px;
-  font-weight: 700;
-}
-.user-name {
-  font-size: 18px;
-  font-weight: 600;
-  color: var(--solo-text-primary);
-}
-.user-phone {
-  font-size: 13px;
+.input-icon {
+  font-size: 16px;
   color: var(--solo-text-muted);
-  margin-top: 2px;
-}
-
-/* Stats */
-.stats-card {
-  border-radius: var(--solo-radius-lg);
-}
-.stats-grid {
-  display: flex;
-  gap: 24px;
-}
-.stat-item {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.stat-number {
-  font-size: 18px;
-  font-weight: 700;
-  color: var(--solo-text-primary);
-}
-.stat-number.income { color: var(--solo-income); }
-.stat-number.expense { color: var(--solo-expense); }
-.stat-label {
-  font-size: 12px;
-  color: var(--solo-text-muted);
-}
-
-/* Menu */
-.menu-card {
-  border-radius: var(--solo-radius-lg);
-}
-.menu-item {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 6px 0;
-  cursor: pointer;
-}
-.menu-icon {
-  font-size: 18px;
-  color: var(--solo-text-secondary);
-  display: flex;
-  align-items: center;
-}
-.menu-extra {
-  font-size: 12px;
-  color: var(--solo-text-muted);
-  margin-right: 8px;
-}
-.menu-label {
-  flex: 1;
-  font-size: 14px;
-  color: var(--solo-text-primary);
-}
-.menu-arrow {
-  color: var(--solo-text-muted);
-  font-size: 14px;
-}
-.menu-divider {
-  height: 1px;
-  background: var(--solo-border-light);
-  margin: 6px 0;
 }
 </style>

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import date, datetime
 from pydantic import BaseModel as PydanticBaseModel, ConfigDict
@@ -356,15 +359,31 @@ class CopilotChatResponse(BaseModel):
 # ── 报表 ──
 
 class MonthlyReportRequest(StrictRequestModel):
-    month: str
+    month: Optional[str] = None
+    period: Optional[str] = None
+    periodType: Optional[Literal["month", "quarter", "year"]] = "month"
+    includeSummary: Optional[bool] = False
+
+class ReportDiagnosisRequest(StrictRequestModel):
+    month: Optional[str] = None
+    period: Optional[str] = None
+    periodType: Optional[Literal["month", "quarter", "year"]] = "month"
+
+class ReportDiagnosisResponse(BaseModel):
+    summary: str
 
 class MonthlyReportResponse(BaseModel):
-    summary: str
+    summary: Optional[str] = None
     monthIncome: Decimal
     monthExpense: Decimal
     netProfit: Decimal
     categoryBreakdown: dict
     taxSummary: Optional[dict] = None
+    availableCash: Optional[Decimal] = None
+    pendingReceivables: Optional[Decimal] = None
+    period: Optional[str] = None
+    periodType: Optional[str] = None
+
 
 
 class HealthScoreRequest(StrictRequestModel):

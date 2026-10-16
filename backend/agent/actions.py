@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """ActionQueue：agent 写操作一律落成"待确认动作"，人确认后才走现有写路径。
 
 approve 路径复用 record/confirm 的确定性管线（compute_vat → get_voucher_hint →

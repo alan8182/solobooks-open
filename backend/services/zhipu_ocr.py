@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """
 智谱 OCR（files/ocr）HTTP 封装：multipart 上传图片，解析 ``words_result`` 为纯文本。
 文档：https://open.bigmodel.cn/api/paas/v4/files/ocr

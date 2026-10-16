@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """MCP stdio 本地入口：单进程调试用（ZCode / Claude Code 本地配置）。
 
 用法（本地 SQLite 测试模式；生产配 DATABASE_URL 指向 PG）：

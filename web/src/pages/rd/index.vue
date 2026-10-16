@@ -1,3 +1,4 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import {
@@ -306,7 +307,7 @@ onMounted(load)
 
     <NCard v-if="reconciliation" :bordered="false" title="总账勾稽与申报预审" class="mb-4">
       <NAlert :type="reconciliation.isReconciled ? 'success' : 'error'" :bordered="false" class="mb-4">
-        辅助账 {{ formatMoney(reconciliation.ledgerTotal) }}，5301 系列总账 {{ formatMoney(reconciliation.generalLedgerTotal) }}，
+        辅助账 {{ formatMoney(reconciliation.ledgerTotal) }}，4301 系列总账 {{ formatMoney(reconciliation.generalLedgerTotal) }}，
         差异 {{ formatMoney(reconciliation.difference) }}。{{ reconciliation.isReconciled ? '账表一致。' : '存在差异，暂不能用于申报复核。' }}
       </NAlert>
       <div class="reconciliation-grid">

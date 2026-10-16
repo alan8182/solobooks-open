@@ -1,3 +1,4 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, h, onMounted, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
@@ -552,7 +553,7 @@ const importedInvoiceColumns = [
         color: row.direction === 'income' ? 'var(--solo-income)' : 'var(--solo-expense)',
         fontWeight: 650,
       },
-    }, `${row.direction === 'income' ? '+' : '-'}${formatMoney(Math.abs(row.amount))}`),
+    }, formatMoney(Number(row.amount) || 0)),
   },
   {
     title: '入账模式', key: 'is_archive_only', width: 130, align: 'center' as const,
@@ -686,8 +687,16 @@ const previewColumns = [
 <template>
   <div class="invoice-import-page">
     <div class="page-header">
-      <NButton text @click="router.push('/ledger')">← 返回账本</NButton>
-      <h2>发票导入</h2>
+      <div class="page-header-left">
+        <NButton text class="back-btn" @click="router.push('/ledger')">
+          <template #icon><i class="ri-arrow-left-line" /></template>
+          返回账本
+        </NButton>
+        <div class="title-section">
+          <h2>发票导入</h2>
+          <p class="subtitle">批量导入税务局全量发票 Excel 明细，自动识别进销项并生成记账草稿</p>
+        </div>
+      </div>
     </div>
 
     <!-- Step: Upload -->
@@ -843,7 +852,7 @@ const previewColumns = [
             </div>
             <div class="summary-row">
               <span class="summary-label">发票金额:</span>
-              <span class="summary-value amount-text" :style="selectedInvoiceForBookkeeping.direction === 'income' ? 'color: var(--solo-income);' : 'color: var(--solo-expense);'">{{ selectedInvoiceForBookkeeping.direction === 'income' ? '+' : '-' }}{{ formatMoney(Math.abs(selectedInvoiceForBookkeeping.amount)) }}</span>
+              <span class="summary-value amount-text" :style="selectedInvoiceForBookkeeping.direction === 'income' ? 'color: var(--solo-income);' : 'color: var(--solo-expense);'">{{ formatMoney(Number(selectedInvoiceForBookkeeping.amount) || 0) }}</span>
             </div>
           </div>
           
@@ -1056,7 +1065,7 @@ const previewColumns = [
             </div>
             <div class="detail-item">
               <span class="detail-label">价税合计</span>
-              <span class="detail-value amount-text">{{ (selectedInvoice.direction === 'income' ? '+' : '-') + formatMoney(Math.abs((selectedInvoice.amount || 0) + (selectedInvoice.tax_amount || selectedInvoice.vatAmount || 0))) }}</span>
+              <span class="detail-value amount-text">{{ formatMoney((Number(selectedInvoice.amount) || 0) + (Number(selectedInvoice.tax_amount || selectedInvoice.vatAmount) || 0)) }}</span>
             </div>
           </div>
         </div>

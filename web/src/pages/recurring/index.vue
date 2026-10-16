@@ -1,3 +1,4 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, h, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
@@ -99,9 +100,13 @@ onMounted(loadTemplates)
 <template>
   <div class="recurring-page">
     <div class="page-header">
-      <NButton text @click="router.push('/mine')">← 返回</NButton>
-      <div class="header-row">
-        <h2>周期性交易模板</h2>
+      <div class="page-header-left">
+        <div class="title-section">
+          <h2>周期性交易模板</h2>
+          <p class="subtitle">管理按月、按季或按年重复发生的固定收支规则</p>
+        </div>
+      </div>
+      <div class="page-header-right">
         <NButton size="small" type="primary" @click="router.push('/recurring/create')">新建模板</NButton>
       </div>
     </div>

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """工资模块补丁：salary_sheets 增加社保/个税缴纳凭证列。
 
 Revision ID: f0a2c4e6b8d1

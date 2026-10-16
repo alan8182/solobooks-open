@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+ * Licensed under the SoloBooks License v2.0.
+ */
+
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
 import EntryDetail from '@/pages/ledger/detail.vue'
@@ -49,7 +54,7 @@ describe('voucher posting workflow', () => {
     ['pending_review', { canApprove: true }, '复核并过账', 'approve'],
     ['draft', { canSubmit: true, canPost: false }, '提交复核', 'submit'],
   ] as const)('reviews %s through the permitted action %s', async (status, options, label, action) => {
-    const entry = { id: 'draft', title: '测试收入', amount: 5, direction: 'income', category: '主营业务收入', occurDate: '2026-07-14', voucherStatus: status, voucherLines: { debit: [{ accountCode: '1012', accountName: '微信待结算', amount: 5 }], credit: [{ accountCode: '6001', accountName: '主营业务收入', amount: 5 }] } }
+    const entry = { id: 'draft', title: '测试收入', amount: 5, direction: 'income', category: '主营业务收入', occurDate: '2026-07-14', voucherStatus: status, voucherLines: { debit: [{ accountCode: '1012001', accountName: '微信待结算', amount: 5 }], credit: [{ accountCode: '5001', accountName: '主营业务收入', amount: 5 }] } }
     h.store = { activeEntries: [entry], fetchEntries: vi.fn(async () => {}) }
     h.options.mockResolvedValue(options)
     h[action].mockResolvedValue({ entry: { ...entry, voucherStatus: action === 'submit' ? 'pending_review' : 'posted', voucherRef: action === 'submit' ? '' : 'VOU-202607-000001' } })
@@ -60,8 +65,8 @@ describe('voucher posting workflow', () => {
     await button.trigger('click')
     expect(h[action]).not.toHaveBeenCalled()
     const modal = wrapper.find('.test-modal')
-    expect(modal.text()).toContain('1012')
-    expect(modal.text()).toContain('6001')
+    expect(modal.text()).toContain('1012001')
+    expect(modal.text()).toContain('5001')
     await modal.findAll('button').find(matchAction)!.trigger('click')
     await flushPromises()
     expect(h[action]).toHaveBeenCalledExactlyOnceWith('draft')

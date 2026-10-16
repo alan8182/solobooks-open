@@ -1,3 +1,4 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, computed, onMounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
@@ -27,6 +28,7 @@ import {
   getStatementMatchedEntryIds,
   getMatchedEntryIdSets,
   groupedEntryTotal,
+  invoiceDisplayAmount,
   isReconciledEntry,
   reconciliationDifference,
   signedInvoiceAmount,
@@ -133,7 +135,11 @@ const cfoDiagnosis = ref<any>(null)
 const confirmZeroActivity = ref(false)
 
 const monthEntries = computed(() =>
-  entryStore.activeEntries.filter(e => e.occurDate?.startsWith(targetMonth.value))
+  entryStore.activeEntries.filter(e =>
+    e.occurDate?.startsWith(targetMonth.value) &&
+    (e as any).entryType !== 'closing' &&
+    !(e as any).isClosingTransfer
+  )
 )
 const monthStatements = computed(() =>
   rawStatements.value.filter(s => s.transaction_date?.startsWith(targetMonth.value))
@@ -1186,9 +1192,11 @@ async function runClosing() {
     await entryStore.fetchEntries()
     await fetchClosedDiagnosis()
     const postedCount = Number(result.autoPostedCount || 0)
+    const closingRefs: string[] = Array.isArray(result.closingVoucherRefs) ? result.closingVoucherRefs.filter(Boolean) : []
+    const closingSuffix = closingRefs.length ? `（已自动生成期末损益结转凭证：${closingRefs.join('、')}）` : ''
     message.success(postedCount
-      ? `🎉 已批量过账 ${postedCount} 张凭证并完成 ${targetMonth.value} 结账。`
-      : `🎉 ${targetMonth.value} 结账成功！本期账册已锁定。`)
+      ? `🎉 已批量过账 ${postedCount} 张凭证并完成 ${targetMonth.value} 结账${closingSuffix}。`
+      : `🎉 ${targetMonth.value} 结账成功！本期账册已锁定${closingSuffix}。`)
   } catch (err: any) {
     const detail = err?.response?.data?.detail
     if (detail?.code === 'CLOSE_CHECK_FAILED' && detail.context?.checks) {
@@ -1668,23 +1676,23 @@ function pairNeedsCategoryReview(pair: any) {
 
 const CATEGORY_OPTIONS = [
   { label: '── 收入 ──', value: '__header_income__', disabled: true },
-  { label: '主营业务收入', value: 'income|主营业务收入|6001|主营业务收入' },
-  { label: '其他业务收入', value: 'income|其他业务收入|6051|其他业务收入' },
-  { label: '营业外收入', value: 'income|营业外收入|6301|营业外收入' },
-  { label: '利息收入', value: 'income|利息收入|6603|财务费用-利息收入' },
+  { label: '主营业务收入', value: 'income|主营业务收入|5001|主营业务收入' },
+  { label: '其他业务收入', value: 'income|其他业务收入|5051|其他业务收入' },
+  { label: '营业外收入', value: 'income|营业外收入|5301|营业外收入' },
+  { label: '利息收入', value: 'income|利息收入|5603004|财务费用-利息收入' },
   { label: '── 员工成本 ──', value: '__header_salary__', disabled: true },
-  { label: '工资支出', value: 'expense|工资支出|5501|应付职工薪酬-工资' },
-  { label: '社保公积金', value: 'expense|社保公积金|5502|应付职工薪酬-社保公积金' },
+  { label: '工资支出', value: 'expense|工资支出|2211|应付职工薪酬' },
+  { label: '社保公积金', value: 'expense|社保公积金|2211|应付职工薪酬' },
   { label: '── 费用支出 ──', value: '__header_expense__', disabled: true },
-  { label: '差旅费', value: 'expense|差旅费|5601|管理费用-差旅费' },
-  { label: '办公费', value: 'expense|办公费|5602|管理费用-办公费' },
-  { label: '业务招待费', value: 'expense|业务招待费|5603|管理费用-业务招待费' },
-  { label: '研发支出-费用化支出', value: 'expense|研发支出-费用化支出|5301|研发支出-费用化支出' },
-  { label: '信息技术服务费', value: 'expense|信息技术服务费|5605|管理费用-信息技术服务费' },
-  { label: '租金支出', value: 'expense|租金支出|5606|管理费用-租金' },
-  { label: '银行及金融手续费', value: 'expense|银行及金融手续费|6602|财务费用-手续费' },
-  { label: '员工报销', value: 'expense|员工报销|5699|管理费用-其他' },
-  { label: '其他支出', value: 'expense|其他支出|5699|管理费用-其他' },
+  { label: '差旅费', value: 'expense|差旅费|5602006|管理费用-差旅费' },
+  { label: '办公费', value: 'expense|办公费|5602004|管理费用-办公费' },
+  { label: '业务招待费', value: 'expense|业务招待费|5602002|管理费用-业务招待费' },
+  { label: '研发支出-费用化支出', value: 'expense|研发支出-费用化支出|4301|研发支出-费用化支出' },
+  { label: '信息技术服务费', value: 'expense|信息技术服务费|5602015|管理费用-信息技术服务费' },
+  { label: '租金支出', value: 'expense|租金支出|5602013|管理费用-租赁费' },
+  { label: '银行及金融手续费', value: 'expense|银行及金融手续费|5603002|财务费用-手续费' },
+  { label: '员工报销', value: 'expense|员工报销|5602999|管理费用-其他' },
+  { label: '其他支出', value: 'expense|其他支出|5602999|管理费用-其他' },
   { label: '── 采购与往来 ──', value: '__header_purchase__', disabled: true },
   { label: '原材料采购', value: 'expense|原材料采购|1403|原材料' },
   { label: '商品采购', value: 'expense|商品采购|1405|库存商品' },
@@ -1696,8 +1704,8 @@ const CATEGORY_OPTIONS = [
   { label: '往来款-收（暂收款）', value: 'income|往来款|2241|其他应付款-其他' },
   { label: '税费支出', value: 'expense|税费支出|2221|应交税费' },
   { label: '── 资本 ──', value: '__header_capital__', disabled: true },
-  { label: '股东投入', value: 'owner_transfer|股东投入|4001|实收资本' },
-  { label: '资本公积', value: 'owner_transfer|资本公积|4002|资本公积-股本溢价' },
+  { label: '股东投入', value: 'owner_transfer|股东投入|3001|实收资本' },
+  { label: '资本公积', value: 'owner_transfer|资本公积|3002|资本公积' },
   { label: '── 往来 ──', value: '__header_owner__', disabled: true },
   { label: '股东垫付', value: 'owner_transfer|股东垫付|2241|其他应付款-股东' },
 ]
@@ -1765,8 +1773,8 @@ const pairCategorySubmitting = ref(false)
 
 function defaultCategoryValue(stmt: any) {
   return stmt.amount >= 0
-    ? 'income|主营业务收入|6001|主营业务收入'
-    : 'expense|其他支出|5699|管理费用-其他'
+    ? 'income|主营业务收入|5001|主营业务收入'
+    : 'expense|其他支出|5602999|管理费用-其他'
 }
 
 function cleanStatementTitle(stmt: any) {
@@ -2097,7 +2105,7 @@ function prevStep() {
                     <NTag v-else size="small" type="default" :bordered="false">其他发票</NTag>
                   </td>
                   <td class="amount-cell" :class="amountClassForDirection(inv.direction, inv.amount)">
-                    {{ formatMoney(signedInvoiceAmount(inv)) }}
+                    {{ formatMoney(invoiceDisplayAmount(inv)) }}
                   </td>
                   <td style="text-align: center;">
                     <NCheckbox 
@@ -2552,7 +2560,7 @@ function prevStep() {
                 <span class="card-title-text">{{ inv.title }}</span>
                 <NTag v-if="isCandidateEntry(inv)" size="tiny" type="success" :bordered="false" class="match-candidate-tag">金额吻合</NTag>
                 <span class="card-amount" :class="amountClassForDirection(inv.direction, inv.amount)">
-                  {{ formatMoney(signedInvoiceAmount(inv)) }}
+                  {{ formatMoney(invoiceDisplayAmount(inv)) }}
                 </span>
               </div>
               <div class="card-meta">
@@ -2593,7 +2601,7 @@ function prevStep() {
                 <span class="card-title-text">{{ inv.title }}</span>
                 <NTag v-if="isCandidateEntry(inv)" size="tiny" type="success" :bordered="false" class="match-candidate-tag">金额吻合</NTag>
                 <span class="card-amount" :class="amountClassForDirection(inv.direction, inv.amount)">
-                  {{ formatMoney(signedInvoiceAmount(inv)) }}
+                  {{ formatMoney(invoiceDisplayAmount(inv)) }}
                 </span>
               </div>
               <div class="card-meta">
@@ -2630,7 +2638,7 @@ function prevStep() {
                 <span class="card-title-text">{{ inv.title }}</span>
                 <NTag v-if="isCandidateEntry(inv)" size="tiny" type="success" :bordered="false" class="match-candidate-tag">金额吻合</NTag>
                 <span class="card-amount" :class="amountClassForDirection(inv.direction, inv.amount)">
-                  {{ formatMoney(signedInvoiceAmount(inv)) }}
+                  {{ formatMoney(invoiceDisplayAmount(inv)) }}
                 </span>
               </div>
               <div class="card-meta">
@@ -2711,7 +2719,7 @@ function prevStep() {
                     <span>{{ entry.title }}</span>
                   </div>
                   <span class="pair-item-val" :class="amountClassForDirection(entry.direction, entry.amount)">
-                    {{ formatMoney(signedInvoiceAmount(entry)) }}
+                    {{ formatMoney(invoiceDisplayAmount(entry)) }}
                   </span>
                 </div>
 

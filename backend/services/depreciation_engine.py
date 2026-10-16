@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 from services.json_utils import json_dumps
 import json
 from datetime import datetime, timezone
@@ -140,7 +143,7 @@ async def run_depreciation(company_id: str, period: str, *, user_id: str) -> dic
             rd_depreciation = money(monthly * rd_use_rate)
             if rd_depreciation > ZERO:
                 debit_lines.append({
-                    "accountCode": "530103",
+                    "accountCode": "430100103",
                     "accountName": "研发支出-折旧与摊销",
                     "amount": rd_depreciation,
                     "rdDetail": {
@@ -154,7 +157,7 @@ async def run_depreciation(company_id: str, period: str, *, user_id: str) -> dic
                 })
         admin_depreciation = money(monthly - rd_depreciation)
         if admin_depreciation > ZERO:
-            debit_lines.append({"accountCode": "5699", "accountName": "管理费用-折旧费", "amount": admin_depreciation})
+            debit_lines.append({"accountCode": "5602007", "accountName": "管理费用-折旧费", "amount": admin_depreciation})
         await save_entry(
             {
                 "id": voucher_entry_id,

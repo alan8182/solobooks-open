@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+ * Licensed under the SoloBooks License v2.0.
+ */
+
 export interface VoucherLineLike {
   accountCode?: string | number | null
   amount?: string | number | null
@@ -9,25 +14,25 @@ export interface VoucherLinesLike {
   credit?: VoucherLineLike[] | null
 }
 
-const WECHAT_CLEARING_CODE = '1012'
+const WECHAT_CLEARING_CODES = ['1012001', '1012'] // 现行（其他货币资金二级）/ 历史
 const BANK_CODE = '1002'
 
-function sideEffect(lines: VoucherLineLike[] | null | undefined, code: string): number {
+function sideEffect(lines: VoucherLineLike[] | null | undefined, codes: string[]): number {
   return (lines || []).reduce(
-    (sum, line) => (String(line.accountCode || '') === code ? sum + (Number((line as any).amount) || 0) : sum),
+    (sum, line) => (codes.includes(String(line.accountCode || '')) ? sum + (Number((line as any).amount) || 0) : sum),
     0,
   )
 }
 
 /**
- * 从凭证分录推断资金渠道：微信待结算（1012）净变动非零即微信商户账户，
+ * 从凭证分录推断资金渠道：微信待结算清算科目（1012001/历史 1012）净变动非零即微信商户账户，
  * 其次看银行存款（1002）；两者皆无（如垫付核销）返回空串。
  */
 export function fundsChannelFromVoucher(voucherLines?: VoucherLinesLike | null): 'wechat_settlement' | 'company_bank' | '' {
   if (!voucherLines || typeof voucherLines !== 'object') return ''
-  const wechatNet = sideEffect(voucherLines.debit, WECHAT_CLEARING_CODE) - sideEffect(voucherLines.credit, WECHAT_CLEARING_CODE)
+  const wechatNet = sideEffect(voucherLines.debit, WECHAT_CLEARING_CODES) - sideEffect(voucherLines.credit, WECHAT_CLEARING_CODES)
   if (Math.abs(wechatNet) > 1e-9) return 'wechat_settlement'
-  const bankNet = sideEffect(voucherLines.debit, BANK_CODE) - sideEffect(voucherLines.credit, BANK_CODE)
+  const bankNet = sideEffect(voucherLines.debit, [BANK_CODE]) - sideEffect(voucherLines.credit, [BANK_CODE])
   if (Math.abs(bankNet) > 1e-9) return 'company_bank'
   return ''
 }

@@ -1,19 +1,24 @@
+/**
+ * Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+ * Licensed under the SoloBooks License v2.0.
+ */
+
 import { describe, expect, it } from 'vitest'
 import { fundsChannelFromVoucher, payerDisplayLabel } from '@/utils/fundsChannel'
 
 const wechatRefund = {
-  debit: [{ accountCode: '6001', amount: '5.00' }],
-  credit: [{ accountCode: '1012', amount: '5.00' }],
+  debit: [{ accountCode: '5001', amount: '5.00' }],
+  credit: [{ accountCode: '1012001', amount: '5.00' }],
 }
 
 const bankPayment = {
-  debit: [{ accountCode: '5608', amount: '0.17' }],
+  debit: [{ accountCode: '5603002', amount: '0.17' }],
   credit: [{ accountCode: '1002', amount: '0.17' }],
 }
 
 const wechatReceive = {
   debit: [{ accountCode: '1012', amount: '19.00' }],
-  credit: [{ accountCode: '6001', amount: '19.00' }],
+  credit: [{ accountCode: '5001', amount: '19.00' }],
 }
 
 describe('fundsChannelFromVoucher', () => {
@@ -28,7 +33,7 @@ describe('fundsChannelFromVoucher', () => {
 
   it('returns empty for missing voucher or neither account', () => {
     expect(fundsChannelFromVoucher(null)).toBe('')
-    expect(fundsChannelFromVoucher({ debit: [{ accountCode: '5608', amount: '1' }], credit: [{ accountCode: '2241', amount: '1' }] })).toBe('')
+    expect(fundsChannelFromVoucher({ debit: [{ accountCode: '5603002', amount: '1' }], credit: [{ accountCode: '2241', amount: '1' }] })).toBe('')
   })
 })
 

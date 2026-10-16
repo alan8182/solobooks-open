@@ -1,5 +1,6 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { NButton, NCard, NInput, NSpin, useMessage } from 'naive-ui'
 import {
@@ -33,6 +34,8 @@ interface ChatMessage {
   content: string
   steps?: ToolStep[]
   actions?: AgentActionItem[]
+  reasoning?: string
+  reasoningCollapsed?: boolean
   streaming?: boolean
   failed?: boolean
   imageUrl?: string
@@ -53,6 +56,7 @@ const TOOL_LABELS: Record<string, string> = {
 const messages = ref<ChatMessage[]>([])
 const input = ref('')
 const streaming = ref(false)
+const enableThinking = ref(false)
 const pendingActions = ref<AgentActionItem[]>([])
 const showRightBoard = ref(true)
 const lastReceiptImage = ref<{ url: string; name: string; receipt?: Record<string, unknown> } | null>(null)
@@ -209,7 +213,14 @@ function argsSummary(args: Record<string, unknown>): string {
 
 function handleEvent(ev: AgentStreamEvent, target: ChatMessage) {
   switch (ev.type) {
+    case 'reasoning':
+      target.reasoning = (target.reasoning || '') + (ev.content || '')
+      scrollBottom()
+      break
     case 'token':
+      if (target.reasoning && target.reasoningCollapsed === undefined) {
+        target.reasoningCollapsed = true
+      }
       target.content += ev.content || ''
       scrollBottom()
       break
@@ -257,7 +268,7 @@ async function send(imageUrl?: string) {
   input.value = ''
   streaming.value = true
 
-  const assistant: ChatMessage = { role: 'assistant', content: '', steps: [], streaming: true }
+  const assistant = reactive<ChatMessage>({ role: 'assistant', content: '', steps: [], streaming: true })
   messages.value.push(assistant)
   scrollBottom()
 
@@ -270,6 +281,7 @@ async function send(imageUrl?: string) {
       (ev) => handleEvent(ev, assistant),
       abortController.signal,
       conversationId.value,
+      enableThinking.value,
     )
   } catch (err) {
     if ((err as Error)?.name !== 'AbortError') {
@@ -299,6 +311,7 @@ function saveChatToStorage() {
       content: m.content,
       imageUrl: m.imageUrl,
       actions: m.actions,
+      reasoning: m.reasoning,
     }))
     localStorage.setItem(STORAGE_KEY, JSON.stringify(serializable))
   } catch {
@@ -426,10 +439,10 @@ watch(
         <!-- 对话区 -->
         <NCard :bordered="false" class="chat-card" ref="chatCardRef">
           <div class="chat-messages" v-if="messages.length > 0">
-            <div v-for="(msg, i) in messages" :key="i" class="message" :class="msg.role">
-              <div class="msg-avatar" :title="msg.role === 'user' ? '我' : '梭罗 · AI 会计'">
+            <div v-for="(msg, i) in messages" :key="i" class="message" :class="[msg.role, { streaming: msg.streaming }]">
+              <div class="msg-avatar" :class="{ 'is-streaming': msg.streaming }" :title="msg.role === 'user' ? '我' : '梭罗 · AI 会计'">
                 <i v-if="msg.role === 'user'" class="ri-user-3-fill" />
-                <i v-else class="ri-sparkling-fill" />
+                <img v-else src="/solo-logo.png" alt="梭罗" class="avatar-logo" />
               </div>
               <div class="msg-main">
                 <!-- 单据图片缩略图 -->
@@ -447,11 +460,40 @@ watch(
                   </div>
                 </div>
 
-                <div class="msg-bubble-wrap" v-if="msg.content || msg.role === 'user' || msg.streaming === false">
+                <!-- 深度思考过程 -->
+                <div class="reasoning-box" v-if="msg.reasoning">
+                  <div
+                    class="reasoning-header"
+                    @click="msg.reasoningCollapsed = !msg.reasoningCollapsed"
+                  >
+                    <div class="reasoning-title">
+                      <NSpin v-if="msg.streaming && !msg.content" :size="12" />
+                      <i v-else class="ri-brain-line" />
+                      <span>{{ msg.streaming && !msg.content ? '深度思考中…' : '已完成深度思考' }}</span>
+                    </div>
+                    <span class="reasoning-toggle">
+                      {{ msg.reasoningCollapsed ? '展开' : '收起' }}
+                      <i :class="msg.reasoningCollapsed ? 'ri-arrow-down-s-line' : 'ri-arrow-up-s-line'" />
+                    </span>
+                  </div>
+                  <div class="reasoning-body" v-show="!msg.reasoningCollapsed">
+                    <pre>{{ msg.reasoning }}</pre>
+                  </div>
+                </div>
+
+                <div class="msg-bubble-wrap" v-if="msg.content || msg.role === 'user' || msg.streaming || !msg.reasoning">
                   <div class="msg-bubble" :class="{ 'is-error': msg.failed }">
                     <template v-if="msg.role === 'user'">{{ msg.content }}</template>
-                    <div v-else class="md-body" v-html="renderMarkdown(msg.content)"></div>
-                    <span class="cursor" v-if="msg.streaming && msg.content">▍</span>
+                    <template v-else>
+                      <!-- 等待首字时的流体打字波 -->
+                      <div class="typing-wave" v-if="msg.streaming && !msg.content && !msg.reasoning && (!msg.steps || !msg.steps.length)">
+                        <span></span>
+                        <span></span>
+                        <span></span>
+                      </div>
+                      <div v-if="msg.content" class="md-body" v-html="renderMarkdown(msg.content)"></div>
+                      <span class="cursor-caret" v-if="msg.streaming && msg.content" />
+                    </template>
                     <div v-if="msg.failed && !streaming" class="retry-hint">
                       <button type="button" class="retry-inline-btn" @click="retryLast">
                         <i class="ri-refresh-line" /> 点击重试
@@ -498,11 +540,6 @@ watch(
             </div>
             <p class="empty-note">查账、记账、找发票、看风险，直接说人话就行。</p>
           </div>
-
-          <div v-if="streaming" class="loading-indicator">
-            <NSpin size="small" />
-            <span>AI 正在处理…</span>
-          </div>
         </NCard>
 
         <!-- 输入区 -->
@@ -535,6 +572,20 @@ watch(
           >
             <i :class="recording ? 'ri-stop-circle-fill' : 'ri-mic-line'" />
             <span v-if="recording" class="recording-text">录音中</span>
+          </NButton>
+          <NButton
+            size="small"
+            :type="enableThinking ? 'primary' : 'default'"
+            :secondary="enableThinking"
+            :quaternary="!enableThinking"
+            class="thinking-toggle-btn"
+            :class="{ active: enableThinking }"
+            title="深度思考：默认关闭保证日常记账秒开；复杂税务筹划建议开启"
+            :disabled="streaming"
+            @click="enableThinking = !enableThinking"
+          >
+            <i class="ri-brain-line" />
+            <span class="thinking-label">{{ enableThinking ? '思考已开' : '深度思考' }}</span>
           </NButton>
           <NInput
             v-model:value="input"
@@ -685,25 +736,47 @@ watch(
   flex-direction: row-reverse;
 }
 .msg-avatar {
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 13.5px;
+  font-size: 14px;
   flex-shrink: 0;
+  transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+  overflow: hidden;
 }
 .message.user .msg-avatar {
   background: var(--solo-primary, #165dff);
   color: #fff;
-  box-shadow: 0 1px 3px rgba(22, 93, 255, 0.2);
+  border-radius: 9px;
+  box-shadow: 0 2px 6px rgba(22, 93, 255, 0.25);
 }
 .message.assistant .msg-avatar {
-  background: var(--solo-bg-blue-soft, #edf3ff);
-  color: var(--solo-primary, #165dff);
-  border: 1px solid rgba(22, 93, 255, 0.15);
-  box-shadow: 0 1px 3px rgba(22, 93, 255, 0.05);
+  background: #ffffff;
+  border: 1px solid rgba(22, 93, 255, 0.16);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
+  padding: 3px;
+}
+.avatar-logo {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+/* 呼吸流光态：生成中/思考中 */
+.message.assistant .msg-avatar.is-streaming {
+  border-color: rgba(22, 93, 255, 0.45);
+  animation: avatar-breathe 2s infinite ease-in-out;
+}
+@keyframes avatar-breathe {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(22, 93, 255, 0.25), 0 1px 4px rgba(0, 0, 0, 0.04);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(22, 93, 255, 0.15), 0 2px 10px rgba(22, 93, 255, 0.22);
+  }
 }
 .msg-main {
   max-width: 82%;
@@ -773,12 +846,55 @@ watch(
   border: 1px solid rgba(0, 0, 0, 0.1);
   padding: 4px 8px;
 }
-.cursor {
-  animation: blink 1s steps(1) infinite;
-  color: var(--solo-ai, var(--solo-primary));
+
+/* 流光打字光标 */
+.cursor-caret {
+  display: inline-block;
+  width: 2px;
+  height: 14px;
+  margin-left: 2px;
+  vertical-align: -1.5px;
+  background: var(--solo-primary, #165dff);
+  border-radius: 1px;
+  box-shadow: 0 0 6px rgba(22, 93, 255, 0.5);
+  animation: caret-pulse 0.9s infinite ease-in-out;
 }
-@keyframes blink {
-  50% { opacity: 0; }
+@keyframes caret-pulse {
+  0%, 100% { opacity: 0.2; }
+  50% { opacity: 1; }
+}
+
+/* 气泡内三点流体打字波（Typing Wave） */
+.typing-wave {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 6px;
+  min-height: 22px;
+}
+.typing-wave span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background-color: var(--solo-primary, #165dff);
+  opacity: 0.35;
+  animation: typing-bounce 1.4s infinite ease-in-out both;
+}
+.typing-wave span:nth-child(1) {
+  animation-delay: -0.32s;
+}
+.typing-wave span:nth-child(2) {
+  animation-delay: -0.16s;
+}
+@keyframes typing-bounce {
+  0%, 80%, 100% {
+    transform: translateY(0);
+    opacity: 0.35;
+  }
+  40% {
+    transform: translateY(-4px);
+    opacity: 1;
+  }
 }
 
 /* 工具步骤 */
@@ -811,6 +927,57 @@ watch(
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* 深度思考过程 */
+.reasoning-box {
+  background: rgba(0, 0, 0, 0.03);
+  border: 1px dashed rgba(0, 0, 0, 0.12);
+  border-radius: 8px;
+  padding: 6px 10px;
+  margin: 2px 0 6px;
+  max-width: 100%;
+}
+.reasoning-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+  user-select: none;
+  font-size: 12px;
+  color: var(--solo-text-muted, #8a95a3);
+}
+.reasoning-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 500;
+}
+.reasoning-title i {
+  font-size: 14px;
+}
+.reasoning-toggle {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 11px;
+}
+.reasoning-body {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(0, 0, 0, 0.06);
+  max-height: 220px;
+  overflow-y: auto;
+}
+.reasoning-body pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--solo-text-secondary, #4e5969);
+  font-family: inherit;
+}
+
 .msg-actions {
   display: flex;
   flex-direction: column;
@@ -973,6 +1140,21 @@ watch(
   margin-left: 4px;
   font-size: 12px;
   animation: blink 1.2s ease-in-out infinite;
+}
+.thinking-toggle-btn {
+  border-radius: 16px;
+  padding: 0 10px;
+  font-size: 12px;
+  transition: all 0.2s ease;
+}
+.thinking-toggle-btn.active {
+  background: var(--solo-bg-blue-soft, #edf3ff);
+  color: var(--solo-primary, #165dff);
+  border-color: rgba(22, 93, 255, 0.3);
+}
+.thinking-label {
+  margin-left: 4px;
+  font-size: 12px;
 }
 
 @media (max-width: 1099px) {

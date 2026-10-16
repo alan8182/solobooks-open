@@ -1,4 +1,9 @@
 /**
+ * Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+ * Licensed under the SoloBooks License v2.0.
+ */
+
+/**
  * 拷贝纯文本至系统剪贴板，支持现代 navigator.clipboard 与 execCommand 兜底
  */
 export async function copyToClipboard(text: string): Promise<boolean> {

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """MCP 接入 M1 测试：写入工具 scope 门禁、审批流落点、调用留痕、限流、token CRUD API。"""
 import asyncio
 

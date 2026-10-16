@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Agent M1：批量记账动作 + 画像写入回路回归测试。
 
 走真实 create_entry 链路（ACCOUNTING_TEST_MODE + sqlite），不 mock 会计核心。
@@ -144,3 +147,51 @@ async def test_batch_propose_and_partial_approve_writes_profile():
     with pytest.raises(HTTPException) as exc:
         await agent_actions.approve_action(action["id"], user_id=user_id, company_id=company_id)
     assert exc.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_run_agent_stream_thinking_and_reasoning_events(monkeypatch):
+    """测试 agent 循环对 enable_thinking 与 reasoning 事件的透传支持。"""
+    from agent.loop import LoopContext, run_agent_stream
+    from routers.agent import AgentChatRequest
+
+    # 1. 验证 Pydantic Schema 解析 enableThinking
+    req = AgentChatRequest(
+        messages=[{"role": "user", "content": "查一下9月收支"}],
+        enableThinking=True,
+    )
+    assert req.enableThinking is True
+
+    # 2. Mock chat_tools_stream_async 产出 reasoning + delta
+    captured_kwargs = {}
+
+    async def fake_chat_tools_stream_async(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        yield {"type": "reasoning", "content": "用户想查询9月收支，正在思考..."}
+        yield {"type": "delta", "content": "9月收入共计 50000 元。"}
+        yield {"type": "final", "content": "9月收入共计 50000 元。", "tool_calls": []}
+
+    import agent.loop as loop_mod
+
+    monkeypatch.setattr(loop_mod, "chat_tools_stream_async", fake_chat_tools_stream_async)
+
+    ctx = LoopContext(user_id="u1", company_id="c1", conversation_id="conv-1")
+    events = []
+    async for ev in run_agent_stream(ctx, [{"role": "user", "content": "查一下9月收支"}], enable_thinking=True):
+        events.append(ev)
+
+    # 验证 meta 包含 enableThinking: True
+    meta = next(e for e in events if e["type"] == "meta")
+    assert meta["enableThinking"] is True
+    assert captured_kwargs.get("enable_thinking") is True
+
+    # 验证 reasoning 事件成功产出
+    reasoning_events = [e for e in events if e["type"] == "reasoning"]
+    assert len(reasoning_events) == 1
+    assert "正在思考" in reasoning_events[0]["content"]
+
+    # 验证 token 事件与 final 正常
+    token_events = [e for e in events if e["type"] == "token"]
+    assert len(token_events) == 1
+    assert "50000" in token_events[0]["content"]
+

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """V3 报表路由：月报 + 增值税/CIT/归档/税负/健康评分"""
 from typing import Optional
 from datetime import date, datetime
@@ -10,6 +13,7 @@ from deps.auth import AuthContext, require_auth
 from models.schemas import (
     d2,
     MonthlyReportRequest, MonthlyReportResponse,
+    ReportDiagnosisRequest, ReportDiagnosisResponse,
     HealthScoreRequest, HealthScoreResponse,
     VatAssistRequest, VatAssistResponse, VatAssistItem,
     CitAssistRequest, CitAssistResponse,
@@ -136,21 +140,21 @@ def _quarter_key(month_num: int) -> str:
 
 def _classify_statement_account(code: str, name: str, category: str) -> Optional[tuple[str, str]]:
     text = f"{code} {name} {category}"
-    if code in ("6001", "6051") or "主营业务收入" in text or "其他业务收入" in text:
+    if code in ("5001", "5051") or "主营业务收入" in text or "其他业务收入" in text:
         return "operating_revenue", "income"
-    if code == "6301" or "营业外收入" in text:
+    if code == "5301" or "营业外收入" in text:
         return "nonoperating_income", "income"
     if "投资收益" in text:
         return "investment_income", "income"
-    if code in ("5001", "5101") or "主营业务成本" in text or "生产成本" in text or "人力成本" in text:
+    if code.startswith(("5401", "5402")) or "主营业务成本" in text or "生产成本" in text or "人力成本" in text:
         return "operating_cost", "expense"
     if code == "5403" or "税金及附加" in text:
         return "tax_surcharges", "expense"
-    if code == "6601" or "销售费用" in text or "推广费" in text:
+    if code.startswith("5601") or "销售费用" in text or "推广费" in text:
         return "selling_expenses", "expense"
-    if code.startswith("560") or "管理费用" in text or "研发支出" in text:
+    if code.startswith(("5602", "4301")) or "管理费用" in text or "研发支出" in text:
         return "admin_expenses", "expense"
-    if code == "6603" or "财务费用" in text or "银行及金融手续费" in text or "利息" in text:
+    if code.startswith("5603") or "财务费用" in text or "银行及金融手续费" in text or "利息" in text:
         return "finance_expenses", "expense"
     if code == "5711" or "营业外支出" in text:
         return "nonoperating_expense", "expense"
@@ -252,7 +256,11 @@ def _add_statement_details(values: dict[str, Decimal], bucket: str, amount: Deci
 
 def _income_statement_entry_values(entry: dict) -> dict[str, Decimal]:
     values = _empty_income_statement_values()
-    if entry.get("source") == "wechat_settlement":
+    if (
+        entry.get("source") == "wechat_settlement"
+        or entry.get("entryType") in ("opening", "closing")
+        or entry.get("isClosingTransfer")
+    ):
         return values
 
     voucher = entry.get("voucherLines") or {}
@@ -330,13 +338,49 @@ def _money(value) -> Decimal:
     return d2(value)
 
 
+def _filter_period(entries: list, period: str, period_type: str = "month") -> list:
+    """Filter entries by period based on periodType ('month', 'quarter', 'year')."""
+    if not period:
+        return entries
+    if period_type == "year":
+        year_str = period[:4]
+        return [e for e in entries if (e.get("occurDate") or "").startswith(year_str)]
+    if period_type == "quarter":
+        year_str = period[:4]
+        try:
+            q = int(period[-1])
+        except (ValueError, IndexError):
+            q = 1
+        months = [f"{year_str}-{(q - 1) * 3 + i:02d}" for i in (1, 2, 3)]
+        return [e for e in entries if any((e.get("occurDate") or "").startswith(m) for m in months)]
+    return [e for e in entries if (e.get("occurDate") or "").startswith(period[:7])]
+
+
+def _period_end_month(period: str, period_type: str) -> str:
+    if not period:
+        now = datetime.now()
+        return f"{now.year}-{now.month:02d}"
+    if period_type == "year":
+        return f"{period[:4]}-12"
+    if period_type == "quarter":
+        try:
+            q = int(period[-1])
+        except (ValueError, IndexError):
+            q = 1
+        return f"{period[:4]}-{q * 3:02d}"
+    return period[:7]
+
+
 @router.post("/report/monthly", response_model=MonthlyReportResponse)
 async def monthly_report(
     req: MonthlyReportRequest,
     ctx: AuthContext = Depends(require_auth),
     session: AsyncSession = Depends(get_db_session),
 ):
-    entries = _filter_month(await _authoritative_entries(session, ctx), req.month)
+    period_type = req.periodType or "month"
+    resolved_period = req.period or req.month or ""
+    all_entries = await _authoritative_entries(session, ctx)
+    entries = _filter_period(all_entries, resolved_period, period_type)
     income = sum(e.get("amount", 0) for e in entries if e.get("direction") == "income")
     expense = sum(e.get("amount", 0) for e in entries if e.get("direction") == "expense")
 
@@ -346,38 +390,102 @@ async def monthly_report(
         breakdown[cat] = breakdown.get(cat, 0) + e.get("amount", 0)
 
     # 税务汇总（只用已有 vatAmount 字段，避免重复计算）
-    # vatAmount 在元数据里可能是字符串（api_money=False 路径只转换 amount），统一用 d2 强转
     total_vat = sum(
         (d2(e.get("vatAmount", 0) or 0) for e in entries if e.get("direction") == "income"),
         Decimal("0"),
     )
-    # #9 CIT 估算加注说明：小微企业所得税实际税负为5%（20% × 25%计入应纳税所得额），实际以年度汇算为准
+    # 小微企业所得税实际税负为5%（20% × 25%计入应纳税所得额），实际以年度汇算为准
     net_profit = income - expense
     estimated_cit = d2(max(Decimal("0"), net_profit) * Decimal("0.05"))
+
+    if period_type == "year":
+        cit_note = "按小微企业所得税实际税负5%测算（年应纳税所得额300万以下，实际以年度汇算清缴结果为准）"
+    elif period_type == "quarter":
+        cit_note = "按小微企业所得税实际税负5%季度预缴估算（实际以年度汇算清缴结果为准）"
+    else:
+        cit_note = "按小微企业所得税实际税负5%粗略估算（实际以年度汇算清缴结果为准）"
+
     tax_summary = {
         "estimatedVat": round(total_vat, 2),
         "estimatedCit": estimated_cit,
-        "citNote": "按小微企业所得税实际税负5%粗略估算（实际以年度汇算清缴结果为准）",
+        "citNote": cit_note,
     }
 
+    summary = None
+    if req.includeSummary:
+        # ponytail: LLM summary only generated when explicitly requested; default returns instantly
+        try:
+            result = chat_text_json(
+                system_prompt="你是经营助手，生成经营总结。只输出JSON: {\"summary\": \"...\"}",
+                user_message=f"统计周期:{period_type}, 期间:{resolved_period}, 收入:{income}, 支出:{expense}, 净利润:{net_profit}, 分类:{breakdown}",
+                max_tokens=512,
+                scene="report",
+                user_id=ctx.user_id,
+                company_id=ctx.company_id,
+            )
+            summary = result.get("summary", "经营报表已生成")
+        except Exception:
+            summary = "经营报表已生成"
+
+    available_cash = None
+    pending_receivables = None
     try:
-        result = chat_text_json(
-            system_prompt="你是经营助手，生成月度总结。只输出JSON: {\"summary\": \"...\"}",
-            user_message=f"月份:{req.month}, 收入:{income}, 支出:{expense}, 净利润:{net_profit}, 分类:{breakdown}",
-            max_tokens=512,
-            scene="report",
-            user_id=ctx.user_id,
-            company_id=ctx.company_id,
+        end_month = _period_end_month(resolved_period, period_type)
+        statement = await build_statement_data(ctx.user_id, ctx.company_id, end_month, "month")
+        available_cash = d2(statement.balance_current.get("cash", Decimal("0")))
+        pending_receivables = d2(
+            statement.balance_current.get("accounts_receivable", Decimal("0"))
+            + statement.balance_current.get("other_receivable", Decimal("0"))
         )
-        summary = result.get("summary", "月度报表已生成")
     except Exception:
-        summary = "月度报表已生成"
+        pass
 
     return MonthlyReportResponse(
         summary=summary, monthIncome=income, monthExpense=expense,
         netProfit=net_profit, categoryBreakdown=breakdown,
         taxSummary=tax_summary,
+        availableCash=available_cash,
+        pendingReceivables=pending_receivables,
+        period=resolved_period,
+        periodType=period_type,
     )
+
+
+@router.post("/report/diagnosis", response_model=ReportDiagnosisResponse)
+async def report_diagnosis(
+    req: ReportDiagnosisRequest,
+    ctx: AuthContext = Depends(require_auth),
+    session: AsyncSession = Depends(get_db_session),
+):
+    # ponytail: manual on-demand AI diagnosis trigger, avoiding blocking normal report loading
+    period_type = req.periodType or "month"
+    resolved_period = req.period or req.month or ""
+    all_entries = await _authoritative_entries(session, ctx)
+    entries = _filter_period(all_entries, resolved_period, period_type)
+    income = sum(e.get("amount", 0) for e in entries if e.get("direction") == "income")
+    expense = sum(e.get("amount", 0) for e in entries if e.get("direction") == "expense")
+
+    breakdown = {}
+    for e in entries:
+        cat = e.get("category", "其他")
+        breakdown[cat] = breakdown.get(cat, 0) + e.get("amount", 0)
+
+    net_profit = income - expense
+
+    try:
+        result = chat_text_json(
+            system_prompt="你是经营助手，生成经营总结。只输出JSON: {\"summary\": \"...\"}",
+            user_message=f"统计周期:{period_type}, 期间:{resolved_period}, 收入:{income}, 支出:{expense}, 净利润:{net_profit}, 分类:{breakdown}",
+            max_tokens=512,
+            scene="report",
+            user_id=ctx.user_id,
+            company_id=ctx.company_id,
+        )
+        summary = result.get("summary", "经营报表已生成")
+    except Exception:
+        summary = "经营报表已生成"
+
+    return ReportDiagnosisResponse(summary=summary)
 
 
 @router.post("/health-score", response_model=HealthScoreResponse)
@@ -863,9 +971,9 @@ async def balance_sheet(
     ])
 
     equity = nonzero_items([
-        ("4001", "实收资本", "paid_in_capital", 1),
-        ("4002", "资本公积", "capital_reserve", 1),
-        ("3102", "盈余公积", "surplus_reserve", 1),
+        ("3001", "实收资本", "paid_in_capital", 1),
+        ("3002", "资本公积", "capital_reserve", 1),
+        ("3101", "盈余公积", "surplus_reserve", 1),
     ])
     equity.append(item("3103", "本年利润", current_profit))
     equity.append(item("3104", "利润分配-未分配利润", prior_retained))

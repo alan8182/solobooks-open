@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """管理后台 M0：auth_users 增加平台管理员/禁用标记。
 
 Revision ID: a7c3e9f1b2d4

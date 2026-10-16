@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Bank reconciliation service (async SQLite)."""
 from __future__ import annotations
 
@@ -16,6 +19,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.database import get_conn
+from services.wechat_bill_service import WECHAT_CLEARING_CODE
 from services.account_mapper import get_voucher_hint
 from services.audit_service import log_action
 from core.money import ZERO, money, money_text
@@ -135,7 +139,7 @@ def _fallback_classification_for_statement(stmt: Dict[str, Any], confidence: flo
     return {
         "direction": "income" if is_income else "expense",
         "category": "其他业务收入" if is_income else "其他支出",
-        "accountCode": "6051" if is_income else "5699",
+        "accountCode": "5051" if is_income else "5602999",
         "accountName": "其他业务收入" if is_income else "管理费用-其他",
         "title": stmt.get("description", ""),
         "confidence": confidence,
@@ -203,7 +207,7 @@ def _entry_bank_effect_from_payload(payload: Dict[str, Any]) -> Decimal:
 def _entry_group_reconciliation_effect(payload: Dict[str, Any]) -> Decimal:
     """Return the cash/settlement effect used when grouping entries to one statement.
 
-    WeChat merchant transactions accrue through 1012 (微信支付待结算) before
+    WeChat merchant transactions accrue through the WeChat clearing account (1012001) before
     the net receipt reaches the bank, so a gross receipt plus its fee must be
     reconciled from the clearing-account net effect.
     """
@@ -213,7 +217,7 @@ def _entry_group_reconciliation_effect(payload: Dict[str, Any]) -> Decimal:
     bank_effect = _bank_effect_from_voucher(voucher)
     if bank_effect != ZERO:
         return bank_effect
-    settlement_effect = _account_effect_from_voucher(voucher, "1012")
+    settlement_effect = _account_effect_from_voucher(voucher, WECHAT_CLEARING_CODE)
     if settlement_effect != ZERO:
         return settlement_effect
     return bank_effect
@@ -266,7 +270,7 @@ def build_group_reconciliation_check(
         for payload in payloads
     ), ZERO))
     entry_bank_effect = direct_bank_effect if direct_bank_effect != ZERO else money(sum((
-        _account_effect_from_voucher(payload.get("voucherLines") or {}, "1012")
+        _account_effect_from_voucher(payload.get("voucherLines") or {}, WECHAT_CLEARING_CODE)
         for payload in payloads
     ), ZERO))
     difference = _amount_difference(statement_amount, entry_bank_effect)
@@ -308,7 +312,7 @@ def diagnose_matched_statement_effect(
         return None
 
     settlement_effect = money(sum((
-        _account_effect_from_voucher(payload.get("voucherLines") or {}, "1012")
+        _account_effect_from_voucher(payload.get("voucherLines") or {}, WECHAT_CLEARING_CODE)
         for payload in payloads
     ), ZERO))
     entry_ids = [str(payload.get("id") or "") for payload in payloads if payload.get("id")]
@@ -1079,12 +1083,12 @@ async def repair_matched_statement_effect(
             if statement_amount > 0:
                 voucher_lines = {
                     "debit": [{"accountCode": "1002", "accountName": "银行存款", "amount": amount}],
-                    "credit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": amount}],
+                    "credit": [{"accountCode": WECHAT_CLEARING_CODE, "accountName": "微信支付待结算", "amount": amount}],
                 }
                 direction = "income"
             else:
                 voucher_lines = {
-                    "debit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": amount}],
+                    "debit": [{"accountCode": WECHAT_CLEARING_CODE, "accountName": "微信支付待结算", "amount": amount}],
                     "credit": [{"accountCode": "1002", "accountName": "银行存款", "amount": amount}],
                 }
                 direction = "expense"
@@ -1766,7 +1770,7 @@ async def classify_single_statement(company_id: str, statement_id: str, business
         return {
             "direction": "expense",
             "category": "研发支出-费用化支出",
-            "accountCode": "5301",
+            "accountCode": "4301",
             "accountName": "研发支出-费用化支出",
             "title": "研发相关支出",
             "confidence": 0.9,
@@ -1788,7 +1792,7 @@ async def classify_single_statement(company_id: str, statement_id: str, business
         BANK_CLASSIFY_PROMPT, classify_msg,
         fallback={"direction": "expense" if stmt["amount"] < 0 else "income",
                   "category": "其他支出" if stmt["amount"] < 0 else "其他业务收入",
-                  "accountCode": "5699" if stmt["amount"] < 0 else "6051",
+                  "accountCode": "5602999" if stmt["amount"] < 0 else "5051",
                   "accountName": "管理费用-其他" if stmt["amount"] < 0 else "其他业务收入",
                   "title": stmt["description"],
                   "confidence": 0.3, "reason": "无法自动分类"},

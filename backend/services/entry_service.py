@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Compatibility facade over the authoritative structured accounting core.
 
 Importers keep using this module, but every write now lands in

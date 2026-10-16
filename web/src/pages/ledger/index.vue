@@ -1,3 +1,4 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { computed, h, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
@@ -33,7 +34,7 @@ const entryStore = useEntryStore()
 const message = useMessage()
 
 const keyword = ref('')
-const timeFilter = ref<TimeFilter>('month')
+const timeFilter = ref<TimeFilter>('year')
 const natureFilter = ref<EntryNatureFilter>('all')
 const categoryFilter = ref<string | null>(null)
 const billingStatusFilter = ref<string | null>(null)
@@ -99,11 +100,19 @@ function isInRange(entry: Entry, range: TimeFilter): boolean {
   if (!timestamp) return true
 
   const now = new Date()
+  if (range === 'year') {
+    const start = new Date(now.getFullYear(), 0, 1, 0, 0, 0, 0).getTime()
+    const end = new Date(now.getFullYear(), 11, 31, 23, 59, 59, 999).getTime()
+    return timestamp >= start && timestamp <= end
+  }
+
   const start = new Date(now)
   start.setHours(0, 0, 0, 0)
-  const days = { week: 7, month: 30, quarter: 90, year: 365 }[range]
+  const days = { week: 7, month: 30, quarter: 90 }[range]
   start.setDate(start.getDate() - days)
-  return timestamp >= start.getTime() && timestamp <= now.getTime()
+  const end = new Date(now)
+  end.setHours(23, 59, 59, 999)
+  return timestamp >= start.getTime() && timestamp <= end.getTime()
 }
 
 function hasDocument(entry: Entry): boolean {
@@ -151,7 +160,7 @@ const categoryOptions = computed(() => Array.from(new Set(
 
 const hasActiveFilters = computed(() => Boolean(
   keyword.value.trim()
-  || timeFilter.value !== 'month'
+  || timeFilter.value !== 'year'
   || natureFilter.value !== 'all'
   || categoryFilter.value
   || billingStatusFilter.value
@@ -284,7 +293,7 @@ function handleSorterChange(nextSorter: DataTableSortState | DataTableSortState[
 
 function resetFilters() {
   keyword.value = ''
-  timeFilter.value = 'month'
+  timeFilter.value = 'year'
   natureFilter.value = 'all'
   categoryFilter.value = null
   billingStatusFilter.value = null

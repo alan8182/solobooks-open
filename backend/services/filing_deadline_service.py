@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """征期日历服务：小规模纳税人申报节奏（M3）。
 
 征期规则为配置数据；节假日顺延日期按税局公告**手工维护**（DEADLINE_OVERRIDES），
@@ -154,10 +157,32 @@ def periods_for_year(year: int) -> Dict[str, List[str]]:
     }
 
 
+async def _company_onboard_date(company_id: str) -> Optional[date]:
+    """公司建档日（系统内创建时间）。征期物化以其为起点：建档前已截止的期间不制造逾期。"""
+    from db.models import Company
+
+    async with session_scope() as session:
+        row = (
+            await session.execute(select(Company.created_at).where(Company.company_id == company_id))
+        ).scalar_one_or_none()
+    if not row:
+        return None
+    try:
+        return date.fromisoformat(str(row)[:10])
+    except ValueError:
+        return None
+
+
 async def refresh_deadlines(company_id: str, year: Optional[int] = None) -> Dict[str, Any]:
-    """按规则物化某年的征期记录（幂等；已存在的保留状态并校准 due_date）。"""
+    """按规则物化某年的征期记录（幂等；已存在的保留状态并校准 due_date）。
+
+    公司建档日之前已截止的期间不物化为待办；历史上已物化为 pending 的存量自动豁免
+    （waived），避免首次打开页面即出现「逾期 176 天」的假噪音。
+    """
     year = year or date.today().year
+    onboard_date = await _company_onboard_date(company_id)
     created = 0
+    auto_waived = 0
     period_map = periods_for_year(year)
     for tax_kind, meta in TAX_KINDS.items():
         if meta["freq"] in ("quarter", "annual_cit", "annual"):
@@ -168,6 +193,27 @@ async def refresh_deadlines(company_id: str, year: Optional[int] = None) -> Dict
             # 个税扣缴、汇算等仅在有意义的窗口生成：全年物化即可，展示层再过滤
             due = compute_due_date(tax_kind, period)
             if not due:
+                continue
+            if onboard_date and due < onboard_date:
+                # 建档前已截止的期间：不再新建；此前误物化的 pending 存量自动豁免
+                async with session_scope() as session:
+                    legacy = (
+                        await session.execute(
+                            select(FilingDeadline).where(
+                                FilingDeadline.company_id == company_id,
+                                FilingDeadline.tax_kind == tax_kind,
+                                FilingDeadline.period == period,
+                            )
+                        )
+                    ).scalar_one_or_none()
+                    if legacy and legacy.status == "pending":
+                        legacy.status = "waived"
+                        legacy.filed_evidence = {
+                            "reason": "pre_onboarding",
+                            "auto": True,
+                            "waivedAt": datetime.utcnow().isoformat(),
+                        }
+                        auto_waived += 1
                 continue
             async with session_scope() as session:
                 existing_record = (
@@ -195,7 +241,7 @@ async def refresh_deadlines(company_id: str, year: Optional[int] = None) -> Dict
                     )
                 )
                 created += 1
-    return {"year": year, "created": created}
+    return {"year": year, "created": created, "autoWaived": auto_waived}
 
 
 async def list_deadlines(
@@ -263,6 +309,44 @@ async def mark_filed(
     from services.audit_service import log_action
 
     await log_action(company_id, user_id, "filing_mark_filed", "filing_deadline", deadline_id, evidence or {})
+    return result
+
+
+async def waive_deadline(
+    company_id: str,
+    user_id: str,
+    deadline_id: str,
+    *,
+    reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    """把某征期标记为「本期不适用」（豁免），用于建档前期间等确实无需申报的场景。"""
+    async with session_scope() as session:
+        row = (
+            await session.execute(
+                select(FilingDeadline).where(
+                    FilingDeadline.id == deadline_id, FilingDeadline.company_id == company_id
+                )
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            raise ValueError("征期记录不存在")
+        if row.status != "pending":
+            raise ValueError("仅待申报状态可标记为不适用")
+        row.status = "waived"
+        row.filed_evidence = {
+            "reason": reason or "manual",
+            "via": "tax-filing-page",
+            "waivedAt": datetime.utcnow().isoformat(),
+        }
+        result = {
+            "id": row.id,
+            "taxKind": row.tax_kind,
+            "period": row.period,
+            "status": row.status,
+        }
+    from services.audit_service import log_action
+
+    await log_action(company_id, user_id, "filing_waive", "filing_deadline", deadline_id, {"reason": reason or "manual"})
     return result
 
 

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """微信支付账单解析与导入服务"""
 from __future__ import annotations
 
@@ -13,11 +16,11 @@ from services.database import get_conn
 from services.entry_service import save_entries_bulk
 from core.money import ZERO, money
 
-WECHAT_CLEARING_CODE = "1012"
+WECHAT_CLEARING_CODE = "1012001"
 WECHAT_CLEARING_NAME = "微信支付待结算"
-REVENUE_CODE = "6001"
+REVENUE_CODE = "5001"
 REVENUE_NAME = "主营业务收入"
-FEE_CODE = "6602"
+FEE_CODE = "5603002"
 FEE_NAME = "财务费用-手续费"
 
 
@@ -526,7 +529,7 @@ async def list_wechat_bill_records(company_id: str, month: str) -> Dict[str, Any
     """当月已导入微信账单的只读记录，按订单号聚合收入、退款与手续费条目。
 
     导入时每笔交易拆成收入+手续费（或退款+手续费退还）多条 entry，
-    这里聚合回 CSV 视图：订单金额、手续费、到账净额（1012 清算净额）。
+    这里聚合回 CSV 视图：订单金额、手续费、到账净额（1012001 清算净额）。
     """
     month = str(month or "").strip()
     if not re.fullmatch(r"\d{4}-\d{2}", month):

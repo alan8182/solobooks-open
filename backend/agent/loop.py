@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Agent 循环：qwen function calling + 工具执行 + SSE 事件流。
 
 事件契约（routers/agent.py 以 SSE data: JSON 下发）：
@@ -97,13 +100,16 @@ def _normalize_history(messages: List[dict]) -> List[dict]:
     return valid[-keep:]
 
 
-async def run_agent_stream(ctx: LoopContext, messages: List[dict]) -> AsyncIterator[dict]:
+async def run_agent_stream(
+    ctx: LoopContext, messages: List[dict], enable_thinking: bool = False
+) -> AsyncIterator[dict]:
     """运行 agent 循环，逐个产出 SSE 事件。"""
     yield {
         "type": "meta",
         "tools": [t["function"]["name"] for t in TOOL_SCHEMAS],
         "maxSteps": MAX_STEPS,
         "companyId": ctx.company_id,
+        "enableThinking": enable_thinking,
     }
 
     system_prompt = await _build_system_prompt(ctx)
@@ -123,12 +129,13 @@ async def run_agent_stream(ctx: LoopContext, messages: List[dict]) -> AsyncItera
                 scene="agent_chat",
                 user_id=ctx.user_id,
                 company_id=ctx.company_id,
+                enable_thinking=enable_thinking,
             ):
                 if chunk["type"] == "delta":
                     content_parts.append(chunk["content"])
                     yield {"type": "token", "content": chunk["content"]}
                 elif chunk["type"] == "reasoning":
-                    continue
+                    yield {"type": "reasoning", "content": chunk["content"]}
                 elif chunk["type"] == "final":
                     final_content = chunk["content"]
                     tool_calls = chunk["tool_calls"]

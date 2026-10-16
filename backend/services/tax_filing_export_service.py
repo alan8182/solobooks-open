@@ -1,4 +1,7 @@
-﻿"""Build and export official tax filing financial statement workbooks."""
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
+"""Build and export official tax filing financial statement workbooks."""
 from __future__ import annotations
 
 import calendar
@@ -24,8 +27,9 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 MONTH_QUARTER_TEMPLATE = BACKEND_DIR / "assets" / "tax" / "财务报表报送与信息采集（小企业会计准则）月季报.xls"
 EXPORT_DIR = BACKEND_DIR / "data" / "tax_exports"
 
-CREDIT_NATURE_CODES = {"1602", "6001", "6051", "6111", "6301"}
-CASH_ACCOUNT_CODES = {"1001", "1002", "1012"}
+# 贷方性质科目：累计折旧/摊销 + 损益收入类（《小企业会计准则》5xxx 收入段）
+CREDIT_NATURE_CODES = {"1602", "1702", "5001", "5051", "5111", "5301"}
+CASH_ACCOUNT_CODES = {"1001", "1002", "1012001", "1012"}
 
 
 @dataclass
@@ -121,7 +125,7 @@ def _sum_prefix(balances: Dict[str, Decimal], *prefixes: str) -> Decimal:
 
 
 def _normal_balance(code: str, debit: Decimal, credit: Decimal) -> Decimal:
-    if code in CREDIT_NATURE_CODES or code.startswith(("2", "3", "4")):
+    if code in CREDIT_NATURE_CODES or code.startswith(("2", "3")):
         return credit - debit
     return debit - credit
 
@@ -159,7 +163,7 @@ def _voucher_for_entry(entry: dict[str, Any]) -> dict[str, list[dict[str, Any]]]
 def _account_movements(entries: list[dict[str, Any]], start: date, end: date) -> Dict[str, dict[str, Any]]:
     totals: Dict[str, dict[str, Any]] = {}
     for entry in entries:
-        if entry.get("entryType") == "opening":
+        if entry.get("entryType") in ("opening", "closing") or entry.get("isClosingTransfer"):
             continue
         occur_date = _parse_entry_date(entry.get("occurDate") or entry.get("date") or entry.get("time"))
         if not occur_date or occur_date < start or occur_date > end:
@@ -184,23 +188,23 @@ def _current_balance_map(opening: Dict[str, Decimal], movements: Dict[str, dict[
 
 def _profit_map(movements: Dict[str, dict[str, Any]]) -> Dict[str, Decimal]:
     balances = {code: _normal_balance(code, info["debit"], info["credit"]) for code, info in movements.items()}
-    research = _sum_codes(balances, ["5301"])
-    management = _sum_prefix(balances, "56") - _sum_codes(balances, ["5608"]) + research
-    finance = _sum_codes(balances, ["5608", "6602", "6603"])
+    research = _sum_prefix(balances, "4301")
+    management = _d2(_sum_prefix(balances, "5602") + research)
+    finance = _sum_prefix(balances, "5603")
     out = {
-        "revenue": _sum_codes(balances, ["6001", "6051"]),
-        "cost": _sum_codes(balances, ["5001", "5101"]),
-        "tax_surcharge": _sum_codes(balances, ["6401"]),
-        "sales_expense": _sum_prefix(balances, "66") - _sum_codes(balances, ["6602", "6603"]),
-        "advertising": _sum_codes(balances, ["6601"]),
-        "management_expense": _d2(management),
-        "entertainment": _sum_codes(balances, ["5603"]),
+        "revenue": _sum_codes(balances, ["5001", "5051"]),
+        "cost": _d2(_sum_prefix(balances, "5401") + _sum_prefix(balances, "5402")),
+        "tax_surcharge": _sum_codes(balances, ["5403"]),
+        "sales_expense": _sum_prefix(balances, "5601"),
+        "advertising": _sum_prefix(balances, "560101"),
+        "management_expense": management,
+        "entertainment": _sum_codes(balances, ["5602002"]),
         "research_expense": research,
         "finance_expense": finance,
-        "investment_income": _sum_codes(balances, ["6111"]),
-        "non_operating_income": _sum_codes(balances, ["6301"]),
-        "non_operating_expense": _sum_codes(balances, ["6711"]),
-        "income_tax": _sum_codes(balances, ["6801"]),
+        "investment_income": _sum_codes(balances, ["5111"]),
+        "non_operating_income": _sum_codes(balances, ["5301"]),
+        "non_operating_expense": _sum_codes(balances, ["5711"]),
+        "income_tax": _sum_codes(balances, ["5801"]),
     }
     out["operating_profit"] = _d2(
         out["revenue"] - out["cost"] - out["tax_surcharge"]
@@ -238,7 +242,7 @@ def _cash_map(entries: list[dict[str, Any]], start: date, end: date, opening_cas
     fixed_asset_categories = {"固定资产", "设备采购"}
     salary_categories = {"人力成本", "工资", "薪酬", "社保", "公积金"}
     for entry in entries:
-        if entry.get("entryType") == "opening":
+        if entry.get("entryType") in ("opening", "closing") or entry.get("isClosingTransfer"):
             continue
         occur_date = _parse_entry_date(entry.get("occurDate") or entry.get("date") or entry.get("time"))
         if not occur_date or occur_date < start or occur_date > end:
@@ -265,27 +269,27 @@ def _cash_map(entries: list[dict[str, Any]], start: date, end: date, opening_cas
             if str(line.get("accountCode") or "") not in CASH_ACCOUNT_CODES
         }
         category = str(entry.get("category") or "")
-        if counterpart_codes & {"6001", "6051"}:
+        if counterpart_codes & {"5001", "5051"}:
             out["sales_cash"] += net_cash
             continue
-        if counterpart_codes & {"6301", "6603"}:
+        if counterpart_codes & {"5301"} or any(code.startswith("5603") for code in counterpart_codes):
             if net_cash > ZERO:
                 out["other_operating_in"] += amount
             else:
                 out["other_operating_out"] += amount
             continue
         if net_cash > ZERO:
-            if counterpart_codes & {"3001", "3002", "4001", "4002"}:
+            if counterpart_codes & {"3001", "3002"}:
                 out["capital_cash"] += amount
             elif counterpart_codes & {"2001", "2501"}:
                 out["borrow_cash"] += amount
-            elif counterpart_codes & {"6111"}:
+            elif counterpart_codes & {"5111"}:
                 out["investment_income"] += amount
             elif counterpart_codes & {"1601", "1604", "1701"}:
                 out["asset_disposal_cash"] += amount
             elif counterpart_codes & {"1101", "1501", "1511"}:
                 out["investment_in"] += amount
-            elif any(code.startswith(("5", "6")) for code in counterpart_codes):
+            elif any(code.startswith(("4", "5")) for code in counterpart_codes):
                 # Cash refunds of previously recognised expenses reduce the
                 # corresponding operating cash outflow.
                 out["other_operating_out"] -= amount
@@ -298,7 +302,7 @@ def _cash_map(entries: list[dict[str, Any]], start: date, end: date, opening_cas
                 out["investment_out"] += amount
             elif counterpart_codes & {"2211"} or category in salary_categories:
                 out["salary_cash"] += amount
-            elif counterpart_codes & {"1403", "1405", "5001", "5101"} or category in purchase_categories:
+            elif counterpart_codes & {"1403", "1405"} or any(code.startswith("5401") for code in counterpart_codes) or category in purchase_categories:
                 out["purchase_cash"] += amount
             elif any(code.startswith("2221") for code in counterpart_codes) or category == "税费缴纳":
                 out["tax_cash"] += amount
@@ -333,7 +337,7 @@ def _net_profit(profit: Dict[str, Decimal]) -> Decimal:
 
 def _build_balance_rows(current: Dict[str, Decimal], opening: Dict[str, Decimal], profit_ytd: Dict[str, Decimal]) -> tuple[dict[str, Decimal], dict[str, Decimal]]:
     def rows(src: Dict[str, Decimal], include_profit: bool) -> dict[str, Decimal]:
-        retained = _sum_codes(src, ["3101", "3103", "3104"])
+        retained = _sum_codes(src, ["3103", "3104", "3104006"])
         if include_profit:
             retained = _d2(retained + _net_profit(profit_ytd))
         out = {
@@ -368,9 +372,9 @@ def _build_balance_rows(current: Dict[str, Decimal], opening: Dict[str, Decimal]
             "long_borrow": _sum_codes(src, ["2501"]),
             "long_payable": _sum_codes(src, ["2701"]),
             "deferred_income": _sum_codes(src, ["2401"]),
-            "paid_in_capital": _sum_codes(src, ["3001", "4001"]),
-            "capital_reserve": _sum_codes(src, ["3002", "4002"]),
-            "surplus_reserve": _sum_codes(src, ["3102"]),
+            "paid_in_capital": _sum_codes(src, ["3001"]),
+            "capital_reserve": _sum_codes(src, ["3002"]),
+            "surplus_reserve": _sum_codes(src, ["3101"]),
             "retained_earnings": retained,
         }
         out["fixed_asset_book_value"] = _d2(out["fixed_asset_cost"] - out["accumulated_depreciation"])

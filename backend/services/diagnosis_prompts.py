@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """AI 经营诊断 Prompt 模板"""
 
 CFO_DIAGNOSIS_PROMPT = """你是「梭罗」的高级财务经理。你的职责是用简单通俗的大白话，向不懂财务的小微企业老板汇报公司本月的经营状况。

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """MCP 接入 M0 测试：PAT 服务、工具注册、HTTP 鉴权与工具执行一致性。"""
 import asyncio
 import json

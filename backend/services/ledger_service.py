@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Authoritative general ledger, sub-ledger, and account summary queries."""
 from __future__ import annotations
 
@@ -14,7 +17,7 @@ from db.models import JournalEntry, JournalLine
 from db.session import session_scope
 
 POSTED_STATUSES = ("posted", "reversed")
-AGGREGATE_PARENT_CODES = {"5301"}
+AGGREGATE_PARENT_CODES = {"4301", "5401", "5601", "5602", "5603"}
 
 
 def _account_matches(requested_code: str, actual_code: str) -> bool:
@@ -163,35 +166,42 @@ async def query_sub_ledger(company_id: str, account_code: str, month: str) -> li
 async def get_balance_summary(company_id: str, month: str) -> dict[str, Any]:
     start, end = _month_range(month)
     async with session_scope() as session:
-        lines = (
+        rows = (
             await session.execute(
-                select(JournalLine)
-                .join(JournalEntry, JournalEntry.id == JournalLine.journal_entry_id)
+                select(JournalEntry, JournalLine)
+                .join(JournalLine, JournalLine.journal_entry_id == JournalEntry.id)
                 .where(
                     JournalEntry.company_id == company_id,
                     JournalEntry.status.in_(POSTED_STATUSES),
-                    JournalEntry.occurred_on >= start,
                     JournalEntry.occurred_on <= end,
                     JournalLine.company_id == company_id,
                 )
             )
-        ).scalars().all()
+        ).all()
 
+    # 期初取月前所有过账分录的累计净额，期末 = 期初 + 本期借贷（借余为正的符号约定）
     accounts: dict[str, dict[str, Any]] = {}
-    for line in lines:
+    for entry, line in rows:
         bucket = accounts.setdefault(
             line.account_code,
-            {"name": line.account_name, "debit": ZERO, "credit": ZERO},
+            {"name": line.account_name, "opening": ZERO, "debit": ZERO, "credit": ZERO},
         )
-        bucket[line.direction] += money(line.amount)
+        if entry.occurred_on < start:
+            bucket["opening"] += money(line.amount) if line.direction == "debit" else -money(line.amount)
+        elif line.direction == "debit":
+            bucket["debit"] += money(line.amount)
+        else:
+            bucket["credit"] += money(line.amount)
 
     items = [
         {
             "accountCode": code,
             "accountName": info["name"],
+            "openingBalance": money_text(info["opening"]),
             "debitTotal": money_text(info["debit"]),
             "creditTotal": money_text(info["credit"]),
             "balance": money_text(info["debit"] - info["credit"]),
+            "closingBalance": money_text(info["opening"] + info["debit"] - info["credit"]),
         }
         for code, info in sorted(accounts.items())
     ]

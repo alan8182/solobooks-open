@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+ * Licensed under the SoloBooks License v2.0.
+ */
+
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
 import { reactive } from 'vue'
@@ -55,7 +60,7 @@ describe('closing wizard settlement interaction', () => {
         entries.push({ id: 'settlement', title: '微信净额结算', amount: 4.95,
           direction: 'owner_transfer', occurDate: `${month}-15`, category: '微信支付结算',
           billingStatus: 'reconciled', reconciliationType: 'wechat_settlement', voucherStatus: 'draft',
-          voucherLines: { debit: [{ accountCode: '1002', amount: 4.95 }], credit: [{ accountCode: '1012', amount: 4.95 }] },
+          voucherLines: { debit: [{ accountCode: '1002', amount: 4.95 }], credit: [{ accountCode: '1012001', amount: 4.95 }] },
         })
         return { status: 'matched', settlementEntryId: 'settlement', settlementStatus: 'draft' }
       }

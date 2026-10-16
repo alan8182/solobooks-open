@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 from __future__ import annotations
 
 from datetime import date, datetime
@@ -255,7 +258,7 @@ class JournalEntry(Base):
     posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     reversal_of_id: Mapped[str | None] = mapped_column(String(128), ForeignKey("journal_entries.id"))
     reason: Mapped[str | None] = mapped_column(Text)
-    rule_version: Mapped[str] = mapped_column(String(64), nullable=False, default="account-mapping-v1")
+    rule_version: Mapped[str] = mapped_column(String(64), nullable=False, default="account-mapping-v2")
     metadata_json: Mapped[dict] = mapped_column("metadata", JSON_VALUE, nullable=False, default=dict)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 from __future__ import annotations
 
 import json
@@ -86,7 +89,7 @@ def sample_payload(entry_id: str = "entry-1", occurred_on: str = "2026-07-01") -
         "sourceType": "manual",
         "voucherLines": {
             "debit": [{"accountCode": "1002", "accountName": "银行存款", "amount": "100.10"}],
-            "credit": [{"accountCode": "6001", "accountName": "主营业务收入", "amount": "100.10"}],
+            "credit": [{"accountCode": "5001", "accountName": "主营业务收入", "amount": "100.10"}],
         },
     }
 
@@ -225,8 +228,8 @@ async def test_bank_match_accepts_settlement_account_entry(accounting_sessions):
                     **sample_payload("bank-settle-entry", "2026-07-05"),
                     "amount": "5.00",
                     "voucherLines": {
-                        "debit": [{"accountCode": "1012", "accountName": "其他货币资金", "amount": "5.00"}],
-                        "credit": [{"accountCode": "6001", "accountName": "主营业务收入", "amount": "5.00"}],
+                        "debit": [{"accountCode": "1012001", "accountName": "其他货币资金", "amount": "5.00"}],
+                        "credit": [{"accountCode": "5001", "accountName": "主营业务收入", "amount": "5.00"}],
                     },
                 },
                 company_id="c-bank-settle",
@@ -242,7 +245,7 @@ async def test_bank_match_accepts_settlement_account_entry(accounting_sessions):
                     )
                 ).scalars()
             }
-            assert "1012" in line_codes and "1002" not in line_codes
+            assert "1012001" in line_codes and "1002" not in line_codes
             await assert_bank_reconciliable(session, company_id="c-bank-settle", entry_ids=[entry.id])
             await sync_bank_reconciliation(
                 session,
@@ -287,7 +290,7 @@ async def test_bank_match_rejects_entry_without_money_account(accounting_session
                     **sample_payload("bank-nomoney-entry", "2026-07-06"),
                     "amount": "40.00",
                     "voucherLines": {
-                        "debit": [{"accountCode": "5608", "accountName": "管理费用", "amount": "40.00"}],
+                        "debit": [{"accountCode": "5603002", "accountName": "管理费用", "amount": "40.00"}],
                         "credit": [{"accountCode": "1221", "accountName": "其他应收款", "amount": "40.00"}],
                     },
                 },
@@ -446,8 +449,8 @@ async def test_bank_import_duplicate_wechat_income_cannot_be_posted(accounting_s
                 payload = sample_payload(entry_id, "2026-07-14")
                 payload.update({"source": "wechat_bill", "sourceType": "wechat_bill", "wechat_order_no": "order-1", "direction": direction, "amount": amount})
                 payload["voucherLines"] = {
-                    "debit": [{"accountCode": "1012" if direction == "income" else "5608", "accountName": "微信待结算" if direction == "income" else "手续费", "amount": amount}],
-                    "credit": [{"accountCode": "6001" if direction == "income" else "1012", "accountName": "收入" if direction == "income" else "微信待结算", "amount": amount}],
+                    "debit": [{"accountCode": "1012001" if direction == "income" else "5603002", "accountName": "微信待结算" if direction == "income" else "手续费", "amount": amount}],
+                    "credit": [{"accountCode": "5001" if direction == "income" else "1012001", "accountName": "收入" if direction == "income" else "微信待结算", "amount": amount}],
                 }
                 await create_entry(session, payload, company_id="c-dupe", user_id="owner", request_id=entry_id, confirm=False)
             bank = sample_payload("bank-duplicate", "2026-07-15")
@@ -642,7 +645,7 @@ async def test_reversal_swaps_lines_and_marks_original_reversed(accounting_sessi
             assert original and original.status == "reversed"
             assert reversal.status == "posted"
             assert payload["voucherLines"]["credit"][0]["accountCode"] == "1002"
-            assert payload["voucherLines"]["debit"][0]["accountCode"] == "6001"
+            assert payload["voucherLines"]["debit"][0]["accountCode"] == "5001"
 
 
 @pytest.mark.asyncio
@@ -669,7 +672,7 @@ async def test_rd_reversal_preserves_detail_and_multi_project_correction(account
                     "title": "历史研发材料", "category": "研发支出-费用化支出",
                     "occurDate": "2026-06-01", "voucherAuthority": "legacy_import",
                     "voucherLines": {
-                        "debit": [{"accountCode": "5301", "accountName": "研发支出-费用化支出（待归集）", "amount": "100.00"}],
+                        "debit": [{"accountCode": "4301", "accountName": "研发支出-费用化支出（待归集）", "amount": "100.00"}],
                         "credit": [{"accountCode": "1002", "accountName": "银行存款", "amount": "100.00"}],
                     },
                 },
@@ -690,7 +693,7 @@ async def test_rd_reversal_preserves_detail_and_multi_project_correction(account
             corrected = result["correctedEntry"]
             assert result["reversalEntryId"]
             assert [line["amount"] for line in corrected["voucherLines"]["debit"]] == ["60.00", "40.00"]
-            assert all(line["accountCode"] == "530102" for line in corrected["voucherLines"]["debit"])
+            assert all(line["accountCode"] == "430100102" for line in corrected["voucherLines"]["debit"])
             assert all(line["rdDetail"]["projectId"] in {project_a["id"], project_b["id"]} for line in corrected["voucherLines"]["debit"])
 
             summary = await rd_reconciliation_summary(
@@ -837,7 +840,7 @@ async def test_transaction_rollback_does_not_leave_partial_journal(accounting_se
 async def test_opening_balance_is_a_step_up_protected_immutable_journal(accounting_sessions):
     items = [
         {"account_code": "1002", "account_name": "银行存款", "debit_balance": "50000.00"},
-        {"account_code": "4001", "account_name": "实收资本", "credit_balance": "50000.00"},
+        {"account_code": "3001", "account_name": "实收资本", "credit_balance": "50000.00"},
     ]
     async with accounting_sessions() as session:
         async with session.begin():
@@ -915,7 +918,7 @@ async def test_tenant_isolation_and_step_up_single_use(accounting_sessions):
                 2025,
                 [
                     {"account_code": "1002", "account_name": "银行存款", "debit_balance": "1.00"},
-                    {"account_code": "4001", "account_name": "实收资本", "credit_balance": "1.00"},
+                    {"account_code": "3001", "account_name": "实收资本", "credit_balance": "1.00"},
                 ],
                 user_id="owner-a",
                 step_up_token=token,
@@ -928,7 +931,7 @@ async def test_tenant_isolation_and_step_up_single_use(accounting_sessions):
                     2024,
                     [
                         {"account_code": "1002", "account_name": "银行存款", "debit_balance": "1.00"},
-                        {"account_code": "4001", "account_name": "实收资本", "credit_balance": "1.00"},
+                        {"account_code": "3001", "account_name": "实收资本", "credit_balance": "1.00"},
                     ],
                     user_id="owner-a",
                     step_up_token=token,
@@ -941,7 +944,7 @@ async def test_tenant_isolation_and_step_up_single_use(accounting_sessions):
 async def _settlement_fixture(session, negative=False, orders=1):
     ids = []
     for index in range(orders):
-        for kind, value, debit, credit in [("sale", "100.00", "1012", "6001"), ("fee", "0.60", "5608", "1012")]:
+        for kind, value, debit, credit in [("sale", "100.00", "1012001", "5001"), ("fee", "0.60", "5603002", "1012001")]:
             if negative:
                 debit, credit = credit, debit
             entry_id = f"wx-{kind}-{index}"
@@ -1082,7 +1085,7 @@ async def _pending_invoice_fixture(session, *, posted: bool):
         "id": "inv-pending-1", "source": "invoice_import", "amount": "300",
         "direction": "expense", "category": "信息技术服务费", "occurDate": "2026-07-10",
         "title": "发票-云服务", "billingStatus": "has_invoice",
-        "voucherLines": {"debit": [{"accountCode": "5605", "accountName": "管理费用-信息技术服务费", "amount": "300"}],
+        "voucherLines": {"debit": [{"accountCode": "5602015", "accountName": "管理费用-信息技术服务费", "amount": "300"}],
                          "credit": [{"accountCode": "2241", "accountName": "其他应付款-发票待付款", "amount": "300"}]},
     }, company_id="c-invoice-pay", user_id="owner", request_id="inv", confirm=posted)
     await import_statements_core(session, company_id="c-invoice-pay", user_id="owner", rows=[{
@@ -1205,3 +1208,157 @@ async def test_reversal_falls_back_to_today_when_original_period_closed(accounti
             # 原期间已关账 → 回落到当天（当期调整口径）
             assert reversal.occurred_on == date.today()
             assert reversal.status == "posted"
+
+
+@pytest.mark.asyncio
+async def test_auto_closing_transfer_reopen_and_year_end_retained_earnings(accounting_sessions):
+    """验证关账全自动损益结转（5xxx -> 3103）、报表防重算、反结账自动红冲及 12 月末结转未分配利润（3103 -> 3104006）。"""
+    from services.accounting_core_service import posted_entries_for_reports, reopen_period
+    from services.tax_filing_export_service import build_statement_data_from_entries, parse_period
+
+    async with accounting_sessions() as session:
+        async with session.begin():
+            await ensure_tenant(session, "c-auto-close", "owner-1")
+            # 1. 2026-07 录入一笔收入 1000.00 与一笔管理费用 300.00（均走现金 1001 免银行流水核销阻断）
+            await create_entry(
+                session,
+                {
+                    "id": "inc-july",
+                    "direction": "income",
+                    "amount": "1000.00",
+                    "title": "7月技术服务收入",
+                    "category": "服务收入",
+                    "occurDate": "2026-07-10",
+                    "sourceType": "manual",
+                    "voucherLines": {
+                        "debit": [{"accountCode": "1001", "accountName": "库存现金", "amount": "1000.00"}],
+                        "credit": [{"accountCode": "5001", "accountName": "主营业务收入", "amount": "1000.00"}],
+                    },
+                },
+                company_id="c-auto-close",
+                user_id="owner-1",
+                request_id="req-inc-july",
+                confirm=True,
+            )
+            await create_entry(
+                session,
+                {
+                    "id": "exp-july",
+                    "direction": "expense",
+                    "amount": "300.00",
+                    "title": "7月办公耗材",
+                    "category": "办公费",
+                    "occurDate": "2026-07-15",
+                    "sourceType": "manual",
+                    "voucherLines": {
+                        "debit": [{"accountCode": "5602999", "accountName": "管理费用-其他", "amount": "300.00"}],
+                        "credit": [{"accountCode": "1001", "accountName": "库存现金", "amount": "300.00"}],
+                    },
+                },
+                company_id="c-auto-close",
+                user_id="owner-1",
+                request_id="req-exp-july",
+                confirm=True,
+            )
+
+            # 执行 7 月关账：应自动生成期末损益结转凭证
+            close_july = await close_period(
+                session, "c-auto-close", "2026-07", user_id="owner-1", request_id="req-close-july"
+            )
+            assert close_july["status"] == "closed"
+            assert close_july["closingCount"] == 1
+            assert len(close_july["closingVoucherRefs"]) == 1
+
+            # 检查关账快照：5001 与 5602999 余额归零，3103 本年利润为贷方 700.00（借减贷口径为 -700.00）
+            snap_accounts = {row["accountCode"]: row["balance"] for row in close_july["snapshot"]["accounts"]}
+            assert snap_accounts["5001"] == "0.00"
+            assert snap_accounts["5602999"] == "0.00"
+            assert snap_accounts["3103"] == "-700.00"
+
+            # 检查报表服务：利润表仍显示收入 1000、管理费用 300、净利润 700，资产负债表未分配利润不重复累加
+            report_entries = await posted_entries_for_reports(session, "c-auto-close")
+            opening_items = await get_opening_balances("c-auto-close", 2026, session=session)
+            stmt_july = build_statement_data_from_entries(
+                report_entries, opening_items, parse_period("2026-07", "month"), {"name": "测试公司", "taxId": "91310000TEST"}
+            )
+            assert stmt_july.profit_current["revenue"] == Decimal("1000.00")
+            assert stmt_july.profit_current["management_expense"] == Decimal("300.00")
+            assert stmt_july.profit_current["net_profit"] == Decimal("700.00")
+            assert stmt_july.balance_current["retained_earnings"] == Decimal("700.00")
+
+            # 2. 执行 7 月反结账：自动红字冲销期末结转凭证
+            token = await issue_step_up_token(
+                session, company_id="c-auto-close", user_id="owner-1", action="reopen_period"
+            )
+            reopen_res = await reopen_period(
+                session,
+                "c-auto-close",
+                "2026-07",
+                user_id="owner-1",
+                request_id="req-reopen-july",
+                reason="补录7月差旅费",
+                step_up_token=token,
+            )
+            assert reopen_res["status"] == "reopened"
+            assert len(reopen_res["reversedClosingEntryIds"]) == 1
+
+            # 补录一笔 100.00 费用后再次关账
+            await create_entry(
+                session,
+                {
+                    "id": "exp-july-2",
+                    "direction": "expense",
+                    "amount": "100.00",
+                    "title": "7月补录差旅",
+                    "category": "差旅费",
+                    "occurDate": "2026-07-20",
+                    "sourceType": "manual",
+                    "voucherLines": {
+                        "debit": [{"accountCode": "5602999", "accountName": "管理费用-其他", "amount": "100.00"}],
+                        "credit": [{"accountCode": "1001", "accountName": "库存现金", "amount": "100.00"}],
+                    },
+                },
+                company_id="c-auto-close",
+                user_id="owner-1",
+                request_id="req-exp-july-2",
+                confirm=True,
+            )
+            reclose_july = await close_period(
+                session, "c-auto-close", "2026-07", user_id="owner-1", request_id="req-reclose-july"
+            )
+            snap_after_reclose = {row["accountCode"]: row["balance"] for row in reclose_july["snapshot"]["accounts"]}
+            assert snap_after_reclose["5001"] == "0.00"
+            assert snap_after_reclose["5602999"] == "0.00"
+            assert snap_after_reclose["3103"] == "-600.00"
+
+            # 3. 2026-12 录入一笔收入 400.00 并执行年末关账：生成月度损益结转 + 年末本年利润结转未分配利润（共 2 张结转凭证）
+            await create_entry(
+                session,
+                {
+                    "id": "inc-dec",
+                    "direction": "income",
+                    "amount": "400.00",
+                    "title": "12月咨询收入",
+                    "category": "服务收入",
+                    "occurDate": "2026-12-18",
+                    "sourceType": "manual",
+                    "voucherLines": {
+                        "debit": [{"accountCode": "1001", "accountName": "库存现金", "amount": "400.00"}],
+                        "credit": [{"accountCode": "5001", "accountName": "主营业务收入", "amount": "400.00"}],
+                    },
+                },
+                company_id="c-auto-close",
+                user_id="owner-1",
+                request_id="req-inc-dec",
+                confirm=True,
+            )
+            close_dec = await close_period(
+                session, "c-auto-close", "2026-12", user_id="owner-1", request_id="req-close-dec"
+            )
+            assert close_dec["status"] == "closed"
+            assert close_dec["closingCount"] == 2
+            snap_dec = {row["accountCode"]: row["balance"] for row in close_dec["snapshot"]["accounts"]}
+            assert snap_dec["5001"] == "0.00"
+            assert snap_dec["3103"] == "0.00"
+            assert snap_dec["3104006"] == "-1000.00"
+

@@ -1,5 +1,9 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 from __future__ import annotations
 
+import calendar
 import hashlib
 import json
 import secrets
@@ -52,13 +56,13 @@ POSTING_ROLES = {"owner", "accountant"}
 WRITE_ROLES = {"owner", "accountant", "preparer"}
 ACTIVE_ENTRY_STATUSES = {"draft", "pending_review", "posted", "reversed"}
 RD_ACCOUNT_BY_TYPE = {
-    "personnel": "530101",
-    "direct_input": "530102",
-    "depreciation_amortization": "530103",
-    "design": "530104",
-    "testing": "530105",
-    "outsourced": "530106",
-    "other": "530199",
+    "personnel": "430100101",
+    "direct_input": "430100102",
+    "depreciation_amortization": "430100103",
+    "design": "430100104",
+    "testing": "430100105",
+    "outsourced": "430100106",
+    "other": "430100199",
 }
 RD_ACCOUNT_NAMES = {
     "personnel": "研发支出-人员人工",
@@ -142,7 +146,8 @@ def period_start_for(value: Any) -> date:
     return occurred_on.replace(day=1)
 
 
-MONEY_ACCOUNT_CODES = ("1002", "1012")
+# 1012 为历史编码（现 1012001 其他货币资金-微信待结算），保留以兼容存量行
+MONEY_ACCOUNT_CODES = ("1002", "1012001", "1012")
 
 
 async def _entry_money_link_amount(session: AsyncSession, company_id: str, entry_id: str) -> Decimal:
@@ -355,8 +360,9 @@ def _seed_account_definitions() -> dict[str, dict[str, Any]]:
                     "name": str(info.get("name") or code),
                     "category": str(group_name),
                     "type": str(info.get("type") or ""),
+                    "direction": str(info.get("direction") or ""),
                     "parent_code": str(info.get("parentCode") or "") or None,
-                    "level": 2 if info.get("parentCode") else 1,
+                    "level": 1 + (len(str(code)) > 4) + (len(str(code)) > 7),
                     "is_leaf": bool(info.get("isLeaf", True)),
                 }
     except (OSError, ValueError, TypeError):
@@ -374,7 +380,7 @@ def _seed_account_definitions() -> dict[str, dict[str, Any]]:
             },
         )
     definitions.setdefault("1002", {"name": "银行存款", "category": "资产", "type": "流动资产"})
-    definitions.setdefault("5699", {"name": "管理费用-其他", "category": "损益", "type": "费用"})
+    definitions.setdefault("5602999", {"name": "管理费用-其他", "category": "损益", "type": "费用"})
     return definitions
 
 
@@ -386,10 +392,11 @@ async def seed_accounts(session: AsyncSession, company_id: str) -> None:
     now = _iso_now()
     for code, info in _seed_account_definitions().items():
         if code in existing:
-            if code == "5301" and existing[code].name == "研发支出-费用化支出":
-                existing[code].name = info["name"]
             continue
-        normal_side = "credit" if code.startswith(("2", "3", "4", "6")) else "debit"
+        direction = info.get("direction")
+        if direction not in ("debit", "credit"):
+            # 未声明方向的科目按编码段兜底：负债/权益为贷方，其余为借方
+            direction = "credit" if code.startswith(("2", "3")) else "debit"
         session.add(
             ChartAccount(
                 id=f"acct-{company_id}-{code}",
@@ -400,7 +407,7 @@ async def seed_accounts(session: AsyncSession, company_id: str) -> None:
                 level=int(info.get("level") or 1),
                 category=info["category"],
                 type=info["type"],
-                normal_side=normal_side,
+                normal_side=direction,
                 is_leaf=bool(info.get("is_leaf", True)),
                 is_system=True,
                 is_active=True,
@@ -687,10 +694,11 @@ async def _post_existing(
     if member.role not in POSTING_ROLES:
         entry.status = "pending_review"
         raise AccountingError(REVIEW_REQUIRED, "该凭证需要老板或会计复核", 409)
-    if company.posting_policy == "maker_checker" and entry.created_by == user_id and not reviewer:
+    is_system_entry = entry.entry_type in {"opening", "closing", "reversal"}
+    if company.posting_policy == "maker_checker" and not is_system_entry and entry.created_by == user_id and not reviewer:
         entry.status = "pending_review"
         raise AccountingError(REVIEW_REQUIRED, "制单人与复核人必须不同", 409)
-    if company.posting_policy == "maker_checker" and entry.created_by == user_id:
+    if company.posting_policy == "maker_checker" and not is_system_entry and entry.created_by == user_id:
         raise AccountingError(REVIEW_REQUIRED, "制单人不能复核自己的凭证", 409)
 
     period = await get_or_create_period(session, entry.company_id, entry.period_start, lock=True)
@@ -811,7 +819,7 @@ async def create_entry(
         entry_type=str(payload.get("entryType") or "standard"),
         currency="CNY",
         created_by=user_id,
-        rule_version=str(payload.get("ruleVersion") or "account-mapping-v1"),
+        rule_version=str(payload.get("ruleVersion") or "account-mapping-v2"),
         metadata_json=metadata,
         version=1,
     )
@@ -831,7 +839,10 @@ async def create_entry(
     )
 
     if confirm:
-        if member.role in POSTING_ROLES and company.posting_policy == "owner_self_post":
+        if member.role in POSTING_ROLES and (
+            company.posting_policy == "owner_self_post"
+            or entry.entry_type in {"opening", "closing", "reversal"}
+        ):
             return await _post_existing(session, entry, user_id=user_id, request_id=request_id)
         entry.status = "pending_review"
         await session.flush()
@@ -1276,6 +1287,14 @@ async def reverse_journal(
             "payer": (original.metadata_json or {}).get("payer") or "company_account",
             "amount": money_text(-reversal_total),
             "isReversal": True,
+            **(
+                {
+                    "isClosingTransfer": True,
+                    "sourceType": (original.metadata_json or {}).get("sourceType") or "closing_transfer",
+                }
+                if original.entry_type == "closing" or (original.metadata_json or {}).get("isClosingTransfer")
+                else {}
+            ),
         },
         version=1,
     )
@@ -1448,7 +1467,7 @@ async def period_close_checks(session: AsyncSession, company_id: str, month: Any
     report_issues = [item for item in statement.checks[2:] if item["level"] == "error"]
     # Compare the actual exported statement's cash to authoritative account
     # balances, rather than comparing debit and credit totals a second time.
-    ledger_cash = sum((money(row[2]) - money(row[3]) for row in account_rows if row[0] in {"1001", "1002", "1012"}), ZERO)
+    ledger_cash = sum((money(row[2]) - money(row[3]) for row in account_rows if row[0] in {"1001", "1002", "1012001", "1012"}), ZERO)
     report_cash = money(statement.balance_current.get("cash", ZERO))
     if ledger_cash != report_cash:
         report_issues.append({"level": "error", "message": "账簿货币资金与申报财务报表不一致"})
@@ -1537,6 +1556,164 @@ async def period_close_checks(session: AsyncSession, company_id: str, month: Any
     }
 
 
+async def _generate_closing_entries(
+    session: AsyncSession,
+    company_id: str,
+    period_start: date,
+    *,
+    period_version: int,
+    user_id: str,
+    request_id: str,
+) -> list[JournalEntry]:
+    """自动生成并过账期末损益结转凭证（月末结转 5xxx 至 3103 本年利润；12 月末结转 3103 至 3104006 未分配利润）。"""
+    month_end = date(
+        period_start.year,
+        period_start.month,
+        calendar.monthrange(period_start.year, period_start.month)[1],
+    )
+    period_label = period_start.strftime("%Y-%m")
+    created_entries: list[JournalEntry] = []
+
+    # 1. 汇总当期已过账/冲销的 5xxx 损益类科目净发生额
+    pnl_rows = (
+        await session.execute(
+            select(
+                JournalLine.account_code,
+                JournalLine.account_name,
+                func.coalesce(func.sum(JournalLine.amount).filter(JournalLine.direction == "debit"), 0),
+                func.coalesce(func.sum(JournalLine.amount).filter(JournalLine.direction == "credit"), 0),
+            )
+            .join(JournalEntry, JournalEntry.id == JournalLine.journal_entry_id)
+            .where(
+                JournalEntry.company_id == company_id,
+                JournalEntry.period_start == period_start,
+                JournalEntry.status.in_(("posted", "reversed")),
+                JournalLine.company_id == company_id,
+                JournalLine.account_code.startswith("5"),
+            )
+            .group_by(JournalLine.account_code, JournalLine.account_name)
+            .order_by(JournalLine.account_code)
+        )
+    ).all()
+
+    closing_debits: list[dict[str, Any]] = []
+    closing_credits: list[dict[str, Any]] = []
+    total_debit = ZERO
+    total_credit = ZERO
+
+    for code, name, raw_debit, raw_credit in pnl_rows:
+        net_debit = money(raw_debit) - money(raw_credit)
+        if net_debit < ZERO:
+            # 贷方净额（如收入类 5001、利息收入 5603005）：借记该科目予以清零
+            amt = abs(net_debit)
+            closing_debits.append({"accountCode": code, "accountName": name, "amount": amt})
+            total_debit += amt
+        elif net_debit > ZERO:
+            # 借方净额（如成本费用类 5401、5601、5602、5603、5711、5801）：贷记该科目予以清零
+            closing_credits.append({"accountCode": code, "accountName": name, "amount": net_debit})
+            total_credit += net_debit
+
+    if closing_debits or closing_credits:
+        profit_diff = total_debit - total_credit
+        if profit_diff > ZERO:
+            # 本期实现净利润：贷记 3103 本年利润
+            closing_credits.append({"accountCode": "3103", "accountName": "本年利润", "amount": profit_diff})
+        elif profit_diff < ZERO:
+            # 本期发生净亏损：借记 3103 本年利润
+            closing_debits.append({"accountCode": "3103", "accountName": "本年利润", "amount": abs(profit_diff)})
+
+        voucher_total = max(total_debit, total_credit)
+        pnl_entry = await create_entry(
+            session,
+            {
+                "id": f"closing-pnl-{company_id}-{period_label}-v{period_version}",
+                "direction": "owner_transfer",
+                "amount": voucher_total,
+                "title": f"{period_start.year} 年 {period_start.month} 月期末损益结转",
+                "category": "期末损益结转",
+                "occurDate": month_end.isoformat(),
+                "sourceType": "closing_transfer",
+                "dedupFingerprint": f"closing_pnl:{company_id}:{period_label}:v{period_version}",
+                "entryType": "closing",
+                "ruleVersion": "closing-transfer-v1",
+                "voucherAuthority": "system",
+                "isClosingTransfer": True,
+                "voucherLines": {"debit": closing_debits, "credit": closing_credits},
+            },
+            company_id=company_id,
+            user_id=user_id,
+            request_id=f"{request_id}:closing-pnl",
+            confirm=True,
+        )
+        created_entries.append(pnl_entry)
+
+    # 2. 年末（12月）将 3103 本年利润全年累计余额结转至 3104006 未分配利润
+    if period_start.month == 12:
+        profit_totals = (
+            await session.execute(
+                select(
+                    func.coalesce(func.sum(JournalLine.amount).filter(JournalLine.direction == "debit"), 0),
+                    func.coalesce(func.sum(JournalLine.amount).filter(JournalLine.direction == "credit"), 0),
+                )
+                .join(JournalEntry, JournalEntry.id == JournalLine.journal_entry_id)
+                .where(
+                    JournalEntry.company_id == company_id,
+                    JournalEntry.occurred_on <= month_end,
+                    JournalEntry.status.in_(("posted", "reversed")),
+                    JournalLine.company_id == company_id,
+                    JournalLine.account_code == "3103",
+                )
+            )
+        ).one()
+        annual_net_credit = money(profit_totals[1]) - money(profit_totals[0])
+        if annual_net_credit != ZERO:
+            retained_acc = (
+                await session.execute(
+                    select(ChartAccount).where(
+                        ChartAccount.company_id == company_id,
+                        ChartAccount.is_active.is_(True),
+                        ChartAccount.is_leaf.is_(True),
+                        ChartAccount.code.in_(("3104006", "3104")),
+                    ).order_by(ChartAccount.code.desc())
+                )
+            ).scalars().first()
+            ret_code = retained_acc.code if retained_acc else "3104006"
+            ret_name = retained_acc.name if retained_acc else "未分配利润"
+            amt = abs(annual_net_credit)
+            if annual_net_credit > ZERO:
+                ye_debits = [{"accountCode": "3103", "accountName": "本年利润", "amount": amt}]
+                ye_credits = [{"accountCode": ret_code, "accountName": ret_name, "amount": amt}]
+            else:
+                ye_debits = [{"accountCode": ret_code, "accountName": ret_name, "amount": amt}]
+                ye_credits = [{"accountCode": "3103", "accountName": "本年利润", "amount": amt}]
+
+            ye_entry = await create_entry(
+                session,
+                {
+                    "id": f"closing-ye-{company_id}-{period_start.year}-v{period_version}",
+                    "direction": "owner_transfer",
+                    "amount": amt,
+                    "title": f"{period_start.year} 年末本年利润结转未分配利润",
+                    "category": "年末利润分配结转",
+                    "occurDate": month_end.isoformat(),
+                    "sourceType": "closing_year_end",
+                    "dedupFingerprint": f"closing_ye:{company_id}:{period_start.year}:v{period_version}",
+                    "entryType": "closing",
+                    "ruleVersion": "closing-transfer-v1",
+                    "voucherAuthority": "system",
+                    "isClosingTransfer": True,
+                    "voucherLines": {"debit": ye_debits, "credit": ye_credits},
+                },
+                company_id=company_id,
+                user_id=user_id,
+                request_id=f"{request_id}:closing-ye",
+                confirm=True,
+            )
+            created_entries.append(ye_entry)
+
+    return created_entries
+
+
 async def _close_period_in_transaction(
     session: AsyncSession,
     company_id: str,
@@ -1571,6 +1748,37 @@ async def _close_period_in_transaction(
             request_id=f"{request_id}:close-post:{entry.id}",
         ))
 
+    pre_check = await period_close_checks(session, company_id, month)
+    if not pre_check["canClose"]:
+        snapshot_json = json.dumps(pre_check["snapshot"], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
+        session.add(
+            PeriodCloseRun(
+                company_id=company_id,
+                period_start=period.period_start,
+                status="blocked",
+                checks=pre_check["checks"],
+                snapshot=pre_check["snapshot"],
+                snapshot_hash=digest,
+                rule_versions={"accountMapping": "account-mapping-v2"},
+                ledger_watermark=int((await session.execute(select(func.max(AuditEvent.sequence_no)))).scalar_one_or_none() or 0),
+                requested_by=user_id,
+            )
+        )
+        period.status = "open"
+        await session.flush()
+        raise AccountingError("CLOSE_CHECK_FAILED", "存在阻断项，不能关账", 409, {"checks": pre_check["checks"]})
+
+    # 五项核验通过后，全自动生成并过账期末损益结转凭证（含 12 月末未分配利润结转）
+    closing_entries = await _generate_closing_entries(
+        session,
+        company_id,
+        period.period_start,
+        period_version=period.version,
+        user_id=user_id,
+        request_id=request_id,
+    )
+
     period.status = "closing"
     await session.flush()
     result = await period_close_checks(session, company_id, month)
@@ -1584,7 +1792,7 @@ async def _close_period_in_transaction(
             checks=result["checks"],
             snapshot=result["snapshot"],
             snapshot_hash=digest,
-            rule_versions={"accountMapping": "account-mapping-v1"},
+            rule_versions={"accountMapping": "account-mapping-v2", "closingTransfer": "closing-transfer-v1"},
             ledger_watermark=int((await session.execute(select(func.max(AuditEvent.sequence_no)))).scalar_one_or_none() or 0),
             requested_by=user_id,
         )
@@ -1608,13 +1816,18 @@ async def _close_period_in_transaction(
         request_id=request_id,
         after={"period": result["period"], "status": "closed", "snapshotHash": digest,
                "autoPostedEntryIds": [entry.id for entry in posted_at_close],
-               "autoPostedVoucherRefs": [entry.voucher_no for entry in posted_at_close]},
+               "autoPostedVoucherRefs": [entry.voucher_no for entry in posted_at_close],
+               "closingEntryIds": [entry.id for entry in closing_entries],
+               "closingVoucherRefs": [entry.voucher_no for entry in closing_entries]},
         entity_version=period.version,
     )
     result["status"] = "closed"
     result["snapshotHash"] = digest
     result["autoPostedCount"] = len(posted_at_close)
     result["autoPostedVoucherRefs"] = [entry.voucher_no for entry in posted_at_close]
+    result["closingCount"] = len(closing_entries)
+    result["closingEntryIds"] = [entry.id for entry in closing_entries]
+    result["closingVoucherRefs"] = [entry.voucher_no for entry in closing_entries]
     return result
 
 
@@ -1716,6 +1929,34 @@ async def reopen_period(
     period.reopened_by = user_id
     period.reopened_at = _utcnow()
     period.version += 1
+    await session.flush()
+
+    # 反结账时自动红字冲销当期已过账的期末损益结转凭证
+    closing_entries = (
+        await session.execute(
+            select(JournalEntry)
+            .where(
+                JournalEntry.company_id == company_id,
+                JournalEntry.period_start == period.period_start,
+                JournalEntry.entry_type == "closing",
+                JournalEntry.status == "posted",
+            )
+            .order_by(JournalEntry.occurred_on.desc(), JournalEntry.id.desc())
+            .with_for_update()
+        )
+    ).scalars().all()
+    reversed_closing: list[JournalEntry] = []
+    for c_entry in closing_entries:
+        rev = await reverse_journal(
+            session,
+            c_entry.id,
+            company_id=company_id,
+            user_id=user_id,
+            request_id=f"{request_id}:reopen-rev:{c_entry.id}",
+            reason=f"反结账自动冲销期末结转：{reason.strip()}",
+        )
+        reversed_closing.append(rev)
+
     session.add(
         PeriodCloseRun(
             company_id=company_id,
@@ -1739,11 +1980,21 @@ async def reopen_period(
         entity_id=period.id,
         request_id=request_id,
         before=before,
-        after={"period": period.period_start.isoformat()[:7], "status": "reopened"},
+        after={
+            "period": period.period_start.isoformat()[:7],
+            "status": "reopened",
+            "reversedClosingEntryIds": [r.id for r in reversed_closing],
+            "reversedClosingVoucherRefs": [r.voucher_no for r in reversed_closing],
+        },
         reason=reason.strip(),
         entity_version=period.version,
     )
-    return {"period": period.period_start.isoformat()[:7], "status": "reopened"}
+    return {
+        "period": period.period_start.isoformat()[:7],
+        "status": "reopened",
+        "reversedClosingEntryIds": [r.id for r in reversed_closing],
+        "reversedClosingVoucherRefs": [r.voucher_no for r in reversed_closing],
+    }
 
 
 def request_digest(payload: Any) -> str:

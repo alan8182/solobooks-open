@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Employee Salary and Social Security database service."""
 from __future__ import annotations
 
@@ -554,7 +557,7 @@ async def accrue_salary_sheet(company_id: str, user_id: str, month: str) -> Dict
                 if amount <= ZERO:
                     continue
                 rd_debit_lines.append({
-                    "accountCode": "530101",
+                    "accountCode": "430100101",
                     "accountName": "研发支出-人员人工",
                     "amount": amount,
                     "rdDetail": {
@@ -581,7 +584,7 @@ async def accrue_salary_sheet(company_id: str, user_id: str, month: str) -> Dict
         debit_lines = list(rd_debit_lines)
         if admin_cost > ZERO:
             debit_lines.append({
-                "accountCode": "5609",
+                "accountCode": "5602014",
                 "accountName": "管理费用-福利费",
                 "amount": admin_cost
             })

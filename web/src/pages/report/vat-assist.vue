@@ -1,13 +1,17 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { NAlert, NButton, NSelect, NSpin, NTag, useMessage } from 'naive-ui'
 import { getVatAssist } from '@/api/report'
 import { formatMoney } from '@/utils/format'
 import type { VatAssistResponse, VatFilingField } from '@/api/types'
 
+const route = useRoute()
 const router = useRouter()
 const message = useMessage()
+const requestedMonth = String(route.query.month || '')
+const hasRequestedMonth = /^\d{4}-(0[1-9]|1[0-2])$/.test(requestedMonth)
 const periodType = ref<'month' | 'quarter'>('quarter')
 const loading = ref(false)
 const result = ref<VatAssistResponse | null>(null)
@@ -33,12 +37,26 @@ function periodOptions(type: 'month' | 'quarter') {
   return options
 }
 
+function resolveInitialPeriod() {
+  if (hasRequestedMonth) {
+    const year = requestedMonth.slice(0, 4)
+    const m = parseInt(requestedMonth.slice(5, 7), 10)
+    const q = Math.ceil(m / 3)
+    return `${year}-Q${q}`
+  }
+  return periodOptions('quarter')[0].value
+}
+
 const options = computed(() => periodOptions(periodType.value))
-const period = ref(periodOptions('quarter')[0].value)
+const period = ref(resolveInitialPeriod())
 const typeOptions = [
   { label: '季度申报', value: 'quarter' },
   { label: '月度申报', value: 'month' },
 ]
+
+function handleBack() {
+  router.push({ path: '/reports', query: hasRequestedMonth ? { month: requestedMonth } : {} })
+}
 
 const filingSections = computed(() => {
   const order = ['货物及劳务', '服务、不动产和无形资产', '税费试算', '附加税费']
@@ -90,9 +108,9 @@ onMounted(load)
   <div class="report-container vat-workbench">
     <div class="report-header">
       <div class="report-header-left">
-        <NButton text class="report-back-btn" @click="router.push('/reports')">
+        <NButton text class="report-back-btn" @click="handleBack">
           <template #icon><i class="ri-arrow-left-line" /></template>
-          返回
+          返回报表中心
         </NButton>
         <div class="report-title-section">
           <h2>增值税简易申报辅助</h2>
@@ -200,7 +218,7 @@ onMounted(load)
           <div class="section-heading compact">
             <div>
               <h3>销售额来源核对</h3>
-              <p>只归集已过账的6001/6051营业收入，资金结算、银行利息和验证款不进入销售额。</p>
+              <p>只归集已过账的5001/5051营业收入，资金结算、银行利息和验证款不进入销售额。</p>
             </div>
             <span class="source-count">{{ result.sourceEntryCount }} 笔</span>
           </div>

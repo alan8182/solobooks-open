@@ -1,23 +1,37 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NButton, NTag, useMessage } from 'naive-ui'
+import { NButton, useMessage } from 'naive-ui'
 import { useEntryStore } from '@/stores/entry'
 import { generateVoucherLines, normalizeVoucherLines } from '@/utils/accounting'
-import { formatMoney, formatDate } from '@/utils/format'
+import { formatMoney, formatDate, amountToChineseCapital } from '@/utils/format'
 import { getRdExpenseTypes, getRdProjects } from '@/api/rd'
 import type { RdExpenseTypeOption, RdProject } from '@/api/types'
+import { useAuthStore } from '@/stores/auth'
 
 const route = useRoute()
 const router = useRouter()
 const message = useMessage()
 const entryStore = useEntryStore()
+const authStore = useAuthStore()
 
 const entry = ref<(typeof entryStore.activeEntries)[0] | null>(null)
 const loading = ref(true)
 const rdProjects = ref<RdProject[]>([])
 const rdExpenseTypes = ref<RdExpenseTypeOption[]>([])
 
+const companyName = computed(() =>
+  authStore.user?.companies.find((c) => c.company_id === authStore.currentCompanyId)?.name || '',
+)
+const dateCN = computed(() =>
+  formatDate(entry.value?.occurDate || entry.value?.created_at || '', 'YYYY年MM月DD日'),
+)
+// 「记-202609-001」→「记字第1号」；解析失败回退显示原凭证号
+const voucherSeq = computed(() => {
+  const m = (entry.value?.voucherRef || '').match(/(\d+)\s*$/)
+  return m ? String(Number(m[1])) : entry.value?.voucherRef || '—'
+})
 const voucherLines = computed(() => {
   if (!entry.value) return []
   const storedLines = normalizeVoucherLines((entry.value as any).voucherLines)
@@ -36,7 +50,18 @@ const totalDebit = computed(() =>
 const totalCredit = computed(() =>
   voucherLines.value.filter((l) => l.side === 'credit').reduce((s, l) => s + l.amount, 0),
 )
+const capitalAmount = computed(() => amountToChineseCapital(Math.max(totalDebit.value, totalCredit.value)))
+// 固定行数占位：分录少于 6 行时补空行撑满版面（传统凭证样式）
+const blankRowCount = computed(() => Math.max(0, 6 - voucherLines.value.length))
 const rdVoucherLines = computed(() => voucherLines.value.filter(line => line.rdDetail))
+
+// 凭证金额列不带 ¥ 前缀（对齐传统凭证版式）
+function plainMoney(value: number) {
+  return Number(value || 0).toLocaleString('zh-CN', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })
+}
 
 function rdProjectLabel(projectId: string) {
   const project = rdProjects.value.find(item => item.id === projectId)
@@ -93,52 +118,55 @@ onMounted(async () => {
 
     <!-- Voucher printable area -->
     <div class="print-area">
-      <div class="voucher-title">记 账 凭 证</div>
-
-      <div class="voucher-header-info">
-        <div class="info-row">
-          <span class="info-label">凭证号：</span>
-          <span class="info-value">{{ entry.voucherRef || '—' }}</span>
-        </div>
-        <div class="info-row">
-          <span class="info-label">日期：</span>
-          <span class="info-value">{{ formatDate(entry.occurDate || entry.created_at || '') }}</span>
-        </div>
-        <div class="info-row">
-          <span class="info-label">摘要：</span>
-          <span class="info-value">{{ entry.title }}</span>
-        </div>
+      <div class="voucher-company">{{ companyName }}</div>
+      <div class="voucher-title-wrap">
+        <span class="voucher-title">记 账 凭 证</span>
+      </div>
+      <div class="voucher-meta">
+        <span class="meta-date">{{ dateCN }}</span>
+        <span class="meta-ref">记字第{{ voucherSeq }}号</span>
       </div>
 
       <table class="voucher-table">
         <thead>
           <tr>
-            <th class="col-code">科目编码</th>
-            <th class="col-name">科目名称</th>
-            <th class="col-side">方向</th>
-            <th class="col-amount">金额</th>
+            <th class="col-summary">摘要</th>
+            <th class="col-account">科目</th>
+            <th class="col-amount">借方金额</th>
+            <th class="col-amount">贷方金额</th>
           </tr>
         </thead>
         <tbody>
           <tr v-for="(line, i) in voucherLines" :key="i">
-            <td>{{ line.code }}</td>
+            <td class="cell-summary" :title="line.code">{{ entry.title }}</td>
             <td>{{ line.name }}</td>
-            <td>
-              <NTag size="tiny" :type="line.side === 'debit' ? 'error' : 'success'" :bordered="false">
-                {{ line.side === 'debit' ? '借方' : '贷方' }}
-              </NTag>
-            </td>
-            <td class="amount">{{ formatMoney(line.amount) }}</td>
+            <td class="amount">{{ line.side === 'debit' ? plainMoney(line.amount) : '' }}</td>
+            <td class="amount">{{ line.side === 'credit' ? plainMoney(line.amount) : '' }}</td>
+          </tr>
+          <!-- 空行仅打印时显示：纸质凭证惯例（固定版面/防加行篡改），屏幕上无意义 -->
+          <tr v-for="n in blankRowCount" :key="`blank-${n}`" class="blank-row">
+            <td>&nbsp;</td><td></td><td></td><td></td>
           </tr>
         </tbody>
         <tfoot>
           <tr>
-            <td colspan="3" class="total-label">合计</td>
-            <td class="amount total">{{ formatMoney(Math.max(totalDebit, totalCredit)) }}</td>
+            <td colspan="2" class="total-capital">合　计：{{ capitalAmount }}</td>
+            <td class="amount total">{{ plainMoney(totalDebit) }}</td>
+            <td class="amount total">{{ plainMoney(totalCredit) }}</td>
           </tr>
         </tfoot>
       </table>
 
+      <div class="voucher-sign">
+        <span class="sign-item">财务主管</span>
+        <span class="sign-item">复核 {{ entry.reviewedByName || '' }}</span>
+        <span class="sign-item">记账 {{ entry.postedByName || '' }}</span>
+        <span class="sign-item">出纳</span>
+        <span class="sign-item">经办</span>
+        <span class="sign-item">制单 {{ entry.createdByName || '' }}</span>
+      </div>
+
+      <!-- 研发归集附注：不进凭证主体，打印时位于签章行之后 -->
       <div v-if="rdVoucherLines.length" class="rd-section">
         <div class="rd-section-title">研发费用归集</div>
         <div v-for="line in rdVoucherLines" :key="`${line.code}-${line.rdDetail?.projectId}`" class="rd-line">
@@ -154,28 +182,13 @@ onMounted(async () => {
       <div v-if="entry.riskTags?.length" class="risk-tags">
         <span v-for="tag in entry.riskTags" :key="tag" class="risk-tag">{{ tag }}</span>
       </div>
-
-      <div class="voucher-footer">
-        <div class="footer-row">
-          <span>制单人：</span>
-          <span class="footer-name">{{ entry.createdByName || '—' }}</span>
-        </div>
-        <div class="footer-row">
-          <span>审核人：</span>
-          <span class="footer-name">{{ entry.reviewedByName || '—' }}</span>
-        </div>
-        <div class="footer-row">
-          <span>记账人：</span>
-          <span class="footer-name">{{ entry.postedByName || '—' }}</span>
-        </div>
-      </div>
     </div>
   </div>
 </template>
 
 <style scoped>
 .voucher-detail-page {
-  max-width: 680px;
+  max-width: 760px;
   margin: 0 auto;
 }
 .toolbar {
@@ -192,14 +205,98 @@ onMounted(async () => {
   border-radius: var(--solo-radius-lg);
   box-shadow: var(--solo-shadow);
 }
-.voucher-title {
+
+/* 抬头：公司名 + 标题 + 日期/凭证号 */
+.voucher-company {
   text-align: center;
-  font-size: 20px;
-  font-weight: 700;
-  letter-spacing: 6px;
-  margin-bottom: 24px;
+  font-size: 15px;
+  font-weight: 500;
   color: var(--solo-text-primary);
 }
+.voucher-title-wrap {
+  text-align: center;
+  margin: 6px 0 14px;
+}
+.voucher-title {
+  display: inline-block;
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: 10px;
+  margin-right: -10px;
+  padding: 0 2px 6px;
+  border-bottom: 3px solid var(--solo-text-primary);
+}
+.voucher-meta {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  margin-bottom: 14px;
+  font-size: 13px;
+}
+.meta-date {
+  grid-column: 2;
+  color: var(--solo-text-primary);
+}
+.meta-ref {
+  grid-column: 3;
+  text-align: right;
+  font-weight: 500;
+}
+
+/* 凭证表格：摘要 | 科目 | 借方金额 | 贷方金额 */
+.voucher-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.voucher-table th,
+.voucher-table td {
+  border: 1px solid #9ca3af;
+}
+.voucher-table th {
+  padding: 10px 12px;
+  text-align: center;
+  font-weight: 600;
+  color: var(--solo-text-primary);
+  font-size: 13px;
+}
+.voucher-table td {
+  padding: 10px 12px;
+  text-align: left;
+  vertical-align: top;
+}
+.col-summary { width: 22%; }
+.col-account { width: 42%; }
+.col-amount { width: 18%; }
+.cell-summary {
+  color: var(--solo-text-primary);
+}
+.amount {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.total-capital {
+  font-weight: 700;
+}
+.total {
+  font-weight: 700;
+}
+
+/* 空行占位仅打印输出，屏幕隐藏 */
+.blank-row {
+  display: none;
+}
+
+/* 签章行 */
+.voucher-sign {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 22px;
+  font-size: 13px;
+  color: var(--solo-text-primary);
+}
+
+/* 研发归集附注 */
 .rd-section {
   margin-top: 16px;
   padding: 12px;
@@ -221,63 +318,12 @@ onMounted(async () => {
   margin-top: 8px;
   padding-top: 8px;
 }
-.voucher-header-info {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 24px;
-  margin-bottom: 20px;
-  font-size: 13px;
-}
-.info-row {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-.info-label {
-  color: var(--solo-text-muted);
-}
-.info-value {
-  color: var(--solo-text-primary);
-  font-weight: 500;
-}
-
-/* Table */
-.voucher-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 13px;
-  margin-bottom: 16px;
-}
-.voucher-table th,
-.voucher-table td {
-  padding: 10px 12px;
-  text-align: left;
-  border: 1px solid #d1d5db;
-}
-.voucher-table th {
-  background: #f9fafb;
-  font-weight: 600;
-  color: var(--solo-text-secondary);
-  font-size: 12px;
-}
-.col-code { width: 20%; }
-.col-name { width: 35%; }
-.col-side { width: 15%; }
-.col-amount { width: 30%; text-align: right; }
-.amount {
-  text-align: right;
-  font-weight: 600;
-  font-family: 'Inter', monospace;
-}
-.total {
-  font-size: 14px;
-}
 
 /* Risk tags */
 .risk-tags {
   display: flex;
   gap: 6px;
-  margin-bottom: 16px;
+  margin-top: 16px;
 }
 .risk-tag {
   font-size: 11px;
@@ -285,30 +331,6 @@ onMounted(async () => {
   background: #fef2f2;
   padding: 2px 8px;
   border-radius: 4px;
-}
-
-/* Footer */
-.voucher-footer {
-  display: flex;
-  justify-content: flex-end;
-  gap: 40px;
-  margin-top: 24px;
-  padding-top: 16px;
-}
-.footer-row {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 13px;
-  color: var(--solo-text-muted);
-}
-.footer-name {
-  display: inline-block;
-  min-width: 80px;
-  border-bottom: 1px solid #d1d5db;
-  text-align: center;
-  font-weight: 500;
-  color: var(--solo-text-primary, #182230);
 }
 
 /* Print styles */
@@ -324,9 +346,15 @@ onMounted(async () => {
     padding: 40px;
     border-radius: 0;
   }
+  .voucher-title {
+    border-bottom-color: #000;
+  }
   .voucher-table th,
   .voucher-table td {
     border-color: #000;
+  }
+  .blank-row {
+    display: table-row;
   }
 }
 </style>
