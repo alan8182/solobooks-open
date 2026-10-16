@@ -1,13 +1,19 @@
 # 梭罗记账 SoloBooks · 面向一人公司与小微企业的 AI 记账工具
 
-<p align="center"><img src="brand/solo-lockup.png" alt="梭罗记账 SoloBooks" width="420" /></p>
+<p align="center">
+  <img src="brand/solo-lockup.png" alt="梭罗记账 SoloBooks" width="420" /><br/>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-SoloBooks_v2.0-blue.svg" alt="SoloBooks License v2.0" /></a>
+  <a href="#技术栈"><img src="https://img.shields.io/badge/Python-3.13-brightgreen.svg" alt="Python 3.13" /></a>
+  <a href="#技术栈"><img src="https://img.shields.io/badge/Vue-3.x-42b883.svg" alt="Vue 3" /></a>
+  <a href="MCP接入方案.md"><img src="https://img.shields.io/badge/MCP-Supported-purple.svg" alt="MCP Supported" /></a>
+</p>
 
 梭罗记账（SoloBooks）是一套面向**一人公司与小微企业**的智能记账与财税管理系统。以「记录 + 智能 → 记账 + 对账」为核心，帮助个体经营者、小微公司把日常收支、发票、银行流水管理成规范的会计账目，并自动生成凭证与经营报表。
 
 > **为什么做梭罗记账？**
 > 梭罗一个人在瓦尔登湖边生活、劳作、记录——一个人的公司，也值得一套真正清晰的账。传统代记账机构往往只帮你「把账记下来」，停留在流水登记，并不会真正去分析、管理你的财务。梭罗记账的初衷，是让 OPC（一人公司）和小微企业拥有一套**真正管好财务**的工具——不只是记录，而是对账、生成报表、做结账检查，让经营者自己也能看懂、掌控经营。
 
-> 📌 **授权说明**：本项目采用自定义**源码可用许可**（`LICENSE`）：个人、个体工商户、一人公司与小微企业可**永久免费自托管**用于本企业内部记账（含产生经营收入的日常记账）；未经书面授权，不得对外提供 SaaS 托管或第三方商业代账服务。商业授权（Partner License）请联系作者。
+> 📌 **授权说明**：本项目采用**源码可用许可**（[SoloBooks License v2.0](LICENSE)）：个人、个体工商户、一人公司与小微企业可**永久免费自托管**用于本企业内部记账（含产生经营收入的日常记账）；未经书面授权，**不得**对外提供 SaaS 托管、付费云平台或第三方商业代账服务。商业授权（Partner License）与合作请联系：**taoguo66@yeah.net**。
 
 ---
 
@@ -148,9 +154,12 @@ docker compose up -d
 
 欢迎通过 Issue 报告问题、提出建议或提交 PR。请阅读 [CONTRIBUTING.md](CONTRIBUTING.md) 了解贡献规范。
 
-## 许可证
+## 许可证与商业授权
 
-本项目采用 [SoloBooks 源码可用许可 v2.0](LICENSE)：**个人、个体工商户、一人公司与小微企业可永久免费自托管用于本企业内部记账**；未经书面授权，禁止将本软件用于对外 SaaS 托管、付费云服务或第三方商业代账。详见 `LICENSE`。
+本项目核心开源底座采用 [SoloBooks 源码可用许可 v2.0](LICENSE)：
+- **个人与企业自用**：个人、个体工商户、一人公司与小微企业可**永久免费自托管**用于本企业内部记账（包括产生经营收入的真实记账场景），享有阅读源码、自用修改与部署运行的完整自由。
+- **商业使用限制**：未经芥子星辰（杭州）智能科技有限公司书面授权，**禁止**将本软件用于对外 SaaS 托管经营、按用户/多租户收费、或持牌代账机构向客户提供商业记账/报税服务。
+- **商业授权（Partner License）**：如需多租户云端连接器、代账批量管户平台或商业联合运营授权，请联系商务邮箱：**taoguo66@yeah.net**。
 
 ## 免责声明
 
