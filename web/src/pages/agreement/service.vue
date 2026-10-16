@@ -58,7 +58,7 @@ const sections: LegalSection[] = [
   {
     heading: '八、联系方式',
     paragraphs: [
-      '如您对本协议或本平台服务有任何疑问、意见或建议，可通过以下方式联系我们：taoguo66@yeah.net。',
+      '如您对本协议或本平台服务有任何疑问、意见或建议，可通过以下方式联系我们：founder@jiezixingchen.com。',
     ],
   },
 ]
