@@ -1,4 +1,6 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
+import { usePageRefresh } from '@/composables/usePageRefresh'
 import { computed, onMounted, ref } from 'vue'
 import {
   NAlert, NButton, NCard, NDatePicker, NForm, NFormItem, NInput, NInputNumber, NModal,
@@ -9,6 +11,7 @@ import { correctRdUnallocated, createRdEvidence, createRdProject, getRdEvidence,
 import type { RdCorrectionAllocation, RdEvidenceDocument, RdEvidenceInput, RdLedgerItem, RdProjectInput, RdReconciliationSummary, RdUnallocatedItem } from '@/api/rd'
 import type { RdExpenseTypeOption, RdProject } from '@/api/types'
 import { formatMoney } from '@/utils/format'
+import { SoloEmpty } from '@/components/ui'
 
 const message = useMessage()
 const loading = ref(false)
@@ -281,6 +284,9 @@ async function exportLedger() {
 }
 
 onMounted(load)
+
+// 从别的标签切回来时静默重拉，避免对着旧数字干活
+usePageRefresh(load)
 </script>
 
 <template>
@@ -306,7 +312,7 @@ onMounted(load)
 
     <NCard v-if="reconciliation" :bordered="false" title="总账勾稽与申报预审" class="mb-4">
       <NAlert :type="reconciliation.isReconciled ? 'success' : 'error'" :bordered="false" class="mb-4">
-        辅助账 {{ formatMoney(reconciliation.ledgerTotal) }}，5301 系列总账 {{ formatMoney(reconciliation.generalLedgerTotal) }}，
+        辅助账 {{ formatMoney(reconciliation.ledgerTotal) }}，4301 系列总账 {{ formatMoney(reconciliation.generalLedgerTotal) }}，
         差异 {{ formatMoney(reconciliation.difference) }}。{{ reconciliation.isReconciled ? '账表一致。' : '存在差异，暂不能用于申报复核。' }}
       </NAlert>
       <div class="reconciliation-grid">
@@ -340,7 +346,12 @@ onMounted(load)
           </tr></tbody>
         </table>
       </div>
-      <div v-else class="empty">尚未登记研发证据资料。</div>
+      <SoloEmpty
+        v-else
+        variant="hint"
+        title="尚未登记研发证据资料"
+        description="立项文件、研发台账等证明材料齐了，加计扣除才立得住。"
+      />
     </NCard>
 
     <NCard :bordered="false" title="研发项目" class="mb-4">
@@ -359,7 +370,12 @@ onMounted(load)
           </NSpace>
         </div>
       </div>
-      <div v-else class="empty">尚未建立研发项目。</div>
+      <SoloEmpty
+        v-else
+        variant="hint"
+        title="尚未建立研发项目"
+        description="先建项目，费用归集和加计扣除才有归处。"
+      />
     </NCard>
 
     <NCard v-if="unallocatedItems.length" :bordered="false" title="待补充归集" class="mb-4">

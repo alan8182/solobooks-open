@@ -1,11 +1,22 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
-import { NCard, NGrid, NGi } from 'naive-ui'
 import { useEntryStore } from '@/stores/entry'
 import { useAuthStore } from '@/stores/auth'
 import { getAllExpenses } from '@/api/private-expense'
 import type { PrivateExpense } from '@/api/private-expense'
 import { formatMoney } from '@/utils/format'
+import { SoloSkeleton } from '@/components/ui'
+import { SoloErrorState } from '@/components/ui'
+
+/** 失败后重试：store 会把失败原因写进 error，成功时自动清空 */
+async function reloadEntries() {
+  try {
+    await entryStore.fetchEntries()
+  } catch {
+    // 失败原因已由 store 记录，页面会继续显示错误态
+  }
+}
 
 const entryStore = useEntryStore()
 const authStore = useAuthStore()
@@ -89,28 +100,38 @@ const periodProfit = computed(() => periodIncome.value - periodExpense.value)
 </script>
 
 <template>
-  <div class="summary-panel">
+  <div v-if="entryStore.loading && entryStore.activeEntries.length === 0" class="summary-panel-loading">
+    <SoloSkeleton variant="stat" />
+  </div>
+  <SoloErrorState
+    v-else-if="entryStore.error && entryStore.activeEntries.length === 0"
+    title="经营概览加载失败"
+    description="没能取到账目数据，这里不会显示 0，以免让你以为这个月真的一分没赚。"
+    :detail="entryStore.error"
+    @retry="reloadEntries"
+  />
+  <div v-else class="summary-panel">
     <div class="summary-intro">
       <div class="summary-heading">
         <span class="summary-kicker">{{ periodMeta.title }}</span>
         <div class="summary-controls">
           <div class="period-switch" role="group" aria-label="经营概览时间范围">
-          <button
-            type="button"
-            :class="{ active: selectedPeriod === 'year' }"
-            :aria-pressed="selectedPeriod === 'year'"
-            @click="selectedPeriod = 'year'"
-          >
-            本年累计
-          </button>
-          <button
-            type="button"
-            :class="{ active: selectedPeriod === 'lastMonth' }"
-            :aria-pressed="selectedPeriod === 'lastMonth'"
-            @click="selectedPeriod = 'lastMonth'"
-          >
-            上月
-          </button>
+            <button
+              type="button"
+              :class="{ active: selectedPeriod === 'year' }"
+              :aria-pressed="selectedPeriod === 'year'"
+              @click="selectedPeriod = 'year'"
+            >
+              本年累计
+            </button>
+            <button
+              type="button"
+              :class="{ active: selectedPeriod === 'lastMonth' }"
+              :aria-pressed="selectedPeriod === 'lastMonth'"
+              @click="selectedPeriod = 'lastMonth'"
+            >
+              上月
+            </button>
           </div>
           <button
             type="button"
@@ -134,85 +155,57 @@ const periodProfit = computed(() => periodIncome.value - periodExpense.value)
         {{ periodMeta.note }}{{ includePrivate ? '，含未转入正式账本的小私账' : '' }}
       </span>
     </div>
-    <NGrid :cols="2" :x-gap="0" :y-gap="0" class="stats-grid">
-    <NGi>
-      <NCard :bordered="false" class="stat-card income">
-        <div class="stat-content">
-          <div class="stat-info">
-            <span class="stat-label">{{ periodMeta.incomeLabel }}</span>
-            <span class="stat-value" :title="formatMoney(periodIncome)">
-              {{ formatMoney(periodIncome) }}
-            </span>
-          </div>
-          <div class="stat-icon-wrapper">
-            <i class="ri-arrow-left-down-line" />
-          </div>
-        </div>
-      </NCard>
-    </NGi>
-
-    <NGi>
-      <NCard :bordered="false" class="stat-card expense">
-        <div class="stat-content">
-          <div class="stat-info">
-            <span class="stat-label">{{ periodMeta.expenseLabel }}</span>
-            <span class="stat-value" :title="formatMoney(periodExpense)">
-              {{ formatMoney(periodExpense) }}
-            </span>
-          </div>
-          <div class="stat-icon-wrapper">
-            <i class="ri-arrow-right-up-line" />
-          </div>
-        </div>
-      </NCard>
-    </NGi>
-
-    </NGrid>
-    <div class="health-strip">
-      <div><i class="ri-checkbox-circle-line" /> 账务记录完整</div>
-      <div><i class="ri-shield-check-line" /> 当前无高风险事项</div>
-      <button @click="$router.push('/reports/health')">查看经营健康度 <i class="ri-arrow-right-line" /></button>
+    <div class="stats-list">
+      <div class="stat-row income">
+        <span class="stat-label">{{ periodMeta.incomeLabel }}</span>
+        <span class="stat-value" :title="formatMoney(periodIncome)">
+          {{ formatMoney(periodIncome) }}
+        </span>
+      </div>
+      <div class="stat-row expense">
+        <span class="stat-label">{{ periodMeta.expenseLabel }}</span>
+        <span class="stat-value" :title="formatMoney(periodExpense)">
+          {{ formatMoney(periodExpense) }}
+        </span>
+      </div>
     </div>
   </div>
 </template>
 
 <style scoped>
-.stats-grid {
-  min-width: 0;
-}
-:deep(.n-card__content) {
-  padding: 18px 20px !important;
-}
 .summary-panel {
   display: grid;
-  grid-template-columns: minmax(260px, 0.8fr) minmax(400px, 1.2fr);
+  grid-template-columns: minmax(280px, 0.9fr) minmax(340px, 1.1fr);
   border: 1px solid var(--solo-border);
   border-radius: var(--solo-radius-xl);
   background: #fff;
   overflow: hidden;
 }
 .summary-intro {
-  padding: 24px 28px;
+  padding: 22px 24px;
   border-right: 1px solid var(--solo-border-light);
   display: flex;
   flex-direction: column;
 }
 .summary-heading {
-  margin-bottom: 22px;
+  margin-bottom: 16px;
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
 }
 .summary-kicker {
   color: var(--solo-text-primary);
   font-size: 14px;
   font-weight: 650;
+  line-height: 1.3;
+  white-space: nowrap;
 }
 .summary-controls {
   display: flex;
   align-items: center;
-  gap: 6px;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 .period-switch {
   display: inline-flex;
@@ -232,6 +225,7 @@ const periodProfit = computed(() => periodIncome.value - periodExpense.value)
   color: var(--solo-text-secondary);
   font: inherit;
   font-size: 11px;
+  white-space: nowrap;
   cursor: pointer;
 }
 .period-switch button:hover {
@@ -248,6 +242,9 @@ const periodProfit = computed(() => periodIncome.value - periodExpense.value)
   box-shadow: var(--solo-shadow-sm);
 }
 .private-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   min-height: 30px;
   padding: 3px 9px;
   border: 1px solid var(--solo-border-light);
@@ -256,6 +253,7 @@ const periodProfit = computed(() => periodIncome.value - periodExpense.value)
   color: var(--solo-text-secondary);
   font: inherit;
   font-size: 11px;
+  white-space: nowrap;
   cursor: pointer;
 }
 .private-toggle:hover:not(:disabled),
@@ -277,56 +275,49 @@ const periodProfit = computed(() => periodIncome.value - periodExpense.value)
   font-size: 12px;
 }
 .summary-profit {
-  margin: 4px 0 12px;
+  margin: 4px 0 10px;
   color: var(--solo-primary);
   font-size: 34px;
   font-weight: 700;
   letter-spacing: -1px;
+  line-height: 1.15;
   font-variant-numeric: tabular-nums;
 }
 .summary-profit.negative {
   color: var(--solo-expense);
 }
-.stat-card {
-  height: 100%;
-  border-radius: 0;
-  background: var(--solo-bg-card);
-  box-shadow: none;
-  border: 0;
-  position: relative;
-  overflow: hidden;
-  transition: all 0.2s;
-}
-.stat-card:hover {
-  transform: none;
-  box-shadow: none;
-  background: var(--solo-bg-soft);
-}
-.stat-content {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 0;
-}
-.stat-info {
+.stats-list {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  justify-content: center;
   min-width: 0;
-  flex: 1;
+}
+.stat-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 20px 26px;
+  min-width: 0;
+}
+.stat-row + .stat-row {
+  border-top: 1px solid var(--solo-border-light);
 }
 .stat-label {
+  flex-shrink: 0;
   font-size: 13px;
   font-weight: 600;
   color: var(--solo-text-secondary);
 }
 .stat-value {
-  font-size: 22px;
+  min-width: 0;
+  font-size: 24px;
   font-weight: 680;
   color: var(--solo-text-primary);
   font-family: 'Outfit', 'Inter', sans-serif;
   letter-spacing: -0.4px;
   font-variant-numeric: tabular-nums;
+  text-align: right;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -337,64 +328,7 @@ const periodProfit = computed(() => periodIncome.value - periodExpense.value)
 .expense .stat-value {
   color: var(--solo-expense);
 }
-.stat-value.positive {
-  color: var(--solo-income);
-}
-.stat-value.negative {
-  color: var(--solo-expense);
-}
-.stat-icon-wrapper {
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 18px;
-  flex-shrink: 0;
-  margin-left: 8px;
-}
-.income .stat-icon-wrapper {
-  background: var(--solo-income-bg);
-  color: var(--solo-income);
-}
-.expense .stat-icon-wrapper {
-  background: var(--solo-expense-bg);
-  color: var(--solo-expense);
-}
-.profit .stat-icon-wrapper {
-  background: var(--solo-primary-glow);
-  color: var(--solo-primary);
-}
-.health-strip {
-  grid-column: 1 / -1;
-  min-height: 44px;
-  padding: 0 18px;
-  border-top: 1px solid var(--solo-border-light);
-  display: flex;
-  align-items: center;
-  gap: 22px;
-  color: var(--solo-text-secondary);
-  font-size: 12px;
-}
-.health-strip div {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.health-strip i {
-  color: var(--solo-income);
-}
-.health-strip button {
-  margin-left: auto;
-  border: 0;
-  background: none;
-  color: var(--solo-primary);
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-}
-@media (max-width: 768px) {
+@media (max-width: 660px) {
   .summary-panel {
     grid-template-columns: 1fr;
   }
@@ -402,18 +336,8 @@ const periodProfit = computed(() => periodIncome.value - periodExpense.value)
     border-right: 0;
     border-bottom: 1px solid var(--solo-border-light);
   }
-  .summary-heading {
-    align-items: flex-start;
-    flex-direction: column;
-  }
-  .health-strip {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 8px;
-    padding: 14px 18px;
-  }
-  .health-strip button {
-    margin-left: 0;
+  .stat-row {
+    padding: 16px 22px;
   }
 }
 </style>

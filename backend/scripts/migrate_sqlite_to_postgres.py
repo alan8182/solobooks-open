@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Offline SQLite -> PostgreSQL migration with cent-exact reconciliation.
 
 Run Alembic first, then rehearse against a staging database:
@@ -57,9 +60,10 @@ MONEY_COLUMNS = {
     "company_social_security", "net_salary", "total_cost",
 }
 COPY_TABLES = [
-    "auth_consents", "fixed_assets", "todo_states", "categories", "private_expenses",
+    "auth_consents", "todo_states", "categories", "private_expenses",
     "employees", "salary_sheets", "salary_records", "recurring_templates",
-    "depreciation_schedule",
+    # P1 WP-B：固定资产进核心 ORM；legacy blob 表（fixed_assets / depreciation_schedule）
+    # 不再拷贝——生产 PG 由 alembic 建新表 + 回填服务从 legacy_fixed_assets 迁移。
 ]
 
 
@@ -471,7 +475,7 @@ async def _migrate_bank(source: sqlite3.Connection, session) -> None:
             company_id=company_id, source_type="bank_statement", external_key=values["id"],
             occurred_on=date.fromisoformat(str(values["transaction_date"])[:10]),
             description=values.get("description") or "银行流水", amount=abs(amount_value), currency="CNY",
-            raw_payload=_json(values), status="reconciled" if matches_by_statement.get(values["id"]) else "candidate",
+            raw_payload=_json({**values, "signedAmount": money_text(amount_value)}), status="reconciled" if matches_by_statement.get(values["id"]) else "candidate",
             created_by="migration",
         )
         session.add(source_transaction)

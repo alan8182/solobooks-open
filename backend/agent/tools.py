@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Agent 工具注册表：对现有 services 的薄包装。
 
 - 只读工具直接执行；
@@ -7,7 +10,10 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import re
 import time
+from datetime import datetime
 from decimal import Decimal
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional
@@ -176,12 +182,129 @@ async def _list_bank_statements(
     return {"count": len(out[:cap]), "total": len(out), "statements": out[:cap]}
 
 
-async def _get_aging(ctx: ToolContext, kind: str = "ar") -> Any:
+async def _list_fixed_assets(
+    ctx: ToolContext,
+    keyword: Optional[str] = None,
+    status: Optional[str] = None,
+    category: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 50,
+) -> Any:
+    """固定资产台账：回答「有哪些资产/每月折旧多少/净值还剩多少」，结账账实核对入口。"""
+    from db.session import session_scope
+    from services.fixed_asset_service import list_assets
+
+    safe_page = max(1, min(int(page or 1), 1000))
+    safe_size = max(1, min(int(page_size or 50), 100))
+    async with session_scope() as session:
+        result = await list_assets(
+            session,
+            company_id=ctx.company_id,
+            user_id=ctx.user_id,
+            status=status or None,
+            category=category or None,
+            keyword=keyword or None,
+            page=safe_page,
+            page_size=safe_size,
+        )
+    # 投影：卡片 25+ 字段只留台账盘点/折旧核对所需，控上下文体积
+    items = [
+        _pick(a, (
+            "id", "code", "name", "category", "categoryName", "status",
+            "acquisitionDate", "originalValue", "accumulatedDepreciation",
+            "netValue", "monthlyDepreciation", "remainingMonths",
+            "depreciationMethod", "lastDepreciatedPeriod",
+        ))
+        for a in result.get("items", [])
+    ]
+    return {
+        "total": result.get("total", 0),
+        "count": len(items),
+        "page": result.get("page", safe_page),
+        "pageSize": result.get("pageSize", safe_size),
+        "assets": items,
+    }
+
+
+async def _list_intangible_assets(
+    ctx: ToolContext,
+    keyword: Optional[str] = None,
+    status: Optional[str] = None,
+    category: Optional[str] = None,
+    expiring_in_days: Optional[int] = None,
+    page: int = 1,
+    page_size: int = 50,
+) -> Any:
+    """无形资产台账：查询软件著作权、商标、专利、域名等无形资产原值、累计摊销、净值与权利到期日。"""
+    from db.session import session_scope
+    from services.intangible_asset_service import list_assets
+
+    safe_page = max(1, min(int(page or 1), 1000))
+    safe_size = max(1, min(int(page_size or 50), 100))
+    safe_days = max(1, min(int(expiring_in_days), 3650)) if expiring_in_days is not None else None
+    async with session_scope() as session:
+        result = await list_assets(
+            session,
+            company_id=ctx.company_id,
+            user_id=ctx.user_id,
+            status=status or None,
+            category=category or None,
+            keyword=keyword or None,
+            expiring_in_days=safe_days,
+            page=safe_page,
+            page_size=safe_size,
+        )
+    # 投影：只保留台账盘点、摊销核对与权利到期预警所需字段，控上下文体积
+    items = [
+        _pick(
+            a,
+            (
+                "id",
+                "code",
+                "name",
+                "category",
+                "categoryName",
+                "status",
+                "originalValue",
+                "accumulatedAmortization",
+                "netValue",
+                "usefulLifeMonths",
+                "remainingMonths",
+                "lastAmortizedPeriod",
+                "amortizationEndPeriod",
+                "legalCertNo",
+                "expiryDate",
+                "rdProjectId",
+            ),
+        )
+        for a in result.get("items", [])
+    ]
+    return {
+        "total": result.get("total", 0),
+        "count": len(items),
+        "page": result.get("page", safe_page),
+        "pageSize": result.get("pageSize", safe_size),
+        "assets": items,
+    }
+
+
+async def _get_advance_balances(ctx: ToolContext, month: Optional[str] = None) -> Any:
+    """股东/员工垫付台账：按垫付人汇总其他应付款的期初、本期发生、报销冲销与期末未报余额。"""
+    from datetime import datetime, timezone
+    from services.ledger_service import query_advance_balances
+
+    target_month = month or datetime.now(timezone.utc).strftime("%Y-%m")
+    return await query_advance_balances(ctx.company_id, target_month)
+
+
+async def _get_aging(ctx: ToolContext, kind: str = "ar", group_by: str = "none") -> Any:
     from services.aging_service import query_ap_aging, query_ar_aging
 
+    # group_by=partner 时按往来单位分组（P0 WP2 升级），默认 none 保持旧结构
+    resolved = "partner" if str(group_by or "").lower() == "partner" else "none"
     if str(kind).lower() == "ap":
-        return await query_ap_aging(ctx.company_id)
-    return await query_ar_aging(ctx.company_id)
+        return await query_ap_aging(ctx.company_id, group_by=resolved)
+    return await query_ar_aging(ctx.company_id, group_by=resolved)
 
 
 async def _list_todos(
@@ -211,7 +334,24 @@ async def _search_books(ctx: ToolContext, query: str) -> Any:
 
 
 async def _get_company_profile(ctx: ToolContext) -> Any:
-    return await get_profile(ctx.company_id)
+    profile = await get_profile(ctx.company_id)
+    # 员工名单：让 agent 能核实"员工小李垫的"里的姓名是否真实存在，
+    # 避免它凭空编一个名字写进「其他应付款-员工往来」。员工模块没启用时留空数组。
+    try:
+        from services.salary_service import list_employees
+
+        employees = await list_employees(ctx.company_id)
+        profile["employees"] = [
+            {
+                "name": e.get("name"),
+                "department": e.get("department"),
+                "isOwner": bool(e.get("is_owner")),
+            }
+            for e in employees
+        ]
+    except Exception:  # 员工档案读取失败不阻塞画像查询
+        profile["employees"] = []
+    return profile
 
 
 async def _update_company_profile(
@@ -288,12 +428,14 @@ async def _run_close_checks(ctx: ToolContext, month: str) -> Any:
         return result
 
 
-async def _list_unmatched(ctx: ToolContext, month: str, limit: int = 20) -> Any:
+async def _list_unmatched(ctx: ToolContext, month: Optional[str] = None, limit: int = 20) -> Any:
     """票/流/账差异：未匹配流水清单（带 ID）+ AI 对账建议（带可直接用的 ID 对）。"""
+    from datetime import datetime, timezone
     from services.bank_service import get_difference_report, ai_suggest_matches, get_statements
     from services.accounting_core_service import period_start_for
 
-    month = period_start_for(str(month)).strftime("%Y-%m")
+    target_month = str(month or "").strip() or datetime.now(timezone.utc).strftime("%Y-%m")
+    month = period_start_for(target_month).strftime("%Y-%m")
     diff = await get_difference_report(ctx.company_id, month)
 
     # 本月未匹配流水的真实 ID 清单（difference report 只有摘要，没有 ID）
@@ -351,53 +493,82 @@ async def _list_unmatched(ctx: ToolContext, month: str, limit: int = 20) -> Any:
 
 
 async def _preview_accruals(ctx: ToolContext, month: str) -> Any:
-    """预览本月待计提事项：折旧（未计提的在用资产）与工资（工资表状态）。"""
+    """预览本月待计提事项：折旧（未计提的在用固定资产）、摊销（未计提的在用无形资产）与工资（工资表状态）。"""
     from services.database import get_conn
-    from services.depreciation_engine import calculate_monthly_depreciation
 
     period = str(month)
     result: Dict[str, Any] = {"month": period}
 
-    # 折旧：在用资产中本月尚未计提的
-    conn = await get_conn()
-    try:
-        cursor = await conn.execute(
-            "SELECT id, payload FROM fixed_assets WHERE company_id = ?",
-            (ctx.company_id,),
-        )
-        asset_rows = await cursor.fetchall()
-    finally:
-        await conn.close()
+    # 折旧：在用固定资产中本期 planned 且未过账的（P1 WP-B 起读核心 ORM）
     pending_depreciation: List[Dict[str, Any]] = []
-    total = Decimal("0")
-    for row in asset_rows:
-        try:
-            payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if not isinstance(payload, dict) or payload.get("status", "in_use") != "in_use":
-            continue
-        conn = await get_conn()
-        try:
-            cursor = await conn.execute(
-                "SELECT 1 FROM depreciation_schedule WHERE asset_id = ? AND period = ?",
-                (row["id"], period),
-            )
-            already = await cursor.fetchone()
-        finally:
-            await conn.close()
-        if already:
-            continue
-        try:
-            monthly = calculate_monthly_depreciation(payload)
-        except Exception:
-            monthly = Decimal("0")
-        total += monthly or Decimal("0")
-        pending_depreciation.append({"assetId": row["id"], "name": payload.get("name"), "monthly": float(monthly or 0)})
+    dep_total = Decimal("0")
+    try:
+        from sqlalchemy import select
+
+        from db.models import FixedAsset, FixedAssetDepreciationSchedule
+        from db.session import session_scope
+
+        async with session_scope() as session:
+            rows = (
+                await session.execute(
+                    select(FixedAssetDepreciationSchedule, FixedAsset)
+                    .join(FixedAsset, FixedAsset.id == FixedAssetDepreciationSchedule.asset_id)
+                    .where(
+                        FixedAssetDepreciationSchedule.company_id == ctx.company_id,
+                        FixedAssetDepreciationSchedule.period_start == period,
+                        FixedAssetDepreciationSchedule.status == "planned",
+                        FixedAsset.deleted_at.is_(None),
+                        FixedAsset.status.in_(("active", "idle")),
+                    )
+                    .order_by(FixedAssetDepreciationSchedule.sequence_no.asc())
+                )
+            ).all()
+            for row, asset in rows:
+                amount = Decimal(str(row.amount or 0))
+                dep_total += amount
+                pending_depreciation.append({"assetId": asset.id, "name": asset.name, "monthly": float(amount)})
+    except Exception:
+        logger.exception("fixed asset depreciation preview failed")
     result["depreciation"] = {
         "pendingCount": len(pending_depreciation),
-        "pendingTotal": float(total),
+        "pendingTotal": float(dep_total),
         "assets": pending_depreciation[:10],
+    }
+
+    # 摊销：在用无形资产中本期 planned 且未过账的
+    pending_amortization: List[Dict[str, Any]] = []
+    amort_total = Decimal("0")
+    try:
+        from sqlalchemy import select
+
+        from db.models import IntangibleAsset, IntangibleAmortizationSchedule
+        from db.session import session_scope
+
+        async with session_scope() as session:
+            amort_rows = (
+                await session.execute(
+                    select(IntangibleAmortizationSchedule, IntangibleAsset)
+                    .join(IntangibleAsset, IntangibleAsset.id == IntangibleAmortizationSchedule.asset_id)
+                    .where(
+                        IntangibleAmortizationSchedule.company_id == ctx.company_id,
+                        IntangibleAmortizationSchedule.period_start == period,
+                        IntangibleAmortizationSchedule.status == "planned",
+                        IntangibleAsset.deleted_at.is_(None),
+                        IntangibleAsset.status.in_(("active", "idle")),
+                    )
+                    .order_by(IntangibleAmortizationSchedule.sequence_no.asc())
+                )
+            ).all()
+            for row, asset in amort_rows:
+                amount = Decimal(str(row.amount or 0))
+                amort_total += amount
+                pending_amortization.append({"assetId": asset.id, "name": asset.name, "monthly": float(amount)})
+    except Exception:
+        logger.exception("intangible asset amortization preview failed")
+    result["amortization"] = {
+        "pendingCount": len(pending_amortization),
+        "pendingTotal": float(amort_total),
+        "assets": pending_amortization[:10],
     }
 
     # 工资：工资表状态
@@ -409,13 +580,12 @@ async def _preview_accruals(ctx: ToolContext, month: str) -> Any:
                 (ctx.company_id, period),
             )
             sheet = await cursor.fetchone()
-            cursor = await conn.execute(
-                "SELECT COUNT(*) AS n FROM employees WHERE company_id = ?",
-                (ctx.company_id,),
-            )
-            emp_count = int((await cursor.fetchone())["n"])
         finally:
             await conn.close()
+        # 与个税扣缴/小型微利同口径：只算在职员工（is_active = 1）
+        from services.headcount_service import count_active_employees
+
+        emp_count = await count_active_employees(ctx.company_id)
         result["salary"] = {
             "sheetExists": bool(sheet),
             "status": str(sheet["status"]) if sheet else None,
@@ -501,24 +671,31 @@ async def _propose_match(
 
 
 async def _propose_accrual(ctx: ToolContext, kind: str, month: str, note: Optional[str] = None) -> Any:
-    """创建计提确认草稿（折旧/工资），用户确认后执行现有计提服务。"""
+    """创建计提确认草稿（折旧/摊销/工资），用户确认后执行现有计提服务。"""
     from agent.actions import create_action
 
     kind = str(kind or "").strip().lower()
     month = str(month or "").strip()
-    if kind not in ("depreciation", "salary"):
-        return {"error": "kind 必须是 depreciation 或 salary"}
+    if kind not in ("depreciation", "amortization", "salary"):
+        return {"error": "kind 必须是 depreciation、amortization 或 salary"}
     if not month:
         return {"error": "需要月份（YYYY-MM）"}
 
     preview = await _preview_accruals(ctx, month)
-    kind_preview = preview.get("depreciation" if kind == "depreciation" else "salary") or {}
+    kind_preview = preview.get(kind) or {}
+
+    title_map = {
+        "depreciation": "折旧计提",
+        "amortization": "无形资产摊销",
+        "salary": "工资计提",
+    }
+    title = f"{title_map.get(kind, '计提')}（{month}）"
 
     action = await create_action(
         company_id=ctx.company_id,
         user_id=ctx.user_id,
         action_type="propose_accrual",
-        title=f"{'折旧' if kind == 'depreciation' else '工资'}计提（{month}）",
+        title=title,
         payload={
             "kind": kind,
             "month": month,
@@ -531,6 +708,52 @@ async def _propose_accrual(ctx: ToolContext, kind: str, month: str, note: Option
         "status": action["status"],
         "preview": kind_preview,
         "message": "计提草稿已创建，等待用户确认后执行",
+    }
+
+
+async def _preview_asset_actions(ctx: ToolContext, month: str) -> Any:
+    """预览资产处理：缺卡交易、待提折旧/摊销、阻塞项。"""
+    from services.asset_closure_service import preview_asset_closure
+
+    return await preview_asset_closure(ctx.company_id, ctx.user_id, str(month))
+
+
+async def _propose_asset_closure(ctx: ToolContext, month: str, note: Optional[str] = None) -> Any:
+    """把建卡和折旧/摊销补提合成一张待确认动作。"""
+    from services.asset_closure_service import (
+        build_asset_closure_payload,
+        preview_asset_closure,
+    )
+
+    preview = await preview_asset_closure(ctx.company_id, ctx.user_id, str(month))
+    payload = build_asset_closure_payload(preview)
+    has_processable = bool(
+        payload["fixedCards"]
+        or payload["intangibleCards"]
+        or payload["runFixedDepreciation"]
+        or payload["runIntangibleAmortization"]
+    )
+    if not has_processable:
+        return {
+            "actionId": None,
+            "status": "nothing_to_do",
+            "preview": preview,
+            "message": "当前没有可处理的资产建卡或待补提折旧/摊销事项。",
+        }
+
+    action = await agent_actions.create_action(
+        company_id=ctx.company_id,
+        user_id=ctx.user_id,
+        action_type="propose_accrual",
+        title=f"资产处理确认（{month}）",
+        payload=payload,
+        evidence={"note": note or "", "created_via": "agent_close"},
+    )
+    return {
+        "actionId": action["id"],
+        "status": action["status"],
+        "preview": preview,
+        "message": "资产处理确认已创建，等待老板确认后执行。",
     }
 
 
@@ -581,9 +804,11 @@ async def _generate_close_report(ctx: ToolContext, month: str) -> Any:
         lines.append(f"未匹配银行流水 {len(unmatched['unmatchedStatements'])} 笔。")
 
     dep = accruals.get("depreciation") or {}
+    amo = accruals.get("amortization") or {}
     sal = accruals.get("salary") or {}
     lines.extend(["", "## 计提状态", ""])
     lines.append(f"- 折旧：待计提 {dep.get('pendingCount', 0)} 项，合计 {dep.get('pendingTotal', 0)} 元")
+    lines.append(f"- 摊销：待计提 {amo.get('pendingCount', 0)} 项，合计 {amo.get('pendingTotal', 0)} 元")
     lines.append(f"- 工资：{sal.get('message', '未知')}")
 
     lines.extend(["", "## 下一步", ""])
@@ -602,18 +827,30 @@ async def _generate_close_report(ctx: ToolContext, month: str) -> Any:
 # 写工具：批量起草（一张清单确认）
 # ---------------------------------------------------------------------------
 
+_PAYER_SCHEMA = {
+    "type": "string",
+    "description": (
+        "付款方，三种取值：company_account=公司对公账户（默认）；"
+        "boss_personal=老板/股东个人垫付（贷「其他应付款-股东」）；"
+        "employee_personal:<姓名>=员工个人垫付（贷「其他应付款-员工往来(姓名)」）。"
+        "员工垫付但用户没说是谁时只传 employee_personal，让用户在确认卡里选人。"
+        "用户说“我垫的/我自己付的/老板付的”用 boss_personal；"
+        "绝不要编造员工姓名，不确定就只传 employee_personal。"
+    ),
+}
+
 _VOUCHER_PROPOSAL_SCHEMA = {
     "type": "object",
     "properties": {
         "direction": {"type": "string", "enum": ["income", "expense", "owner_transfer"]},
-        "amount": {"type": "number", "description": "金额（元），正数"},
+        "amount": {"type": "number", "description": "金额（元），正数", "exclusiveMinimum": 0},
         "title": {"type": "string", "description": "事项摘要"},
         "category": {
             "type": "string",
             "description": "费用/收入一级分类（如：交通费、餐饮费、办公费、通讯费、差旅费、咨询服务收入、技术服务收入）。不确定时可先调用 get_company_profile 读取公司分类习惯",
         },
         "occur_date": {"type": "string", "description": "业务发生日期 YYYY-MM-DD，可选", "pattern": DATE_PATTERN},
-        "payer": {"type": "string", "enum": ["company_account", "personal"], "description": "付款账户，默认 company_account"},
+        "payer": _PAYER_SCHEMA,
         "merchant": {"type": "string", "description": "对方商户/单位，可选"},
         "note": {"type": "string", "description": "给用户的备注，可选"},
     },
@@ -621,27 +858,42 @@ _VOUCHER_PROPOSAL_SCHEMA = {
 }
 
 
+def _assert_real_date(raw: Optional[str], prefix: str = "") -> None:
+    """DATE_PATTERN 只能保证形状（2026-02-30 也匹配），真实历法日期在此校验。"""
+    value = str(raw or "").strip()
+    if not value:
+        return
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise ValueError(f"{prefix}occur_date 必须是真实存在的日期（YYYY-MM-DD），收到 {value!r}")
+
+
 async def _propose_vouchers(ctx: ToolContext, proposals: List[dict], note: Optional[str] = None) -> Any:
     """批量创建记账凭证草稿（一张清单，用户一次性确认/排除行/改分类）。"""
+    from services.account_mapper import normalize_payer
+
     items = []
-    for p in proposals:
+    for i, p in enumerate(proposals):
         if not isinstance(p, dict):
-            continue
+            raise ValueError(f"proposals[{i}] 应为对象")
+        cleaned = _enforce_schema(p, _VOUCHER_PROPOSAL_SCHEMA, f"proposals[{i}]")
+        _assert_real_date(cleaned.get("occur_date"), f"proposals[{i}].")
         item = {
-            "direction": p.get("direction"),
-            "amount": p.get("amount"),
-            "title": p.get("title"),
-            "category": p.get("category"),
-            "payer": p.get("payer") or "company_account",
+            "direction": cleaned.get("direction"),
+            "amount": cleaned.get("amount"),
+            "title": cleaned.get("title"),
+            "category": cleaned.get("category"),
+            "payer": normalize_payer(cleaned.get("payer")),
         }
         for optional_key, payload_key in (
             ("occur_date", "occurDate"),
             ("merchant", "merchant"),
         ):
-            if p.get(optional_key):
-                item[payload_key] = p[optional_key]
-        if p.get("note"):
-            item["note"] = p["note"]
+            if cleaned.get(optional_key):
+                item[payload_key] = cleaned[optional_key]
+        if cleaned.get("note"):
+            item["note"] = cleaned["note"]
         items.append(item)
     if not items:
         return {"error": "proposals 为空"}
@@ -681,12 +933,15 @@ async def _propose_voucher(
     evidence: Optional[dict] = None,
 ) -> Any:
     """创建凭证草稿（不入账），等待用户在界面上确认。"""
+    from services.account_mapper import normalize_payer
+
+    _assert_real_date(occur_date)
     payload: Dict[str, Any] = {
         "direction": direction,
         "amount": amount,
         "title": title,
         "category": category,
-        "payer": payer or "company_account",
+        "payer": normalize_payer(payer),
     }
     if occur_date:
         payload["occurDate"] = occur_date
@@ -743,6 +998,8 @@ async def _generate_filing_package(ctx: ToolContext, period: str) -> Any:
     package = await build_filing_package(ctx.user_id, ctx.company_id, period_str)
     # 精简给模型的视图：保留决策需要的关键数据
     vat = package.get("vat") or {}
+    cit = package.get("cit") or {}
+    iit = package.get("businessIncomeIit") or {}
     result = {
         "period": package["period"],
         "summary": package["summary"],
@@ -756,10 +1013,39 @@ async def _generate_filing_package(ctx: ToolContext, period: str) -> Any:
             "warnings": vat.get("warnings"),
             "deadline": vat.get("deadline"),
         },
-        "cit": {
-            k: package["cit"].get(k)
-            for k in ("revenue", "totalProfit", "preferentialTax", "note", "deadline")
-        },
+        "cit": (
+            {
+                k: cit.get(k)
+                for k in (
+                    "revenue",
+                    "cost",
+                    "totalProfit",
+                    "autoAdjustmentTotal",
+                    "taxableIncome",
+                    "preferentialTax",
+                    "fields",
+                    "note",
+                    "deadline",
+                )
+            }
+            if cit
+            else None
+        ),
+        "citNotice": package.get("citNotice"),
+        # 经营所得个税（个体户/个独）：查账征收 A 表预缴测算，5%-35% 五级累进
+        "businessIncomeIit": (
+            {
+                k: iit.get(k)
+                for k in (
+                    "applicable", "period", "filingCycle", "entityType",
+                    "revenue", "expenses", "profitTotal", "taxableIncome",
+                    "tax", "halvingReduction", "halvingApplied",
+                    "suggestedPayable", "previouslyPaid", "notes", "deadline",
+                )
+            }
+            if iit
+            else None
+        ),
         "crossCheck": package.get("crossCheck"),
         "preferences": package.get("preferences"),
         "checklist": [
@@ -769,6 +1055,13 @@ async def _generate_filing_package(ctx: ToolContext, period: str) -> Any:
         "usage": (
             "引导用户报税：先报 summary 与核对结果；逐字段给申报表草稿（vat.filingFields）；"
             "清单事项完成后引导用户在「税务申报」页标记完成（AI 不能代操作）。"
+            "若 citNotice.citApplicable 为 false（个人独资企业/个体工商户），"
+            "不要报企业所得税，也不要按企业所得税预缴表引导；"
+            "改用 businessIncomeIit 卡按 A 表（自然人电子税务局经营所得预缴）引导，"
+            "数字为累计口径且个体户已含减半优惠（halvingApplied），"
+            "口径声明：仅查账征收，核定征收不适用本系统。"
+            "年度汇算（B 表）走 POST /api/tax-filing/iit-annual-assist 测算，"
+            "截止次年 3 月 31 日；两处以上经营所得需合并 C 表。"
             "提交申报必须由用户本人在电子税务局完成。"
         ),
     }
@@ -837,9 +1130,36 @@ TOOLS: List[Tool] = [
     ),
     Tool(
         name="get_aging",
-        description="查询应收(ar)/应付(ap)账龄汇总，回答'谁欠我钱/我欠谁钱'。",
-        parameters=_obj({"kind": {"type": "string", "enum": ["ar", "ap"], "description": "ar=应收，ap=应付"}}, ["kind"]),
+        description="查询应收(ar)/应付(ap)账龄汇总，回答'谁欠我钱/我欠谁钱'；group_by=partner 可按往来单位分组。",
+        parameters=_obj(
+            {
+                "kind": {"type": "string", "enum": ["ar", "ap"], "description": "ar=应收，ap=应付"},
+                "group_by": {
+                    "type": "string",
+                    "enum": ["none", "partner"],
+                    "description": "可选，partner=按往来单位分组（返回 groups 数组）；默认 none",
+                },
+            },
+            ["kind"],
+        ),
         handler=_get_aging,
+    ),
+    Tool(
+        name="get_advance_balances",
+        description=(
+            "查询股东/员工垫付台账（期初/垫付/报销冲销/期末未报余额），回答「老板/员工垫了多少钱、"
+            "还有多少没报销、本期报销了多少」；用于清点 2241 其他应付款个人往来。month 格式 YYYY-MM，默认当前月。"
+        ),
+        parameters=_obj(
+            {
+                "month": {
+                    "type": "string",
+                    "description": "可选，账期月份 YYYY-MM，默认当前月",
+                    "pattern": MONTH_PATTERN,
+                },
+            }
+        ),
+        handler=_get_advance_balances,
     ),
     Tool(
         name="list_todos",
@@ -855,6 +1175,67 @@ TOOLS: List[Tool] = [
             }
         ),
         handler=_list_todos,
+    ),
+    Tool(
+        name="list_fixed_assets",
+        description=(
+            "查询固定资产台账（原值/累计折旧/净值/月折旧/剩余期数），回答「公司有哪些资产、"
+            "每月折旧多少、某资产还剩几期折旧」；结账账实核对先拉这里。支持名称/编号关键词、状态、类别过滤与分页。"
+        ),
+        parameters=_obj(
+            {
+                "keyword": {"type": "string", "description": "可选，按资产名称或编号模糊匹配"},
+                "status": {
+                    "type": "string",
+                    "enum": [
+                        "in_use", "active", "idle", "fully_depreciated",
+                        "pending_review", "draft", "disposing", "disposed", "scrapped",
+                    ],
+                    "description": "可选，in_use=在用（含正常/闲置/已提完）",
+                },
+                "category": {"type": "string", "description": "可选，按资产类别代码过滤（如 electronics）"},
+                "page": {"type": "integer", "description": "可选，页码，默认 1"},
+                "page_size": {"type": "integer", "description": "可选，每页条数（≤100），默认 50"},
+            }
+        ),
+        handler=_list_fixed_assets,
+    ),
+    Tool(
+        name="list_intangible_assets",
+        description=(
+            "查询无形资产台账（软件著作权/专利/商标/域名等，含原值/累计摊销/净值/剩余月数/到期日），"
+            "回答「公司有哪些无形资产、每月摊销多少、权利证书何时到期、研发资本化资产」；结账账实核对入口。"
+            "支持关键词、状态、分类、临期天数（expiring_in_days）过滤与分页。"
+        ),
+        parameters=_obj(
+            {
+                "keyword": {"type": "string", "description": "可选，按资产名称、编号或证书号模糊匹配"},
+                "status": {
+                    "type": "string",
+                    "enum": [
+                        "in_use",
+                        "active",
+                        "idle",
+                        "fully_amortized",
+                        "pending_review",
+                        "draft",
+                        "disposed",
+                    ],
+                    "description": "可选，in_use=在用（含正常/闲置/已提完）",
+                },
+                "category": {
+                    "type": "string",
+                    "description": "可选，按无形资产分类代码过滤（如 software, trademark, patent, copyright）",
+                },
+                "expiring_in_days": {
+                    "type": "integer",
+                    "description": "可选，筛选未来 N 天内权利到期的在用资产（如 30、90）",
+                },
+                "page": {"type": "integer", "description": "可选，页码，默认 1"},
+                "page_size": {"type": "integer", "description": "可选，每页条数（≤100），默认 50"},
+            }
+        ),
+        handler=_list_intangible_assets,
     ),
     Tool(
         name="search_books",
@@ -879,17 +1260,26 @@ TOOLS: List[Tool] = [
         description="列出票/流/账差异：银行流水差异报告（银行有账上没有、账上有银行没有）+ AI 对账建议。",
         parameters=_obj(
             {
-                "month": {"type": "string", "description": "月份，格式 YYYY-MM", "pattern": MONTH_PATTERN},
+                "month": {"type": "string", "description": "月份，格式 YYYY-MM，缺省取当月", "pattern": MONTH_PATTERN},
                 "limit": {"type": "integer", "description": "建议条数上限，默认 20"},
-            }
+            },
         ),
         handler=_list_unmatched,
     ),
     Tool(
         name="preview_accruals",
-        description="预览本月待计提事项：折旧（未计提的在用资产及金额）与工资（工资表状态）。",
+        description="预览本月待计提事项：折旧（未计提的在用固定资产及金额）、摊销（未计提的在用无形资产及金额）与工资（工资表状态）。",
         parameters=_obj({"month": {"type": "string", "description": "月份，格式 YYYY-MM", "pattern": MONTH_PATTERN}}, ["month"]),
         handler=_preview_accruals,
+    ),
+    Tool(
+        name="preview_asset_actions",
+        description=(
+            "预览资产处理事项：缺固定资产/无形资产卡片的原交易、待补提折旧/摊销期间、"
+            "以及不能处理的原因。用于零基础老板一键确认资产处理前的检查。"
+        ),
+        parameters=_obj({"month": {"type": "string", "description": "月份，格式 YYYY-MM", "pattern": MONTH_PATTERN}}, ["month"]),
+        handler=_preview_asset_actions,
     ),
     Tool(
         name="propose_match",
@@ -910,18 +1300,33 @@ TOOLS: List[Tool] = [
     Tool(
         name="propose_accrual",
         description=(
-            "发起计提确认草稿（kind=depreciation 折旧 / salary 工资；month 格式 YYYY-MM）。"
+            "发起计提确认草稿（kind=depreciation 折旧 / amortization 摊销 / salary 工资；month 格式 YYYY-MM）。"
             "用户确认后执行现有计提服务；已计提过会被幂等跳过。"
         ),
         parameters=_obj(
             {
-                "kind": {"type": "string", "enum": ["depreciation", "salary"]},
+                "kind": {"type": "string", "enum": ["depreciation", "amortization", "salary"]},
                 "month": {"type": "string", "description": "月份，格式 YYYY-MM", "pattern": MONTH_PATTERN},
                 "note": {"type": "string", "description": "给用户的说明，可选"},
             },
             ["kind", "month"],
         ),
         handler=_propose_accrual,
+    ),
+    Tool(
+        name="propose_asset_closure",
+        description=(
+            "发起资产处理确认：自动建立缺卡的固定资产/无形资产，并补提截至指定月份的折旧/摊销。"
+            "只生成待确认动作，老板在对话窗口确认后才执行。"
+        ),
+        parameters=_obj(
+            {
+                "month": {"type": "string", "description": "月份，格式 YYYY-MM", "pattern": MONTH_PATTERN},
+                "note": {"type": "string", "description": "给老板的说明，可选"},
+            },
+            ["month"],
+        ),
+        handler=_propose_asset_closure,
     ),
     Tool(
         name="generate_close_report",
@@ -946,7 +1351,7 @@ TOOLS: List[Tool] = [
     ),
     Tool(
         name="get_company_profile",
-        description="读取本公司画像（行业、纳税人身份、常用分类习惯、往来单位名单）。",
+        description="读取本公司画像（行业、纳税人身份、常用分类习惯、往来单位名单、在职员工名单）。",
         parameters=_obj({}),
         handler=_get_company_profile,
     ),
@@ -977,14 +1382,14 @@ TOOLS: List[Tool] = [
         parameters=_obj(
             {
                 "direction": {"type": "string", "enum": ["income", "expense", "owner_transfer"]},
-                "amount": {"type": "number", "description": "金额（元），正数"},
+                "amount": {"type": "number", "description": "金额（元），正数", "exclusiveMinimum": 0},
                 "title": {"type": "string", "description": "事项摘要，如'打车去客户处'"},
                 "category": {
                     "type": "string",
                     "description": "费用/收入一级分类（如：交通费、餐饮费、办公费、通讯费、差旅费、咨询服务收入、技术服务收入）。不确定时可先调用 get_company_profile 读取公司分类习惯",
                 },
                 "occur_date": {"type": "string", "description": "业务发生日期 YYYY-MM-DD，可选", "pattern": DATE_PATTERN},
-                "payer": {"type": "string", "enum": ["company_account", "personal"], "description": "付款账户：对公/老板私账，默认 company_account"},
+                "payer": _PAYER_SCHEMA,
                 "merchant": {"type": "string", "description": "对方商户/单位，可选"},
                 "note": {"type": "string", "description": "给用户的备注说明，可选"},
                 "evidence": {"type": "string", "description": "用户原话中与该笔相关的关键信息，可选"},
@@ -1024,4 +1429,58 @@ async def execute_tool(name: str, arguments: Dict[str, Any], ctx: ToolContext) -
     tool = TOOLS_BY_NAME.get(name)
     if tool is None:
         raise ValueError(f"unknown tool: {name}")
-    return await tool.handler(ctx, **arguments)
+    return await tool.handler(ctx, **_enforce_schema(arguments, tool.parameters or {}))
+
+
+def _enforce_schema(value: Any, schema: Dict[str, Any], path: str = "参数") -> Any:
+    """按 JSON Schema 子集在服务端强制校验（required/未知字段/pattern/enum/type/有限性/下界）。
+
+    schema 会随 tools/list 广播给客户端，但 FastMCP 不在服务端执行校验：
+    不守约的客户端（或乱传参的 AI）会把脏参数直接打进 handler——枚举、负金额、
+    非法月份、日历不存在的日期都会变成待确认草稿（2026-10-25 对抗测试实测）。
+    MCP 与产品内 agent loop 均经 execute_tool，一处强制全部受益。
+    """
+    if "properties" in schema or schema.get("type") == "object":
+        if not isinstance(value, dict):
+            raise ValueError(f"{path} 应为对象")
+        props = schema.get("properties") or {}
+        for key in schema.get("required") or []:
+            if value.get(key) is None:
+                raise ValueError(f"{path} 缺少必填字段: {key}")
+        cleaned: Dict[str, Any] = {}
+        for key, item in value.items():
+            spec = props.get(key)
+            if spec is None:
+                # 未声明字段：按 JSON Schema 惯例忽略，绝不透传给 handler
+                continue
+            cleaned[key] = _enforce_schema(item, spec, f"{path}.{key}") if item is not None else item
+        return cleaned
+    if schema.get("type") == "array":
+        if not isinstance(value, list):
+            raise ValueError(f"{path} 应为数组")
+        items_spec = schema.get("items")
+        if not items_spec:
+            return value
+        return [_enforce_schema(v, items_spec, f"{path}[{i}]") for i, v in enumerate(value)]
+    if value is None:
+        return value
+    stype = schema.get("type")
+    if stype == "string":
+        if not isinstance(value, str):
+            raise ValueError(f"{path} 应为字符串，收到 {type(value).__name__}")
+        pattern = schema.get("pattern")
+        if pattern and not re.fullmatch(pattern, value):
+            raise ValueError(f"{path} 格式不符（应为 {pattern}）：{value!r}")
+    elif stype == "number":
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError(f"{path} 必须是有限数字，收到 {value!r}")
+        minimum = schema.get("exclusiveMinimum")
+        if minimum is not None and value <= minimum:
+            raise ValueError(f"{path} 必须大于 {minimum}，收到 {value!r}")
+    elif stype == "integer":
+        is_int = isinstance(value, int) and not isinstance(value, bool)
+        if not is_int and not (isinstance(value, float) and value.is_integer()):
+            raise ValueError(f"{path} 应为整数，收到 {value!r}")
+    if schema.get("enum") and value not in schema["enum"]:
+        raise ValueError(f"{path} 只能取 {'/'.join(str(x) for x in schema['enum'])}，收到 {value!r}")
+    return value

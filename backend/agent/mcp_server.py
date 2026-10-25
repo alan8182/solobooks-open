@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """MCP Server：把 agent 工具层开放为 MCP 协议端点。
 
 复用 `agent/tools.py` 的 Tool 四件套与 `execute_tool` 统一入口：
@@ -40,6 +43,9 @@ MCP_READ_TOOLS = frozenset(
         "list_entries",
         "list_invoice_entries",
         "list_bank_statements",
+        "list_fixed_assets",
+        "list_intangible_assets",
+        "get_advance_balances",
         "get_aging",
         "list_todos",
         "search_books",
@@ -50,8 +56,9 @@ MCP_READ_TOOLS = frozenset(
         "get_filing_deadlines",
         "generate_close_report",
         "generate_filing_package",
-        # 纯预览，无副作用（方案原归 write，实现确认只读后归 read）
+        # 纯预览，无副作用（只读）
         "preview_accruals",
+        "preview_asset_actions",
     }
 )
 
@@ -63,13 +70,16 @@ MCP_WRITE_TOOLS = frozenset(
     {
         "propose_match",
         "propose_accrual",
+        "propose_asset_closure",
         "propose_voucher",
         "propose_vouchers",
     }
 )
 
-# 每个 PAT 每分钟工具调用上限（进程内滑动窗口；多实例部署需换集中存储）
-RATE_LIMIT_PER_MINUTE = int(os.getenv("MCP_RATE_LIMIT_PER_MINUTE", "60"))
+# 每个 PAT 每分钟工具调用上限（进程内滑动窗口；多实例部署需换集中存储）。
+# 60 会拦住 AI 客户端的连环工具链（单任务连环 20+ 次调用常见，2026-10-25
+# 对抗压测 20 并发全 429）；120 对人类用户仍是充足的保护阈值。
+RATE_LIMIT_PER_MINUTE = int(os.getenv("MCP_RATE_LIMIT_PER_MINUTE", "120"))
 RATE_LIMIT_ENABLED = os.getenv("MCP_RATE_LIMIT", "1").strip().lower() not in ("0", "false", "off")
 
 _ARGUMENTS_DIGEST_LIMIT = 2000
@@ -159,6 +169,14 @@ class PatAuthMiddleware:
 
     async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
         if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        # 本中间件只负责 /mcp。子应用被 mount 在根路径当兜底，未命中的 /api/*
+        # （拼错的路由、还没加载的新路由）也会落到这里——若照样返回 401 JSON-RPC，
+        # 前端 axios 拦截器会把「接口不存在」当成登录失效，直接把用户踢回登录页。
+        # 交给内部路由处理，让它老老实实回 404。
+        path = scope.get("path", "")
+        if path != "/mcp" and not path.startswith("/mcp/"):
             await self.app(scope, receive, send)
             return
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
@@ -344,6 +362,7 @@ def _build_prompts(mcp: FastMCP) -> None:
                 "1. 调用 run_close_checks(month) 获取五项检查（账证/账账/账实/账表/税表）结果；\n"
                 "2. 对每一项 blocked/needs_review 的检查，用 list_unmatched(month)、list_todos 等工具定位具体问题；\n"
                 "3. 给出修复建议。可以用 propose_voucher / propose_match 起草修复凭证或对账（我只会在产品内确认后才入账）；\n"
+                "3b. 调用 preview_asset_actions(month) 检查缺资产卡和待补提折旧/摊销；有可处理项时用 propose_asset_closure(month) 生成一张资产处理确认卡（我只会在产品内确认后才执行）；\n"
                 "4. 不要声称已结账——真正的关账操作（close）需要我在产品内执行。\n"
                 "最后用老板看得懂的语言汇总：本月能不能结账、还差什么。"
             ),
@@ -396,18 +415,18 @@ def build_mcp_server(name: str = "solobooks") -> FastMCP:
             started = time.monotonic()
             try:
                 result = await _execute_with_identity(tool.name, kwargs, identity)
+                # 单一载荷：dict 返回值经 FastMCP 会同时生成 content(JSON 文本) +
+                # structuredContent 两路，客户端两份都进上下文（token ×2）。
+                # 收敛为仅 content 一路紧凑 JSON；default=str 兼容 Decimal/date。
+                if isinstance(result, (dict, list)):
+                    result = ToolResult(
+                        content=json.dumps(result, ensure_ascii=False, separators=(",", ":"), default=str),
+                        structured_content=None,
+                    )
             except BaseException as exc:  # noqa: BLE001 —— 记录后原样抛出
                 await _log_call(identity, tool.name, kwargs, started, exc)
                 raise
             await _log_call(identity, tool.name, kwargs, started, None)
-            # 单一载荷：dict 返回值经 FastMCP 会同时生成 content(JSON 文本) +
-            # structuredContent 两路，客户端两份都进上下文（token ×2）。
-            # 收敛为仅 content 一路紧凑 JSON；字符串结果原样返回（本就单路）。
-            if isinstance(result, (dict, list)):
-                return ToolResult(
-                    content=json.dumps(result, ensure_ascii=False, separators=(",", ":")),
-                    structured_content=None,
-                )
             return result
 
         _handler.__name__ = f"mcp_{tool.name}"

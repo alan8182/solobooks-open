@@ -1,7 +1,18 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
-import { computed, reactive } from 'vue'
-import { NButton, NCheckbox, NInput, NTag, useMessage } from 'naive-ui'
+import { computed, reactive, watch } from 'vue'
+import { NButton, NCheckbox, NInput, NModal, NSelect, NTag, useMessage } from 'naive-ui'
 import { approveAgentAction, rejectAgentAction, type AgentActionItem } from '@/api/agent'
+import { getBackfillTarget } from '@/api/accounting'
+import { usePayeeEmployees } from '@/composables/usePayeeEmployees'
+import { guideStartDate } from '@/composables/startDateGuide'
+import {
+  PAYER_OPTIONS,
+  joinPayer,
+  payerCardLabel,
+  splitPayer,
+  type PayerKind,
+} from '@/utils/fundsChannel'
 
 interface VoucherRow {
   direction?: string
@@ -43,7 +54,44 @@ const accrualData = computed(() => ({
   month: String(payload.value.month || ''),
   preview: (payload.value.preview || {}) as Record<string, unknown>,
 }))
-const accrualKindText = computed(() => (accrualData.value.kind === 'depreciation' ? '折旧计提' : '工资计提'))
+const isAssetClosure = computed(() => isAccrual.value && accrualData.value.kind === 'asset_closure')
+const accrualKindText = computed(() => {
+  if (accrualData.value.kind === 'depreciation') return '折旧计提'
+  if (accrualData.value.kind === 'asset_closure') return '资产处理'
+  return '工资计提'
+})
+interface AssetClosureCard {
+  name: string
+  originalValue: number
+  categoryName?: string
+  usefulLifeMonths?: number
+}
+interface AssetClosureDue {
+  period: string
+  amount: number
+  count: number
+}
+interface AssetClosureBlocked {
+  name?: string
+  period?: string
+  reason: string
+}
+
+const assetClosureData = computed(() => {
+  const preview = (payload.value.preview || {}) as Record<string, unknown>
+  const fixed = (preview.fixedAssets || {}) as Record<string, unknown>
+  const intangible = (preview.intangibles || {}) as Record<string, unknown>
+  return {
+    fixedCards: (fixed.missingCards || []) as AssetClosureCard[],
+    fixedDue: (fixed.dueDepreciation || []) as AssetClosureDue[],
+    fixedBlocked: (fixed.blockedItems || []) as AssetClosureBlocked[],
+    intangibleCards: (intangible.missingCards || []) as AssetClosureCard[],
+    intangibleDue: (intangible.dueAmortization || []) as AssetClosureDue[],
+    intangibleBlocked: (intangible.blockedItems || []) as AssetClosureBlocked[],
+  }
+})
+const runFixedDepreciation = computed(() => Boolean(payload.value.runFixedDepreciation))
+const runIntangibleAmortization = computed(() => Boolean(payload.value.runIntangibleAmortization))
 
 // 批量清单：可勾选排除、可改分类
 const rows = reactive<{ row: VoucherRow; include: boolean; editedCategory: string }[]>([])
@@ -58,14 +106,38 @@ if (!isBatch.value) {
   singleEditedCategory.value = String(payload.value.category ?? '')
 }
 
+// ── 付款方（公司对公 / 老板垫付 / 员工垫付）──────────────────────
+// 老板固定一项、不绑员工档案；员工从在职员工里选人。is_owner=1 的人不进
+// 员工列表——否则同一笔垫付会落到「员工往来」而不是「其他应付款-股东」。
+const payer = reactive<{ kind: PayerKind; employeeName: string }>({
+  kind: 'company_account',
+  employeeName: '',
+})
+if (!isBatch.value) {
+  const initialPayer = splitPayer(payload.value.payer)
+  payer.kind = initialPayer.kind
+  payer.employeeName = initialPayer.employeeName
+}
+
+const employeeState = usePayeeEmployees()
+const employeeLoading = employeeState.loading
+
+const employeeOptions = computed(() => employeeState.options(payer.employeeName))
+
+function onPayerKindChange(kind: PayerKind) {
+  if (kind === 'employee_personal') {
+    void employeeState.ensure()
+    return
+  }
+  payer.employeeName = ''
+}
+
+watch(() => payer.kind, onPayerKindChange, { immediate: true })
+
 const DIRECTION_TEXT: Record<string, string> = {
   income: '收入',
   expense: '支出',
   owner_transfer: '老板投入',
-}
-const PAYER_TEXT: Record<string, string> = {
-  company_account: '对公',
-  personal: '私账',
 }
 const STATUS_TAG: Record<string, { text: string; type: 'info' | 'success' | 'default' | 'warning' }> = {
   pending: { text: '待确认', type: 'warning' },
@@ -95,6 +167,7 @@ async function doApprove(opts: Parameters<typeof approveAgentAction>[1] = {}) {
     local.result = resp.result || null
     emit('resolved')
   } catch (err) {
+    if (guideStartDate(err)) return
     message.error(err instanceof Error ? err.message : '确认失败')
   } finally {
     busy.approving = false
@@ -103,11 +176,23 @@ async function doApprove(opts: Parameters<typeof approveAgentAction>[1] = {}) {
 
 async function approveSingle() {
   if (isMatch.value || isAccrual.value) return doApprove()
-  const edits: Record<string, { category?: string }> = {}
-  if (singleEditedCategory.value && singleEditedCategory.value !== payload.value.category) {
-    edits['0'] = { category: singleEditedCategory.value }
+  if (payer.kind === 'employee_personal' && !payer.employeeName.trim()) {
+    message.warning('请选择垫付的员工，或改为老板垫付')
+    return
   }
-  await doApprove(Object.keys(edits).length ? { edits } : {})
+  const edits: Record<string, { category?: string; payer?: string }> = {}
+  const edit: { category?: string; payer?: string } = {}
+  if (singleEditedCategory.value && singleEditedCategory.value !== payload.value.category) {
+    edit.category = singleEditedCategory.value
+  }
+  const nextPayer = joinPayer(payer.kind, payer.employeeName)
+  if (nextPayer !== String(payload.value.payer || 'company_account')) {
+    edit.payer = nextPayer
+  }
+  if (Object.keys(edit).length) edits['0'] = edit
+  const opts = Object.keys(edits).length ? { edits } : {}
+  if (!(await guardBackfill(opts, [String(payload.value.occurDate || '')]))) return
+  await doApprove(opts)
 }
 
 async function approveBatch() {
@@ -122,10 +207,68 @@ async function approveBatch() {
       edits[String(i)] = { category: r.editedCategory }
     }
   })
-  await doApprove({
+  const opts = {
     excludeIndexes: excludeIndexes.length ? excludeIndexes : undefined,
     edits: Object.keys(edits).length ? edits : undefined,
-  })
+  }
+  const dates = rows.filter((r) => r.include).map((r) => String(r.row.occurDate || ''))
+  if (!(await guardBackfill(opts, dates))) return
+  await doApprove(opts)
+}
+
+// ── 跨期补记确认 ──────────────────────────────────────────────
+// 单据所属期间已关账时，后端默认抛 PERIOD_CLOSED。这里先预判、再让用户
+// 明确选「补记到 X 月」并填原因，最后带 allowBackfill 重新提交。
+const backfill = reactive({
+  show: false,
+  businessPeriod: '',
+  targetPeriod: '',
+  crossQuarter: false,
+  reason: '',
+  pending: null as Parameters<typeof approveAgentAction>[1] | null,
+})
+
+async function guardBackfill(
+  opts: Parameters<typeof approveAgentAction>[1],
+  dates: string[],
+): Promise<boolean> {
+  const unique = [...new Set(dates.map((d) => String(d).slice(0, 10)).filter(Boolean))]
+  for (const day of unique) {
+    let target
+    try {
+      target = await getBackfillTarget(day)
+    } catch {
+      continue // 预判失败不阻塞正常入账，后端仍会做最终校验
+    }
+    if (!target?.needsBackfill) continue
+    if (!target.canBackfill) {
+      message.error(
+        `${day} 属于 ${target.businessPeriod || day.slice(0, 7)}，该年度已结账，不能补记。` +
+          '请由财税人员按以前年度应扣未扣支出做专项申报，或在「结账 → 导出清单」中下载底稿。',
+        { duration: 8000 },
+      )
+      return false
+    }
+    backfill.pending = opts
+    backfill.businessPeriod = target.businessPeriod || day.slice(0, 7)
+    backfill.targetPeriod = target.targetPeriod || ''
+    backfill.crossQuarter = !!target.crossQuarter
+    backfill.reason = ''
+    backfill.show = true
+    return false
+  }
+  return true
+}
+
+async function confirmBackfill() {
+  const reason = backfill.reason.trim()
+  if (!reason) {
+    message.warning('请填写补记原因，它会写进跨期补记台账')
+    return
+  }
+  const opts = { ...(backfill.pending || {}), allowBackfill: true, backfillReason: reason }
+  backfill.show = false
+  await doApprove(opts)
 }
 
 async function reject() {
@@ -164,8 +307,25 @@ function summarizeAccrualResult(result: unknown): string {
   return text
 }
 
+function summarizeAssetClosureResult(result: unknown): string {
+  const closure = (result as Record<string, unknown>)?.assetClosure as Record<string, unknown> | undefined
+  if (!closure) return '资产处理已完成'
+  const fixedCards = Array.isArray(closure.fixedCards) ? closure.fixedCards.length : 0
+  const intangibleCards = Array.isArray(closure.intangibleCards) ? closure.intangibleCards.length : 0
+  const fixedDep = closure.fixedDepreciation as Record<string, unknown> | null | undefined
+  const intangibleAmt = closure.intangibleAmortization as Record<string, unknown> | null | undefined
+  const parts = [
+    fixedCards ? `固定资产卡 ${fixedCards} 张` : '',
+    intangibleCards ? `无形资产卡 ${intangibleCards} 张` : '',
+    fixedDep?.processedCount ? `固定资产折旧 ${fixedDep.processedCount} 期` : '',
+    intangibleAmt?.processedCount ? `无形资产摊销 ${intangibleAmt.processedCount} 期` : '',
+  ].filter(Boolean)
+  return parts.length ? `资产处理完成：${parts.join('，')}` : '资产处理已完成'
+}
+
 const approveText = computed(() => {
   if (isMatch.value) return '确认对账'
+  if (isAssetClosure.value) return '确认处理'
   if (isAccrual.value) return '确认计提'
   if (isBatch.value) return `确认入账（${includedIndexes.value.length} 笔）`
   return '确认入账'
@@ -210,6 +370,87 @@ const approveText = computed(() => {
       </div>
       <div class="card-result" v-if="local.status === 'approved'">
         {{ (local.result as any)?.match?.status === 'matched' ? '已对账 ✓' : '已处理' }}
+      </div>
+    </template>
+
+    <!-- 资产处理确认 -->
+    <template v-else-if="isAssetClosure">
+      <div class="card-fields">
+        <div class="field">
+          <span class="field-label">处理月份</span>
+          <span class="field-value">{{ accrualData.month }}</span>
+        </div>
+      </div>
+
+      <div v-if="assetClosureData.fixedCards.length" class="match-block">
+        <div class="match-row">
+          <span class="match-side">固定资产</span>
+          <span class="match-main">将建立 {{ assetClosureData.fixedCards.length }} 张资产卡</span>
+        </div>
+        <div v-for="(card, i) in assetClosureData.fixedCards" :key="`fa-${i}`" class="match-row">
+          <span class="match-side" />
+          <span class="match-main">
+            {{ card.name }}
+            <span class="muted">{{ card.categoryName }} · {{ card.usefulLifeMonths }} 个月</span>
+          </span>
+          <span class="row-amount">¥ {{ amountText(card.originalValue) }}</span>
+        </div>
+      </div>
+
+      <div v-if="assetClosureData.intangibleCards.length" class="match-block">
+        <div class="match-row">
+          <span class="match-side">无形资产</span>
+          <span class="match-main">将建立 {{ assetClosureData.intangibleCards.length }} 张资产卡</span>
+        </div>
+        <div v-for="(card, i) in assetClosureData.intangibleCards" :key="`ia-${i}`" class="match-row">
+          <span class="match-side" />
+          <span class="match-main">
+            {{ card.name }}
+            <span class="muted">{{ card.categoryName }} · {{ card.usefulLifeMonths }} 个月</span>
+          </span>
+          <span class="row-amount">¥ {{ amountText(card.originalValue) }}</span>
+        </div>
+      </div>
+
+      <div v-if="runFixedDepreciation && assetClosureData.fixedDue.length" class="match-block">
+        <div class="match-row">
+          <span class="match-side">折旧</span>
+          <span class="match-main">将补提 {{ assetClosureData.fixedDue.length }} 个期间</span>
+        </div>
+        <div v-for="item in assetClosureData.fixedDue" :key="`fd-${item.period}`" class="match-row">
+          <span class="match-side" />
+          <span class="match-main">{{ item.period }} · {{ item.count }} 项</span>
+          <span class="row-amount">¥ {{ amountText(item.amount) }}</span>
+        </div>
+      </div>
+
+      <div v-if="runIntangibleAmortization && assetClosureData.intangibleDue.length" class="match-block">
+        <div class="match-row">
+          <span class="match-side">摊销</span>
+          <span class="match-main">将补提 {{ assetClosureData.intangibleDue.length }} 个期间</span>
+        </div>
+        <div v-for="item in assetClosureData.intangibleDue" :key="`id-${item.period}`" class="match-row">
+          <span class="match-side" />
+          <span class="match-main">{{ item.period }} · {{ item.count }} 项</span>
+          <span class="row-amount">¥ {{ amountText(item.amount) }}</span>
+        </div>
+      </div>
+
+      <div
+        v-if="assetClosureData.fixedBlocked.length || assetClosureData.intangibleBlocked.length"
+        class="card-evidence"
+      >
+        <div>以下项目暂不能处理：</div>
+        <div
+          v-for="(item, i) in [...assetClosureData.fixedBlocked, ...assetClosureData.intangibleBlocked]"
+          :key="`blocked-${i}`"
+        >
+          · {{ item.name || item.period }}：{{ item.reason }}
+        </div>
+      </div>
+
+      <div class="card-result" v-if="local.status === 'approved' && local.result">
+        {{ summarizeAssetClosureResult(local.result) }}
       </div>
     </template>
 
@@ -267,7 +508,7 @@ const approveText = computed(() => {
             {{ (batchResults?.[i]?.category as string) || r.row.category }}
           </span>
           <span class="row-field muted" v-if="r.row.occurDate">{{ r.row.occurDate }}</span>
-          <span class="row-field muted" v-if="r.row.payer">{{ PAYER_TEXT[r.row.payer] || r.row.payer }}</span>
+          <span class="row-field muted" v-if="r.row.payer">{{ payerCardLabel(r.row.payer) }}</span>
           <span class="row-result" v-if="batchResults && batchResults[i]">
             {{ resultLine(batchResults[i]) }}
           </span>
@@ -302,9 +543,27 @@ const approveText = computed(() => {
           <span class="field-label">日期</span>
           <span class="field-value">{{ payload.occurDate || '—' }}</span>
         </div>
-        <div class="field">
-          <span class="field-label">账户</span>
-          <span class="field-value">{{ PAYER_TEXT[String(payload.payer)] || payload.payer || '对公' }}</span>
+        <div class="field field-payer">
+          <span class="field-label">付款方</span>
+          <template v-if="local.status === 'pending'">
+            <NSelect
+              v-model:value="payer.kind"
+              :options="PAYER_OPTIONS"
+              size="tiny"
+            />
+            <NSelect
+              v-if="payer.kind === 'employee_personal'"
+              v-model:value="payer.employeeName"
+              :options="employeeOptions"
+              size="tiny"
+              filterable
+              clearable
+              :loading="employeeLoading"
+              placeholder="选择垫付员工"
+              class="employee-select"
+            />
+          </template>
+          <span v-else class="field-value">{{ payerCardLabel(payload.payer) }}</span>
         </div>
         <div class="field" v-if="payload.merchant">
           <span class="field-label">对方</span>
@@ -337,13 +596,47 @@ const approveText = computed(() => {
         {{ approveText }}
       </NButton>
     </div>
+
+    <NModal
+      v-model:show="backfill.show"
+      preset="card"
+      title="这笔业务要补记到下个月"
+      style="max-width: 460px;"
+      :mask-closable="false"
+    >
+      <div class="backfill-copy">
+        <p>
+          <strong>{{ backfill.businessPeriod }}</strong> 已经关账，这笔业务将按
+          <strong>{{ backfill.targetPeriod }}</strong> 记账（原始单据日期不变）。
+        </p>
+        <p class="muted">
+          依据《小企业会计准则》第 88 条，差错在发现当期更正，不追溯调整已关账月份。
+        </p>
+        <p v-if="backfill.crossQuarter" class="backfill-warn">
+          注意：这次补记跨越季度，会同时影响两个季度的所得税预缴；小规模纳税人的
+          季度 30 万免税判断也可能因此变化。
+        </p>
+      </div>
+      <NInput
+        v-model:value="backfill.reason"
+        type="textarea"
+        placeholder="补记原因（必填，例如：8 月发票 9 月才收到）"
+        :autosize="{ minRows: 2, maxRows: 4 }"
+      />
+      <template #footer>
+        <div class="backfill-actions">
+          <NButton size="small" quaternary @click="backfill.show = false">取消</NButton>
+          <NButton size="small" type="primary" @click="confirmBackfill">确认补记到 {{ backfill.targetPeriod }}</NButton>
+        </div>
+      </template>
+    </NModal>
   </div>
 </template>
 
 <style scoped>
 .agent-action-card {
   border: 1px solid var(--solo-border, #dde3ea);
-  border-left: 3px solid var(--solo-primary, #165dff);
+  border-left: 3px solid var(--solo-primary, #1747b0);
   border-radius: var(--solo-radius, 8px);
   padding: 11px 13px;
   background: var(--solo-bg-card, #ffffff);
@@ -351,11 +644,11 @@ const approveText = computed(() => {
   transition: all 0.2s ease;
 }
 .agent-action-card.approved {
-  border-left-color: var(--solo-income, #12805c);
-  background: #fafcfb;
+  border-left-color: var(--solo-income, #0f7354);
+  background: var(--solo-income-bg);
 }
 .agent-action-card.rejected {
-  border-left-color: var(--solo-text-muted, #8a95a3);
+  border-left-color: var(--solo-text-muted, #636e7c);
   opacity: 0.8;
 }
 .card-head {
@@ -382,7 +675,7 @@ const approveText = computed(() => {
 }
 .field-label {
   font-size: 11px;
-  color: var(--solo-text-muted, #8a95a3);
+  color: var(--solo-text-muted, #636e7c);
 }
 .field-value {
   color: var(--solo-text-primary, #182230);
@@ -396,7 +689,15 @@ const approveText = computed(() => {
 }
 .field-value.is-income,
 .row-amount.is-income {
-  color: var(--solo-income, #12805c);
+  color: var(--solo-income, #0f7354);
+}
+
+/* 付款方：选「员工垫付」时级联出员工名单，两个选择器竖排 */
+.field-payer {
+  gap: 4px;
+}
+.employee-select {
+  margin-top: 2px;
 }
 
 /* 批量清单 */
@@ -409,7 +710,7 @@ const approveText = computed(() => {
 }
 .batch-row {
   border: 1px solid var(--solo-border, #dde3ea);
-  border-radius: var(--solo-radius, 6px);
+  border-radius: var(--solo-radius, 4px);
   padding: 6px 8px;
   background: var(--solo-bg-page, #f6f7f9);
 }
@@ -422,14 +723,14 @@ const approveText = computed(() => {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--solo-income, #12805c);
+  background: var(--solo-income, #0f7354);
   flex-shrink: 0;
 }
 .row-dot.excluded {
-  background: var(--solo-text-muted, #8a95a3);
+  background: var(--solo-text-muted, #636e7c);
 }
 .row-dot.failed {
-  background: var(--solo-expense, #c74444);
+  background: var(--solo-expense, #bd3d3d);
 }
 .row-title {
   flex: 1;
@@ -459,22 +760,22 @@ const approveText = computed(() => {
   color: var(--solo-text-primary, #182230);
 }
 .row-field.muted {
-  color: var(--solo-text-muted, #8a95a3);
+  color: var(--solo-text-muted, #636e7c);
 }
 .row-result {
   font-size: 12px;
-  color: var(--solo-income, #12805c);
+  color: var(--solo-income, #0f7354);
 }
 
 .card-evidence {
   margin-top: 8px;
   font-size: 12px;
-  color: var(--solo-text-muted, #8a95a3);
+  color: var(--solo-text-muted, #636e7c);
 }
 .card-result {
   margin-top: 8px;
   font-size: 12px;
-  color: var(--solo-income, #12805c);
+  color: var(--solo-income, #0f7354);
 }
 .card-actions {
   display: flex;
@@ -498,7 +799,7 @@ const approveText = computed(() => {
   flex-shrink: 0;
   font-size: 11px;
   color: var(--solo-text-muted);
-  border: 1px solid var(--solo-border, #e5e6eb);
+  border: 1px solid var(--solo-border, #dde3ea);
   border-radius: 4px;
   padding: 1px 6px;
 }
@@ -512,5 +813,29 @@ const approveText = computed(() => {
 .muted {
   color: var(--solo-text-muted);
   font-size: 12px;
+}
+
+.backfill-copy {
+  margin-bottom: 10px;
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.backfill-copy p {
+  margin: 0 0 6px;
+}
+
+.backfill-warn {
+  padding: 8px 10px;
+  border-radius: 4px;
+  background: var(--solo-warning-bg, #fff5e8);
+  color: var(--solo-warning, #a05c10);
+  font-size: 12px;
+}
+
+.backfill-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 </style>

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """申报作业包服务（M3，小规模纳税人）。
 
 把已有的测算资产编排成"应报尽报 + 数字一致 + 应享尽享"的作业包：
@@ -17,7 +20,7 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from core.money import ZERO, money
-from services import filing_deadline_service
+from services import business_income_iit_service, company_entity_service, filing_deadline_service, headcount_service
 from services.tax_filing_export_service import build_statement_data, parse_period
 from services.vat_filing_service import build_small_scale_vat_assist
 
@@ -49,10 +52,44 @@ def _quarter_of_period(period: str) -> Optional[str]:
         return None
 
 
-async def _vat_assist(user_id: str, company_id: str, period: str, period_type: str) -> Dict[str, Any]:
-    from services.entry_service import list_entries
+async def _authoritative_entries(company_id: str) -> list[Dict[str, Any]]:
+    """申报底稿只认已过账/已冲销的复式分录，草稿不得混入申报口径。"""
+    from db.session import session_scope
+    from services.accounting_core_service import posted_entries_for_reports
 
-    entries = await list_entries(user_id, company_id)
+    async with session_scope() as session:
+        return await posted_entries_for_reports(session, company_id)
+
+
+async def _deduction_materials(company_id: str, period: str, period_type: str) -> Dict[str, Any]:
+    """企业所得税税前扣除资料状态（原报表中心税务汇总页口径，随作业包收口）。"""
+    entries = await _authoritative_entries(company_id)
+    period_range = parse_period(period, period_type)
+    book = deductible = non_deductible = Decimal("0")
+    for entry in entries:
+        occurred = str(entry.get("occurDate") or "")[:10]
+        if not occurred or not period_range.start.isoformat() <= occurred <= period_range.end.isoformat():
+            continue
+        if entry.get("direction") != "expense":
+            continue
+        amount = _d2(entry.get("amount", 0))
+        book += amount
+        flag = entry.get("taxDeductible")
+        if flag is True:
+            deductible += amount
+        elif flag is False:
+            non_deductible += amount
+    pending = max(Decimal("0"), book - deductible - non_deductible)
+    return {
+        "bookExpenses": _f(book),
+        "totalDeductible": _f(deductible),
+        "totalNonDeductible": _f(non_deductible),
+        "pendingDeductibility": _f(pending),
+    }
+
+
+async def _vat_assist(user_id: str, company_id: str, period: str, period_type: str) -> Dict[str, Any]:
+    entries = await _authoritative_entries(company_id)
     return build_small_scale_vat_assist(entries, period, period_type)  # type: ignore[arg-type]
 
 
@@ -60,28 +97,57 @@ async def _cit_estimate(user_id: str, company_id: str, period: str) -> Dict[str,
     """小型微利企业所得税预缴估算（A200000 口径的精简版）。
 
     与 /report/cit-assist 同源（build_statement_data 的利润表本年累计），
-    作业包场景无人工调整项输入，按实际利润额直接测算并标注前提。
+    并执行同一套确定性纳税调整（招待费/广宣费限额、罚款滞纳金、无票支出）。
     """
     statement = await build_statement_data(user_id, company_id, period, "quarter")
+    from services.cit_adjustment_service import build_cit_adjustments
 
     profit = statement.profit_ytd or {}
     total_profit = _d2(profit.get("total_profit", 0))
     revenue = _d2(profit.get("revenue", 0))
-    taxable_base = max(Decimal("0"), total_profit)
+    cost = _d2(profit.get("cost", 0))
+
+    entries = await _authoritative_entries(company_id)
+    period_range = parse_period(period, "quarter")
+    year_entries = [
+        entry for entry in entries
+        if (occurred := str(entry.get("occurDate") or "")[:10])
+        and statement.period.fiscal_year_start.isoformat() <= occurred <= period_range.end.isoformat()
+    ]
+    adjustments = build_cit_adjustments(
+        year_entries, profit, statement.period.fiscal_year_start, period_range.end,
+    )
+    auto_increase = _d2(adjustments.get("totalIncrease") or 0)
+
+    taxable_base = max(Decimal("0"), total_profit + auto_increase)
     standard_tax = (taxable_base * Decimal("0.25")).quantize(D2, rounding="ROUND_HALF_UP")
     preferential_tax = (taxable_base * Decimal("0.05")).quantize(D2, rounding="ROUND_HALF_UP")
+
+    note = "按实际利润额×5% 估算（小型微利优惠）。如有以前年度亏损或已预缴，以税局申报表为准。"
+    if auto_increase > 0:
+        note = (
+            f"已按规则自动纳税调增 {auto_increase}（招待费/广宣费限额、罚款滞纳金、无票支出），"
+            + note
+        )
 
     return {
         "period": statement.period.label if statement.period else period,
         "revenue": _f(revenue),
+        "cost": _f(cost),
         "totalProfit": _f(total_profit),
+        "autoAdjustmentTotal": _f(auto_increase),
+        "autoAdjustments": adjustments.get("items", []),
         "taxableBase": _f(taxable_base),
         "standardTax": _f(standard_tax),
         "preferentialTax": _f(preferential_tax),
-        "note": "按实际利润额×5% 估算（小型微利优惠）。如有纳税调整、以前年度亏损或已预缴，以税局申报表为准。",
+        # A200000 第 28 栏减免所得税额（老板小抄直接抄表用）
+        "preferentialRelief": _f(standard_tax - preferential_tax),
+        "note": note,
         "fields": [
             {"line": "1", "label": "营业收入（本年累计）", "amount": _f(revenue)},
+            {"line": "2", "label": "营业成本（本年累计）", "amount": _f(cost)},
             {"line": "18", "label": "利润总额（本年累计）", "amount": _f(total_profit)},
+            {"line": "18A", "label": "纳税调增（系统测算）", "amount": _f(auto_increase)},
             {"line": "25", "label": "实际利润额", "amount": _f(taxable_base)},
             {"line": "27", "label": "应纳所得税额（25%）", "amount": _f(standard_tax)},
             {"line": "28", "label": "减免所得税额（小型微利）", "amount": _f(standard_tax - preferential_tax)},
@@ -93,13 +159,12 @@ async def _cit_estimate(user_id: str, company_id: str, period: str) -> Dict[str,
 async def _cross_check(user_id: str, company_id: str, period: str, vat: Dict[str, Any]) -> Dict[str, Any]:
     """三方核对：增值税销售额（账载） vs 发票池 vs 银行流水入账。"""
     from services.bank_service import get_statements
-    from services.entry_service import list_entries
 
     period_range = parse_period(period, "quarter" if "Q" in period.upper() else "month")
     start = period_range.start
     end = period_range.end
 
-    entries = await list_entries(user_id, company_id)
+    entries = await _authoritative_entries(company_id)
     invoice_total = ZERO
     invoice_count = 0
     for entry in entries:
@@ -166,7 +231,7 @@ async def _cross_check(user_id: str, company_id: str, period: str, vat: Dict[str
     }
 
 
-def _preferences(vat: Dict[str, Any], cit: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _preferences(vat: Dict[str, Any], cit: Optional[Dict[str, Any]], cit_applicable: bool = True) -> List[Dict[str, Any]]:
     """优惠勾选建议：应享尽享。"""
     out: List[Dict[str, Any]] = []
     if vat.get("isBelowThreshold"):
@@ -199,18 +264,19 @@ def _preferences(vat: Dict[str, Any], cit: Dict[str, Any]) -> List[Dict[str, Any
                 "action": "无需操作",
             }
         )
-    out.append(
-        {
-            "code": "cit_small_micro",
-            "title": "企业所得税小型微利优惠（实际税负 5%）",
-            "detail": (
-                f"本年累计实际利润额 {cit.get('totalProfit')} 元；按小型微利企业政策"
-                "（应纳税所得额≤300 万部分实际税负 5%，政策至 2027 年）估算本期预缴 "
-                f"{cit.get('preferentialTax')} 元。"
-            ),
-            "action": "预缴申报表第 28 行'减免所得税额'自动体现，确认从业人数/资产总额条件即可",
-        }
-    )
+    if cit_applicable and cit:
+        out.append(
+            {
+                "code": "cit_small_micro",
+                "title": "企业所得税小型微利优惠（实际税负 5%）",
+                "detail": (
+                    f"本年累计实际利润额 {cit.get('totalProfit')} 元；按小型微利企业政策"
+                    "（应纳税所得额≤300 万部分实际税负 5%，政策至 2027 年）估算本期预缴 "
+                    f"{cit.get('preferentialTax')} 元。"
+                ),
+                "action": "预缴申报表第 28 行'减免所得税额'自动体现；从业人数自动取自员工名册、资产总额取自报表，补充所属行业即可",
+            }
+        )
     out.append(
         {
             "code": "six_taxes_half",
@@ -222,10 +288,46 @@ def _preferences(vat: Dict[str, Any], cit: Dict[str, Any]) -> List[Dict[str, Any
     return out
 
 
-def _checklist(period: str, quarter: str, employees_hint: Optional[int] = None) -> List[Dict[str, Any]]:
-    """申报事项清单（不含 vat/cit 两个主表，它们单独成节）。"""
+def _iit_hint(
+    headcount: Optional[Any], entity_type: str
+) -> tuple[str, bool]:
+    """个税扣缴提示：按主体类型分叉，返回 (hint, 是否需要先录入员工)。"""
+    et = company_entity_service.normalize_entity_type(entity_type)
+    label = company_entity_service.ENTITY_LABELS.get(et, "当前主体")
+    if headcount is None:
+        return "暂时无法读取员工名册；如本月有工资发放，需在扣缴端按月申报。", False
+    if headcount.is_corporate:
+        if headcount.raw == 0:
+            return (
+                "公司制企业至少应有 1 名从业人员（含法定代表人）。请先在「薪酬社保」"
+                "录入员工名册，再按月申报工资薪金个税。",
+                True,
+            )
+        return "有员工，必须在自然人电子税务局扣缴端按月申报。", False
+    if headcount.raw == 0:
+        return f"{label}无雇工的可不办理工资薪金扣缴申报；如有雇工，请先录入员工名册。", False
+    return "有雇工，需在扣缴端按月申报工资薪金个税。", False
+
+
+def _checklist(
+    period: str,
+    quarter: str,
+    headcount: Optional[Any] = None,
+    entity_type: str = "ltd",
+    cit_applicable: bool = True,
+    active_groups: Optional[set] = None,
+) -> List[Dict[str, Any]]:
+    """申报事项清单（不含 vat/cit 两个主表，它们单独成节）。
+
+    `active_groups` 为税费种认定表里出现过的申报表组；为 None 表示公司还没同步
+    认定表，按内置清单全量展示。同步过之后，认定表里没有的税种不再出现在清单里
+    ——否则用户刚把不需要的税种去掉，页面上又冒出来一条待办。
+    """
     items: List[Dict[str, Any]] = []
     year = int(period[:4]) if period[:4].isdigit() else date.today().year
+
+    def _enabled(tax_kind: str) -> bool:
+        return active_groups is None or tax_kind in active_groups
     items.append(
         {
             "taxKind": "fin_statements",
@@ -235,26 +337,37 @@ def _checklist(period: str, quarter: str, employees_hint: Optional[int] = None) 
             "canExport": True,
         }
     )
-    items.append(
-        {
-            "taxKind": "stamp_duty",
-            "name": filing_deadline_service.TAX_KINDS["stamp_duty"]["name"],
-            "guide": filing_deadline_service.TAX_KINDS["stamp_duty"]["guide"],
-            "hint": "本期无应税合同/增资可零申报（确认后本项即完成）。",
-        }
-    )
-    items.append(
-        {
-            "taxKind": "iit_withholding",
-            "name": filing_deadline_service.TAX_KINDS["iit_withholding"]["name"],
-            "guide": filing_deadline_service.TAX_KINDS["iit_withholding"]["guide"],
-            "hint": (
-                "插件覆盖不到扣缴端；无员工无工资发放时本月可不做（确认后完成）。"
-                if (employees_hint or 0) == 0
-                else "有员工，必须在自然人电子税务局扣缴端按月申报。"
-            ),
-        }
-    )
+    if _enabled("stamp_duty"):
+        items.append(
+            {
+                "taxKind": "stamp_duty",
+                "name": filing_deadline_service.TAX_KINDS["stamp_duty"]["name"],
+                "guide": filing_deadline_service.TAX_KINDS["stamp_duty"]["guide"],
+                "hint": "本期无应税合同/增资可零申报（确认后本项即完成）。",
+            }
+        )
+    if _enabled("iit_withholding"):
+        iit_hint, needs_employee_setup = _iit_hint(headcount, entity_type)
+        items.append(
+            {
+                "taxKind": "iit_withholding",
+                "name": filing_deadline_service.TAX_KINDS["iit_withholding"]["name"],
+                "guide": filing_deadline_service.TAX_KINDS["iit_withholding"]["guide"],
+                "hint": iit_hint,
+                "needsEmployeeSetup": needs_employee_setup,
+                "actionPath": "/mine/salary" if needs_employee_setup else None,
+                "actionLabel": "去录入员工" if needs_employee_setup else None,
+            }
+        )
+    if entity_type != "ltd" and _enabled("business_income_iit_prepay"):
+        items.append(
+            {
+                "taxKind": "business_income_iit_prepay",
+                "name": filing_deadline_service.TAX_KINDS["business_income_iit_prepay"]["name"],
+                "guide": filing_deadline_service.TAX_KINDS["business_income_iit_prepay"]["guide"],
+                "hint": "查账征收适用；累计收入、应纳税所得额与应纳税额见上方经营所得卡片，核定征收不适用。",
+            }
+        )
     if quarter and quarter.endswith("-Q2"):
         items.append(
             {
@@ -264,7 +377,20 @@ def _checklist(period: str, quarter: str, employees_hint: Optional[int] = None) 
                 "hint": f"{year} 年度年报，6 月 30 日截止，现在做正合适。",
             }
         )
-    if quarter and quarter.endswith("-Q4"):
+    if active_groups:
+        for tax_kind in ("culture_fee", "disability_fund", "other"):
+            if tax_kind not in active_groups:
+                continue
+            meta = filing_deadline_service.TAX_KINDS[tax_kind]
+            items.append(
+                {
+                    "taxKind": tax_kind,
+                    "name": meta["name"],
+                    "guide": meta["guide"],
+                    "hint": "按税费种认定表的纳税期限申报，可在「税费种认定」页查看认定明细。",
+                }
+            )
+    if cit_applicable and quarter and quarter.endswith("-Q4"):
         items.append(
             {
                 "taxKind": "cit_annual",
@@ -289,8 +415,24 @@ async def build_filing_package(
     period_type = "quarter" if is_quarter else "month"
 
     vat = await _vat_assist(user_id, company_id, package_period, period_type)
-    cit = await _cit_estimate(user_id, company_id, quarter)
+    # 所得税按主体类型分支：个人独资/个体工商户不缴企业所得税，CIT 整体不适用，
+    # 改出经营所得个税 A 表预缴卡（5%-35% 五级累进，个体户 200 万内减半）
+    entity_type = await company_entity_service.get_company_entity_type(company_id)
+    cit_applicable = company_entity_service.pays_corporate_income_tax(entity_type)
+    cit = await _cit_estimate(user_id, company_id, quarter) if cit_applicable else None
+    iit = (
+        await business_income_iit_service.build_prepayment_assist(user_id, company_id, package_period)
+        if not cit_applicable else None
+    )
+    iit_applicable = bool(iit and iit.get("applicable"))
     cross = await _cross_check(user_id, company_id, package_period, vat)
+    deduction = await _deduction_materials(company_id, package_period, period_type)
+
+    # 税费种认定表：有认定就按认定口径裁剪申报清单，没认定走内置全量清单
+    from services import tax_registration_service
+
+    registrations = await tax_registration_service.list_registrations(company_id)
+    active_groups = {reg["returnGroup"] for reg in registrations} or None
 
     # 征期状态（物化后读取）
     try:
@@ -312,16 +454,25 @@ async def build_filing_package(
             }
         return {"deadlineId": None, "status": "untracked", "dueDate": None, "daysLeft": None}
 
-    vat_deadline = _item_state("vat", quarter)
-    cit_deadline = _item_state("cit", quarter)
+    # 增值税征期随公司申报周期：月报公司取该季度末月，季报公司取季度期间
+    # 周期以税费种认定表为准（公司档案只是未同步前的兜底）
+    vat_cycle = await filing_deadline_service.effective_vat_cycle(company_id)
+    vat_deadline_period = quarter
+    if vat_cycle == "month":
+        parsed_quarter = filing_deadline_service._quarter_label(quarter)
+        if parsed_quarter:
+            vat_deadline_period = f"{parsed_quarter[0]}-{parsed_quarter[1] * 3:02d}"
+    vat_deadline = _item_state("vat", vat_deadline_period)
+    # 申报口径不一致时要显式告诉用户：季报公司看季度包、月报公司看月度包
+    vat_cycle_mismatch = (vat_cycle == "month") != (period_type == "month")
+    cit_deadline = _item_state("cit", quarter) if cit_applicable else None
+    iit_deadline = _item_state("business_income_iit_prepay", package_period) if iit_applicable else None
 
-    employees_hint = None
+    headcount = None
     try:
-        from services.salary_service import list_employees
-
-        employees_hint = len(await list_employees(company_id))
-    except Exception:
-        pass
+        headcount = await headcount_service.get_headcount(company_id, entity_type)
+    except Exception:  # noqa: BLE001 —— 名册读取失败降级为兜底文案
+        logger.exception("headcount lookup failed company=%s", company_id)
 
     def _item_period_for(tax_kind: str) -> str:
         # 个税扣缴按月申报：用该季度最后一个月的征期作为代表
@@ -331,12 +482,26 @@ async def build_filing_package(
                 year, q = parsed
                 return f"{year}-{q * 3:02d}"
             return quarter
+        # 经营所得 A 表预缴周期随公司配置（月/季）：直接用作业包自身期间匹配
+        if tax_kind == "business_income_iit_prepay":
+            return package_period
+        # 残保金按年属期（次年 9-30），期间就是年份本身
+        if tax_kind == "disability_fund":
+            return quarter[:4] if quarter[:4].isdigit() else quarter
         return quarter
 
     package = {
         "period": package_period,
+        "taxRegistrations": {
+            "synced": bool(registrations),
+            "count": len(registrations),
+            "groups": sorted(active_groups) if active_groups else [],
+        },
         "periodType": period_type,
         "generatedAt": date.today().isoformat(),
+        # 各税种申报周期（增值税与经营所得可能不同）
+        "filingCycles": {"vat": vat_cycle},
+        "vatCycleMismatch": vat_cycle_mismatch,
         "vat": {
             **{k: (float(v) if isinstance(v, Decimal) else v) for k, v in vat.items() if k not in ("items", "filingFields", "threshold")},
             "filingFields": [
@@ -347,19 +512,40 @@ async def build_filing_package(
             ],
             "deadline": vat_deadline,
         },
-        "cit": {**cit, "deadline": cit_deadline},
+        "cit": {**cit, "deadline": cit_deadline} if cit else None,
+        "citNotice": company_entity_service.income_tax_notice(entity_type),
+        "businessIncomeIit": (
+            {
+                **{
+                    k: (float(v) if isinstance(v, Decimal) else v)
+                    for k, v in iit.items() if k not in ("notes",)
+                },
+                "notes": iit.get("notes", []),
+                "deadline": iit_deadline,
+            }
+            if iit_applicable else None
+        ),
         "crossCheck": cross,
-        "preferences": _preferences(vat, cit),
+        "deductionMaterials": deduction,
+        "preferences": _preferences(vat, cit, cit_applicable),
         "checklist": [
             {**item, **_item_state(item["taxKind"], _item_period_for(item["taxKind"]))}
-            for item in _checklist(package_period, quarter, employees_hint)
+            for item in _checklist(
+                package_period,
+                quarter,
+                headcount=headcount,
+                entity_type=entity_type,
+                cit_applicable=cit_applicable,
+                active_groups=active_groups,
+            )
         ],
         "summary": {
             "readyToFile": bool(vat.get("readyToFile")),
             "blockingIssues": vat.get("blockingIssues", []),
             "warnings": vat.get("warnings", []),
             "vatPayable": float(_d2(vat.get("totalVatPayable"))),
-            "citPayable": cit.get("preferentialTax"),
+            "citPayable": cit.get("preferentialTax") if cit else 0,
+            "iitPayable": float(iit.get("suggestedPayable")) if iit_applicable else 0,
             "overdue": [d["taxName"] for d in quarter_deadlines if d["status"] == "pending" and d["daysLeft"] < 0],
         },
     }

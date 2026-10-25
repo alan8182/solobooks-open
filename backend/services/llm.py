@@ -1,7 +1,10 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """LLM 服务门面（供应商无关）。
 
 所有 LLM 调用（文本、视觉/多模态、agent 工具循环）统一走 OpenAI 兼容协议：
-  - 端点  config.LLM_BASE_URL      （qwen: dashscope.aliyuncs.com/compatible-mode/v1）
+  - 端点  config.LLM_BASE_URL      （qwen: maas.qianwenaiapi.com/compatible-mode/v1）
   - 密钥  config.LLM_API_KEY       （默认复用 DASHSCOPE_API_KEY）
   - 模型  config.QWEN_TEXT_MODEL / config.QWEN_VL_MODEL
 
@@ -285,9 +288,23 @@ def chat_text(system_prompt: str, user_message: str, **kwargs) -> str:
         raise
 
 
-def chat_text_json(system_prompt: str, user_message: str, **kwargs) -> dict:
-    """调用 LLM 并解析 JSON 响应，失败时抛出异常"""
+def chat_text_json(system_prompt: str, user_message: str, *, retry_on_parse: bool = False, **kwargs) -> dict:
+    """调用 LLM 并解析 JSON，失败时抛出异常。
+
+    ``retry_on_parse=True`` 时，若首次返回无法解析为 JSON，追加"只输出 JSON"的
+    约束重试一次（仅覆盖解析失败；网络错误由 chat_text 的 max_retries 处理）。
+    """
     text = chat_text(system_prompt, user_message, **kwargs)
+    try:
+        return _extract_json(text)
+    except ValueError:
+        if not retry_on_parse:
+            raise
+    strict_message = (
+        f"{user_message}\n\n上一次回复无法解析为 JSON。"
+        "请只输出一个 JSON 对象，不要解释、不要 Markdown、不要代码块。"
+    )
+    text = chat_text(system_prompt, strict_message, **kwargs)
     return _extract_json(text)
 
 
@@ -448,9 +465,12 @@ async def chat_tools_stream_async(
         # 用量采集（M1）：OpenAI 兼容协议标准字段，从最后一个 chunk 读 usage
         "stream_options": {"include_usage": True},
     }
-    # Qwen 思考开关；DeepSeek 等供应商不发送该参数（LLM_SEND_ENABLE_THINKING=0）
+    # Qwen 思考开关；优先使用传入参数，未传则回退到配置；DeepSeek 等不需要时置 0
+    enable_thinking = kwargs.get("enable_thinking")
+    if enable_thinking is None:
+        enable_thinking = QWEN_ENABLE_THINKING
     if LLM_SEND_ENABLE_THINKING:
-        payload["extra_body"] = {"enable_thinking": QWEN_ENABLE_THINKING}
+        payload["extra_body"] = {"enable_thinking": bool(enable_thinking)}
     if tools:
         payload["tools"] = tools
 

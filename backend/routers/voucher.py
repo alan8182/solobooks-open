@@ -1,13 +1,12 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Authoritative voucher and trial-balance routes."""
 from __future__ import annotations
 
-from decimal import Decimal
-
 from fastapi import APIRouter, Depends
-from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import JournalEntry, JournalLine
 from db.session import get_db_session
 from deps.auth import AuthContext, require_auth
 from models.schemas import (
@@ -20,7 +19,8 @@ from models.schemas import (
     VoucherGenerateResponse,
     d2,
 )
-from services.accounting_core_service import ensure_tenant, get_journal, period_start_for, serialize_journal
+from services.accounting_core_service import ensure_tenant, get_journal, serialize_journal
+from services.ledger_book_service import build_ledger_book
 
 
 router = APIRouter(prefix="/api/ledger", tags=["voucher"], dependencies=[Depends(require_auth)])
@@ -62,45 +62,28 @@ async def trial_balance(
     ctx: AuthContext = Depends(require_auth),
     session: AsyncSession = Depends(get_db_session),
 ):
-    """Calculate the period trial balance only from posted journal lines."""
+    """试算平衡：与科目余额表同一实现、同一口径。
+
+    历史上先是独立 SQL 聚合，后改为从 balance-summary 派生，始终与账簿两套
+    取数路径并存、口径容易漂移；现在统一从整册（build_ledger_book）的 balance
+    段派生（剔除容器合计行），端点与返回结构保持不变。
+    """
     await ensure_tenant(session, ctx.company_id, ctx.user_id)
-    rows = (
-        await session.execute(
-            select(
-                JournalLine.account_code,
-                JournalLine.account_name,
-                func.coalesce(func.sum(JournalLine.amount).filter(JournalLine.direction == "debit"), 0),
-                func.coalesce(func.sum(JournalLine.amount).filter(JournalLine.direction == "credit"), 0),
-            )
-            .join(JournalEntry, JournalEntry.id == JournalLine.journal_entry_id)
-            .where(
-                JournalEntry.company_id == ctx.company_id,
-                JournalEntry.period_start == period_start_for(req.month),
-                JournalEntry.status.in_(("posted", "reversed")),
-            )
-            .group_by(JournalLine.account_code, JournalLine.account_name)
-            .order_by(JournalLine.account_code)
+    book = await build_ledger_book(ctx.company_id, month=req.month, include_zero_rows=True)
+    balance = book["balance"]
+    items = [
+        TrialBalanceItem(
+            accountCode=item["accountCode"],
+            accountName=item["accountName"],
+            debitTotal=d2(item["debitTotal"]),
+            creditTotal=d2(item["creditTotal"]),
+            balance=d2(item["balance"]),
         )
-    ).all()
-    items: list[TrialBalanceItem] = []
-    total_debit = Decimal("0")
-    total_credit = Decimal("0")
-    for code, name, debit, credit in rows:
-        debit_value = d2(debit)
-        credit_value = d2(credit)
-        total_debit += debit_value
-        total_credit += credit_value
-        items.append(
-            TrialBalanceItem(
-                accountCode=code,
-                accountName=name,
-                debitTotal=debit_value,
-                creditTotal=credit_value,
-                balance=d2(debit_value - credit_value),
-            )
-        )
+        for item in balance["items"]
+        if not item["isParent"]
+    ]
     return TrialBalanceResponse(
         month=req.month,
         items=items,
-        isBalanced=total_debit == total_credit,
+        isBalanced=balance["isBalanced"],
     )

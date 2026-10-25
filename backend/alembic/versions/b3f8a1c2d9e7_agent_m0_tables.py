@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Agent M0 基础设施：待确认动作表 + 公司画像表。
 
 Revision ID: b3f8a1c2d9e7

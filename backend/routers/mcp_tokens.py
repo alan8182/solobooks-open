@@ -1,7 +1,10 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """MCP 个人访问令牌（PAT）管理 API：用户管理自己的令牌。
 
 - 列表/吊销只针对本人令牌；
-- 签发默认绑定当前公司（JWT company_id），为其他公司签发需校验成员关系；
+- 签发一律校验持有人对目标公司（含 JWT 当前公司）的 owner/成员关系；
 - scopes 白名单：read / write:draft（写入类工具只产生待确认草稿）；
 - 明文 token 仅在签发响应里出现一次。
 """
@@ -47,9 +50,9 @@ async def list_tokens(ctx: AuthContext = Depends(require_auth)):
 async def create_token(body: CreateTokenRequest, ctx: AuthContext = Depends(require_auth)):
     scopes = _parse_scopes(body.scopes)
     company_id = body.company_id or ctx.company_id
-    if company_id != ctx.company_id and not await svc.is_company_member(
-        user_id=ctx.user_id, company_id=company_id
-    ):
+    # 无条件校验（不对 ctx.company_id 走捷径）：JWT 的公司上下文不保证持有人
+    # 仍是该公司的 owner/成员，错绑令牌会经 MCP 读到他人账本（2026-10-20）
+    if not await svc.is_company_member(user_id=ctx.user_id, company_id=company_id):
         raise HTTPException(status_code=403, detail="只能为已加入的公司签发令牌")
     raw, row = await svc.issue_token(
         user_id=ctx.user_id,

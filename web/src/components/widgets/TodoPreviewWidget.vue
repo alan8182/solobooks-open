@@ -1,3 +1,4 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
@@ -5,6 +6,7 @@ import { NButton } from 'naive-ui'
 import { getTodos } from '@/api/todo'
 import type { TodoItem } from '@/api/types'
 import { formatMoney } from '@/utils/format'
+import { SoloEmpty } from '@/components/ui'
 
 const router = useRouter()
 const todoList = ref<TodoItem[]>([])
@@ -36,12 +38,11 @@ onMounted(async () => {
     </div>
 
     <div class="todos-card">
-      <div v-if="todoList.length === 0" class="empty-state">
-        <div class="empty-icon-wrapper">
-          <i class="ri-checkbox-circle-line" />
-        </div>
-        <p class="empty-text">太棒了，目前没有待办事项</p>
-      </div>
+      <SoloEmpty
+        v-if="todoList.length === 0"
+        title="太棒了，目前没有待办事项"
+        icon="ri-checkbox-circle-line"
+      />
 
       <div v-else class="todo-list">
         <div
@@ -131,7 +132,7 @@ onMounted(async () => {
   font-size: 11px;
   font-weight: 700;
   padding: 2px 8px;
-  border-radius: 6px;
+  border-radius: 4px;
   white-space: nowrap;
   flex-shrink: 0;
 }

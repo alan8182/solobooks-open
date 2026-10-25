@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """存量发票"直付"模式迁移（P2 一次性）。
 
 背景：发票导入曾直接生成 贷1002（银行直付）凭证，配对前虚减银行存款；
@@ -48,15 +51,31 @@ def _is_platform_fee(payload: dict) -> bool:
     return bool(PLATFORM_FEE_SELLER.search(seller) or PLATFORM_FEE_ITEM.search(f"{item} {payload.get('title', '')}"))
 
 
+def _as_dict(value) -> dict:
+    """PG 的 JSONB 列驱动直接返回 dict，SQLite 返回 str，统一成 dict。"""
+    if isinstance(value, dict):
+        return value
+    return json.loads(value)
+
+
+async def _invoice_import_filter(session) -> str:
+    """JSON 提取语法按方言选择：PG 用 ::jsonb，SQLite 用 json_extract。"""
+    dialect = session.bind.dialect.name
+    if dialect == "postgresql":
+        return "payload::jsonb->>'source' = 'invoice_import'"
+    return "json_extract(payload, '$.source') = 'invoice_import'"
+
+
 async def migrate(dry_run: bool = False) -> None:
     async with session_scope() as session:
+        source_filter = await _invoice_import_filter(session)
         rows = (await session.execute(text(
             "SELECT id, company_id, user_id, payload FROM entries "
-            "WHERE payload::jsonb->>'source' = 'invoice_import'"
+            f"WHERE {source_filter}"
         ))).mappings().all()
         report = {"archived_reversed": [], "archived_deleted": [], "draft_to_payable": [], "posted_manual": []}
         for row in rows:
-            payload = json.loads(row["payload"])
+            payload = _as_dict(row["payload"])
             entry_id, company_id, user_id = row["id"], row["company_id"], row["user_id"]
             already_archived = bool(payload.get("is_archive_only") or payload.get("isArchiveOnly"))
             reconciled = str(payload.get("billingStatus") or "") == "reconciled"
@@ -90,10 +109,17 @@ async def migrate(dry_run: bool = False) -> None:
                 report["draft_to_payable"].append((entry_id, payload.get("title"), str(payload.get("amount"))))
                 if not dry_run:
                     voucher = json.loads(json.dumps(payload.get("voucherLines") or {}))
-                    for line in voucher.get("credit") or []:
-                        if str(line.get("accountCode")) == "1002":
-                            line["accountCode"] = "2241"
-                            line["accountName"] = "其他应付款-发票待付款"
+                    if str(payload.get("direction")) == "income":
+                        # 收入发票：借方 1002 改 1122 应收（待收款模式）
+                        for line in voucher.get("debit") or []:
+                            if str(line.get("accountCode")) == "1002":
+                                line["accountCode"] = "1122"
+                                line["accountName"] = "应收账款-发票待收"
+                    else:
+                        for line in voucher.get("credit") or []:
+                            if str(line.get("accountCode")) == "1002":
+                                line["accountCode"] = "2241"
+                                line["accountName"] = "其他应付款-发票待付款"
                     await update_draft(session, entry_id, {"voucherLines": voucher},
                                        company_id=company_id, user_id=user_id,
                                        request_id=f"migrate-invoice-{entry_id[:8]}")

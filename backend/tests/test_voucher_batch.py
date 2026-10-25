@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 from __future__ import annotations
 
 import json
@@ -69,7 +72,7 @@ def sample_payload(entry_id: str, occurred_on: str = "2026-07-01") -> dict:
         "sourceType": "manual",
         "voucherLines": {
             "debit": [{"accountCode": "1002", "accountName": "银行存款", "amount": "100.00"}],
-            "credit": [{"accountCode": "6001", "accountName": "主营业务收入", "amount": "100.00"}],
+            "credit": [{"accountCode": "5001", "accountName": "主营业务收入", "amount": "100.00"}],
         },
     }
 

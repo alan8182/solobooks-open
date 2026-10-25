@@ -1,3 +1,4 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useRouter } from 'vue-router'
@@ -6,6 +7,19 @@ import { useEntryStore } from '@/stores/entry'
 import { moneyPresentation } from '@/utils/accounting'
 import { getEntryNaturePresentation } from '@/utils/entryNature'
 import { formatDate } from '@/utils/format'
+import { SoloEmpty } from '@/components/ui'
+import { SoloErrorState } from '@/components/ui'
+
+/** 首屏拉取失败时不要显示「暂无记账记录」——失败和无数据必须长得不一样 */
+const failed = computed(() => Boolean(entryStore.error) && entryStore.activeEntries.length === 0)
+
+async function reloadEntries() {
+  try {
+    await entryStore.fetchEntries()
+  } catch {
+    // 失败原因已由 store 记录
+  }
+}
 
 const router = useRouter()
 const entryStore = useEntryStore()
@@ -26,23 +40,36 @@ function moneyDisplay(dir: string, category: string, amount: number | string) {
 </script>
 
 <template>
-  <div class="recent-entries-section">
-    <div class="section-header">
-      <h3 class="section-title">最近交易记录</h3>
-      <NButton text type="primary" class="view-all-btn" @click="router.push('/ledger')" v-if="recentEntries.length > 0">
-        <span>查看全部</span>
-        <i class="ri-arrow-right-s-line" />
-      </NButton>
-    </div>
-
-    <div class="entries-card">
-      <div v-if="recentEntries.length === 0" class="empty-state">
-        <div class="empty-icon-wrapper">
-          <i class="ri-folder-open-line" />
-        </div>
-        <p class="empty-text">暂无记账记录</p>
-        <NButton size="small" type="primary" class="empty-btn" @click="router.push('/copilot')">立即开始</NButton>
-      </div>
+  <div class="entries-card">
+    <header class="entries-header">
+      <h2 class="entries-title">最近交易记录</h2>
+      <button
+        v-if="recentEntries.length > 0"
+        type="button"
+        class="view-all"
+        @click="router.push('/ledger')"
+      >
+        查看全部
+        <i class="ri-arrow-right-line" aria-hidden="true" />
+      </button>
+    </header>
+      <SoloErrorState
+        v-if="failed"
+        title="最近交易加载失败"
+        description="没能取到账目记录，稍后重试即可。"
+        :detail="entryStore.error"
+        @retry="reloadEntries"
+      />
+      <SoloEmpty
+        v-else-if="recentEntries.length === 0"
+        title="暂无记账记录"
+        description="一句话、一张发票就能开始。"
+        icon="ri-quill-pen-line"
+      >
+        <template #action>
+          <NButton size="small" type="primary" @click="router.push('/copilot')">立即开始</NButton>
+        </template>
+      </SoloEmpty>
 
       <div v-else class="entry-list">
         <div
@@ -72,41 +99,51 @@ function moneyDisplay(dir: string, category: string, amount: number | string) {
           </div>
         </div>
       </div>
-    </div>
   </div>
 </template>
 
 <style scoped>
-.recent-entries-section {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-.section-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-.section-title {
-  font-size: 14px;
-  font-weight: 650;
-  color: var(--solo-text-primary);
-  margin: 0;
-  letter-spacing: 0.5px;
-}
-.view-all-btn {
-  font-size: 13px;
-  font-weight: 600;
-  display: flex;
-  align-items: center;
-  gap: 2px;
-}
 .entries-card {
   background: var(--solo-bg-card);
-  border: 1px solid var(--solo-border-glass);
+  border: 1px solid var(--solo-border);
   border-radius: var(--solo-radius-lg);
   box-shadow: none;
   overflow: hidden;
+}
+.entries-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 18px 12px;
+}
+.entries-title {
+  margin: 0;
+  color: var(--solo-text-primary);
+  font-size: 14.5px;
+  font-weight: 650;
+  line-height: 1.3;
+}
+.view-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--solo-primary);
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 650;
+  cursor: pointer;
+}
+.view-all:hover {
+  background: var(--solo-bg-blue-soft);
+}
+.view-all:focus-visible {
+  outline: 2px solid var(--solo-primary);
+  outline-offset: -2px;
 }
 .entry-list {
   display: flex;
@@ -116,13 +153,11 @@ function moneyDisplay(dir: string, category: string, amount: number | string) {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 16px 20px;
+  gap: 12px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--solo-border-light);
   cursor: pointer;
-  transition: all 0.2s;
-  border-bottom: 1px solid var(--solo-border-light);
-}
-.entry-row:last-child {
-  border-bottom: none;
+  transition: background-color 160ms ease-out;
 }
 .entry-row:hover {
   background: var(--solo-bg-soft);
@@ -134,29 +169,29 @@ function moneyDisplay(dir: string, category: string, amount: number | string) {
 .entry-left {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 12px;
   min-width: 0;
 }
 .category-icon {
-  width: 40px;
-  height: 40px;
-  border-radius: 10px;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 13px;
+  font-size: 11px;
   font-weight: 700;
   flex-shrink: 0;
 }
 .entry-details {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 3px;
   min-width: 0;
 }
 .entry-title {
-  font-size: 14px;
-  font-weight: 600;
+  font-size: 13px;
+  font-weight: 650;
   color: var(--solo-text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -166,7 +201,7 @@ function moneyDisplay(dir: string, category: string, amount: number | string) {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--solo-text-secondary);
 }
 .meta-tag {
@@ -185,15 +220,15 @@ function moneyDisplay(dir: string, category: string, amount: number | string) {
   flex-shrink: 0;
 }
 .entry-amount {
-  font-size: 15px;
+  font-size: 13px;
   font-weight: 700;
   font-family: 'Outfit', 'Inter', sans-serif;
   font-variant-numeric: tabular-nums;
 }
 .row-arrow {
-  font-size: 16px;
+  font-size: 14px;
   color: var(--solo-text-muted);
-  transition: transform 0.2s, color 0.2s;
+  transition: transform 160ms ease-out, color 160ms ease-out;
 }
 .empty-state {
   text-align: center;
@@ -221,7 +256,7 @@ function moneyDisplay(dir: string, category: string, amount: number | string) {
   margin: 0;
 }
 .empty-btn {
-  border-radius: 20px;
+  border-radius: 12px;
   font-weight: 600;
 }
 </style>

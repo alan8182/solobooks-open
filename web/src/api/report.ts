@@ -1,20 +1,50 @@
+/**
+ * Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+ * Licensed under the SoloBooks License v2.0.
+ */
+
 import apiClient from './client'
 import type {
   MonthlyReportResponse,
+  ReportDiagnosisResponse,
   HealthScoreResponse,
   VatAssistResponse,
   CitAssistResponse,
   ArchiveChecklistResponse,
-  TaxSummaryResponse,
   BalanceSheetResponse,
   CashFlowResponse,
   IncomeStatementResponse,
   IncomeStatementViewMode,
+  IncomeStatementBasis,
   ComparisonResponse,
 } from './types'
 
-export function getMonthlyReport(month: string): Promise<MonthlyReportResponse> {
-  return apiClient.post('/api/report/monthly', { month })
+export function getMonthlyReport(
+  period: string,
+  periodType: 'month' | 'quarter' | 'year' = 'month',
+  includeSummary = false,
+  includeDrafts = false,
+): Promise<MonthlyReportResponse> {
+  const payload: Record<string, unknown> = {
+    month: period,
+    period,
+    periodType,
+  }
+  if (includeSummary) {
+    payload.includeSummary = true
+  }
+  if (includeDrafts) {
+    payload.includeDrafts = true
+  }
+  return apiClient.post('/api/report/monthly', payload)
+}
+
+export function getReportDiagnosis(
+  period: string,
+  periodType: 'month' | 'quarter' | 'year' = 'month',
+  includeDrafts = false,
+): Promise<ReportDiagnosisResponse> {
+  return apiClient.post('/api/report/diagnosis', { month: period, period, periodType, includeDrafts })
 }
 
 export function getHealthScore(month: string): Promise<HealthScoreResponse> {
@@ -37,26 +67,42 @@ export function getArchiveChecklist(month: string): Promise<ArchiveChecklistResp
   return apiClient.post('/api/report/archive-checklist', { month })
 }
 
-export function getTaxSummary(
-  period: string,
-  periodType: 'month' | 'quarter' = 'quarter',
-): Promise<TaxSummaryResponse> {
-  return apiClient.post('/api/report/tax-summary', { period, periodType })
+export function getBalanceSheet(month: string, periodType: 'month' | 'quarter' = 'month'): Promise<BalanceSheetResponse> {
+  return apiClient.post('/api/report/balance-sheet', { month, periodType })
 }
 
-export function getBalanceSheet(month: string): Promise<BalanceSheetResponse> {
-  return apiClient.post('/api/report/balance-sheet', { month })
+export function getCashFlow(month: string, periodType: 'month' | 'quarter' = 'month'): Promise<CashFlowResponse> {
+  return apiClient.post('/api/report/cash-flow', { month, periodType })
 }
 
-export function getCashFlow(month: string): Promise<CashFlowResponse> {
-  return apiClient.post('/api/report/cash-flow', { month })
+export interface EquityChangeRow {
+  key: string
+  label: string
+  priorYearEnd: number
+  increase: number
+  decrease: number
+  yearEnd: number
+  isRetained?: boolean
+}
+
+export interface EquityChangesResponse {
+  year: number
+  rows: EquityChangeRow[]
+  netProfit: number
+  totals: { priorYearEnd: number; increase: number; decrease: number; yearEnd: number }
+  simplified: boolean
+}
+
+export function getEquityChanges(year: number): Promise<EquityChangesResponse> {
+  return apiClient.post('/api/report/equity-changes', { year })
 }
 
 export function getIncomeStatement(
   month: string,
   viewMode: IncomeStatementViewMode = 'summary',
+  basis: IncomeStatementBasis = 'posting',
 ): Promise<IncomeStatementResponse> {
-  return apiClient.post('/api/report/income-statement', { month, viewMode })
+  return apiClient.post('/api/report/income-statement', { month, viewMode, basis })
 }
 
 export function getComparison(

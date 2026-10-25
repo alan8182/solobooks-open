@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 from decimal import Decimal
 
 from services.bank_service import (
@@ -60,16 +63,16 @@ def test_diagnose_missing_wechat_settlement_voucher():
                 "id": "sale",
                 "title": "销售收入",
                 "voucherLines": {
-                    "debit": [{"accountCode": "1012", "amount": 59}],
-                    "credit": [{"accountCode": "6001", "amount": 59}],
+                    "debit": [{"accountCode": "1012001", "amount": 59}],
+                    "credit": [{"accountCode": "5001", "amount": 59}],
                 },
             },
             {
                 "id": "fee",
                 "title": "微信手续费",
                 "voucherLines": {
-                    "debit": [{"accountCode": "5608", "amount": 0.53}],
-                    "credit": [{"accountCode": "1012", "amount": 0.53}],
+                    "debit": [{"accountCode": "5603002", "amount": 0.53}],
+                    "credit": [{"accountCode": "1012001", "amount": 0.53}],
                 },
             },
         ],

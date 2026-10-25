@@ -1,6 +1,10 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """小私账服务 —— 记录未入公账的经营收支"""
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -10,6 +14,7 @@ from core.money import ZERO, money, money_text
 
 _PAGE_SIZE_DEFAULT = 20
 _DEPOSIT_CATEGORY = "押金保证金"
+logger = logging.getLogger(__name__)
 
 
 def _now_iso() -> str:
@@ -82,12 +87,22 @@ async def _ensure_schema() -> None:
         await conn.close()
 
 
+async def _ensure_demo_samples(company_id: str) -> None:
+    try:
+        from services.demo_book_service import ensure_demo_private_expenses
+
+        await ensure_demo_private_expenses(company_id)
+    except Exception:  # noqa: BLE001 - 演示样本补齐失败不影响真实私账
+        logger.warning("演示账套：小私账补齐失败（company=%s）", company_id, exc_info=True)
+
+
 async def list_expenses(
     company_id: str, page: int = 1, page_size: int = _PAGE_SIZE_DEFAULT,
     owner_name: str = "",
 ) -> Dict[str, Any]:
     """分页查询私账记录，按日期倒序。"""
     await _ensure_schema()
+    await _ensure_demo_samples(company_id)
     offset = (page - 1) * page_size
     conn = await get_conn()
     try:
@@ -247,6 +262,7 @@ async def delete_expense(company_id: str, expense_id: str, user_id: str) -> bool
 async def get_expense_summary(company_id: str, owner_name: str = "") -> Dict[str, Any]:
     """汇总：收支金额、总笔数与简单冲销结果。"""
     await _ensure_schema()
+    await _ensure_demo_samples(company_id)
     conn = await get_conn()
     try:
         where = "company_id = ?"

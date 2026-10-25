@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 from __future__ import annotations
 
 from uuid import uuid4
@@ -26,14 +29,14 @@ def test_rd_project_types_and_posted_ledger(client, auth_headers):
     types = client.get("/api/rd/expense-types", headers=auth_headers)
     assert types.status_code == 200
     assert [item["accountCode"] for item in types.json()["items"]] == [
-        "530101", "530102", "530103", "530104", "530105", "530106", "530199"
+        "430100101", "430100102", "430100103", "430100104", "430100105", "430100106", "430100199"
     ]
 
     project = _active_project(client, auth_headers)
     accounts = client.get("/api/ledger/accounts", headers=auth_headers)
     assert accounts.status_code == 200
     account_codes = {item["code"] for item in accounts.json()["accounts"]}
-    assert {"530101", "530102", "530103", "530104", "530105", "530106", "530199"} <= account_codes
+    assert {"430100101", "430100102", "430100103", "430100104", "430100105", "430100106", "430100199"} <= account_codes
     confirmed = client.post(
         "/api/record/confirm",
         headers={**auth_headers, "Idempotency-Key": f"rd-{uuid4()}"},
@@ -53,7 +56,7 @@ def test_rd_project_types_and_posted_ledger(client, auth_headers):
     assert confirmed.status_code == 200, confirmed.text
     entry = confirmed.json()["entry"]
     rd_line = entry["voucherLines"]["debit"][0]
-    assert rd_line["accountCode"] == "530102"
+    assert rd_line["accountCode"] == "430100102"
     assert rd_line["rdDetail"]["projectId"] == project["id"]
     assert rd_line["rdDetail"]["expenseType"] == "direct_input"
 
@@ -69,7 +72,7 @@ def test_rd_project_types_and_posted_ledger(client, auth_headers):
     assert payload["items"][0]["expenseTypeLabel"] == "直接投入"
 
     parent_ledger = client.get(
-        "/api/ledger/general?account_code=5301&month=2026-06",
+        "/api/ledger/general?account_code=4301&month=2026-06",
         headers=auth_headers,
     )
     assert parent_ledger.status_code == 200
@@ -193,7 +196,7 @@ def test_salary_accrual_requires_and_uses_project_timesheet(client, auth_headers
     voucher_id = accrued.json()["accrual_voucher_id"]
     entries = client.get("/api/record/entries", headers=auth_headers).json()["entries"]
     voucher = next(entry for entry in entries if entry["id"] == voucher_id)
-    rd_line = next(line for line in voucher["voucherLines"]["debit"] if line["accountCode"] == "530101")
+    rd_line = next(line for line in voucher["voucherLines"]["debit"] if line["accountCode"] == "430100101")
     assert rd_line["rdDetail"]["projectId"] == project["id"]
     assert rd_line["rdDetail"]["allocationMethod"] == "timesheet"
 
@@ -206,25 +209,31 @@ def test_asset_depreciation_splits_rd_and_admin_usage(client, auth_headers):
         json={
             "name": f"研发测试设备-{uuid4().hex[:5]}",
             "originalValue": "1200.00",
-            "purchaseDate": "2026-05-01",
-            "category": "电子设备",
-            "usefulLife": 1,
-            "residualValueRate": "0",
-            "oneTimeDepreciation": False,
+            "acquisitionDate": "2026-05-01",
+            "availableForUseDate": "2026-05-01",
+            "category": "electronics",
+            "usefulLifeMonths": 12,
+            "residualValue": "0",
+            "depreciationMethod": "straight_line",
             "rdProjectId": project["id"],
             "rdUseRate": "0.60",
             "rdAllocationBasis": "设备使用日志：研发使用时长占60%",
         },
     )
     assert asset.status_code == 200, asset.text
-    result = client.post("/api/asset/depreciation/run?period=2026-06", headers=auth_headers)
+    asset_id = asset.json()["id"]
+    submitted = client.post(f"/api/asset/assets/{asset_id}/submit", headers=auth_headers)
+    assert submitted.status_code == 200, submitted.text
+    result = client.post(
+        "/api/asset/depreciation/run", headers=auth_headers, json={"period": "2026-06"}
+    )
     assert result.status_code == 200, result.text
-    entry_id = next(item["voucher_ref"] for item in result.json()["entries"] if item["asset_id"] == asset.json()["id"])
+    entry_id = next(item["journalEntryId"] for item in result.json()["items"] if item["assetId"] == asset_id)
     entries = client.get("/api/record/entries", headers=auth_headers).json()["entries"]
     voucher = next(entry for entry in entries if entry["id"] == entry_id)
     debit = voucher["voucherLines"]["debit"]
-    rd_line = next(line for line in debit if line["accountCode"] == "530103")
-    admin_line = next(line for line in debit if line["accountCode"] == "5699")
+    rd_line = next(line for line in debit if line["accountCode"] == "430100103")
+    admin_line = next(line for line in debit if line["accountCode"] == "5602007")
     assert rd_line["amount"] == "60.00"
     assert rd_line["rdDetail"]["projectId"] == project["id"]
     assert admin_line["amount"] == "40.00"
@@ -268,7 +277,7 @@ def test_invoice_import_requires_and_applies_rd_detail(client, auth_headers):
     entries = client.get("/api/record/entries", headers=auth_headers).json()["entries"]
     voucher = next(entry for entry in entries if entry["id"] == entry_id)
     rd_line = voucher["voucherLines"]["debit"][0]
-    assert rd_line["accountCode"] == "530102"
+    assert rd_line["accountCode"] == "430100102"
     assert rd_line["rdDetail"]["projectId"] == project["id"]
 
 
@@ -315,6 +324,6 @@ def test_draft_reclassification_rebuilds_voucher_with_rd_detail(client, auth_hea
     )
     assert updated.status_code == 200, updated.text
     rd_line = updated.json()["entry"]["voucherLines"]["debit"][0]
-    assert rd_line["accountCode"] == "530106"
+    assert rd_line["accountCode"] == "430100106"
     assert rd_line["rdDetail"]["projectId"] == project["id"]
     assert rd_line["rdDetail"]["allocationBasis"] == "技术开发合同 RD-2026-01"

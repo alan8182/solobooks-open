@@ -1,6 +1,9 @@
-"""存量手续费科目迁移：5608 管理费用-银行及金融手续费 → 6602 财务费用-手续费。
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
 
-《小企业会计准则》口径：支付手续费归财务费用。与既有的 6603
+"""存量手续费科目迁移：5608 管理费用-银行及金融手续费 → 5603002 财务费用-手续费（编码已对齐小企业会计准则）。
+
+《小企业会计准则》口径：支付手续费归财务费用（5603 明细）。与既有的 5603004
 财务费用-利息收入对齐，利息与手续费同族展示。
 
 处理对象：仅 category='银行及金融手续费' 条目名下的 5608 分录行
@@ -22,11 +25,11 @@ from sqlalchemy import text  # noqa: E402
 from db.session import session_scope  # noqa: E402
 
 OLD_CODE, OLD_NAME = "5608", "管理费用-银行及金融手续费"
-NEW_CODE, NEW_NAME = "6602", "财务费用-手续费"
+NEW_CODE, NEW_NAME = "5603002", "财务费用-手续费"
 
 
 async def _pass_chart_and_collect() -> list:
-    """事务一：确保 6602 科目存在，并返回待迁移的 (company_id, [(line_id, entry_id), ...])。"""
+    """事务一：确保 5603002 科目存在，并返回待迁移的 (company_id, [(line_id, entry_id), ...])。"""
     async with session_scope() as session:
         companies = (await session.execute(text(
             "SELECT DISTINCT company_id FROM journal_lines WHERE account_code = :old"
@@ -42,8 +45,8 @@ async def _pass_chart_and_collect() -> list:
                 now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
                 await session.execute(text(
                     "INSERT INTO chart_accounts (id, company_id, code, name, parent_code, level, category, type, normal_side, is_leaf, is_system, is_active, created_at, updated_at) "
-                    "VALUES (:id, :c, :code, :name, NULL, 1, '损益-费用类', '费用', 'debit', TRUE, TRUE, TRUE, :now, :now)"
-                ), {"id": f"acct-{company_id}-{NEW_CODE}", "c": company_id, "code": NEW_CODE, "name": NEW_NAME, "now": now_iso})
+                    "VALUES (:id, :c, :code, :name, :parent, 2, '损益-费用类', '费用', 'debit', TRUE, TRUE, TRUE, :now, :now)"
+                ), {"id": f"acct-{company_id}-{NEW_CODE}", "c": company_id, "code": NEW_CODE, "name": NEW_NAME, "parent": "5603", "now": now_iso})
             rows = (await session.execute(text(
                 "SELECT jl.id FROM journal_lines jl "
                 "JOIN entries e ON e.id = jl.journal_entry_id "

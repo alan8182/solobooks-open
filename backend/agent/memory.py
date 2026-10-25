@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """公司画像：agent 的长期记忆（M0 只读注入，写入回路在 M1 补）。"""
 from __future__ import annotations
 

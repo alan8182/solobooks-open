@@ -1,4 +1,5 @@
 @import 'tailwindcss';
+@import './assets/styles/icons.css';
 @import './assets/styles/variables.css';
 @import './assets/styles/reports.css';
 @import './assets/styles/layout.css';
@@ -44,6 +45,38 @@ a:focus-visible {
   min-height: 100vh;
 }
 
+/* naive-ui 的空态描述沿用 disabled 级文字色（#c2c2c2，白底只有 1.78:1）。
+   空态文案是引导语而不是"不可用"信息，收进 muted token。
+   选择器提到两级是为了盖过 naive-ui 运行时注入的 .n-empty .n-empty__description。 */
+.n-empty .n-empty__description {
+  color: var(--solo-text-muted);
+}
+
+/* 分段控件的凹槽。配合 App.vue 里 Radio 主题的「透明按钮 + 白色滑块」：
+   滑块由主题给，凹槽由这里给，页面不要再自己套白底描边容器。
+   重复类名是为了压过 naive-ui 运行时注入的 .n-radio-group 样式。 */
+.n-radio-group.n-radio-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 8px;
+  background: var(--solo-bg-soft);
+}
+
+/* 全局动效降级：用户系统里关掉动画时，站内的过渡/动画一律停掉。
+   之前只有个别组件自己处理，页面级过渡（侧栏、标签页、抽屉）仍会动。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 /* Scrollbar */
 ::-webkit-scrollbar {
   width: 6px;
@@ -54,18 +87,64 @@ a:focus-visible {
 }
 ::-webkit-scrollbar-thumb {
   background: #cbd5e1;
-  border-radius: 3px;
+  border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #94a3b8;
+  background: #636e7c;
 }
 
-/* Print */
+/* Print：凭证/账簿/报表共用基线。
+   打印样式全部收敛在这里与组件的 @media print，屏幕样式零改动。 */
+.print-only {
+  display: none;
+}
+
 @media print {
   .no-print {
     display: none !important;
   }
+  .print-only {
+    display: block;
+  }
   body {
     background: #fff;
+    color: #000;
+    font-size: 12px;
+  }
+  /* A4 纵向 + 装订边距：左侧留 18mm 便于左侧装订 */
+  @page {
+    size: A4 portrait;
+    margin: 16mm 14mm 16mm 18mm;
+  }
+  /* 打印时主内容区去掉侧栏偏移与滚动条 */
+  .app-layout .main-area,
+  .app-layout .main-area.collapsed {
+    margin-left: 0 !important;
+  }
+  .app-layout .content {
+    padding: 0 !important;
+    overflow: visible !important;
+  }
+  /* 表格跨页时重复表头，金额列对齐 */
+  table thead {
+    display: table-header-group;
+  }
+  table tfoot {
+    display: table-row-group;
+  }
+  tr,
+  img {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+  .amount-cell,
+  .amount {
+    font-variant-numeric: tabular-nums;
+  }
+  /* 屏幕上的卡片阴影/圆角在纸上是噪声 */
+  .report-card,
+  .n-card {
+    box-shadow: none !important;
+    border-radius: 0 !important;
   }
 }

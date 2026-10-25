@@ -1,13 +1,17 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
-import { ref, computed, onMounted, nextTick } from 'vue'
+import { usePageRefresh } from '@/composables/usePageRefresh'
+import { ref, computed, onMounted, nextTick, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
+  NAlert,
   NButton,
   NCard,
   NCheckbox,
   NCollapse,
   NCollapseItem,
   NDivider,
+  NDropdown,
   NGrid,
   NGridItem,
   NInput,
@@ -18,7 +22,9 @@ import {
   NStep,
   NSteps,
   NTag,
+  NTooltip,
   useMessage,
+  useDialog,
 } from 'naive-ui'
 import { formatMoney } from '@/utils/format'
 import {
@@ -26,10 +32,11 @@ import {
   buildSuggestedMatchPair,
   getStatementMatchedEntryIds,
   getMatchedEntryIdSets,
-  groupedEntryTotal,
+  invoiceDisplayAmount,
   isReconciledEntry,
-  reconciliationDifference,
-  signedInvoiceAmount,
+  isNonBankSettledEntry,
+  formatDispositionTag,
+  formatDispositionExplanation,
 } from '@/utils/closingWizard'
 import { sortEntriesByDateDescending } from '@/utils/entrySort'
 import { getEntryNaturePresentation } from '@/utils/entryNature'
@@ -41,20 +48,43 @@ import { importInvoices } from '@/api/invoice'
 import { getRdExpenseTypes, getRdProjects } from '@/api/rd'
 import type { RdExpenseTypeOption, RdProject } from '@/api/types'
 import { parseWechatBill, importWechatBill, fetchWechatBillRecords } from '@/api/wechat-bill'
-import { getClosingReadiness, canBatchPostDrafts, deriveClosingTasks, type ClosingReadinessItem, type ClosingTaskAction } from '@/utils/closingReadiness'
-import { postEntry, getPostingOptions, batchPostEntries } from '@/api/accounting'
-import { normalizeVoucherLines, generateVoucherLines, type VoucherLine } from '@/utils/accounting'
+import { useBackfillConfirm, isBackfillCancelled } from '@/composables/backfillConfirm'
+import { summarizeWechatImportFailures, type WechatImportFailureGroup } from '@/utils/wechatImport'
+import { useAuthStore } from '@/stores/auth'
+import { getClosingReadiness, canBatchPostDrafts, deriveClosingTasks, type ClosingNotice, type ClosingNoticeRecord, type ClosingReadinessItem, type ClosingTaskAction } from '@/utils/closingReadiness'
+import { postEntry, getPostingOptions, batchPostEntries, getFilingObligations, reopenPeriod, type FilingObligation, type FilingObligations } from '@/api/accounting'
+import { updateEntry } from '@/api/record'
+import { requestStepUp, sendPhoneCode } from '@/api/auth'
+import { normalizeVoucherLines, generateVoucherLines, loadAccountMapping, accountForCategory, type VoucherLine } from '@/utils/accounting'
 import ClosingAgentPanel from '@/components/business/ClosingAgentPanel.vue'
+import FileDropzone from '@/components/business/FileDropzone.vue'
 import * as XLSX from 'xlsx'
+
+import { SoloEmpty } from '@/components/ui'
+import { reportErrorToast } from '@/utils/errorPresenter'
+import { offerRescue } from '@/composables/useRescue'
 
 const router = useRouter()
 const message = useMessage()
+const dialog = useDialog()
 const entryStore = useEntryStore()
+const authStore = useAuthStore()
 const { confirmDelete } = useDeleteConfirm()
+// 导入/对账遇到「所属期间已关账」时的补记确认（不静默换期）
+const backfillConfirm = useBackfillConfirm()
 
 const currentStep = ref(1)
+
+// 步骤变化同步到 URL：否则任何 loadAllData 刷新都会按旧的 query.step 把用户弹回第一步
+watch(currentStep, (step) => {
+  const route = router.currentRoute.value
+  if (String(route.query.step || '') === String(step)) return
+  router.replace({ query: { ...route.query, month: targetMonth.value, step: String(step) } })
+})
 const loading = ref(false)
 const periodCloseChecks = ref<any | null>(null)
+// 结账按月、申报按税种：向导要告诉用户「这个月结完，本期该报什么」
+const filingInfo = ref<FilingObligations | null>(null)
 // ponytail: unified 5-step wizard with built-in readiness checks, replacing the dual-track showDetailWorkflow toggle
 const showAgentPanel = ref(false)
 
@@ -62,16 +92,34 @@ const showAgentPanel = ref(false)
 const now = new Date()
 const currentYear = now.getFullYear()
 const currentMonth = now.getMonth() // 0-11
-const monthOptions = Array.from({ length: 6 }).map((_, i) => {
-  const d = new Date(currentYear, currentMonth - i, 1)
-  const val = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
-  return { label: `${d.getFullYear()}年${d.getMonth() + 1}月`, value: val }
-})
+const availablePeriods = ref<{ month: string; status: string | null }[]>([])
 const defaultPrevMonth = new Date(currentYear, currentMonth - 1, 1)
 const targetMonth = ref(`${defaultPrevMonth.getFullYear()}-${String(defaultPrevMonth.getMonth() + 1).padStart(2, '0')}`)
 // 待办/关账任务跳入时按 query.month 定位月份（YYYY-MM），step/statement 见 loadAllData
 const queryMonth = String(router.currentRoute?.value?.query?.month || '')
 if (/^\d{4}-\d{2}$/.test(queryMonth)) targetMonth.value = queryMonth
+// 期次下拉 = 最近 6 个月 ∪ 有数据的月份（凭证/账期/银行流水/工资表），保证历史有数据月份始终可选
+const monthOptions = computed(() => {
+  const labelOf = (val: string) => {
+    const [yearStr, monthStr] = val.split('-')
+    return `${yearStr}年${parseInt(monthStr, 10)}月`
+  }
+  const map = new Map<string, { label: string; value: string }>()
+  for (let i = 0; i < 6; i++) {
+    const d = new Date(currentYear, currentMonth - i, 1)
+    const val = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+    map.set(val, { label: labelOf(val), value: val })
+  }
+  for (const item of availablePeriods.value) {
+    if (/^\d{4}-\d{2}$/.test(item.month)) {
+      map.set(item.month, { label: labelOf(item.month), value: item.month })
+    }
+  }
+  if (targetMonth.value && !map.has(targetMonth.value)) {
+    map.set(targetMonth.value, { label: labelOf(targetMonth.value), value: targetMonth.value })
+  }
+  return [...map.values()].sort((a, b) => b.value.localeCompare(a.value))
+})
 
 const closedQuarter = computed(() => {
   if (!targetMonth.value) return ''
@@ -93,24 +141,35 @@ const bankStatements = ref<any[]>([])
 const invoicesList = ref<any[]>([])
 const bankUploadResult = ref<{ imported: number; errors: number; rows: any[] } | null>(null)
 
-// Uploader input refs
-const invoiceInput = ref<HTMLInputElement | null>(null)
-const bankInput = ref<HTMLInputElement | null>(null)
-const wechatBillInput = ref<HTMLInputElement | null>(null)
-
 // WeChat bill state
 const wechatBillRows = ref<any[]>([])
 const wechatBillSummary = ref<Record<string, any>>({})
 const wechatBillImported = ref(false)
 const wechatBillImporting = ref(false)
+const wechatImportMode = ref<'summary' | 'detail'>('summary')
+// 导入失败明细（按原因聚合）：失败不再只靠一闪而过的 message，内嵌面板可读、可操作
+const wechatBillFailures = ref<WechatImportFailureGroup[]>([])
+
+// 「重新上传/重新导入」按钮复用拖拽区的文件选择器
+const wechatDropzone = ref<InstanceType<typeof FileDropzone> | null>(null)
+const invoiceDropzone = ref<InstanceType<typeof FileDropzone> | null>(null)
+// 发票表的专业列（类型/入账模式/冲销）默认收起，老板只需要日期/名称/金额/状态
+const showInvoiceDetails = ref(false)
 const wechatBillRecords = ref<any[]>([])
 const wechatBillRecordsSummary = ref<Record<string, any>>({})
 
 // Step 3: Payroll data
 const payrollAccrued = ref(false)
 const payrollPaid = ref(false)
+const payrollPendingReview = ref(false)
+const payrollSsPaid = ref(false)
+const payrollHfPaid = ref(false)
+const payrollTaxPaid = ref(false)
 const employees = ref<any[]>([])
 const salarySheet = ref<any>(null)
+const showSalaryTable = ref(false)
+const payrollPaymentSuggestions = ref<any[]>([])
+const applyingSalaryStatementId = ref('')
 
 // Step 4: Matching workspace states
 const selectedInvoiceIds = ref<string[]>([])
@@ -119,7 +178,6 @@ const matchedPairs = ref<any[]>([])
 const aiSuggestions = ref<any[]>([])
 const reconciliationHealth = ref<any | null>(null)
 const reconciliationHealthLoading = ref(false)
-const pendingMatchedPairCount = computed(() => matchedPairs.value.filter((pair) => pair.status !== 'confirmed').length)
 
 // Step 5: Closing states
 const closed = ref(false)
@@ -128,12 +186,23 @@ const monthlyIncome = ref(0)
 const monthlyExpense = ref(0)
 const netProfit = ref(0)
 const cfoDiagnosis = ref<any>(null)
+// 本次结账自动生成的期末损益结转凭证号（完成页持久展示，不只靠瞬时 toast）
+const closingVoucherRefs = ref<string[]>([])
 
 // ponytail: explicit detection of zero-transaction periods to prevent false "ready to close" reports
 const confirmZeroActivity = ref(false)
 
+// 期间归集以记账期间为准：补记凭证的业务日期在上个月，按 occurDate 过滤会让它
+// 在自己的记账期间里消失（与凭证列表同一处坑）。
+const entryPeriod = (e: any): string =>
+  String(e.period || '').slice(0, 7) || String(e.occurDate || '').slice(0, 7)
+
 const monthEntries = computed(() =>
-  entryStore.activeEntries.filter(e => e.occurDate?.startsWith(targetMonth.value))
+  entryStore.activeEntries.filter(e =>
+    entryPeriod(e) === targetMonth.value &&
+    (e as any).entryType !== 'closing' &&
+    !(e as any).isClosingTransfer
+  )
 )
 const monthStatements = computed(() =>
   rawStatements.value.filter(s => s.transaction_date?.startsWith(targetMonth.value))
@@ -146,20 +215,115 @@ const isZeroRecordMonth = computed(() =>
   monthStatements.value.length === 0 &&
   monthInvoices.value.length === 0
 )
+// 工资按权责发生制：所属月必须计提；发放可延到次月，凭银行流水核销，
+// 社保/个税挂账同样作为负债结转，均不阻断本月结账。
+const payrollHasSocial = computed(() =>
+  employees.value.some((emp) => safeFloat(emp.social) > 0 || safeFloat(emp.personalSocial) > 0)
+)
+const payrollHasTax = computed(() =>
+  employees.value.some((emp) => safeFloat(emp.personalTax) > 0)
+)
 const hasBlockingPayroll = computed(() =>
-  employees.value.length > 0 && (!payrollAccrued.value || !payrollPaid.value)
+  employees.value.length > 0 && (!payrollAccrued.value || payrollPendingReview.value)
 )
 
 const readinessItems = computed(() => getClosingReadiness(periodCloseChecks.value))
 const closingTasks = computed(() => deriveClosingTasks(periodCloseChecks.value))
 
+// 提示项：跨期未处理单据 / 本期补记。不阻断结账，只要求用户知情。
+const closingNotices = computed<ClosingNotice[]>(() => periodCloseChecks.value?.notices ?? [])
+
+// 向导是「月度」的，但申报是「分税种」的：只显示与本期结账真正相关的两类申报义务，
+// 个税扣缴、印花税等留给申报作业台，避免向导变成税务清单。
+const MAIN_FILING_KINDS = new Set(['vat', 'cit', 'business_income_iit_prepay'])
+const mainFilingObligations = computed<FilingObligation[]>(() =>
+  (filingInfo.value?.obligations || []).filter(item => MAIN_FILING_KINDS.has(item.taxKind)),
+)
+
+function filingDueLabel(item: FilingObligation): string {
+  const text = String(item.dueDate || '').slice(5)
+  if (!text) return ''
+  const [month, day] = text.split('-')
+  return `${Number(month)} 月 ${Number(day)} 日前`
+}
+
+function goFilingPackage(item?: FilingObligation) {
+  const period = item?.period || filingInfo.value?.quarter
+  if (!period) return
+  router.push({ path: '/tax-filing', query: { period } })
+}
+
+function noticeTitle(notice: ClosingNotice): string {
+  // 启用前的数据是「流水 N 条 + 工资表 N 份」，混算成「N 笔」会串味；
+  // 具体构成由 message 说明，标题只报事项名。
+  if (notice.code === 'PRE_BOOK_START_ACTIVITY') return notice.name
+  const amount = notice.amount ? ` · ¥${notice.amount}` : ''
+  return `${notice.name}（${notice.count} 笔${amount}）`
+}
+
+function noticeRecordTitle(record: ClosingNoticeRecord): string {
+  return String(record.summary || record.description || '')
+}
+
+function noticeRecordMeta(record: ClosingNoticeRecord): string {
+  if (record.businessFilingPeriod) {
+    return `纳税义务 ${record.businessFilingPeriod} → 记账 ${record.postingFilingPeriod}`
+  }
+  if (record.originalPeriod) return `原期间 ${record.originalPeriod}`
+  if (record.businessPeriod) return `所属 ${record.businessPeriod}`
+  return ''
+}
+
+function noticeRecordAmount(record: ClosingNoticeRecord): string {
+  return String(record.amount ?? record.vatAmount ?? '')
+}
+
+const NOTICE_EXPORT_SCOPE: Record<string, string> = {
+  CROSS_PERIOD_PENDING: 'cross-period',
+  VAT_PERIOD_MISMATCH: 'vat-period',
+}
+
+async function exportBackfillNotice(notice: ClosingNotice) {
+  const scope = NOTICE_EXPORT_SCOPE[notice.code] || 'backfill'
+  try {
+    const blob = (await apiClient.get('/api/periods/backfills/export', {
+      params: { scope, month: targetMonth.value },
+      responseType: 'blob',
+    })) as unknown as Blob
+    if (!(blob instanceof Blob)) throw new Error('导出响应格式异常')
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${notice.name}_${targetMonth.value}.csv`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+    message.success(`${notice.name}已导出`)
+  } catch {
+    message.error('导出失败，请稍后重试')
+  }
+}
+
+function normalizeStep(s: number): number {
+  if (s === 4) return 2
+  if (s === 5) return 3
+  if (s >= 1 && s <= 3) return s
+  return 1
+}
+
 function runTaskAction(action: ClosingTaskAction) {
+  if (action.month) {
+    targetMonth.value = action.month
+    loadAllData()
+    return
+  }
   if (action.kind === 'run-closing') {
     runClosing()
     return
   }
   if (action.kind === 'match') {
-    currentStep.value = 4
+    currentStep.value = 2
     if (action.statementId) {
       selectedBank.value = action.statementId
       scrollIntoBank(action.statementId)
@@ -173,10 +337,10 @@ function runTaskAction(action: ClosingTaskAction) {
       openVoucherModal(String(firstEntryId))
       return
     }
-    router.push({ path: action.route || '/vouchers', query: { month: targetMonth.value, from: `/closing-wizard?month=${targetMonth.value}&step=5` } })
+    router.push({ path: action.route || '/vouchers', query: { month: targetMonth.value, from: `/closing-wizard?month=${targetMonth.value}&step=3` } })
     return
   }
-  currentStep.value = 4
+  currentStep.value = 2
 }
 
 function scrollIntoBank(statementId: string) {
@@ -185,6 +349,15 @@ function scrollIntoBank(statementId: string) {
   })
 }
 function handleReadinessAction(item: ClosingReadinessItem) {
+  if (item.code === 'PERIOD_ORDER') {
+    const orderCheck = periodCloseChecks.value?.checks?.find((c: any) => c.code === 'PERIOD_ORDER')
+    const earliest = String(orderCheck?.earliestOpenMonth || '')
+    if (earliest) {
+      targetMonth.value = earliest
+      loadAllData()
+    }
+    return
+  }
   if (item.code === 'VOUCHER_TO_SOURCE') {
     const voucherCheck = periodCloseChecks.value?.checks?.find((c: any) => c.code === 'VOUCHER_TO_SOURCE')
     const firstEntryId = voucherCheck?.records?.[0]?.entryId
@@ -193,8 +366,8 @@ function handleReadinessAction(item: ClosingReadinessItem) {
       return
     }
   }
-  if (item.route) router.push({ path: item.route, query: { month: targetMonth.value, from: `/closing-wizard?month=${targetMonth.value}&step=5` } })
-  else currentStep.value = item.step
+  if (item.route) router.push({ path: item.route, query: { month: targetMonth.value, from: `/closing-wizard?month=${targetMonth.value}&step=3` } })
+  else currentStep.value = normalizeStep(item.step)
 }
 const closeDraftCount = computed(() => Number(periodCloseChecks.value?.checks?.find((check: any) => check.code === 'VOUCHER_TO_SOURCE')?.autoPostAtCloseCount || 0))
 const canBatchPostAndClose = computed(() => canBatchPostDrafts(periodCloseChecks.value))
@@ -209,14 +382,14 @@ let suggestionsController: AbortController | null = null
 
 // Load all data on mount
 onMounted(async () => {
-  await Promise.all([loadAllData(), loadRdOptions()])
+  await Promise.all([loadAllData(), loadRdOptions(), loadAccountMapping()])
+  refreshCategoryOptions()
 })
 
 async function loadAllData() {
   if (suggestionsController) {
     try {
       suggestionsController.abort()
-      console.log('[loadAllData] Previous pending AI suggestion safely aborted at startup')
     } catch {
       // ignore
     }
@@ -224,28 +397,29 @@ async function loadAllData() {
 
   loading.value = true
   confirmZeroActivity.value = false
-  console.log('[loadAllData] Started loading for month:', targetMonth.value)
   try {
     // 1. 并发加载最核心的记账 entries 与银行 statements 数据，极大缩短串行等待时间
-    const [_, res, periodChecks] = await Promise.all([
+    const [_, res, periodChecks, availRes, obligations] = await Promise.all([
       entryStore.fetchEntries(),
       apiClient.get('/api/bank/statements', { timeout: 30000 }),
       apiClient.get(`/api/periods/${targetMonth.value}/close-checks`),
+      apiClient.get('/api/periods/available').catch(() => null),
+      getFilingObligations(targetMonth.value).catch(() => null),
     ])
-    console.log('[loadAllData] Core APIs completed')
+    filingInfo.value = (obligations as unknown as FilingObligations | null) ?? null
     rawStatements.value = (res as any).items || []
     periodCloseChecks.value = periodChecks as any
+    availablePeriods.value = (availRes as any)?.months || []
     
     // 2. 账期状态只以后端为准
     closed.value = (periodChecks as any).periodStatus === 'closed'
-    console.log('[loadAllData] locked check completed, closed:', closed.value)
     if (closed.value) {
-      currentStep.value = 5
+      currentStep.value = 3
     } else if (router.currentRoute?.value?.query?.step) {
       const s = parseInt(String(router.currentRoute.value.query.step), 10)
-      if (s >= 1 && s <= 5) currentStep.value = s
+      if (!isNaN(s)) currentStep.value = normalizeStep(s)
     } else if (closingReady.value && currentStep.value === 1) {
-      currentStep.value = 5
+      currentStep.value = 3
     }
 
     // 待办跳入：预选指定银行流水并滚动定位（清掉 query 避免刷新后重复触发）
@@ -265,20 +439,18 @@ async function loadAllData() {
     const selectableIds = new Set(allUnmatchedEntries.value.map((entry) => entry.id))
     selectedInvoiceIds.value = selectedInvoiceIds.value.filter((id) => selectableIds.has(id))
     if (!bankStatements.value.some((statement) => statement.id === selectedBank.value)) selectedBank.value = null
-    console.log('[loadAllData] filterUnmatchedData completed')
   } catch (err: any) {
     console.error('[loadAllData] Core error occurred:', err)
     message.error(`加载核心账目数据失败: ${err.message || err}`)
   } finally {
     // 4. 核心数据已加载或报错后，立即关闭大 Loading，让 UI 保持流畅
     loading.value = false
-    console.log('[loadAllData] finally block executed, loading set to false')
   }
 
   // 5. 辅助与 AI 接口转为后台异步并行加载，防止慢接口超时阻断整个 UI 正常渲染
-  console.log('[loadAllData] Launching auxiliary tasks...')
   loadReconciliationHealth()
   loadSalarySheet()
+  loadPayrollPaymentSuggestions()
   loadWechatBillRecords()
   
   if (closed.value) {
@@ -324,7 +496,7 @@ function filterUnmatchedData() {
   const { linkedEntryIds, confirmedEntryIds } = getMatchedEntryIdSets(rawStatements.value, entryStore.activeEntries)
   invoicesList.value = entryStore.activeEntries.filter((e) => {
     const isInvoice = (e as any).source === 'invoice_import' || !!(e as any).invoiceNumber
-    const isInMonth = e.occurDate?.startsWith(targetMonth.value)
+    const isInMonth = entryPeriod(e) === targetMonth.value
     return isInvoice && isInMonth
   }).map(e => ({
     id: e.id,
@@ -332,8 +504,12 @@ function filterUnmatchedData() {
     date: e.occurDate,
     amount: e.amount,
     direction: e.direction,
+    category: (e as any).category || '',
     billingStatus: (e as any).billingStatus,
+    paymentStatus: (e as any).paymentStatus || '',
     voucherStatus: (e as any).voucherStatus || '',
+    voucherRef: (e as any).voucherRef || (e as any).voucher_no || '',
+    payer: (e as any).payer || 'company_account',
     is_archive_only: (e as any).is_archive_only || (e as any).isArchiveOnly || false,
     status: confirmedEntryIds.has(e.id) ? 'matched' : linkedEntryIds.has(e.id) ? 'pending_confirmation' : 'unmatched'
   }))
@@ -374,46 +550,13 @@ async function toggleArchiveMode(id: string, isArchive: boolean) {
   }
 }
 
-async function handleMarkBossPayer(id: string) {
-  loading.value = true
-  try {
-    await apiClient.patch(`/api/record/entries/${id}`, { payer: 'boss_personal' })
-    message.success('已转为【老板个人垫付】（贷方记入其他应付款，不影响银行账实核对）')
-    await loadAllData()
-  } catch (err) {
-    message.error('转为老板垫付失败')
-  } finally {
-    loading.value = false
-  }
-}
-
-function isMonthEndTransit(entry: any): boolean {
-  if (entry.source !== 'wechat_bill') return false
-  if (!entry.date) return false
-  const day = parseInt(entry.date.slice(8, 10), 10)
-  return day >= 28
-}
-
-// Invoices file select trigger
-function triggerInvoiceSelect() {
-  invoiceInput.value?.click()
-}
-
-// Bank statements file select trigger
-function triggerBankSelect() {
-  bankInput.value?.click()
-}
-
-// WeChat bill file select trigger
-function triggerWechatBillSelect() {
-  wechatBillInput.value?.click()
+// 拖拽上传的校验失败提示（统一入口）
+function onFileError(msg: string) {
+  message.error(msg)
 }
 
 // Parse WeChat bill CSV (preview only, not yet imported)
-async function handleWechatBillUpload(event: Event) {
-  const input = event.target as HTMLInputElement
-  if (!input.files || input.files.length === 0) return
-  const file = input.files[0]
+async function processWechatBillFile(file: File) {
   loading.value = true
   try {
     const res = await parseWechatBill(file)
@@ -424,12 +567,12 @@ async function handleWechatBillUpload(event: Event) {
     wechatBillRows.value = res.valid
     wechatBillSummary.value = res.summary || {}
     wechatBillImported.value = false
+    wechatBillFailures.value = []
     message.success(`已解析 ${res.valid.length} 条交易记录，请确认后点击导入`)
   } catch (e) {
     message.error('微信账单文件解析失败，请确认为微信商户后台导出的 CSV 格式')
   } finally {
     loading.value = false
-    input.value = ''
   }
 }
 
@@ -440,20 +583,41 @@ function removeWechatRow(index: number) {
 
 // Confirm import of previewed wechat bill rows
 async function confirmWechatBillImport() {
+  const isSummaryMode = wechatImportMode.value === 'summary'
   const importableRows = wechatBillRows.value.filter((row) => !row.is_duplicate)
-  if (wechatBillImporting.value || importableRows.length === 0) return
+  if (wechatBillImporting.value) return
+  if (!isSummaryMode && importableRows.length === 0) return
+
+  // 计算发生日期：取账单最晚一条日期或目标月份最后一天
+  let latestDate = ''
+  for (const r of wechatBillRows.value) {
+    if (r.date && (!latestDate || r.date > latestDate)) latestDate = r.date
+  }
+  const occurDate = latestDate || (targetMonth.value ? `${targetMonth.value}-28` : '')
+
   loading.value = true
   wechatBillImporting.value = true
   try {
-    const res: any = await importWechatBill(importableRows)
+    const res: any = await backfillConfirm.withBackfill((allowBackfill, backfillReason) =>
+      importWechatBill(isSummaryMode ? [] : importableRows, {
+        allowBackfill,
+        backfillReason,
+        importMode: wechatImportMode.value,
+        summary: wechatBillSummary.value,
+        occurDate,
+      }),
+    )
+    wechatBillFailures.value = summarizeWechatImportFailures(res.results || [])
     wechatBillImported.value = true
     wechatBillRows.value = []
-    let msg = `微信账单导入完成：${res.imported} 条交易已入账。`
+    let msg = isSummaryMode
+      ? `微信账单月度汇总完成：已生成 1 张月度综合凭证。`
+      : `微信账单导入完成：${res.imported} 条交易已入账。`
     if (res.ignored_duplicates > 0) {
-      msg += `（已过滤 ${res.ignored_duplicates} 条已存在交易）`
+      msg += `（已过滤 ${res.ignored_duplicates} 条已存在账目）`
     }
     if (res.failed > 0) {
-      msg += `，${res.failed} 条失败`
+      msg += `，${res.failed} 条失败（原因见下方提示）`
     }
     if (res.imported > 0) {
       message.success(msg)
@@ -462,11 +626,17 @@ async function confirmWechatBillImport() {
     }
     await loadAllData()
   } catch (e) {
-    message.error('导入失败，请重试')
+    if (!isBackfillCancelled(e)) message.error('导入失败，请重试')
   } finally {
     wechatBillImporting.value = false
     loading.value = false
   }
+}
+
+// 启用日期拦截是「账套配置问题」而非数据问题，一键直达编辑弹窗修正
+function gotoAdjustStartDate() {
+  const companyId = authStore.currentCompanyId
+  router.push({ path: '/mine/companies', query: companyId ? { edit: companyId } : {} })
 }
 
 // Load previously imported wechat bill records for the target month
@@ -482,10 +652,7 @@ async function loadWechatBillRecords() {
 }
 
 // Parse and upload invoices Excel/CSV
-async function handleInvoiceUpload(event: Event) {
-  const input = event.target as HTMLInputElement
-  if (!input.files || input.files.length === 0) return
-  const file = input.files[0]
+async function processInvoiceFile(file: File) {
   loading.value = true
   
   const reader = new FileReader()
@@ -590,7 +757,9 @@ async function handleInvoiceUpload(event: Event) {
       const rows = parseRes.valid.map((r: any) => ({
         ...r,
         direction: r.direction || 'expense',
-        category: r.category || '其他支出'
+        // 类别必须与方向同侧：销项票（income）兜底为主营业务收入，
+        // 否则后端生成的挂账凭证会被收支校验拒绝导致整批导入失败
+        category: r.category || (r.direction === 'income' ? '主营业务收入' : '其他支出')
       }))
       
       const importRes: any = await importInvoices(rows, false)
@@ -607,7 +776,6 @@ async function handleInvoiceUpload(event: Event) {
     }
   }
   reader.readAsArrayBuffer(file)
-  input.value = ''
 }
 
 // Convert various date formats (including XLSX serial numbers) to YYYY-MM-DD
@@ -706,10 +874,7 @@ function parseBankExcel(sheet: any): any[] {
 }
 
 // Parse and upload bank statements CSV/Excel
-async function handleBankUpload(event: Event) {
-  const input = event.target as HTMLInputElement
-  if (!input.files || input.files.length === 0) return
-  const file = input.files[0]
+async function processBankFile(file: File) {
   loading.value = true
   
   const reader = new FileReader()
@@ -733,17 +898,30 @@ async function handleBankUpload(event: Event) {
       
       let incomeCol = ''
       let expenseCol = ''
-      
+
+      // 只选一个日期列：优先 交易日期/记账日期/入账日期；纯时间列（如 交易时间）不是日期源，
+      // 否则多列同时映射时起息日期会覆盖交易日期，时间值还会导致后端日期解析失败
+      const isTimeOnlyCol = (col: string) => {
+        const lc = col.toLowerCase()
+        return /时间|time/i.test(lc) && !/日期|交易日/i.test(lc)
+      }
+      const dateCandidates = columns.filter((col) => {
+        const lc = col.toLowerCase()
+        return !/对方/.test(lc) && !isTimeOnlyCol(col) && /日期|交易日|date/i.test(lc)
+      })
+      const dateCol = dateCandidates.find((col) => /交易日期|记账日期|入账日期|交易日/.test(col)) || dateCandidates[0] || ''
+
       for (const col of columns) {
         const lc = col.toLowerCase()
-        // Match date but exclude time
-        if (/交易日期|记账日期|入账日期|交易日|起息日期|日期|date/i.test(lc) || (/交易时间|时间/.test(lc) && !/对方/.test(lc))) {
+        if (col === dateCol) {
           map[col] = 'transaction_date'
         } else if (/账户余额|余额|balance/i.test(lc)) {
           map[col] = 'balance'
-        } else if (/支出金额|支出|借方|支取|付款/.test(lc) && !/商户支出/.test(lc)) {
+        } else if (/金额|发生额|amount/i.test(lc) && /支出|借方|支取|付款/.test(lc) && !/商户支出/.test(lc)) {
+          // 必须同时是金额类表头：付款人名称/名义付款人名称 等对手方列含“付款”，
+          // 若不限定金额列会把它们误判为支出金额列，导致交易金额列无法映射、金额全为 0
           expenseCol = col
-        } else if (/收入金额|收入|贷方|存入|收款/.test(lc) && !/商户收入/.test(lc)) {
+        } else if (/金额|发生额|amount/i.test(lc) && /收入|贷方|存入|收款/.test(lc) && !/商户收入/.test(lc)) {
           incomeCol = col
         }
         
@@ -835,36 +1013,75 @@ async function handleBankUpload(event: Event) {
     }
   }
   reader.readAsArrayBuffer(file)
-  input.value = ''
 }
 
 // Fetch Salary sheet
 async function loadSalarySheet() {
-  console.log('[loadSalarySheet] Started for month:', targetMonth.value)
   try {
+    // GET /api/salary/sheets/{month} 直接返回工资表对象（扁平结构，无 sheet 包装层）
     const res: any = await apiClient.get(`/api/salary/sheets/${targetMonth.value}`)
-    console.log('[loadSalarySheet] API returned successfully, records count:', res.records?.length)
-    salarySheet.value = res.sheet
+    salarySheet.value = res
     employees.value = (res.records || []).map((r: any) => ({
       name: r.employee_name,
       dept: r.department,
       base: r.base_salary,
       bonus: r.bonus,
       social: r.company_social_security,
+      personalSocial: r.personal_social_security,
+      personalTax: r.personal_tax,
       net: r.net_salary,
       cost: r.total_cost
     }))
-    console.log('[loadSalarySheet] records mapping completed')
-    
-    if (res.sheet) {
-      payrollAccrued.value = res.sheet.status === 'accrued' || res.sheet.status === 'paid'
-      payrollPaid.value = res.sheet.status === 'paid'
+
+    if (res && res.id) {
+      // accrued/paid：计提凭证已入账；pending_review：计提凭证待审核（maker_checker）
+      payrollAccrued.value = res.status === 'accrued' || res.status === 'paid'
+      payrollPendingReview.value = res.status === 'pending_review'
+      payrollPaid.value = res.status === 'paid'
+      payrollSsPaid.value = ['posted', 'not_required'].includes(res.ssPaymentStatus)
+      payrollHfPaid.value = ['posted', 'not_required'].includes(res.hfPaymentStatus)
+      payrollTaxPaid.value = ['posted', 'not_required'].includes(res.taxPaymentStatus)
     }
   } catch (err: any) {
     console.error('[loadSalarySheet] Error occurred:', err)
     employees.value = []
     payrollAccrued.value = false
     payrollPaid.value = false
+    payrollPendingReview.value = false
+      payrollSsPaid.value = false
+      payrollHfPaid.value = false
+      payrollTaxPaid.value = false
+  }
+}
+
+async function loadPayrollPaymentSuggestions() {
+  try {
+    const res: any = await apiClient.get('/api/salary/payments/suggestions')
+    payrollPaymentSuggestions.value = res.suggestions || []
+  } catch {
+    payrollPaymentSuggestions.value = []
+  }
+}
+
+async function handleApplySalaryPayment(item: any) {
+  applyingSalaryStatementId.value = item.statement.id
+  try {
+    const result: any = await apiClient.post('/api/salary/payments/apply', {
+      month: item.month,
+      statementId: item.statement.id,
+    })
+    message.success(
+      result.linked
+        ? `${item.month} 工资已按 ${item.statement.date} 流水发放并核销`
+        : `工资已发放，但流水核销失败：${result.linkError || '请到银行流水页手工关联'}`,
+    )
+    await entryStore.fetchEntries()
+    await loadAllData()
+  } catch (err: any) {
+    const detail = err.response?.data?.detail
+    message.error(typeof detail === 'string' ? detail : detail?.message || '工资流水核销失败')
+  } finally {
+    applyingSalaryStatementId.value = ''
   }
 }
 
@@ -896,6 +1113,48 @@ async function handlePayPayroll() {
   }
 }
 
+async function handlePaySocial() {
+  loading.value = true
+  try {
+    await apiClient.post(`/api/salary/sheets/${targetMonth.value}/pay-social`)
+    await entryStore.fetchEntries()
+    message.success(`${targetMonth.value} 社保缴纳成功，已生成付款凭证！`)
+    await loadAllData()
+  } catch (err: any) {
+    message.error(err.response?.data?.detail || '社保缴纳失败')
+  } finally {
+    loading.value = false
+  }
+}
+
+async function handlePayHousingFund() {
+  loading.value = true
+  try {
+    await apiClient.post(`/api/salary/sheets/${targetMonth.value}/pay-housing-fund`)
+    await entryStore.fetchEntries()
+    message.success(`${targetMonth.value} 公积金缴纳成功，已生成付款凭证！`)
+    await loadAllData()
+  } catch (err: any) {
+    message.error(err.response?.data?.detail || '公积金缴纳失败')
+  } finally {
+    loading.value = false
+  }
+}
+
+async function handlePayTax() {
+  loading.value = true
+  try {
+    await apiClient.post(`/api/salary/sheets/${targetMonth.value}/pay-tax`)
+    await entryStore.fetchEntries()
+    message.success(`${targetMonth.value} 个人所得税缴纳成功，已生成付款凭证！`)
+    await loadAllData()
+  } catch (err: any) {
+    message.error(err.response?.data?.detail || '个税缴纳失败')
+  } finally {
+    loading.value = false
+  }
+}
+
 // Fetch AI matching suggestions
 async function loadAiSuggestions() {
   if (suggestionsController) {
@@ -922,7 +1181,6 @@ async function loadAiSuggestions() {
     matchedPairs.value = [...buildPersistedMatchedPairs(), ...suggestionPairs]
   } catch (err: any) {
     if (err.name === 'CanceledError' || err.code === 'ERR_CANCELED') {
-      console.log('[loadAiSuggestions] Request canceled safely')
       return
     }
     matchedPairs.value = buildPersistedMatchedPairs()
@@ -953,101 +1211,6 @@ async function loadReconciliationHealth() {
     reconciliationHealthLoading.value = false
   }
 }
-function selectInvoiceCard(id: string) {
-  selectedInvoiceIds.value = selectedInvoiceIds.value.includes(id)
-    ? selectedInvoiceIds.value.filter((entryId) => entryId !== id)
-    : [...selectedInvoiceIds.value, id]
-}
-
-function selectBankCard(id: string) {
-  if (selectedBank.value === id) {
-    selectedBank.value = null
-  } else {
-    selectedBank.value = id
-  }
-}
-
-function clearManualSelection() {
-  selectedInvoiceIds.value = []
-  selectedBank.value = null
-}
-
-// Manual match trigger
-async function handleManualMatch() {
-  if (selectedInvoiceIds.value.length === 0 || !selectedBank.value) return
-  const entries = selectedInvoiceIds.value
-    .map((id) => allUnmatchedEntries.value.find((entry) => entry.id === id))
-    .filter(Boolean) as any[]
-  const b = bankStatements.value.find(s => s.id === selectedBank.value)
-  
-  if (entries.length === selectedInvoiceIds.value.length && b) {
-    const entriesTotal = groupedEntryTotal(entries)
-    const difference = reconciliationDifference(b.amount, entries)
-    if (Math.abs(difference) > 0.01) {
-      message.warning(`所选 ${entries.length} 笔账目净额为 ${formatMoney(entriesTotal)}，与流水相差 ${formatMoney(difference)}。`)
-      return
-    }
-    if ((b.amount > 0 && entriesTotal < 0) || (b.amount < 0 && entriesTotal > 0)) {
-      message.warning('所选账目净额方向与银行流水方向不一致，请核对收入、支出和手续费。')
-      return
-    }
-    
-    loading.value = true
-    try {
-      const result: any = await apiClient.post('/api/bank/confirm-suggestion', {
-        statement_id: b.id,
-        type: 'match',
-        matched_entry_ids: selectedInvoiceIds.value,
-      })
-      
-      message.success(result?.settlementStatus && result.settlementStatus !== 'posted'
-        ? '已关联原收款与手续费，结算凭证已生成（结账时将自动过账）'
-        : entries.length > 1 ? `已将 ${entries.length} 笔账目合并匹配到该流水` : '手动对账匹配成功')
-      clearManualSelection()
-      await loadAllData()
-    } catch (err: any) {
-      message.error(apiErrorMessage(err, '手动对账失败'))
-    } finally {
-      loading.value = false
-    }
-  }
-}
-
-// Confirm AI Match pair
-async function confirmPair(id: string) {
-  const pair = matchedPairs.value.find(p => p.id === id)
-  if (pair) {
-    if (!pair.matchedEntryId) {
-      message.warning('该建议缺少可匹配的账目记录')
-      return
-    }
-    if (pairNeedsCategoryReview(pair)) {
-      message.warning('请先确认并补齐该账目的科目分类')
-      openPairCategoryDialog(pair)
-      return
-    }
-    if (!pair.persisted && (pair.entries?.length || 1) === 1 && !isDirectionCompatible(pair.invoice?.direction, safeFloat(pair.bank?.amount))) {
-      message.warning('该候选的流水方向与账目方向不一致，请拆开后重新分类或手动匹配')
-      return
-    }
-    try {
-      const res: any = await apiClient.post('/api/bank/confirm-suggestion', {
-        statement_id: pair.statementId,
-        type: 'match',
-        matched_entry_id: pair.matchedEntryId,
-        matched_entry_ids: pair.matchedEntryIds || [],
-      })
-      pair.status = 'confirmed'
-      message.success(res?.settlementStatus && res.settlementStatus !== 'posted'
-        ? '已关联原收款与手续费，结算凭证已生成（结账时将自动过账）'
-        : res?.status === 'already_matched' ? '该流水原已关联，已补充确认对账' : `已核对并确认：${pair.invoice.title}`)
-      await loadAllData()
-    } catch (err: any) {
-      message.error(apiErrorMessage(err, '确认对账失败'))
-    }
-  }
-}
-
 // Split / delete a pair
 async function deletePair(id: string) {
   const pair = matchedPairs.value.find(p => p.id === id)
@@ -1094,40 +1257,7 @@ function apiErrorMessage(err: any, fallback: string) {
   }
   return detail ? `${fallback}：${detail}` : fallback
 }
-// AI suggest entry classification (without matched invoice)
-async function handleAutoPostStatement(id: string) {
-  const b = bankStatements.value.find(s => s.id === id)
-  if (!b || aiDraftLoadingStatementId.value) return
 
-  const sug = getAiSuggestion(id)
-  if (sug?.type === 'match' || sug?.type === 'existing') {
-    openManualClassify(b)
-    return
-  }
-  if (sug?.suggestedEntry) {
-    openManualClassify(b, sug.suggestedEntry)
-    message.info('已生成 AI 分类草稿，请核对后再确认记账并对账。')
-    return
-  }
-
-  aiDraftLoadingStatementId.value = id
-  try {
-    const res: any = await apiClient.post('/api/bank/classify-statement', { statement_id: id }, { timeout: 60000 })
-    if (res?.suggestedEntry) {
-      openManualClassify(b, res.suggestedEntry)
-      message.success('已生成 AI 分类草稿，请补充说明或修改分类后确认。')
-    } else {
-      openManualClassify(b)
-      message.warning('未能获取 AI 分类建议，请手动选择分类。')
-    }
-  } catch (err: any) {
-    console.error('[AI Classify Error Details]:', err)
-    openManualClassify(b)
-    message.error(`获取 AI 分类建议失败: ${err.message || err}`)
-  } finally {
-    aiDraftLoadingStatementId.value = null
-  }
-}
 // Fetch diagnostic metrics and report when closed
 async function fetchClosedDiagnosis() {
   try {
@@ -1148,8 +1278,8 @@ async function fetchClosedDiagnosis() {
 // Perform Month-end Closing and lock period
 async function runClosing() {
   if (hasBlockingPayroll.value) {
-    currentStep.value = 3
-    message.warning('本月在职员工薪酬尚未完成计提或发放确认，请先处理后再结账。')
+    currentStep.value = 2
+    message.warning('本月在职员工工资尚未完成计提，请先计提后再结账（发放可延至次月）。')
     return
   }
   if (isZeroRecordMonth.value && !confirmZeroActivity.value) {
@@ -1161,8 +1291,8 @@ async function runClosing() {
   try {
     await loadReconciliationHealth()
     if (hasBlockingReconciliationRisk.value) {
-      currentStep.value = 4
-      message.warning('仍有高风险对账问题，请先修复后再结账。')
+      currentStep.value = 2
+      message.warning('仍有高风险流水认领问题，请先处理后再结账。')
       return
     }
 
@@ -1170,7 +1300,7 @@ async function runClosing() {
     periodCloseChecks.value = checks
     if (!checks.canClose && !canBatchPostAndClose.value) {
       const blocking = getClosingReadiness(checks).filter(item => item.status === 'blocked')
-      currentStep.value = 5
+      currentStep.value = 3
       message.warning(`还不能结账：${blocking.map(item => item.title).join('、')}`)
       return
     }
@@ -1182,22 +1312,28 @@ async function runClosing() {
     )
     closed.value = result.status === 'closed' || result.periodStatus === 'closed'
     periodCloseChecks.value = result
-    currentStep.value = 5
+    currentStep.value = 3
     await entryStore.fetchEntries()
     await fetchClosedDiagnosis()
     const postedCount = Number(result.autoPostedCount || 0)
+    const closingRefs: string[] = Array.isArray(result.closingVoucherRefs) ? result.closingVoucherRefs.filter(Boolean) : []
+    closingVoucherRefs.value = closingRefs
+    const closingSuffix = closingRefs.length ? `（已自动生成期末损益结转凭证：${closingRefs.join('、')}）` : ''
     message.success(postedCount
-      ? `🎉 已批量过账 ${postedCount} 张凭证并完成 ${targetMonth.value} 结账。`
-      : `🎉 ${targetMonth.value} 结账成功！本期账册已锁定。`)
+      ? `🎉 已批量过账 ${postedCount} 张凭证并完成 ${targetMonth.value} 结账${closingSuffix}。`
+      : `🎉 ${targetMonth.value} 结账成功！本期账册已锁定${closingSuffix}。`)
   } catch (err: any) {
     const detail = err?.response?.data?.detail
     if (detail?.code === 'CLOSE_CHECK_FAILED' && detail.context?.checks) {
       periodCloseChecks.value = { ...periodCloseChecks.value, checks: detail.context.checks, canClose: false }
       message.error('本月核验仍有阻断项；本次自动过账已一并回滚，请按检查结果处理后重试。')
     } else if (detail?.code === 'REVIEW_REQUIRED') {
-      message.error('本月有凭证需要其他复核人审批，本次过账和结账均未完成。')
+      // 救援层能定位到具体是哪张待复核，比这里一句笼统的话有用
+      if (!offerRescue(err)) {
+        message.error('本月有凭证需要其他复核人审批，本次过账和结账均未完成。')
+      }
     } else {
-      message.error(typeof detail === 'string' ? detail : detail?.message || '结账失败，请检查阻断项')
+      reportErrorToast(message, err, '结账失败，请检查阻断项')
     }
   } finally {
     closingLoading.value = false
@@ -1205,6 +1341,64 @@ async function runClosing() {
 }
 function downloadReport() {
   message.success('月度财务报销报告及凭证归档包 PDF 生成成功，正在下载...')
+}
+
+// ── 反结账：解锁本期账册并自动红冲期末损益结转凭证（后端 reopen_period） ──
+const reopenVisible = ref(false)
+const reopenReason = ref('')
+const reopenPhone = ref('')
+const reopenCode = ref('')
+const reopenBizId = ref('')
+const reopenSending = ref(false)
+const reopenSubmitting = ref(false)
+
+async function sendReopenCode() {
+  if (!reopenPhone.value) {
+    message.warning('请输入账号绑定的手机号')
+    return
+  }
+  reopenSending.value = true
+  try {
+    const result = await sendPhoneCode({ phone: reopenPhone.value })
+    reopenBizId.value = (result as any).biz_id || ''
+    message.success('验证码已发送')
+  } catch {
+    message.error('验证码发送失败')
+  } finally {
+    reopenSending.value = false
+  }
+}
+
+async function submitReopen() {
+  if (!reopenReason.value.trim()) {
+    message.warning('请填写反结账原因（将留痕）')
+    return
+  }
+  if (!reopenPhone.value || !reopenCode.value) {
+    message.warning('请输入手机号和短信验证码完成安全验证')
+    return
+  }
+  reopenSubmitting.value = true
+  try {
+    const stepUp = await requestStepUp({
+      action: 'reopen_period',
+      phone: reopenPhone.value,
+      code: reopenCode.value,
+      bizId: reopenBizId.value || undefined,
+    })
+    await reopenPeriod(targetMonth.value, reopenReason.value.trim(), stepUp.stepUpToken)
+    reopenVisible.value = false
+    closingVoucherRefs.value = []
+    closed.value = false
+    await entryStore.fetchEntries()
+    periodCloseChecks.value = await apiClient.get(`/api/periods/${targetMonth.value}/close-checks`)
+    message.success(`${targetMonth.value} 已反结账：本期期末损益结转凭证已自动红冲，账册解锁，可补记后重新结账。`)
+  } catch (err: any) {
+    const detail = err?.response?.data?.detail
+    message.error(typeof detail === 'string' ? detail : detail?.message || '反结账失败')
+  } finally {
+    reopenSubmitting.value = false
+  }
 }
 
 function safeFloat(val: any): number {
@@ -1327,11 +1521,11 @@ const allUnmatchedEntries = computed(() => {
       const isNotMatched = !matchedIds.has(e.id)
       const isNotArchiveOnly = !((e as any).is_archive_only || (e as any).isArchiveOnly)
       const isNotReconciled = e.billingStatus !== 'reconciled' && (e as any).billing_status !== 'reconciled'
-      // ponytail: 个人垫付（老板/员工）不通过公司对公账户扣款，无需且无法匹配银行对公流水
-      const isPaidPersonally = (e as any).payer === 'boss_personal' || (e as any).payer?.startsWith?.('employee_personal')
+      // ponytail: 非公户结算（垫付、未付款挂账、预存扣款、平台未提现等）无需且无法匹配公户银行流水
+      const isNonBank = isNonBankSettledEntry(e as any)
       const isReversal = (e as any).entryType === 'reversal' || (e as any).entry_type === 'reversal'
       const isReversedOriginal = reversalIds.has(String(e.id))
-      return isBeforeOrInMonth && isNotMatched && isNotArchiveOnly && isNotReconciled && !isPaidPersonally && !isReversal && !isReversedOriginal
+      return isBeforeOrInMonth && isNotMatched && isNotArchiveOnly && isNotReconciled && !isNonBank && !isReversal && !isReversedOriginal
     }).map(e => ({
       id: e.id,
       title: e.title,
@@ -1339,10 +1533,13 @@ const allUnmatchedEntries = computed(() => {
       month: e.occurDate ? e.occurDate.substring(0, 7) : '',
       amount: e.amount,
       direction: e.direction,
+      category: (e as any).category || '',
       source: (e as any).source || 'manual',
+      paymentStatus: (e as any).paymentStatus || '',
       invoiceNumber: (e as any).invoiceNumber || '',
       voucherLines: (e as any).voucherLines || null,
       payer: (e as any).payer || 'company_account',
+      voucherStatus: (e as any).voucherStatus || '',
       is_archive_only: (e as any).is_archive_only || (e as any).isArchiveOnly || false,
       status: 'unmatched'
     })))
@@ -1351,45 +1548,6 @@ const allUnmatchedEntries = computed(() => {
     return []
   }
 })
-const selectedEntriesForMatch = computed(() => selectedInvoiceIds.value
-  .map((id) => allUnmatchedEntries.value.find((entry) => entry.id === id))
-  .filter(Boolean) as any[])
-const selectedBankForMatch = computed(() => bankStatements.value.find((statement) => statement.id === selectedBank.value) || null)
-const selectedEntriesTotal = computed(() => groupedEntryTotal(selectedEntriesForMatch.value))
-const selectedMatchDifference = computed(() => selectedBankForMatch.value
-  ? reconciliationDifference(selectedBankForMatch.value.amount, selectedEntriesForMatch.value)
-  : 0)
-// 全抵消组合（如原记录+冲销对）净额为 0，对账无意义，明确禁止
-const isZeroNetSelection = computed(() => (
-  selectedEntriesForMatch.value.length > 0
-  && Math.abs(selectedEntriesTotal.value) <= 0.005
-))
-const canConfirmManualMatch = computed(() => (
-  selectedEntriesForMatch.value.length > 0
-  && !!selectedBankForMatch.value
-  && !isZeroNetSelection.value
-  && Math.abs(selectedMatchDifference.value) <= 0.01
-))
-
-// ponytail: highlight items that exactly reconcile with current selection to cut cognitive search time
-function isCandidateEntry(entry: any): boolean {
-  if (!selectedBankForMatch.value) return false
-  if (selectedInvoiceIds.value.includes(entry.id)) return false
-  if (selectedInvoiceIds.value.length === 0) {
-    const amt = signedInvoiceAmount(entry)
-    return Math.abs(amt - selectedBankForMatch.value.amount) < 0.01
-  }
-  const candidateList = [...selectedEntriesForMatch.value, entry]
-  const diff = reconciliationDifference(selectedBankForMatch.value.amount, candidateList)
-  return Math.abs(diff) < 0.01
-}
-
-function isCandidateBank(stmt: any): boolean {
-  if (selectedBank.value === stmt.id) return false
-  if (!selectedEntriesForMatch.value.length) return false
-  const diff = reconciliationDifference(stmt.amount, selectedEntriesForMatch.value)
-  return Math.abs(diff) < 0.01
-}
 
 // ── In-place Voucher Inspection & Posting Modal (ponytail: zero-redirect inspection) ──
 const showVoucherModal = ref(false)
@@ -1491,23 +1649,6 @@ const unmatchedEntries = computed(() => {
     return []
   }
 })
-// ponytail: 语义分组——发票条目的"配对"是付款状态确认（票等钱），与账目核销
-// （钱对钱）语义不同，分组展示避免概念混淆
-const unmatchedInvoiceEntries = computed(() =>
-  unmatchedEntries.value.filter(e => (e as any).source === 'invoice_import'))
-const unmatchedLedgerEntries = computed(() =>
-  unmatchedEntries.value.filter(e => (e as any).source !== 'invoice_import'))
-const historicalUnmatchedEntries = computed(() => {
-  try {
-    return allUnmatchedEntries.value.filter(e => {
-      const month = getEntryMonth(e)
-      return month && month < targetMonth.value
-    })
-  } catch (err) {
-    console.error('historicalUnmatchedEntries computed error:', err)
-    return []
-  }
-})
 const unmatchedStatements = computed(() => {
   try {
     return bankStatements.value.filter(s => {
@@ -1579,33 +1720,11 @@ const reconciliationStats = computed(() => {
 
 
 
-function healthIssueCount(key: string) {
-  try {
-    return reconciliationHealth.value?.[key]?.length || 0
-  } catch {
-    return 0
-  }
-}
-
-const differenceSuggestionCount = computed(() => {
-  try {
-    return aiSuggestions.value.filter((s: any) => s.type === 'difference').length
-  } catch {
-    return 0
-  }
-})
 const reconciliationHealthSummary = computed(() => {
   try {
     return reconciliationHealth.value?.summary || { highRiskCount: 0, warningCount: 0 }
   } catch {
     return { highRiskCount: 0, warningCount: 0 }
-  }
-})
-const reconciliationWarningCount = computed(() => {
-  try {
-    return reconciliationHealthSummary.value.warningCount + differenceSuggestionCount.value
-  } catch {
-    return 0
   }
 })
 const hasBlockingReconciliationRisk = computed(() => {
@@ -1615,38 +1734,26 @@ const hasBlockingReconciliationRisk = computed(() => {
     return false
   }
 })
-const reconciliationRiskItems = computed(() => {
-  try {
-    return [
-      { key: 'broken_links', label: '断链流水', count: healthIssueCount('broken_links'), type: 'error' },
-      { key: 'amount_mismatches', label: '金额不一致', count: healthIssueCount('amount_mismatches'), type: 'error' },
-      { key: 'direction_mismatches', label: '方向不一致', count: healthIssueCount('direction_mismatches'), type: 'error' },
-      { key: 'duplicate_entry_matches', label: '重复引用', count: healthIssueCount('duplicate_entry_matches'), type: 'error' },
-      { key: 'pending_confirmations', label: '待补确认', count: healthIssueCount('pending_confirmations'), type: 'warning' },
-      { key: 'difference_suggestions', label: '差异候选', count: differenceSuggestionCount.value, type: 'warning' },
-    ].filter(item => item.count > 0)
-  } catch (err) {
-    console.error('reconciliationRiskItems computed error:', err)
-    return []
-  }
-})
 // Get AI suggestion for a statement
 function getAiSuggestion(stmtId: string) {
   return aiSuggestions.value.find(s => s.statementId === stmtId)
 }
 
-function findEntryById(id: string) {
-  return entryStore.activeEntries.find((entry: any) => entry.id === id)
+/** 账上已有对应凭证：此时该做的是核对并确认配对，不是再记一笔。 */
+function hasExistingEntrySuggestion(stmt: any) {
+  const sug = getAiSuggestion(stmt.id)
+  return sug?.type === 'match' || sug?.type === 'existing'
 }
 
-function pairConfidenceText(pair: any) {
-  if (pair.entries?.length > 1) {
-    return `合并对账 · ${pair.entries.length} 笔`
-  }
-  if (pair.persisted) {
-    return pair.status === 'confirmed' ? '匹配状态: 已核对' : '匹配状态: 已关联待确认'
-  }
-  return `AI 置信度: ${pair.confidence}`
+/** 低置信 / 兜底草稿不是 AI 的判断，不能按「建议分类」展示。 */
+function isFallbackSuggestion(stmt: any) {
+  const sug = getAiSuggestion(stmt.id)
+  if (!sug || sug.type !== 'new') return false
+  return Number(sug.confidence || 0) < 0.5
+}
+
+function findEntryById(id: string) {
+  return entryStore.activeEntries.find((entry: any) => entry.id === id)
 }
 
 function pairCategoryPreview(pair: any) {
@@ -1659,48 +1766,62 @@ function pairCategoryPreview(pair: any) {
   return account ? `${category} · ${account}` : category
 }
 
-function pairNeedsCategoryReview(pair: any) {
-  if (pair.entries?.length > 1) return false
-  return !pair.invoice?.category
-}
-
 // ─── Manual Classify Dialog ──────────────────────────────────────────────────
 
-const CATEGORY_OPTIONS = [
+const CATEGORY_OPTIONS_RAW = [
   { label: '── 收入 ──', value: '__header_income__', disabled: true },
-  { label: '主营业务收入', value: 'income|主营业务收入|6001|主营业务收入' },
-  { label: '其他业务收入', value: 'income|其他业务收入|6051|其他业务收入' },
-  { label: '营业外收入', value: 'income|营业外收入|6301|营业外收入' },
-  { label: '利息收入', value: 'income|利息收入|6603|财务费用-利息收入' },
+  { label: '主营业务收入', value: 'income|主营业务收入|5001|主营业务收入' },
+  { label: '其他业务收入', value: 'income|其他业务收入|5051|其他业务收入' },
+  { label: '营业外收入', value: 'income|营业外收入|5301|营业外收入' },
+  { label: '利息收入', value: 'income|利息收入|5603005|财务费用-利息收入' },
   { label: '── 员工成本 ──', value: '__header_salary__', disabled: true },
-  { label: '工资支出', value: 'expense|工资支出|5501|应付职工薪酬-工资' },
-  { label: '社保公积金', value: 'expense|社保公积金|5502|应付职工薪酬-社保公积金' },
+  // 工资/社保流水走工资模块核销（应付职工薪酬），不直接记费用；与后端 account_mapper 对齐
+  { label: '工资发放', value: 'expense|工资发放|221101|应付职工薪酬-工资' },
+  { label: '社保公积金', value: 'expense|社保公积金|221102|应付职工薪酬-单位社保' },
   { label: '── 费用支出 ──', value: '__header_expense__', disabled: true },
-  { label: '差旅费', value: 'expense|差旅费|5601|管理费用-差旅费' },
-  { label: '办公费', value: 'expense|办公费|5602|管理费用-办公费' },
-  { label: '业务招待费', value: 'expense|业务招待费|5603|管理费用-业务招待费' },
-  { label: '研发支出-费用化支出', value: 'expense|研发支出-费用化支出|5301|研发支出-费用化支出' },
-  { label: '信息技术服务费', value: 'expense|信息技术服务费|5605|管理费用-信息技术服务费' },
-  { label: '租金支出', value: 'expense|租金支出|5606|管理费用-租金' },
-  { label: '银行及金融手续费', value: 'expense|银行及金融手续费|6602|财务费用-手续费' },
-  { label: '员工报销', value: 'expense|员工报销|5699|管理费用-其他' },
-  { label: '其他支出', value: 'expense|其他支出|5699|管理费用-其他' },
+  { label: '差旅费', value: 'expense|差旅费|5602006|管理费用-差旅费' },
+  { label: '办公费', value: 'expense|办公费|5602004|管理费用-办公费' },
+  { label: '业务招待费', value: 'expense|业务招待费|5602002|管理费用-业务招待费' },
+  { label: '研发支出-费用化支出', value: 'expense|研发支出-费用化支出|4301|研发支出-费用化支出' },
+  { label: '信息技术服务费', value: 'expense|信息技术服务费|5602015|管理费用-信息技术服务费' },
+  { label: '租金物业', value: 'expense|租金物业|5602013|管理费用-租赁费' },
+  { label: '银行及金融手续费', value: 'expense|银行及金融手续费|5603002|财务费用-手续费' },
+  { label: '其他支出', value: 'expense|其他支出|5602999|管理费用-其他' },
   { label: '── 采购与往来 ──', value: '__header_purchase__', disabled: true },
   { label: '原材料采购', value: 'expense|原材料采购|1403|原材料' },
   { label: '商品采购', value: 'expense|商品采购|1405|库存商品' },
   { label: '供应商付款', value: 'expense|供应商付款|2202|应付账款' },
   { label: '预付账款', value: 'expense|预付账款|1123|预付账款' },
-  { label: '其他应收款', value: 'expense|其他应收款|1221|其他应收款-其他' },
+  // 1221 已容器化：往来款一律落末级子科目（员工往来 122103）
+  { label: '其他应收款', value: 'expense|其他应收款|122103|其他应收款-员工往来' },
   { label: '其他应付款', value: 'expense|其他应付款|2241|其他应付款-其他' },
-  { label: '往来款-支（暂付款）', value: 'expense|往来款|1221|其他应收款-其他' },
+  { label: '往来款-支（暂付款）', value: 'expense|往来款|122103|其他应收款-员工往来' },
   { label: '往来款-收（暂收款）', value: 'income|往来款|2241|其他应付款-其他' },
-  { label: '税费支出', value: 'expense|税费支出|2221|应交税费' },
+  // 2221 是容器：税费缴纳落应交增值税末级（小规模纳税人专用）
+  { label: '税费缴纳', value: 'expense|税费缴纳|2221026|应交增值税（小规模纳税人专用）' },
   { label: '── 资本 ──', value: '__header_capital__', disabled: true },
-  { label: '股东投入', value: 'owner_transfer|股东投入|4001|实收资本' },
-  { label: '资本公积', value: 'owner_transfer|资本公积|4002|资本公积-股本溢价' },
+  { label: '股东投入', value: 'owner_transfer|股东投入|3001|实收资本' },
+  { label: '资本公积', value: 'owner_transfer|资本公积|3002|资本公积' },
   { label: '── 往来 ──', value: '__header_owner__', disabled: true },
   { label: '股东垫付', value: 'owner_transfer|股东垫付|2241|其他应付款-股东' },
+  { label: '员工垫付报销', value: 'owner_transfer|员工垫付报销|2241|其他应付款-员工' },
 ]
+
+// 下拉选项：accountCode/accountName 权威值从后端 /account-mapping 加载后刷新，
+// 硬编码仅兜底；分组/顺序/往来款收支拆分是前端 UI 编排，保留在此。
+const CATEGORY_OPTIONS = ref(CATEGORY_OPTIONS_RAW)
+
+function refreshCategoryOptions() {
+  CATEGORY_OPTIONS.value = CATEGORY_OPTIONS_RAW.map((opt: any) => {
+    if (opt.disabled || !opt.value || opt.value.startsWith('__')) return opt
+    const [direction, category] = opt.value.split('|')
+    // 往来款收/支是前端特化，后端映射只给单一 code，跳过以免覆盖收=2241 的语义
+    if (category === '往来款') return opt
+    const acct = accountForCategory(category)
+    if (!acct) return opt
+    return { ...opt, value: `${direction}|${category}|${acct.code}|${acct.name}` }
+  })
+}
 
 function categoryValueNatureLabel(value: string) {
   const [direction = '', category = ''] = value.split('|')
@@ -1747,9 +1868,10 @@ const manualForm = ref({
   rdProjectId: '',
   rdExpenseType: '',
   rdAllocationBasis: '',
+  suggestedSubAccount: null as null | { parentCode: string; name: string },
+  useSuggestedSubAccount: true,
 })
 const manualSubmitting = ref(false)
-const aiDraftLoadingStatementId = ref<string | null>(null)
 const manualAiLoading = ref(false)
 const manualSuggestionMeta = ref<{ confidence?: number; reason?: string }>({})
 const showPairCategoryDialog = ref(false)
@@ -1765,8 +1887,8 @@ const pairCategorySubmitting = ref(false)
 
 function defaultCategoryValue(stmt: any) {
   return stmt.amount >= 0
-    ? 'income|主营业务收入|6001|主营业务收入'
-    : 'expense|其他支出|5699|管理费用-其他'
+    ? 'income|主营业务收入|5001|主营业务收入'
+    : 'expense|其他支出|5602999|管理费用-其他'
 }
 
 function cleanStatementTitle(stmt: any) {
@@ -1778,16 +1900,16 @@ function categoryValueFromSuggestion(stmt: any, suggested: any) {
   if (!suggested) return defaultCategoryValue(stmt)
   const direction = suggested.direction || (stmt.amount >= 0 ? 'income' : 'expense')
   const exact = `${direction}|${suggested.category}|${suggested.accountCode}|${suggested.accountName}`
-  if (CATEGORY_OPTIONS.some((opt: any) => !opt.disabled && opt.value === exact)) return exact
-  const byCategory = CATEGORY_OPTIONS.find((opt: any) => !opt.disabled && String(opt.value).includes(`|${suggested.category}|`))
+  if (CATEGORY_OPTIONS.value.some((opt: any) => !opt.disabled && opt.value === exact)) return exact
+  const byCategory = CATEGORY_OPTIONS.value.find((opt: any) => !opt.disabled && String(opt.value).includes(`|${suggested.category}|`))
   return byCategory?.value || defaultCategoryValue(stmt)
 }
 
 function categoryValueFromEntry(entry: any, stmt: any) {
   if (!entry) return defaultCategoryValue(stmt)
   const exact = `${entry.direction}|${entry.category}|${entry.accountCode}|${entry.accountName}`
-  if (CATEGORY_OPTIONS.some((opt: any) => !opt.disabled && opt.value === exact)) return exact
-  const byCategory = CATEGORY_OPTIONS.find((opt: any) => !opt.disabled && String(opt.value).includes(`|${entry.category}|`))
+  if (CATEGORY_OPTIONS.value.some((opt: any) => !opt.disabled && opt.value === exact)) return exact
+  const byCategory = CATEGORY_OPTIONS.value.find((opt: any) => !opt.disabled && String(opt.value).includes(`|${entry.category}|`))
   return byCategory?.value || defaultCategoryValue(stmt)
 }
 
@@ -1801,6 +1923,7 @@ function openManualClassify(stmt: any, suggestedEntry: any = null) {
   manualSuggestionMeta.value = suggestedEntry
     ? { confidence: suggestedEntry.confidence, reason: suggestedEntry.reason }
     : {}
+  const sub = suggestedEntry?.suggestedSubAccount
   manualForm.value = {
     title: suggestedEntry?.title || cleanStatementTitle(stmt),
     categoryValue: categoryValueFromSuggestion(stmt, suggestedEntry),
@@ -1809,6 +1932,10 @@ function openManualClassify(stmt: any, suggestedEntry: any = null) {
     rdProjectId: '',
     rdExpenseType: '',
     rdAllocationBasis: '',
+    suggestedSubAccount: (sub?.parentCode && sub?.name)
+      ? { parentCode: String(sub.parentCode), name: String(sub.name) }
+      : null,
+    useSuggestedSubAccount: !!(sub?.parentCode && sub?.name),
   }
   showManualDialog.value = true
 }
@@ -1899,10 +2026,15 @@ async function refreshManualAiSuggestion() {
     }
     const suggested = res.suggestedEntry
     manualSuggestionMeta.value = { confidence: suggested.confidence, reason: suggested.reason }
+    const sub = suggested?.suggestedSubAccount
     manualForm.value = {
       ...manualForm.value,
       title: suggested.title || manualForm.value.title,
       categoryValue: categoryValueFromSuggestion(manualTarget.value, suggested),
+      suggestedSubAccount: (sub?.parentCode && sub?.name)
+        ? { parentCode: String(sub.parentCode), name: String(sub.name) }
+        : manualForm.value.suggestedSubAccount,
+      useSuggestedSubAccount: !!(sub?.parentCode && sub?.name) || manualForm.value.useSuggestedSubAccount,
     }
     message.success('已根据业务说明更新 AI 分类草稿')
   } catch (err: any) {
@@ -1918,7 +2050,9 @@ async function handleManualClassify() {
     return
   }
 
-  const [direction, category, accountCode, accountName] = manualForm.value.categoryValue.split('|')
+  const [direction, category, suggestedCode, suggestedName] = manualForm.value.categoryValue.split('|')
+  let accountCode = suggestedCode
+  let accountName = suggestedName
   if (category === '研发支出-费用化支出' && !(
     manualForm.value.rdProjectId && manualForm.value.rdExpenseType
   )) {
@@ -1936,11 +2070,30 @@ async function handleManualClassify() {
     manualForm.value.remark.trim(),
   ].filter(Boolean).join('\n')
 
+  // 若 AI 建议新建二级科目且用户确认，先落地科目，再用新 code 记账；失败则回落原映射科目
+  if (manualForm.value.useSuggestedSubAccount && manualForm.value.suggestedSubAccount) {
+    try {
+      const created: any = await apiClient.post('/api/ledger/accounts/ensure-sub', {
+        parent_code: manualForm.value.suggestedSubAccount.parentCode,
+        name: manualForm.value.suggestedSubAccount.name,
+      })
+      if (created?.code && created?.name) {
+        accountCode = created.code
+        accountName = created.name
+      }
+    } catch {
+      // 建科失败不阻断记账
+    }
+  }
+
   manualSubmitting.value = true
   try {
-    const confirmRes: any = await apiClient.post('/api/bank/confirm-suggestion', {
+    const confirmRes: any = await backfillConfirm.withBackfill((allowBackfill, backfillReason) =>
+      apiClient.post('/api/bank/confirm-suggestion', {
       statement_id: stmt.id,
       type: 'new',
+      allowBackfill,
+      backfillReason,
       new_entry: {
         title: manualForm.value.title.trim(),
         amount: Math.abs(stmt.amount),
@@ -1958,7 +2111,8 @@ async function handleManualClassify() {
           rdAllocationBasis: manualForm.value.rdAllocationBasis || undefined,
         } : {}),
       }
-    }, { timeout: 60000 })
+    }, { timeout: 60000 }),
+    )
     if (confirmRes?.status === 'already_matched') {
       message.success('该流水已完成对账，已刷新列表。')
     } else {
@@ -1970,6 +2124,10 @@ async function handleManualClassify() {
     manualSubmitting.value = false
     loadAllData()
   } catch (err: any) {
+    if (isBackfillCancelled(err)) {
+      manualSubmitting.value = false
+      return
+    }
     const detail = err?.response?.data?.detail
     if (detail?.code === 'EXISTING_WECHAT_ENTRIES') {
       showManualDialog.value = false
@@ -1981,12 +2139,569 @@ async function handleManualClassify() {
     manualSubmitting.value = false
   }
 }
-function nextStep() {
-  if (currentStep.value === 3 && employees.value.length > 0 && (!payrollAccrued.value || !payrollPaid.value)) {
-    message.warning('请先完成本月的工资计提和发放确认。')
+
+const highConfidenceStatements = computed(() => {
+  return unmatchedStatements.value.filter((stmt: any) => {
+    const sug = getAiSuggestion(stmt.id)
+    return sug && sug.confidence >= 0.95
+  })
+})
+
+const statementTierFilter = ref<'all' | 'ready' | 'attention'>('all')
+const selectedStatementIds = ref<string[]>([])
+const rememberRuleOnConfirm = ref(true)
+
+function isSelectableForBatch(stmt: any): boolean {
+  const sug = getAiSuggestion(stmt.id)
+  if (!sug) return false
+  if (isFallbackSuggestion(stmt)) return false
+  if (sug.type === 'new' && sug.suggestedEntry?.category === '研发支出-费用化支出') return false
+  return Number(sug.confidence || 0) >= 0.5
+}
+
+function isNeedsAttentionStatement(stmt: any): boolean {
+  if (findMatchingInvoiceForStatement(stmt)) return false
+  const sug = getAiSuggestion(stmt.id)
+  if (!sug) return true
+  return isFallbackSuggestion(stmt)
+}
+
+function suggestionBadgeLabel(stmt: any): string {
+  if (isFallbackSuggestion(stmt)) return '待人工指定'
+  const sug = getAiSuggestion(stmt.id)
+  if (!sug) return '待指定'
+  if (sug.rule === 'company_memory_rule') return '记忆规则 98%'
+  if (sug.rule) return '系统规则 100%'
+  const conf = Number(sug.confidence || 0)
+  if (conf >= 0.95) return '高置信度'
+  return '推荐依据'
+}
+
+const selectableBatchStatements = computed(() =>
+  unmatchedStatements.value.filter((stmt: any) => isSelectableForBatch(stmt))
+)
+
+const attentionStatements = computed(() =>
+  unmatchedStatements.value.filter((stmt: any) => isNeedsAttentionStatement(stmt))
+)
+
+const filteredUnmatchedStatements = computed(() => {
+  if (statementTierFilter.value === 'ready') {
+    return unmatchedStatements.value.filter((stmt: any) => !isNeedsAttentionStatement(stmt))
+  }
+  if (statementTierFilter.value === 'attention') {
+    return attentionStatements.value
+  }
+  return unmatchedStatements.value
+})
+
+watch(
+  [unmatchedStatements, aiSuggestions],
+  () => {
+    const validSelectable = new Set(selectableBatchStatements.value.map((s: any) => s.id))
+    const defaultHighConf = highConfidenceStatements.value
+      .filter((s: any) => validSelectable.has(s.id))
+      .map((s: any) => s.id)
+    const kept = selectedStatementIds.value.filter((id) => validSelectable.has(id))
+    selectedStatementIds.value = kept.length > 0 ? kept : defaultHighConf
+  },
+  { immediate: true }
+)
+
+function toggleStatementSelection(stmtId: string, checked: boolean) {
+  if (checked) {
+    if (!selectedStatementIds.value.includes(stmtId)) {
+      selectedStatementIds.value = [...selectedStatementIds.value, stmtId]
+    }
+  } else {
+    selectedStatementIds.value = selectedStatementIds.value.filter((id) => id !== stmtId)
+  }
+}
+
+const allSelectableChecked = computed(
+  () =>
+    selectableBatchStatements.value.length > 0 &&
+    selectableBatchStatements.value.every((stmt: any) => selectedStatementIds.value.includes(stmt.id))
+)
+
+const someSelectableChecked = computed(
+  () =>
+    !allSelectableChecked.value &&
+    selectableBatchStatements.value.some((stmt: any) => selectedStatementIds.value.includes(stmt.id))
+)
+
+function toggleSelectAllStatements(checked: boolean) {
+  selectedStatementIds.value = checked
+    ? selectableBatchStatements.value.map((stmt: any) => stmt.id)
+    : []
+}
+
+const batchTargetStatements = computed(() => {
+  const selectedSet = new Set(selectedStatementIds.value)
+  const picked = unmatchedStatements.value.filter(
+    (stmt: any) => selectedSet.has(stmt.id) && isSelectableForBatch(stmt)
+  )
+  return picked.length > 0 ? picked : highConfidenceStatements.value
+})
+
+/** 按建议确认单笔流水（match 关联已有记录 / new 新建入账）。批量与单条共用同一路径。 */
+async function confirmSuggested(
+  stmt: any,
+  sug: any,
+  opts: { skipDuplicateCheck?: boolean; rememberRule?: boolean } = {}
+) {
+  if (sug.type === 'match') {
+    const matchIds = sug.matchedEntryIds || [sug.matchedEntryId].filter(Boolean)
+    return await backfillConfirm.withBackfill((allowBackfill, backfillReason) =>
+      apiClient.post('/api/bank/confirm-suggestion', {
+        statement_id: stmt.id,
+        type: 'match',
+        matched_entry_ids: matchIds,
+        allowBackfill,
+        backfillReason,
+      })
+    )
+  }
+  const suggestedEntry = sug.suggestedEntry || {}
+  return await backfillConfirm.withBackfill((allowBackfill, backfillReason) =>
+    apiClient.post('/api/bank/confirm-suggestion', {
+      statement_id: stmt.id,
+      type: 'new',
+      new_entry: {
+        title: suggestedEntry.title || cleanStatementTitle(stmt),
+        category: suggestedEntry.category || (stmt.amount > 0 ? '其他业务收入' : '其他支出'),
+        amount: Math.abs(stmt.amount),
+        direction: stmt.amount > 0 ? 'income' : 'expense',
+        occurDate: stmt.transaction_date ? stmt.transaction_date.slice(0, 10) : '',
+        paymentDate: stmt.transaction_date ? stmt.transaction_date.slice(0, 10) : '',
+        billingStatus: 'reconciled',
+        source: 'bank_import',
+        payer: 'company_account',
+        rdProjectId: suggestedEntry.rdProjectId,
+        rdExpenseType: suggestedEntry.rdExpenseType,
+      },
+      allowBackfill,
+      backfillReason,
+      ...(opts.skipDuplicateCheck ? { skipDuplicateCheck: true } : {}),
+      ...(opts.rememberRule ? { rememberRule: true } : {}),
+    })
+  )
+}
+
+const batchConfirming = ref(false)
+async function handleBatchConfirmRules() {
+  const items = batchTargetStatements.value
+    .map((stmt: any) => ({ stmt, sug: getAiSuggestion(stmt.id) }))
+    .filter((item: any) => item.sug)
+  if (items.length === 0) return
+  batchConfirming.value = true
+  let confirmed = 0
+  let cancelled = false
+  try {
+    // 串行执行：跨期补记弹窗共用同一个 resolver，并发会互相覆盖
+    for (const { stmt, sug } of items) {
+      try {
+        await confirmSuggested(stmt, sug)
+        confirmed += 1
+      } catch (err: any) {
+        if (isBackfillCancelled(err)) {
+          cancelled = true
+          break
+        }
+        console.error('批量确认失败:', stmt.id, err)
+      }
+    }
+    selectedStatementIds.value = []
+    await loadAllData()
+    const failed = items.length - confirmed
+    if (cancelled) message.info(`已确认 ${confirmed} 笔，其余已取消`)
+    else if (failed > 0) message.warning(`已确认 ${confirmed} 笔，${failed} 笔未能自动确认，请手动处理`)
+    else message.success(`已确认 ${confirmed} 笔流水`)
+  } finally {
+    batchConfirming.value = false
+  }
+}
+
+const quickSubmittingId = ref<string | null>(null)
+
+/**
+ * 新建入账时账上已有等额凭证（后端 EXISTING_ENTRY_MATCH）：
+ * 直接给出"配对"选项，而不是再记一笔。返回 true 表示已接管错误提示。
+ */
+function promptExistingEntryMatch(stmt: any, err: any, retryAsNew?: () => Promise<void>): boolean {
+  const detail = err?.response?.data?.detail
+  if (!detail || detail.code !== 'EXISTING_ENTRY_MATCH') return false
+  const entryIds: string[] = (detail.candidateEntryIds || []).map(String)
+  if (!entryIds.length) return false
+  const first = (detail.entries || [])[0] || {}
+  dialog.warning({
+    title: '发现一笔相同金额的已有凭证',
+    content: `账上已有「${first.title || stmt.description}」${first.date ? `（${first.date}）` : ''}，金额相同。直接配对即可，避免同一笔钱记两次；确实属于两笔独立付款时再单独记账。`,
+    positiveText: '直接配对',
+    negativeText: '确认是两笔，仍要记账',
+    onPositiveClick: async () => {
+      try {
+        await backfillConfirm.withBackfill((allowBackfill, backfillReason) =>
+          apiClient.post('/api/bank/confirm-suggestion', {
+            statement_id: stmt.id,
+            type: 'match',
+            matched_entry_ids: entryIds,
+            allowBackfill,
+            backfillReason,
+          })
+        )
+        message.success(`已配对，未重复记账：「${stmt.description}」`)
+        await loadAllData()
+      } catch (pairErr: any) {
+        if (!isBackfillCancelled(pairErr)) message.error(apiErrorMessage(pairErr, '配对失败'))
+      }
+    },
+    onNegativeClick: async () => {
+      if (!retryAsNew) {
+        openVoucherModal(entryIds[0])
+        return
+      }
+      try {
+        await retryAsNew()
+        message.success(`已按独立的一笔记账：「${stmt.description}」`)
+        await loadAllData()
+      } catch (retryErr: any) {
+        if (!isBackfillCancelled(retryErr)) message.error(apiErrorMessage(retryErr, '入账失败'))
+      }
+    },
+  })
+  return true
+}
+
+async function handleAcceptSuggested(stmt: any) {
+  const sug = getAiSuggestion(stmt.id)
+  if (!sug) return
+  quickSubmittingId.value = stmt.id
+  const shouldRemember = Boolean(rememberRuleOnConfirm.value && sug.type === 'new' && !isFallbackSuggestion(stmt))
+  try {
+    const res: any = await confirmSuggested(stmt, sug, { rememberRule: shouldRemember })
+    const suggestedEntry = sug.suggestedEntry || {}
+    if (sug.type === 'match') {
+      message.success(`已完成对账：「${stmt.description}」`)
+    } else if (res?.savedRulePattern) {
+      message.success(`已确认入账并对账：「${stmt.description}」→ ${suggestedEntry.category}（已沉淀规则：后续「${res.savedRulePattern}」自动归入此科目）`)
+    } else {
+      message.success(`已确认入账并对账：「${stmt.description}」→ ${suggestedEntry.category}`)
+    }
+    await loadAllData()
+  } catch (err: any) {
+    if (isBackfillCancelled(err)) return
+    if (promptExistingEntryMatch(stmt, err, () => confirmSuggested(stmt, sug, { skipDuplicateCheck: true, rememberRule: shouldRemember }).then(() => undefined))) return
+    message.error(apiErrorMessage(err, '入账失败'))
+  } finally {
+    quickSubmittingId.value = null
+  }
+}
+
+async function handleQuickSelectCategory(stmt: any, category: string) {
+  if (!category) return
+  if (category === '研发支出-费用化支出') {
+    openManualClassify(stmt, { category: '研发支出-费用化支出' })
     return
   }
-  if (currentStep.value < 5) {
+  quickSubmittingId.value = stmt.id
+  const submitNewEntry = (allowBackfill: boolean, backfillReason?: string, skipDuplicateCheck = false) =>
+    apiClient.post('/api/bank/confirm-suggestion', {
+      statement_id: stmt.id,
+      type: 'new',
+      new_entry: {
+        title: cleanStatementTitle(stmt),
+        category: category,
+        amount: Math.abs(stmt.amount),
+        direction: stmt.amount > 0 ? 'income' : 'expense',
+        occurDate: stmt.transaction_date ? stmt.transaction_date.slice(0, 10) : '',
+        paymentDate: stmt.transaction_date ? stmt.transaction_date.slice(0, 10) : '',
+        billingStatus: 'reconciled',
+        source: 'bank_import',
+        payer: 'company_account',
+      },
+      allowBackfill,
+      backfillReason,
+      ...(skipDuplicateCheck ? { skipDuplicateCheck: true } : {}),
+      ...(rememberRuleOnConfirm.value ? { rememberRule: true } : {}),
+    })
+  try {
+    const res: any = await backfillConfirm.withBackfill((allowBackfill, backfillReason) =>
+      submitNewEntry(allowBackfill, backfillReason)
+    )
+    if (res?.savedRulePattern) {
+      message.success(`已入账：「${stmt.description}」→ ${category}（已沉淀规则：后续「${res.savedRulePattern}」自动归入此科目）`)
+    } else {
+      message.success(`已入账：「${stmt.description}」→ ${category}`)
+    }
+    await loadAllData()
+  } catch (err: any) {
+    if (isBackfillCancelled(err)) return
+    if (promptExistingEntryMatch(stmt, err, () => submitNewEntry(false, undefined, true).then(() => undefined))) return
+    message.error(apiErrorMessage(err, '入账失败'))
+  } finally {
+    quickSubmittingId.value = null
+  }
+}
+
+function findMatchingInvoiceForStatement(stmt: any) {
+  const stmtAmount = Math.abs(stmt.amount)
+  return unmatchedEntries.value.find((entry: any) => {
+    const entryAmount = Math.abs(Number(entry.amount) || 0)
+    return Math.abs(stmtAmount - entryAmount) < 0.01 && isDirectionCompatible(entry.direction, stmt.amount)
+  })
+}
+
+// ── 待确认账目（发票/手工账）：老板只需要回答"付款了吗" ─────────────────
+
+/** 给一笔账目找最可能的银行流水：方向一致、日期 ±10 天、金额最接近。 */
+function findStatementCandidateForEntry(entry: any) {
+  const entryAmount = Math.abs(Number(entry.amount) || 0)
+  const entryDate = String(entry.date || entry.occurDate || '').slice(0, 10)
+  const wantsIncome = entry.direction === 'income'
+  let best: { statement: any; diff: number } | null = null
+  for (const stmt of unmatchedStatements.value) {
+    const stmtAmount = Number(stmt.amount) || 0
+    if ((stmtAmount > 0) !== wantsIncome) continue
+    const stmtDate = String(stmt.transaction_date || '').slice(0, 10)
+    if (entryDate && stmtDate) {
+      const dayDiff = Math.abs(new Date(entryDate).getTime() - new Date(stmtDate).getTime()) / 86400000
+      if (dayDiff > 10) continue
+    }
+    const diff = Math.abs(Math.abs(stmtAmount) - entryAmount)
+    if (!best || diff < best.diff) best = { statement: stmt, diff }
+  }
+  return best
+}
+
+function statementCandidateText(candidate: { statement: any; diff: number } | null) {
+  if (!candidate) return ''
+  const stmt = candidate.statement
+  const relation = candidate.diff < 0.01 ? '金额一致' : `差 ${formatMoney(candidate.diff)}`
+  return `疑似对应 ${String(stmt.transaction_date).slice(0, 10)} ${stmt.description}（${relation}）`
+}
+
+/** 账目已付款：带用户去核对对应流水；找不到流水时提示补导。 */
+function handleEntryPaid(entry: any) {
+  const candidate = findStatementCandidateForEntry(entry)
+  currentStep.value = 2
+  if (!candidate) {
+    message.warning('本月没找到对应流水。如果这笔是现金或个人账户支付，可以标记「还没付款」或直接忽略。')
+    return
+  }
+  selectedBank.value = candidate.statement.id
+  nextTick(() => scrollIntoBank(candidate.statement.id))
+  message.info(statementCandidateText(candidate))
+}
+
+/** 确认单据去向（未付款/老板垫付/员工垫付/预存扣除/老板代收/平台未提现/冲前期预收等；若已过账则后台自动冲销重记） */
+async function confirmEntryDisposition(entry: any, choice: { payer?: string; paymentStatus?: 'unpaid'; label: string }) {
+  try {
+    const { label, ...payload } = choice
+    await updateEntry(entry.id, { ...payload, autoReverseRepost: true })
+    message.success(`已确认：${label}`)
+    await loadAllData()
+  } catch (err: any) {
+    message.error(apiErrorMessage(err, '确认失败'))
+  }
+}
+
+/** 撤销去向确认：单据重新回到待确认列表 */
+async function resetEntryDisposition(entry: any) {
+  try {
+    await updateEntry(entry.id, { paymentStatus: null, payer: 'company_account', autoReverseRepost: true })
+    message.success('已恢复为待确认状态')
+    await loadAllData()
+  } catch (err: any) {
+    message.error(apiErrorMessage(err, '恢复失败'))
+  }
+}
+
+/** 标记未付款：草稿会改为挂账科目（应付/应收），不再出现在待确认列表。 */
+async function markEntryUnpaid(entry: any) {
+  const label = entry.direction === 'income' ? '客户未付款' : '还没付款'
+  return confirmEntryDisposition(entry, { paymentStatus: 'unpaid', label })
+}
+
+const employeePayerOptions = computed(() => {
+  const options = (employees.value || []).map((emp: any) => ({
+    label: `员工垫付：${emp.name}`,
+    key: `employee_personal:${emp.name}`
+  }))
+  options.push({
+    label: '其他员工垫付',
+    key: 'employee_personal'
+  })
+  return options
+})
+
+const SYSTEM_MANUAL_CATEGORIES = new Set([
+  '人力成本',
+  '工资发放',
+  '社保公积金',
+  '个人所得税',
+  '银行及金融手续费',
+  '银行手续费',
+  '利息收入',
+  '股东投入',
+  '老板投入',
+  '资本公积',
+  '股东取现',
+  '老板取现',
+  '股东垫付报销',
+  '员工垫付报销',
+])
+
+const pendingEntryList = computed(() =>
+  unmatchedEntries.value.filter((entry: any) => {
+    const isInvoice = entry.source === 'invoice_import' || !!entry.invoiceNumber
+    if (isInvoice) return true
+    if (entry.direction === 'owner_transfer') return false
+    const cat = String(entry.category || '').trim()
+    const title = String(entry.title || '').trim()
+    if (SYSTEM_MANUAL_CATEGORIES.has(cat)) return false
+    if (/工资|社保|公积金|手续费|注册资本|股东投入/.test(title)) return false
+    return true
+  })
+)
+
+/** 资金流出：支出，或负数的资本往来（股东取现等）；股东投入按流入显示 */
+const entryIsOutflow = (entry: any) =>
+  entry.direction === 'expense' || (entry.direction !== 'income' && Number(entry.amount) < 0)
+
+const confirmedExceptionEntries = computed(() => {
+  try {
+    return entryStore.activeEntries.filter((e) => {
+      const month = e.occurDate ? e.occurDate.substring(0, 7) : ''
+      const isCurrentMonth = month === targetMonth.value
+      const isNotArchiveOnly = !((e as any).is_archive_only || (e as any).isArchiveOnly)
+      return isCurrentMonth && isNotArchiveOnly && isNonBankSettledEntry(e as any)
+    }).map((e) => ({
+      id: e.id,
+      title: e.title,
+      date: e.occurDate,
+      amount: e.amount,
+      direction: e.direction,
+      category: (e as any).category || '',
+      source: (e as any).source || 'manual',
+      payer: (e as any).payer || 'company_account',
+      paymentStatus: (e as any).paymentStatus || '',
+    }))
+  } catch (err) {
+    console.error('confirmedExceptionEntries computed error:', err)
+    return []
+  }
+})
+
+/** 老板往来小账本汇总：让老板一眼看懂确认后的应收、应付、可免税报销垫付款 */
+const bossLedgerSummary = computed(() => {
+  let customerOwes = 0
+  let customerCount = 0
+  let companyOwesSupplier = 0
+  let supplierCount = 0
+  let companyOwesBossAndEmp = 0
+  let bossOnly = 0
+  let empOnly = 0
+
+  for (const item of confirmedExceptionEntries.value) {
+    const amt = Math.abs(Number(item.amount) || 0)
+    const payer = String(item.payer || '')
+    const status = String(item.paymentStatus || '')
+    if (status === 'unpaid') {
+      if (item.direction === 'income') {
+        customerOwes += amt
+        customerCount += 1
+      } else if (item.direction === 'expense') {
+        companyOwesSupplier += amt
+        supplierCount += 1
+      }
+    } else if (item.direction === 'expense') {
+      if (payer === 'boss_personal') {
+        companyOwesBossAndEmp += amt
+        bossOnly += amt
+      } else if (payer.startsWith('employee_personal')) {
+        companyOwesBossAndEmp += amt
+        empOnly += amt
+      }
+    }
+  }
+  return {
+    customerOwes,
+    customerCount,
+    companyOwesSupplier,
+    supplierCount,
+    companyOwesBossAndEmp,
+    bossOnly,
+    empOnly,
+    hasAny: customerOwes > 0 || companyOwesSupplier > 0 || companyOwesBossAndEmp > 0
+  }
+})
+
+const pendingInvoiceList = computed(() =>
+  pendingEntryList.value.filter((entry: any) => entry.source === 'invoice_import' || !!entry.invoiceNumber)
+)
+
+const unpaidInvoiceCount = computed(() =>
+  invoicesList.value.filter((inv: any) => isNonBankSettledEntry(inv)).length
+)
+
+async function handleMatchInvoiceDirect(stmt: any, invoice: any) {
+  quickSubmittingId.value = stmt.id
+  try {
+    await backfillConfirm.withBackfill((allowBackfill, backfillReason) =>
+      apiClient.post('/api/bank/confirm-suggestion', {
+        statement_id: stmt.id,
+        type: 'match',
+        matched_entry_ids: [invoice.id],
+        allowBackfill,
+        backfillReason,
+      })
+    )
+    message.success(`已关联发票并完成核对：「${invoice.title}」`)
+    await loadAllData()
+  } catch (err: any) {
+    if (isBackfillCancelled(err)) return
+    message.error(apiErrorMessage(err, '发票关联失败'))
+  } finally {
+    quickSubmittingId.value = null
+  }
+}
+
+const bossExpenseOptions = [
+  { label: '办公耗材 / 打印杂费', value: '办公费' },
+  { label: '信息服务 / 云服务器 / 软件', value: '信息技术服务费' },
+  { label: '请客吃饭 / 商务招待', value: '业务招待费' },
+  { label: '打车交通 / 差旅住宿', value: '差旅费' },
+  { label: '研发项目支出（需选项目）', value: '研发支出-费用化支出' },
+  { label: '采购款 / 原材料', value: '原材料采购' },
+  { label: '房租 / 物业 / 水电通讯', value: '租金物业' },
+  { label: '员工报销款 / 往来备用金', value: '其他应收款' },
+  { label: '还老板垫付款 / 股东往来', value: '股东垫付报销' },
+  { label: '税费缴纳（增值税/个税等）', value: '税费缴纳' },
+  { label: '银行手续费 / 转账费', value: '银行及金融手续费' },
+  { label: '其他日常支出', value: '其他支出' },
+]
+
+const bossIncomeOptions = [
+  { label: '微信支付结算（提现到账）', value: '微信支付结算' },
+  { label: '支付宝结算（提现到账）', value: '支付宝结算' },
+  { label: '主营业务收入（货款/服务费）', value: '主营业务收入' },
+  { label: '银行存款结息（利息收入）', value: '利息收入' },
+  { label: '实名认证打款 / 营业外收入', value: '营业外收入' },
+  { label: '股东投资款注入', value: '股东投入' },
+  { label: '其他业务收入', value: '其他业务收入' },
+]
+
+function nextStep() {
+  if (currentStep.value === 2 && hasBlockingPayroll.value) {
+    if (payrollPendingReview.value) {
+      message.warning('工资计提凭证正在等待审核，审核通过后才能继续。')
+    } else {
+      message.warning('本月在职员工工资尚未完成计提，请先计提后再结账（发放可延至次月）。')
+    }
+    return
+  }
+  if (currentStep.value < 3) {
     currentStep.value++
   }
 }
@@ -1996,10 +2711,14 @@ function prevStep() {
     currentStep.value--
   }
 }
+
+
+// 从别的标签切回来时静默重拉，避免对着旧数字干活
+usePageRefresh(loadAllData)
 </script>
 
 <template>
-  <div class="report-container closing-wizard-container" :class="{ 'closing-wizard--wide': currentStep === 4 || currentStep === 5 }">
+  <div class="report-container closing-wizard-container" :class="{ 'closing-wizard--wide': currentStep === 1 || currentStep === 2 || currentStep === 3 }">
     <!-- Header -->
     <div class="report-header">
       <div class="report-header-left">
@@ -2026,6 +2745,25 @@ function prevStep() {
             </NTag>
           </div>
           <p class="report-subtitle">一站式完成发票对齐、流水对账、工资计提并锁定月度账期</p>
+          <div v-if="mainFilingObligations.length" class="filing-obligation-strip">
+            <span class="filing-obligation-lead">
+              <i class="ri-file-list-3-line" />
+              本期申报<template v-if="filingInfo?.vatCycleLabel">（增值税{{ filingInfo.vatCycleLabel }}）</template>
+            </span>
+            <span
+              v-for="item in mainFilingObligations"
+              :key="item.taxKind + item.period"
+              class="filing-obligation-chip"
+              :class="{ 'is-filed': item.status === 'filed' }"
+            >
+              {{ item.name }} · {{ item.period }}
+              <template v-if="filingDueLabel(item)"> · {{ filingDueLabel(item) }}</template>
+              <template v-if="item.status === 'filed'"> · 已申报</template>
+            </span>
+            <NButton text size="tiny" type="primary" class="filing-obligation-link" @click="goFilingPackage(mainFilingObligations[0])">
+              查看申报底稿
+            </NButton>
+          </div>
         </div>
       </div>
       <div class="report-header-right">
@@ -2037,42 +2775,67 @@ function prevStep() {
       </div>
     </div>
 
+    <!-- 一套月结向导同时服务老板与会计：默认大白话，专业明细折叠可展开 -->
     <!-- AI 结账助手 (可折叠抽屉式面板) -->
     <div v-show="showAgentPanel" class="agent-panel-wrapper mb-4">
       <ClosingAgentPanel :month="targetMonth" />
     </div>
 
     <!-- Steps Card (未结账时持续展示步骤导引) -->
-    <NCard v-if="!closed" :bordered="false" class="report-card steps-card mb-4" style="padding: 14px 18px;">
+    <NCard v-if="!closed" :bordered="false" class="report-card steps-card mb-3" style="padding: 6px 14px;">
       <NSteps :current="currentStep" size="small" @update:current="(val: number) => currentStep = val">
-        <NStep title="凭证导入" description="发票与单据" style="cursor: pointer;" @click="currentStep = 1" />
-        <NStep title="银行流水导入" description="网银明细" style="cursor: pointer;" @click="currentStep = 2" />
-        <NStep title="工资发放确认" description="薪酬社保" style="cursor: pointer;" @click="currentStep = 3" />
-        <NStep title="智能对账分类" description="流水配对" style="cursor: pointer;" @click="currentStep = 4" />
-        <NStep title="合规检查与关账" description="体检与封账" style="cursor: pointer;" @click="currentStep = 5" />
+        <NStep title="导入单据" description="发票、流水、账单" style="cursor: pointer;" @click="currentStep = 1" />
+        <NStep title="确认收支" description="系统已自动记账，逐笔确认例外" style="cursor: pointer;" @click="currentStep = 2" />
+        <NStep title="一键锁账" description="检查通过后封账归档" style="cursor: pointer;" @click="currentStep = 3" />
       </NSteps>
     </NCard>
 
-    <!-- Step 1 Layout: Invoices Upload -->
+    <!-- 本月进度条：资料汇总 + 下一步入口，与步骤导航分开 -->
+    <div v-if="!closed && currentStep === 1" class="step-status-bar mb-4">
+      <div class="step-status-main">
+        <i class="ri-folder-shared-line step-status-icon" />
+        <span class="step-status-label">本月已导入</span>
+        <span class="step-status-text">
+          银行流水 {{ rawStatements.length }} 笔 · 待确认发票 {{ pendingInvoiceList.length }} 张{{ unpaidInvoiceCount > 0 ? `（另有 ${unpaidInvoiceCount} 张已确认去向）` : '' }} · 微信账单 {{ wechatBillRecordsSummary.total || wechatBillRecords.length }} 笔
+        </span>
+      </div>
+      <NButton type="primary" size="small" @click="nextStep">
+        {{ unmatchedStatements.length > 0 ? `下一步：确认 ${unmatchedStatements.length} 笔收支` : '下一步：确认收支' }}
+        <template #icon><i class="ri-arrow-right-line" /></template>
+      </NButton>
+    </div>
+
+    <!-- Step 1 Layout: 资料归集与导入 (发票 · 网银流水 · 平台账单) -->
     <div v-if="currentStep === 1">
       <NSpin :show="loading">
-        <NCard :bordered="false" class="report-card mb-4">
-          <h3 class="report-section-title"><i class="ri-file-text-line"></i> 第一步：批量导入销项/进项发票记录</h3>
-          <p class="report-subtitle mb-4">请将当月所有的发票 Excel 汇总表格拖拽上传至下方，系统将自动分析金额、税率并生成待对账发票库。</p>
-          
-          <!-- Hidden File Input for Invoices -->
-          <input
-            type="file"
-            ref="invoiceInput"
-            style="display: none;"
+        <div class="step1-import-grid">
+        <NCard :bordered="false" class="report-card" :class="{ 'step1-card-expanded': unmatchedInvoices.length > 0 }">
+          <div class="step-import-head">
+            <h3 class="report-section-title"><span class="step-import-num">1</span>导入发票</h3>
+            <div class="step-import-meta">
+              <NTag size="small" :type="unmatchedInvoices.length > 0 ? 'info' : 'default'" :bordered="false">
+                {{ unmatchedInvoices.length > 0 ? `本月待核对 ${unmatchedInvoices.length} 张` : '还没导入' }}
+              </NTag>
+              <NButton v-if="unmatchedInvoices.length > 0" size="tiny" quaternary type="primary" @click="invoiceDropzone?.openPicker()">重新上传</NButton>
+              <NButton v-if="unmatchedInvoices.length > 0" text size="tiny" @click="showInvoiceDetails = !showInvoiceDetails">
+                {{ showInvoiceDetails ? '收起明细' : '展开明细' }}
+              </NButton>
+              <NButton text size="tiny" @click="router.push('/invoices')">去整页管理</NButton>
+            </div>
+          </div>
+          <p class="report-subtitle">税局导出的进项/销项发票 Excel，自动拆分税率并生成发票明细。</p>
+
+          <FileDropzone
+            v-show="unmatchedInvoices.length === 0"
+            ref="invoiceDropzone"
             accept=".xlsx,.xls,.csv"
-            @change="handleInvoiceUpload"
+            icon="ri-file-excel-2-line"
+            title="点击或拖拽发票 Excel 上传"
+            subtitle="上传后自动写入系统发票库"
+            :loading="loading"
+            @file="processInvoiceFile"
+            @error="onFileError"
           />
-          <button type="button" class="uploader-zone mb-4" aria-label="选择发票 Excel 文件上传" @click="triggerInvoiceSelect">
-            <i class="ri-file-excel-2-line upload-icon"></i>
-            <span class="upload-title">点击或选择发票 Excel 文件上传</span>
-            <span class="upload-subtitle">支持从税局导出的发票明细单，上传后将自动写入系统发票库</span>
-          </button>
   
           <div v-if="unmatchedInvoices.length > 0" class="report-table-wrapper" style="max-height: 320px; overflow-y: auto;">
             <table class="report-table">
@@ -2080,28 +2843,37 @@ function prevStep() {
                 <tr>
                   <th>日期</th>
                   <th>发票名称</th>
-                  <th style="text-align: center; width: 100px;">发票类型</th>
+                  <th>记账分类</th>
+                  <th v-if="showInvoiceDetails" style="text-align: center; width: 100px;">发票类型</th>
                   <th style="text-align: right;">发票金额</th>
-                  <th style="text-align: center; width: 130px;">入账模式</th>
-                  <th style="text-align: center; width: 100px;">状态</th>
-                  <th style="text-align: center; width: 80px;">操作</th>
+                  <th v-if="showInvoiceDetails" style="text-align: center; width: 130px;">入账模式</th>
+                  <th style="text-align: center; width: 120px;">状态</th>
+                  <th style="text-align: center; width: 190px;">下一步</th>
+                  <th v-if="showInvoiceDetails" style="text-align: center; width: 80px;">冲销 / 删除</th>
                 </tr>
               </thead>
               <tbody>
                 <tr v-for="inv in unmatchedInvoices" :key="inv.id" :style="inv.is_archive_only ? 'opacity: 0.7;' : ''">
                   <td>{{ inv.date }}</td>
                   <td>{{ inv.title }}</td>
-                  <td style="text-align: center;">
+                  <td>
+                    <span>{{ inv.category || '系统未分类' }}</span>
+                    <small
+                      v-if="findStatementCandidateForEntry(inv)"
+                      class="invoice-candidate-hint"
+                    >{{ statementCandidateText(findStatementCandidateForEntry(inv)) }}</small>
+                  </td>
+                  <td v-if="showInvoiceDetails" style="text-align: center;">
                     <NTag v-if="inv.direction === 'income'" size="small" type="info" :bordered="false">销项发票</NTag>
                     <NTag v-else-if="inv.direction === 'expense'" size="small" type="warning" :bordered="false">进项发票</NTag>
                     <NTag v-else size="small" type="default" :bordered="false">其他发票</NTag>
                   </td>
                   <td class="amount-cell" :class="amountClassForDirection(inv.direction, inv.amount)">
-                    {{ formatMoney(signedInvoiceAmount(inv)) }}
+                    {{ formatMoney(invoiceDisplayAmount(inv)) }}
                   </td>
-                  <td style="text-align: center;">
-                    <NCheckbox 
-                      :checked="!inv.is_archive_only" 
+                  <td v-if="showInvoiceDetails" style="text-align: center;">
+                    <NCheckbox
+                      :checked="!inv.is_archive_only"
                       @update:checked="toggleArchiveMode(inv.id, !$event)"
                     >
                       {{ inv.is_archive_only ? '仅归档' : '参与记账' }}
@@ -2109,11 +2881,25 @@ function prevStep() {
                   </td>
                   <td style="text-align: center;">
                     <NTag v-if="inv.is_archive_only" size="small" type="default" :bordered="false">仅归档不入账</NTag>
-                    <NTag v-else-if="inv.status === 'matched'" size="small" type="success" :bordered="false">已对账</NTag>
+                    <NTag v-else-if="isNonBankSettledEntry(inv)" size="small" type="info" :bordered="false">{{ formatDispositionTag(inv) }}</NTag>
+                    <NTag v-else-if="inv.status === 'matched'" size="small" type="success" :bordered="false">已和公户对上</NTag>
                     <NTag v-else-if="inv.status === 'pending_confirmation'" size="small" type="info" :bordered="false">待确认</NTag>
-                    <NTag v-else size="small" type="warning">待对账</NTag>
+                    <NTag v-else size="small" type="warning">还没和公户对上</NTag>
                   </td>
                   <td style="text-align: center;">
+                    <template v-if="!inv.is_archive_only && inv.status !== 'matched' && !isNonBankSettledEntry(inv)">
+                      <NButton size="tiny" type="primary" secondary @click="handleEntryPaid(inv)">已付款</NButton>
+                      <NButton size="tiny" text style="margin-left: 6px;" @click="markEntryUnpaid(inv)">未付款</NButton>
+                    </template>
+                    <NButton
+                      v-else-if="isNonBankSettledEntry(inv)"
+                      size="tiny"
+                      text
+                      @click="resetEntryDisposition(inv)"
+                    >重新确认</NButton>
+                    <span v-else class="invoice-no-action">—</span>
+                  </td>
+                  <td v-if="showInvoiceDetails" style="text-align: center;">
                     <NButton
                       v-if="inv.voucherStatus === 'posted'"
                       size="tiny"
@@ -2143,44 +2929,96 @@ function prevStep() {
         </NCard>
 
         <!-- WeChat Pay Bill Import Card -->
-        <NCard :bordered="false" class="report-card mb-4">
-          <h3 class="report-section-title"><i class="ri-wechat-pay-line"></i> 微信支付账单导入</h3>
-          <p class="report-subtitle mb-4">从微信商户后台导出当月账单 CSV，精确获取每笔手续费，无需估算。</p>
+        <!-- 展开条件两态都要算：wechatBillRows=上传预览中的行；wechatBillRecords=服务端已导入记录。
+             只判前者会导致「已导入 15 笔」的常驻状态依然收起，表格挤在 1/3 卡片里。 -->
+        <NCard :bordered="false" class="report-card" :class="{ 'step1-card-expanded': wechatBillRows.length > 0 || wechatBillRecords.length > 0 }">
+          <div class="step-import-head">
+            <h3 class="report-section-title"><span class="step-import-num">2</span>导入微信/平台账单</h3>
+            <div class="step-import-meta">
+              <NTag
+                size="small"
+                :type="(wechatBillRecordsSummary.total || wechatBillRows.length) > 0 ? 'success' : 'default'"
+                :bordered="false"
+              >
+                {{ (wechatBillRecordsSummary.total || wechatBillRows.length) > 0
+                  ? `已导入 ${wechatBillRecordsSummary.total || wechatBillRows.length} 笔`
+                  : '还没导入' }}
+              </NTag>
+            </div>
+          </div>
+          <p class="report-subtitle">微信商户后台导出的当月账单 CSV，自动识别每笔手续费。</p>
 
-          <input
-            type="file"
-            ref="wechatBillInput"
-            style="display: none;"
+          <FileDropzone
+            v-show="!wechatBillImported && wechatBillRows.length === 0"
+            ref="wechatDropzone"
             accept=".csv"
-            @change="handleWechatBillUpload"
+            icon="ri-wechat-pay-line"
+            icon-color="#07c160"
+            title="点击或拖拽微信账单 CSV 上传"
+            subtitle="从微信「账单中心」按月导出"
+            :loading="loading"
+            @file="processWechatBillFile"
+            @error="onFileError"
           />
 
-          <div v-if="!wechatBillImported && wechatBillRows.length === 0">
-            <button type="button" class="uploader-zone mb-4" aria-label="选择微信支付账单 CSV 文件上传" @click="triggerWechatBillSelect">
-              <i class="ri-wechat-pay-line upload-icon" style="color: #07c160;"></i>
-              <span class="upload-title">点击上传微信支付账单 CSV</span>
-              <span class="upload-subtitle">从微信商户后台「账单中心」导出，支持按月账单</span>
-            </button>
-          </div>
-
-          <!-- Preview table -->
+          <!-- Preview and Import Configuration -->
           <div v-if="wechatBillRows.length > 0">
-            <div class="report-table-wrapper" style="max-height: 300px; overflow-y: auto;">
+            <!-- Summary card for monthly statement -->
+            <div style="background: var(--card-background-hover); border-radius: 8px; padding: 14px 16px; margin-bottom: 12px; border: 1px solid var(--border-color);">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                <span style="font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 6px;">
+                  <i class="ri-file-chart-line" style="color: var(--primary-color);" /> 月度汇总核对（共 {{ wechatBillSummary.总交易单数 || wechatBillRows.length }} 笔）
+                </span>
+                <!-- 记账模式切换 -->
+                <div style="display: flex; align-items: center; gap: 12px;">
+                  <span style="font-size: 13px; color: var(--text-secondary);">记账方式：</span>
+                  <label style="font-size: 13px; cursor: pointer; display: flex; align-items: center; gap: 4px;">
+                    <input type="radio" value="summary" v-model="wechatImportMode" />
+                    <strong>月度汇总记账</strong>（推荐·生成1张凭证）
+                  </label>
+                  <label style="font-size: 13px; cursor: pointer; display: flex; align-items: center; gap: 4px; color: var(--text-secondary);">
+                    <input type="radio" value="detail" v-model="wechatImportMode" />
+                    逐笔明细记账（生成多张凭证）
+                  </label>
+                </div>
+              </div>
+              <div style="display: flex; gap: 24px; font-size: 13px; flex-wrap: wrap;">
+                <div>订单总额：<strong>{{ formatMoney(wechatBillSummary.订单总金额 || wechatBillRows.filter(r => r.status === 'SUCCESS').reduce((s, r) => s + r.order_amount, 0)) }}</strong></div>
+                <div v-if="Number(wechatBillSummary.退款总金额 || 0) > 0" style="color: var(--solo-expense);">
+                  退款总额：-{{ formatMoney(wechatBillSummary.退款总金额) }}
+                </div>
+                <div style="color: var(--solo-expense);">
+                  平台手续费：{{ formatMoney(wechatBillSummary.手续费总金额 || wechatBillRows.reduce((s, r) => s + r.fee, 0)) }}
+                </div>
+                <div>
+                  预计待结算净额：<strong style="color: var(--primary-color);">
+                    {{ formatMoney(
+                      Number(wechatBillSummary.订单总金额 || wechatBillSummary.应结订单总金额 || 0) -
+                      Number(wechatBillSummary.退款总金额 || 0) -
+                      Number(wechatBillSummary.手续费总金额 || 0)
+                    ) }}
+                  </strong>
+                </div>
+              </div>
+            </div>
+
+            <!-- Detail preview table (collapsible or scrollable) -->
+            <div class="report-table-wrapper" style="max-height: 260px; overflow-y: auto;">
               <table class="report-table">
                 <thead>
                   <tr>
-                    <th>日期</th>
+                    <th class="date-cell">日期</th>
                     <th>商品名称</th>
                     <th style="text-align: center; width: 80px;">状态</th>
-                    <th style="text-align: right;">订单金额</th>
-                    <th style="text-align: right;">手续费</th>
-                    <th style="text-align: right;">到账净额</th>
+                    <th class="amount-cell" style="text-align: right;">订单金额</th>
+                    <th class="amount-cell" style="text-align: right;">手续费</th>
+                    <th class="amount-cell" style="text-align: right;">到账净额</th>
                     <th style="text-align: center; width: 60px;">删除</th>
                   </tr>
                 </thead>
                 <tbody>
                   <tr v-for="(row, idx) in wechatBillRows" :key="idx" :style="row.is_duplicate ? 'opacity: 0.55; background-color: var(--card-background-hover);' : ''">
-                    <td>{{ row.date }}</td>
+                    <td class="date-cell">{{ row.date }}</td>
                     <td>
                       {{ row.product_name }}
                       <NTag v-if="row.is_duplicate" size="tiny" type="error" :bordered="false" style="margin-left: 6px;">系统已存在</NTag>
@@ -2189,11 +3027,11 @@ function prevStep() {
                       <NTag v-if="row.status === 'SUCCESS'" size="small" type="success" :bordered="false">收款</NTag>
                       <NTag v-else size="small" type="warning" :bordered="false">退款</NTag>
                     </td>
-                    <td style="text-align: right;" :style="row.status === 'REFUND' ? 'color:var(--solo-expense)' : ''">
+                    <td class="amount-cell" style="text-align: right;" :style="row.status === 'REFUND' ? 'color:var(--solo-expense)' : ''">
                       {{ row.status === 'REFUND' ? '-' : '' }}{{ formatMoney(row.status === 'REFUND' ? row.refund_amount : row.order_amount) }}
                     </td>
-                    <td style="text-align: right; color: var(--solo-expense);">{{ formatMoney(row.fee) }}</td>
-                    <td style="text-align: right;">{{ formatMoney(row.settled_amount) }}</td>
+                    <td class="amount-cell" style="text-align: right; color: var(--solo-expense);">{{ formatMoney(row.fee) }}</td>
+                    <td class="amount-cell" style="text-align: right;">{{ formatMoney(row.settled_amount) }}</td>
                     <td style="text-align: center;">
                       <NButton size="tiny" type="error" ghost @click="removeWechatRow(idx)">删除</NButton>
                     </td>
@@ -2203,23 +3041,26 @@ function prevStep() {
             </div>
             <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 12px;">
               <span style="font-size: 13px; color: var(--text-secondary);">
-                <template v-if="wechatBillRows.some(r => r.is_duplicate)">
-                  将导入 {{ wechatBillRows.filter(r => !r.is_duplicate).length }} 条新记录 · 自动过滤 {{ wechatBillRows.filter(r => r.is_duplicate).length }} 条已存在记录
+                <template v-if="wechatImportMode === 'summary'">
+                  当前模式：将按月度对账结果生成 <strong>1 张综合记账凭证</strong>（自动轧平收入、退款与手续费）
+                </template>
+                <template v-else-if="wechatBillRows.some(r => r.is_duplicate)">
+                  逐笔明细模式：将导入 {{ wechatBillRows.filter(r => !r.is_duplicate).length }} 条新记录 · 自动过滤 {{ wechatBillRows.filter(r => r.is_duplicate).length }} 条已存在记录
                 </template>
                 <template v-else>
-                  共 {{ wechatBillRows.length }} 条 · 合计手续费 {{ formatMoney(wechatBillRows.reduce((s, r) => s + r.fee, 0)) }}
+                  逐笔明细模式：共 {{ wechatBillRows.length }} 条 · 合计手续费 {{ formatMoney(wechatBillRows.reduce((s, r) => s + r.fee, 0)) }}
                 </template>
               </span>
               <div style="display: flex; gap: 8px;">
-                <NButton size="small" ghost @click="triggerWechatBillSelect">重新上传</NButton>
+                <NButton size="small" ghost @click="wechatDropzone?.openPicker()">重新上传</NButton>
                 <NButton
                   size="small"
                   type="primary"
                   @click="confirmWechatBillImport"
                   :loading="wechatBillImporting"
-                  :disabled="wechatBillImporting || wechatBillRows.filter(r => !r.is_duplicate).length === 0"
+                  :disabled="wechatBillImporting || (wechatImportMode === 'detail' && wechatBillRows.filter(r => !r.is_duplicate).length === 0)"
                 >
-                  确认导入
+                  {{ wechatImportMode === 'summary' ? '生成月度汇总凭证' : '确认逐笔导入' }}
                 </NButton>
               </div>
             </div>
@@ -2227,10 +3068,33 @@ function prevStep() {
 
           <!-- Imported success state -->
           <div v-if="wechatBillImported" style="text-align: center; padding: 24px 0;">
-            <i class="ri-checkbox-circle-fill" style="font-size: 32px; color: #07c160;"></i>
-            <p style="margin-top: 8px; color: var(--text-secondary);">微信账单已导入，收款与手续费已自动分录</p>
-            <NButton size="small" ghost style="margin-top: 8px;" @click="() => { wechatBillImported = false; triggerWechatBillSelect() }">重新导入</NButton>
+            <i class="ri-checkbox-circle-fill" :style="{ fontSize: '32px', color: wechatBillFailures.length > 0 ? '#a05c10' : '#07c160' }"></i>
+            <p style="margin-top: 8px; color: var(--text-secondary);">
+              {{ wechatBillFailures.length > 0 ? `导入完成，${wechatBillFailures.reduce((n, f) => n + f.count, 0)} 条交易未能入账（原因见下）` : '微信账单已导入，收款与手续费已自动分录' }}
+            </p>
+            <NButton size="small" ghost style="margin-top: 8px;" @click="() => { wechatBillImported = false; wechatBillFailures = []; wechatDropzone?.openPicker() }">重新导入</NButton>
           </div>
+
+          <!-- Import failure details: aggregated by cause; start-date issues link to the company editor -->
+          <NAlert
+            v-if="wechatBillFailures.length > 0"
+            type="warning"
+            title="部分或全部交易未能入账"
+            style="margin-top: 12px;"
+          >
+            <ul style="margin: 0; padding-left: 18px;">
+              <li v-for="(f, i) in wechatBillFailures" :key="i" style="font-size: 13px; line-height: 1.8;">
+                {{ f.message }}
+                <NTag v-if="f.count > 1" size="small" :bordered="false" style="margin-left: 6px;">× {{ f.count }}</NTag>
+              </li>
+            </ul>
+            <div v-if="wechatBillFailures.some(f => f.isStartDateIssue)" style="margin-top: 8px;">
+              <NButton size="small" type="primary" @click="gotoAdjustStartDate">
+                <i class="ri-calendar-line" />&nbsp;去调整启用日期
+              </NButton>
+              <span style="margin-left: 8px; font-size: 12px; color: var(--text-tertiary);">把启用日期改到账单最早日期之前，再回来重新导入</span>
+            </div>
+          </NAlert>
 
           <!-- Previously imported records for the target month -->
           <div v-if="wechatBillRecords.length > 0" style="margin-top: 16px;">
@@ -2246,55 +3110,55 @@ function prevStep() {
               <table class="report-table">
                 <thead>
                   <tr>
-                    <th>日期</th>
+                    <th class="date-cell">日期</th>
                     <th>商品名称</th>
                     <th style="text-align: center; width: 80px;">状态</th>
-                    <th style="text-align: right;">订单金额</th>
-                    <th style="text-align: right;">手续费</th>
-                    <th style="text-align: right;">到账净额</th>
+                    <th class="amount-cell" style="text-align: right;">订单金额</th>
+                    <th class="amount-cell" style="text-align: right;">手续费</th>
+                    <th class="amount-cell" style="text-align: right;">到账净额</th>
                   </tr>
                 </thead>
                 <tbody>
                   <tr v-for="rec in wechatBillRecords" :key="rec.orderNo">
-                    <td>{{ rec.date }}</td>
+                    <td class="date-cell">{{ rec.date }}</td>
                     <td>{{ rec.title }}</td>
                     <td style="text-align: center;">
-                      <NTag :type="rec.status === 'SUCCESS' ? 'success' : 'warning'" size="small" :bordered="false">
-                        {{ rec.status === 'SUCCESS' ? '收款' : '退款' }}
+                      <NTag :type="rec.status === 'SUCCESS' ? 'success' : rec.status === 'SUMMARY' ? 'info' : 'warning'" size="small" :bordered="false">
+                        {{ rec.status === 'SUCCESS' ? '收款' : rec.status === 'SUMMARY' ? '月度汇总' : '退款' }}
                       </NTag>
                     </td>
-                    <td style="text-align: right;" :style="rec.orderAmount < 0 ? 'color: var(--solo-expense)' : ''">{{ formatMoney(rec.orderAmount) }}</td>
-                    <td style="text-align: right;" :style="rec.fee < 0 ? 'color: var(--solo-income)' : 'color: var(--solo-expense)'">{{ formatMoney(rec.fee) }}</td>
-                    <td style="text-align: right;" :style="rec.settledAmount < 0 ? 'color: var(--solo-expense)' : ''">{{ formatMoney(rec.settledAmount) }}</td>
+                    <td class="amount-cell" style="text-align: right;" :style="rec.orderAmount < 0 ? 'color: var(--solo-expense)' : ''">{{ formatMoney(rec.orderAmount) }}</td>
+                    <td class="amount-cell" style="text-align: right;" :style="rec.fee < 0 ? 'color: var(--solo-income)' : 'color: var(--solo-expense)'">{{ formatMoney(rec.fee) }}</td>
+                    <td class="amount-cell" style="text-align: right;" :style="rec.settledAmount < 0 ? 'color: var(--solo-expense)' : ''">{{ formatMoney(rec.settledAmount) }}</td>
                   </tr>
                 </tbody>
               </table>
             </div>
           </div>
         </NCard>
-      </NSpin>
-    </div>
 
-    <!-- Step 2 Layout: Bank Statement Upload -->
-    <div v-if="currentStep === 2">
-      <NSpin :show="loading">
-        <NCard :bordered="false" class="report-card mb-4">
-          <h3 class="report-section-title"><i class="ri-bank-card-line"></i> 第二步：导入银行交易流水单</h3>
-          <p class="report-subtitle mb-4">请导入本月企业银行网银导出的交易流水对账单，用于智能对齐发票及资金账目流向。</p>
-  
-          <!-- Hidden File Input for Bank Statements -->
-          <input
-            type="file"
-            ref="bankInput"
-            style="display: none;"
+        <!-- 网银流水 -->
+        <NCard :bordered="false" class="report-card" :class="{ 'step1-card-expanded': bankUploadResult || unmatchedStatements.length > 0 }">
+          <div class="step-import-head">
+            <h3 class="report-section-title"><span class="step-import-num">3</span>导入银行流水</h3>
+            <div class="step-import-meta">
+              <NTag size="small" :type="rawStatements.length > 0 ? 'success' : 'default'" :bordered="false">
+                {{ rawStatements.length > 0 ? `已导入 ${rawStatements.length} 笔` : '还没导入' }}
+              </NTag>
+              <NButton text size="tiny" @click="router.push('/bank')">去整页管理</NButton>
+            </div>
+          </div>
+          <p class="report-subtitle">网银导出的本月流水单，自动认领收支并匹配已有记账。</p>
+
+          <FileDropzone
             accept=".xlsx,.xls,.csv"
-            @change="handleBankUpload"
+            icon="ri-download-cloud-2-line"
+            title="点击或拖拽网银流水上传"
+            subtitle="支持工行、招行、建行等 Excel/CSV"
+            :loading="loading"
+            @file="processBankFile"
+            @error="onFileError"
           />
-          <button type="button" class="uploader-zone mb-4" aria-label="选择网银流水文件上传" @click="triggerBankSelect">
-            <i class="ri-download-cloud-2-line upload-icon"></i>
-            <span class="upload-title">点击或选择网银流水文件上传</span>
-            <span class="upload-subtitle">支持工行、招行、建行等各商业银行导出的 Excel/CSV 流水，上传后将自动加载</span>
-          </button>
   
           <!-- Upload Feedback Panel -->
           <div v-if="bankUploadResult" class="mb-4" style="background: rgba(99, 102, 241, 0.02); border: 1px solid var(--solo-border); border-radius: var(--solo-radius); padding: 16px;">
@@ -2369,515 +3233,692 @@ function prevStep() {
             </div>
           </div>
         </NCard>
+        </div>
       </NSpin>
     </div>
 
-    <!-- Step 3 Layout: Salary payroll verification -->
-    <div v-if="currentStep === 3">
-      <NSpin :show="loading">
-        <NCard :bordered="false" class="report-card mb-4">
-          <h3 class="report-section-title"><i class="ri-money-cny-box-line"></i> 第三步：确认本月员工薪酬与社保发放</h3>
-          <p class="report-subtitle mb-4">根据本月花名册基数生成的员工应发薪资明细，请确认无误后计提记账并核销发放。</p>
+    <!-- Step 2 Layout: 流水认领与薪酬 (员工薪酬核对 · 智能流水认领与配平) -->
+    <div v-if="currentStep === 2">
+      <!-- 2.1 员工薪酬核对卡片 (紧凑折叠式，适合不同规模企业) -->
+      <NCard :bordered="false" class="report-card mb-4" style="padding: 16px 20px;">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <i class="ri-user-star-line" style="font-size: 20px; color: var(--solo-primary);"></i>
+            <div>
+              <span style="font-weight: 600; font-size: 15px; color: var(--solo-text-primary);">员工薪酬与社保发放</span>
+              <span v-if="employees.length === 0" style="font-size: 12px; color: var(--solo-text-muted); margin-left: 10px;">
+                💡 本月无在职员工薪酬数据（轻资产/一人企业模式无需计提薪酬）
+              </span>
+              <span v-else style="font-size: 12px; color: var(--solo-text-muted); margin-left: 10px;">
+                应发 {{ employees.length }} 人 · 实发薪酬 {{ formatMoney(totalNetSalary) }} · 企业人工总成本 {{ formatMoney(totalCompanyCost) }}
+              </span>
+            </div>
+          </div>
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <NButton size="tiny" secondary @click="router.push({ path: '/mine/salary', query: targetMonth ? { month: targetMonth } : {} })">
+              <template #icon><i class="ri-edit-line" /></template>
+              去修改
+            </NButton>
+            <template v-if="employees.length > 0">
+              <NButton size="tiny" secondary @click="showSalaryTable = !showSalaryTable">
+                {{ showSalaryTable ? '收起明细' : '查看明细' }}
+                <template #icon><i :class="showSalaryTable ? 'ri-arrow-up-s-line' : 'ri-arrow-down-s-line'" /></template>
+              </NButton>
+              <NTag v-if="payrollPaid" size="small" type="success" :bordered="false">✓ 薪酬已发放</NTag>
+              <NTag v-else-if="payrollAccrued" size="small" type="info" :bordered="false">已计提待发放</NTag>
+              <NTag v-else size="small" type="warning" :bordered="false">待计提记账</NTag>
+            </template>
+          </div>
+        </div>
 
-          <div v-if="employees.length === 0" style="padding: 40px; text-align: center; color: var(--solo-text-secondary); background: rgba(0,0,0,0.01); border-radius: 8px;">
-            ⚠️ 本月无在职员工薪酬数据。请先在个人中心 -「薪酬社保」模块导入/添加在职员工名册。
+        <template v-if="employees.length > 0">
+          <NGrid :cols="3" :x-gap="16" class="mt-3 mb-3">
+            <NGridItem>
+              <div class="report-card" style="padding: 12px; background: rgba(99, 102, 241, 0.02); text-align: center;">
+                <div style="font-size: 12px; color: var(--solo-text-muted);">本月应发人数</div>
+                <div style="font-size: 18px; font-weight: bold; color: var(--solo-text-primary); margin-top: 2px;">{{ employees.length }} 人</div>
+              </div>
+            </NGridItem>
+            <NGridItem>
+              <div class="report-card" style="padding: 12px; background: rgba(99, 102, 241, 0.02); text-align: center;">
+                <div style="font-size: 12px; color: var(--solo-text-muted);">本月实发薪酬</div>
+                <div style="font-size: 18px; font-weight: bold; color: var(--solo-income); margin-top: 2px;">{{ formatMoney(totalNetSalary) }}</div>
+              </div>
+            </NGridItem>
+            <NGridItem>
+              <div class="report-card" style="padding: 12px; background: rgba(99, 102, 241, 0.02); text-align: center;">
+                <div style="font-size: 12px; color: var(--solo-text-muted);">企业总人工成本</div>
+                <div style="font-size: 18px; font-weight: bold; color: var(--solo-expense); margin-top: 2px;">{{ formatMoney(totalCompanyCost) }}</div>
+              </div>
+            </NGridItem>
+          </NGrid>
+
+          <!-- 展开后的员工薪酬明细 -->
+          <div v-show="showSalaryTable" class="report-table-wrapper mb-3" style="max-height: 260px; overflow-y: auto;">
+            <table class="report-table">
+              <thead>
+                <tr>
+                  <th>姓名</th>
+                  <th>部门</th>
+                  <th>基本工资</th>
+                  <th>绩效/奖金</th>
+                  <th>五险一金单位缴存</th>
+                  <th style="text-align: right;">实发工资</th>
+                  <th style="text-align: right;">企业总成本</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="emp in employees" :key="emp.name">
+                  <td>{{ emp.name }}</td>
+                  <td>{{ emp.dept }}</td>
+                  <td>{{ formatMoney(emp.base) }}</td>
+                  <td>{{ formatMoney(emp.bonus) }}</td>
+                  <td>{{ formatMoney(emp.social) }}</td>
+                  <td class="amount-cell income">{{ formatMoney(emp.net) }}</td>
+                  <td class="amount-cell expense">{{ formatMoney(emp.cost) }}</td>
+                </tr>
+              </tbody>
+            </table>
           </div>
 
-          <template v-else>
-            <NGrid :cols="3" :x-gap="16" class="mb-4">
-              <NGridItem>
-                <div class="report-card" style="padding: 16px; background: rgba(99, 102, 241, 0.02); text-align: center;">
-                  <div style="font-size: 12px; color: var(--solo-text-muted);">本月应发人数</div>
-                  <div style="font-size: 20px; font-weight: bold; color: var(--solo-text-primary); margin-top: 4px;">{{ employees.length }} 人</div>
-                </div>
-              </NGridItem>
-              <NGridItem>
-                <div class="report-card" style="padding: 16px; background: rgba(99, 102, 241, 0.02); text-align: center;">
-                  <div style="font-size: 12px; color: var(--solo-text-muted);">本月应发薪酬</div>
-                  <div style="font-size: 20px; font-weight: bold; color: var(--solo-income); margin-top: 4px;">{{ formatMoney(totalNetSalary) }}</div>
-                </div>
-              </NGridItem>
-              <NGridItem>
-                <div class="report-card" style="padding: 16px; background: rgba(99, 102, 241, 0.02); text-align: center;">
-                  <div style="font-size: 12px; color: var(--solo-text-muted);">企业总人工成本</div>
-                  <div style="font-size: 20px; font-weight: bold; color: var(--solo-expense); margin-top: 4px;">{{ formatMoney(totalCompanyCost) }}</div>
-                </div>
-              </NGridItem>
-            </NGrid>
-
-            <div class="report-table-wrapper mb-4">
-              <table class="report-table">
-                <thead>
-                  <tr>
-                    <th>姓名</th>
-                    <th>部门</th>
-                    <th>基本工资</th>
-                    <th>绩效/奖金</th>
-                    <th>五险一金单位缴存</th>
-                    <th style="text-align: right;">实发工资</th>
-                    <th style="text-align: right;">企业总成本</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr v-for="emp in employees" :key="emp.name">
-                    <td>{{ emp.name }}</td>
-                    <td>{{ emp.dept }}</td>
-                    <td>{{ formatMoney(emp.base) }}</td>
-                    <td>{{ formatMoney(emp.bonus) }}</td>
-                    <td>{{ formatMoney(emp.social) }}</td>
-                    <td class="amount-cell income">{{ formatMoney(emp.net) }}</td>
-                    <td class="amount-cell expense">{{ formatMoney(emp.cost) }}</td>
-                  </tr>
-                </tbody>
-              </table>
+          <NAlert
+            v-if="payrollPaymentSuggestions.length"
+            type="info"
+            :show-icon="false"
+            style="margin-bottom: 12px;"
+          >
+            <div style="font-weight: 600; margin-bottom: 6px;">银行流水发现待发工资</div>
+            <div
+              v-for="item in payrollPaymentSuggestions"
+              :key="item.statement.id"
+              style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 6px;"
+            >
+              <span>{{ item.month }} 工资 · 实发 ¥{{ item.netSalary }}</span>
+              <span style="color: var(--solo-text-muted); font-size: 12px;">{{ item.statement.date }} {{ item.statement.description }}</span>
+              <NTag size="tiny" :type="item.confidence === 'high' ? 'success' : 'warning'" :bordered="false">
+                {{ item.confidence === 'high' ? '高置信' : '请确认' }}
+              </NTag>
+              <NButton
+                size="tiny"
+                type="primary"
+                :loading="applyingSalaryStatementId === item.statement.id"
+                @click="handleApplySalaryPayment(item)"
+              >
+                确认发放并核销
+              </NButton>
             </div>
+          </NAlert>
 
-            <NSpace justify="end">
-              <NButton type="warning" :disabled="payrollAccrued" @click="handleAccruePayroll">
-                {{ payrollAccrued ? '✓ 已经计提记账' : '一键计提记账' }}
-              </NButton>
-              <NButton type="primary" :disabled="!payrollAccrued || payrollPaid" @click="handlePayPayroll">
-                {{ payrollPaid ? '✓ 已经确认发放' : '确认发放记账' }}
-              </NButton>
-            </NSpace>
-          </template>
-        </NCard>
-      </NSpin>
-    </div>
+          <NAlert
+            v-if="payrollPendingReview"
+            type="warning"
+            :show-icon="false"
+            style="margin-bottom: 12px;"
+          >
+            工资计提凭证正在等待审核（复核模式下需他人过账）。审核通过后此处会自动更新为「已计提」，届时才能继续发放与缴纳。
+          </NAlert>
 
-    <div v-if="currentStep === 4">
+          <NSpace justify="end">
+            <NButton size="small" type="warning" :disabled="payrollAccrued || payrollPendingReview" @click="handleAccruePayroll">
+              {{ payrollAccrued ? '✓ 已经计提记账' : (payrollPendingReview ? '计提凭证待审核' : '一键计提记账') }}
+            </NButton>
+            <NButton size="small" type="primary" :disabled="!payrollAccrued || payrollPaid || payrollPendingReview" @click="handlePayPayroll">
+              {{ payrollPaid ? '✓ 已经确认发放' : '确认发放记账' }}
+            </NButton>
+            <NButton
+              v-if="payrollHasSocial && !payrollPendingReview"
+              size="small"
+              type="info"
+              :disabled="!payrollAccrued || payrollSsPaid"
+              @click="handlePaySocial"
+            >
+              {{ payrollSsPaid ? '✓ 社保已缴纳' : '确认缴纳社保' }}
+            </NButton>
+            <NButton
+              v-if="payrollHasSocial && !payrollPendingReview"
+              size="small"
+              type="info"
+              :disabled="!payrollAccrued || payrollHfPaid"
+              @click="handlePayHousingFund"
+            >
+              {{ payrollHfPaid ? '✓ 公积金已缴纳' : '确认缴纳公积金' }}
+            </NButton>
+            <NButton
+              v-if="payrollHasTax && !payrollPendingReview"
+              size="small"
+              type="info"
+              :disabled="!payrollAccrued || payrollTaxPaid"
+              @click="handlePayTax"
+            >
+              {{ payrollTaxPaid ? '✓ 个税已缴纳' : '确认缴纳个税' }}
+            </NButton>
+          </NSpace>
+        </template>
+      </NCard>
+
+      <!-- 2.2 智能流水认领与配平工作台 -->
       <NCard :bordered="false" class="report-card mb-4" style="padding: 16px 20px;">
         <div class="page-header" style="margin-bottom: 12px !important;">
           <div class="header-left">
-            <h3 class="report-section-title" style="margin: 0;"><i class="ri-sparkling-fill" style="color: var(--solo-primary);"></i> 第四步：AI 辅助流水对账与分类</h3>
-            <p class="report-subtitle">左右两栏分别展示未匹配的条目与银行流水。AI 只生成候选建议，确认后才会完成对账或记账。</p>
+            <h3 class="report-section-title" style="margin: 0;"><i class="ri-bank-card-line" style="color: var(--solo-primary);"></i> 第二步：银行流水智能对账与配平</h3>
+            <p class="report-subtitle">系统已自动比对银行对账单与记账单据，请复核推荐的入账科目并确认。</p>
           </div>
           <div class="header-right">
-            <NTag size="small" type="warning" :bordered="false">AI 建议需逐条确认</NTag>
+            <NTag size="small" type="info" :bordered="false">流水对账核销</NTag>
           </div>
         </div>
 
-        <!-- Reconciliation Completeness Summary Bar -->
-        <div class="recon-summary-bar" style="margin-bottom: 16px; padding: 14px 16px; border-radius: 10px; background: rgba(99, 102, 241, 0.04); border: 1px solid rgba(99,102,241,0.12); display: flex; gap: 20px; align-items: center; flex-wrap: wrap;">
-          <div style="display: flex; align-items: center; gap: 12px; flex: 1; min-width: 220px;">
-            <div style="position: relative; width: 48px; height: 48px;">
-              <svg width="48" height="48" viewBox="0 0 48 48" style="transform: rotate(-90deg);">
-                <circle cx="24" cy="24" r="19" fill="none" stroke="rgba(99,102,241,0.12)" stroke-width="6"/>
-                <circle cx="24" cy="24" r="19" fill="none" stroke="var(--solo-primary)" stroke-width="6"
-                  :stroke-dasharray="`${reconciliationStats.rate * 1.194} 119.4`"
-                  stroke-linecap="round" style="transition: stroke-dasharray 0.6s ease;"/>
-              </svg>
-              <div style="position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; color: var(--solo-primary);">{{ reconciliationStats.rate }}%</div>
+        <!-- Progress and Hero Action Bar -->
+        <div class="feed-summary-hero">
+          <div class="feed-hero-left">
+            <div class="feed-hero-stat-circle">
+              <div class="stat-number">{{ reconciliationStats.total ? `${reconciliationStats.rate}%` : '—' }}</div>
+              <div class="stat-label">对账完成率</div>
             </div>
-            <div>
-              <div style="font-size: 13px; font-weight: 600; color: var(--solo-text-primary);">对账完整率</div>
-              <div style="font-size: 12px; color: var(--solo-text-muted); margin-top: 2px;">{{ reconciliationStats.matched }}/{{ reconciliationStats.total }} 条流水已匹配</div>
+            <div class="feed-hero-metrics">
+              <div class="metric-pill">本月共 <strong>{{ reconciliationStats.total }}</strong> 笔流水</div>
+              <div class="metric-pill success" v-if="highConfidenceStatements.length > 0">
+                <i class="ri-flashlight-line"></i> 系统已自动配平 <strong>{{ highConfidenceStatements.length }}</strong> 笔
+              </div>
+              <div class="metric-pill warning" v-if="unmatchedStatements.length - highConfidenceStatements.length > 0">
+                待确认用途 <strong>{{ unmatchedStatements.length - highConfidenceStatements.length }}</strong> 笔
+              </div>
+              <div class="metric-pill" v-if="unmatchedStatements.length === 0 && reconciliationStats.total > 0">
+                <i class="ri-check-line" style="color: var(--solo-income);"></i> 本月流水已全部完成
+              </div>
             </div>
           </div>
-          <div style="display: flex; gap: 16px; flex-wrap: wrap;">
-            <div style="text-align: center; padding: 6px 14px; background: rgba(16,185,129,0.07); border-radius: 8px; border: 1px solid rgba(16,185,129,0.15);">
-              <div style="font-size: 18px; font-weight: 700; color: var(--solo-income);">{{ reconciliationStats.unmatchedIncome.length }}</div>
-              <div style="font-size: 11px; color: var(--solo-text-muted);">未匹配收款</div>
-            </div>
-            <div style="text-align: center; padding: 6px 14px; background: rgba(239,68,68,0.07); border-radius: 8px; border: 1px solid rgba(239,68,68,0.15);">
-              <div style="font-size: 18px; font-weight: 700; color: var(--solo-expense);">{{ reconciliationStats.unmatchedExpense.length }}</div>
-              <div style="font-size: 11px; color: var(--solo-text-muted);">未匹配付款</div>
-            </div>
-            <div style="text-align: center; padding: 6px 14px; background: rgba(99,102,241,0.07); border-radius: 8px; border: 1px solid rgba(99,102,241,0.15);">
-              <div style="font-size: 18px; font-weight: 700; color: var(--solo-primary);">{{ pendingMatchedPairCount }}</div>
-              <div style="font-size: 11px; color: var(--solo-text-muted);">待确认配对</div>
+          <div class="feed-hero-right">
+            <NButton
+              v-if="batchTargetStatements.length > 0"
+              type="primary"
+              size="medium"
+              class="hero-action-btn"
+              :loading="batchConfirming"
+              @click="handleBatchConfirmRules"
+            >
+              <template #icon><i class="ri-check-double-line" /></template>
+              批量确认已识别流水 ({{ batchTargetStatements.length }} 笔)
+            </NButton>
+            <div v-else-if="unmatchedStatements.length === 0 && reconciliationStats.total > 0" style="display: flex; align-items: center; gap: 6px; color: var(--solo-income); font-weight: 600;">
+              <i class="ri-checkbox-circle-fill" style="font-size: 20px;"></i> 全部流水已认领平衡
             </div>
           </div>
         </div>
 
-
-        <div class="recon-health-panel" :class="{ danger: hasBlockingReconciliationRisk }">
-          <div class="recon-health-lead">
-            <i :class="hasBlockingReconciliationRisk ? 'ri-error-warning-line' : reconciliationWarningCount > 0 ? 'ri-alert-line' : 'ri-shield-check-line'"></i>
-            <div>
-              <div class="recon-health-title">
-                {{ hasBlockingReconciliationRisk ? '发现高风险对账问题' : reconciliationWarningCount > 0 ? '存在待复核事项' : '对账健康检查通过' }}
-              </div>
-              <div class="recon-health-desc">
-                高风险 {{ reconciliationHealthSummary.highRiskCount }} 项，警告 {{ reconciliationWarningCount }} 项
-              </div>
+        <!-- 老板往来小账本汇总：让老板一眼看懂确认后的应收、应付、可免税报销垫付款 -->
+        <div v-if="bossLedgerSummary.hasAny" class="boss-ledger-summary-bar" style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 18px;">
+          <div style="background: var(--solo-card-bg, #fff); border: 1px solid var(--solo-border, #e5e7eb); border-radius: 10px; padding: 12px 16px;">
+            <div style="font-size: 12px; color: var(--solo-text-muted); display: flex; align-items: center; gap: 4px;">
+              <i class="ri-hand-coin-line" style="color: var(--solo-income);"></i> 客户还欠公司（应收账款）
+            </div>
+            <div style="font-size: 18px; font-weight: 700; color: var(--solo-text-primary); margin-top: 4px;">
+              {{ formatMoney(bossLedgerSummary.customerOwes) }}
+            </div>
+            <div style="font-size: 11px; color: var(--solo-text-muted); margin-top: 2px;">
+              {{ bossLedgerSummary.customerCount > 0 ? `${bossLedgerSummary.customerCount} 张销项票待客户打款，回款时自动核销` : '本月无客户欠款' }}
             </div>
           </div>
-          <div class="recon-health-tags">
-            <NTag
-              v-for="item in reconciliationRiskItems"
-              :key="item.key"
-              size="small"
-              :type="item.type === 'error' ? 'error' : 'warning'"
-              :bordered="false"
-            >
-              {{ item.label }} {{ item.count }}
-            </NTag>
-            <NTag v-if="reconciliationHealthLoading" size="small" type="info" :bordered="false">检查中</NTag>
-            <NTag v-if="!reconciliationHealthLoading && reconciliationRiskItems.length === 0" size="small" type="success" :bordered="false">可进入结账</NTag>
+
+          <div style="background: var(--solo-card-bg, #fff); border: 1px solid var(--solo-border, #e5e7eb); border-radius: 10px; padding: 12px 16px;">
+            <div style="font-size: 12px; color: var(--solo-text-muted); display: flex; align-items: center; gap: 4px;">
+              <i class="ri-bill-line" style="color: #d97706;"></i> 公司还欠供应商（应付挂账）
+            </div>
+            <div style="font-size: 18px; font-weight: 700; color: var(--solo-text-primary); margin-top: 4px;">
+              {{ formatMoney(bossLedgerSummary.companyOwesSupplier) }}
+            </div>
+            <div style="font-size: 11px; color: var(--solo-text-muted); margin-top: 2px;">
+              {{ bossLedgerSummary.supplierCount > 0 ? `${bossLedgerSummary.supplierCount} 张进项票未付款，后续公户打款时核销` : '本月无待付供应商款' }}
+            </div>
+          </div>
+
+          <div style="background: var(--solo-card-bg, #fff); border: 1px solid var(--solo-border, #e5e7eb); border-radius: 10px; padding: 12px 16px;">
+            <div style="font-size: 12px; color: var(--solo-text-muted); display: flex; align-items: center; gap: 4px;">
+              <i class="ri-user-heart-line" style="color: var(--solo-primary);"></i> 公司欠老板/员工（可免税报销提取）
+            </div>
+            <div style="font-size: 18px; font-weight: 700; color: var(--solo-primary); margin-top: 4px;">
+              {{ formatMoney(bossLedgerSummary.companyOwesBossAndEmp) }}
+            </div>
+            <div style="font-size: 11px; color: var(--solo-text-muted); margin-top: 2px;">
+              <template v-if="bossLedgerSummary.companyOwesBossAndEmp > 0">
+                老板垫付 {{ formatMoney(bossLedgerSummary.bossOnly) }} · 员工垫付 {{ formatMoney(bossLedgerSummary.empOnly) }}（公户有钱可随时转回私卡）
+              </template>
+              <template v-else>本月无个人垫付报销款</template>
+            </div>
           </div>
         </div>
-        <!-- Matching canvas -->
-        <div class="canvas-layout">
-          <!-- Left: Unmatched Entries -->
-          <div class="canvas-column">
-            <div class="column-header">
-              <i class="ri-file-text-line"></i>
-              <span>本月待处理账目与发票 ({{ unmatchedEntries.length }})</span>
-              <span class="column-header-hint">可多选</span>
-            </div>
-            <div v-if="unmatchedEntries.length === 0" style="padding: 28px 0; text-align: center; color: var(--solo-text-muted); font-size: 12px;">
-              本月条目已对账完成
-            </div>
-            <!-- 待核销账目：与银行流水核销（钱对钱） -->
-            <div v-if="unmatchedLedgerEntries.length > 0" class="entry-group-title">
-              待核销账目（与流水核对）<span>({{ unmatchedLedgerEntries.length }})</span>
-            </div>
-            <div
-              v-for="inv in unmatchedLedgerEntries"
-              :key="inv.id"
-              class="canvas-card"
-              :class="{ selected: selectedInvoiceIds.includes(inv.id), 'candidate-match': isCandidateEntry(inv) }"
-              role="checkbox"
-              :aria-checked="selectedInvoiceIds.includes(inv.id)"
-              tabindex="0"
-              @click="selectInvoiceCard(inv.id)"
-              @keydown.enter.prevent="selectInvoiceCard(inv.id)"
-              @keydown.space.prevent="selectInvoiceCard(inv.id)"
-            >
-              <div class="card-header-row">
-                <span class="card-selection-indicator" :class="{ active: selectedInvoiceIds.includes(inv.id) }">
-                  <i v-if="selectedInvoiceIds.includes(inv.id)" class="ri-check-line"></i>
-                </span>
-                <span class="card-title-text">{{ inv.title }}</span>
-                <NTag v-if="isCandidateEntry(inv)" size="tiny" type="success" :bordered="false" class="match-candidate-tag">金额吻合</NTag>
-                <span class="card-amount" :class="amountClassForDirection(inv.direction, inv.amount)">
-                  {{ formatMoney(signedInvoiceAmount(inv)) }}
-                </span>
-              </div>
-              <div class="card-meta">
-                <span>{{ inv.date }}</span>
-                <NTag v-if="inv.source === 'invoice_import'" size="tiny" type="info" :bordered="false">发票</NTag>
-                <NTag v-else-if="inv.source === 'wechat_bill'" size="tiny" type="success" :bordered="false">微信账单</NTag>
-                <NTag v-else size="tiny" type="warning" :bordered="false">手动记账</NTag>
-                <NTag v-if="isMonthEndTransit(inv)" size="tiny" type="default" :bordered="false" style="color: var(--solo-primary);">次月在途(D+1)</NTag>
-              </div>
-              <div v-if="inv.source === 'invoice_import' || inv.invoiceNumber" class="card-quick-actions" @click.stop style="display: flex; align-items: center; gap: 8px; margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--solo-border-light); font-size: 11px;">
-                <span style="color: var(--solo-text-muted);">无对公流水？</span>
-                <a style="color: var(--solo-primary); cursor: pointer; text-decoration: underline;" @click="handleMarkBossPayer(inv.id)">转老板垫付</a>
-                <span style="color: var(--solo-border-light);">|</span>
-                <a style="color: var(--solo-text-secondary); cursor: pointer; text-decoration: underline;" @click="toggleArchiveMode(inv.id, true)">设为仅归档</a>
-              </div>
-            </div>
 
-            <!-- 发票待付款：配对=付款状态确认（票等钱），与账目核销语义不同 -->
-            <div v-if="unmatchedInvoiceEntries.length > 0" class="entry-group-title">
-              发票待付款（确认付款状态）<span>({{ unmatchedInvoiceEntries.length }})</span>
+        <!-- 待确认的发票与日常收支：仅列公户没找到流水的发票和日常收支手工账，排除工资/手续费/股东投入等纯会计分录 -->
+        <template v-if="pendingEntryList.length > 0">
+          <div class="feed-section-header">
+            <div style="font-weight: 600; font-size: 14px; color: var(--solo-text-primary); display: flex; align-items: center; gap: 6px;">
+              <i class="ri-file-list-3-line" style="color: var(--solo-primary);"></i>
+              <span>待确认款项的单据 ({{ pendingEntryList.length }})</span>
             </div>
-            <div
-              v-for="inv in unmatchedInvoiceEntries"
-              :key="inv.id"
-              class="canvas-card"
-              :class="{ selected: selectedInvoiceIds.includes(inv.id), 'candidate-match': isCandidateEntry(inv) }"
-              role="checkbox"
-              :aria-checked="selectedInvoiceIds.includes(inv.id)"
-              tabindex="0"
-              @click="selectInvoiceCard(inv.id)"
-              @keydown.enter.prevent="selectInvoiceCard(inv.id)"
-              @keydown.space.prevent="selectInvoiceCard(inv.id)"
-            >
-              <div class="card-header-row">
-                <span class="card-selection-indicator" :class="{ active: selectedInvoiceIds.includes(inv.id) }">
-                  <i v-if="selectedInvoiceIds.includes(inv.id)" class="ri-check-line"></i>
-                </span>
-                <span class="card-title-text">{{ inv.title }}</span>
-                <NTag v-if="isCandidateEntry(inv)" size="tiny" type="success" :bordered="false" class="match-candidate-tag">金额吻合</NTag>
-                <span class="card-amount" :class="amountClassForDirection(inv.direction, inv.amount)">
-                  {{ formatMoney(signedInvoiceAmount(inv)) }}
-                </span>
-              </div>
-              <div class="card-meta">
-                <span>{{ inv.date }}</span>
-                <NTag size="tiny" type="info" :bordered="false">发票</NTag>
-              </div>
-              <div class="card-quick-actions" @click.stop style="display: flex; align-items: center; gap: 8px; margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--solo-border-light); font-size: 11px;">
-                <span style="color: var(--solo-text-muted);">无对公流水？</span>
-                <a style="color: var(--solo-primary); cursor: pointer; text-decoration: underline;" @click="handleMarkBossPayer(inv.id)">转老板垫付</a>
-                <span style="color: var(--solo-border-light);">|</span>
-                <a style="color: var(--solo-text-secondary); cursor: pointer; text-decoration: underline;" @click="toggleArchiveMode(inv.id, true)">设为仅归档</a>
-              </div>
-            </div>
-
-            <div v-if="historicalUnmatchedEntries.length > 0" style="margin: 14px 0 8px; font-size: 11px; font-weight: 600; color: var(--solo-text-muted);">
-              历史遗留未对账 ({{ historicalUnmatchedEntries.length }})
-            </div>
-            <div
-              v-for="inv in historicalUnmatchedEntries"
-              :key="`history-${inv.id}`"
-              class="canvas-card"
-              :class="{ selected: selectedInvoiceIds.includes(inv.id), 'candidate-match': isCandidateEntry(inv) }"
-              role="checkbox"
-              :aria-checked="selectedInvoiceIds.includes(inv.id)"
-              tabindex="0"
-              @click="selectInvoiceCard(inv.id)"
-              @keydown.enter.prevent="selectInvoiceCard(inv.id)"
-              @keydown.space.prevent="selectInvoiceCard(inv.id)"
-            >
-              <div class="card-header-row">
-                <span class="card-selection-indicator" :class="{ active: selectedInvoiceIds.includes(inv.id) }">
-                  <i v-if="selectedInvoiceIds.includes(inv.id)" class="ri-check-line"></i>
-                </span>
-                <span class="card-title-text">{{ inv.title }}</span>
-                <NTag v-if="isCandidateEntry(inv)" size="tiny" type="success" :bordered="false" class="match-candidate-tag">金额吻合</NTag>
-                <span class="card-amount" :class="amountClassForDirection(inv.direction, inv.amount)">
-                  {{ formatMoney(signedInvoiceAmount(inv)) }}
-                </span>
-              </div>
-              <div class="card-meta">
-                <span>{{ inv.date }}</span>
-                <NTag size="tiny" type="warning" :bordered="false">历史遗留</NTag>
-                <NTag v-if="isMonthEndTransit(inv)" size="tiny" type="default" :bordered="false" style="color: var(--solo-primary);">次月在途(D+1)</NTag>
-              </div>
-              <div v-if="inv.source === 'invoice_import' || inv.invoiceNumber" class="card-quick-actions" @click.stop style="display: flex; align-items: center; gap: 8px; margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--solo-border-light); font-size: 11px;">
-                <span style="color: var(--solo-text-muted);">无对公流水？</span>
-                <a style="color: var(--solo-primary); cursor: pointer; text-decoration: underline;" @click="handleMarkBossPayer(inv.id)">转老板垫付</a>
-                <span style="color: var(--solo-border-light);">|</span>
-                <a style="color: var(--solo-text-secondary); cursor: pointer; text-decoration: underline;" @click="toggleArchiveMode(inv.id, true)">设为仅归档</a>
-              </div>
-            </div>
+            <span style="font-size: 12px; color: var(--solo-text-muted);">以下发票或日常收支在本月公户未找到对应流水，点一下确认实际收付情况即可自动入账</span>
           </div>
+          <NAlert v-if="monthStatements.length === 0" type="warning" :bordered="false" style="margin-bottom: 12px;">
+            本月还没有导入公户流水，请先确认是否漏导银行流水；若确定是通过个人垫付或尚未收付款，请直接点选下方胶囊按钮。
+          </NAlert>
 
-          <!-- Middle: Matched Pairs (Pending review/Confirmed) -->
-          <div class="canvas-column" style="background: rgba(16, 185, 129, 0.02); border-color: rgba(16, 185, 129, 0.15);">
-            <div class="column-header"><i class="ri-check-double-line"></i> 已配对账单 ({{ matchedPairs.length }})</div>
-            
-            <!-- Manual match box trigger -->
-            <div v-if="selectedInvoiceIds.length > 0 || selectedBank" class="match-composer">
-              <div class="match-composer-header">
-                <div>
-                  <div class="match-composer-title">组合核对</div>
-                  <div class="match-composer-subtitle">收入与手续费可合并匹配一笔净额流水</div>
+          <div class="pending-entry-list">
+            <div v-for="entry in pendingEntryList" :key="entry.id" class="pending-entry-card">
+              <div class="pending-entry-main">
+                <div class="pending-entry-title">
+                  <NTag v-if="entry.source === 'invoice_import' || entry.invoiceNumber" size="small" :bordered="false" :type="entry.direction === 'income' ? 'success' : 'warning'">
+                    {{ entry.direction === 'income' ? '销项发票' : '进项发票' }}
+                  </NTag>
+                  <NTag v-else size="small" :bordered="false" type="info">
+                    {{ entry.direction === 'income' ? '日常收入' : '日常支出' }}
+                  </NTag>
+                  <span class="pending-entry-date">{{ entry.date }}</span>
+                  <strong>{{ entry.title }}</strong>
                 </div>
-                <NButton size="tiny" text @click="clearManualSelection">清空</NButton>
-              </div>
-              <div class="match-composer-math">
-                <div class="match-math-row">
-                  <span>已选账目（{{ selectedEntriesForMatch.length }}）</span>
-                  <strong :class="selectedEntriesTotal >= 0 ? 'income' : 'expense'">{{ formatMoney(selectedEntriesTotal) }}</strong>
-                </div>
-                <div class="match-math-row">
-                  <span>银行流水</span>
-                  <strong v-if="selectedBankForMatch" :class="selectedBankForMatch.amount >= 0 ? 'income' : 'expense'">
-                    {{ formatMoney(selectedBankForMatch.amount) }}
-                  </strong>
-                  <span v-else class="match-awaiting">请在右侧选择</span>
-                </div>
-                <div v-if="selectedBankForMatch" class="match-math-row match-difference" :class="canConfirmManualMatch ? 'exact' : 'mismatch'">
-                  <span>差额</span>
-                  <strong>{{ formatMoney(selectedMatchDifference) }}</strong>
-                </div>
-              </div>
-              <div v-if="isZeroNetSelection" class="match-composer-hint zero-net">
-                <i class="ri-error-warning-line"></i>
-                <span>所选账目净额为 0（可能包含与冲销抵消的条目），对账无意义，请重新选择</span>
-              </div>
-              <div class="match-composer-hint" :class="{ ready: canConfirmManualMatch }">
-                <i :class="canConfirmManualMatch ? 'ri-checkbox-circle-line' : 'ri-information-line'"></i>
-                <span>{{ canConfirmManualMatch ? '金额一致，可以确认对账' : selectedBankForMatch ? '继续勾选或取消账目，直到差额为 0' : '选择一笔银行流水后核对净额' }}</span>
-              </div>
-              <NButton size="small" type="primary" block :disabled="!canConfirmManualMatch" @click="handleManualMatch">
-                {{ selectedInvoiceIds.length > 1 ? `确认合并 ${selectedInvoiceIds.length} 笔并对账` : '确认对账' }}
-              </NButton>
-            </div>
-
-            <div v-if="matchedPairs.length === 0" style="padding: 40px 0; text-align: center; color: var(--solo-text-muted); font-size: 12px;">
-              暂无已配对账单
-            </div>
-            
-            <!-- Pairs List -->
-            <div v-for="pair in matchedPairs" :key="pair.id" class="matched-pair-card">
-              <div class="pair-header">
-                <span class="confidence-badge" :class="pair.persisted ? 'manual' : 'high'">
-                  {{ pairConfidenceText(pair) }}
-                </span>
-                <NTag v-if="pair.status === 'confirmed'" size="small" type="success">已核对</NTag>
-                <NTag v-else size="small" type="warning">待核对</NTag>
-              </div>
-
-              <div class="pair-content">
-                <div v-for="entry in pair.entries || [pair.invoice]" :key="entry.id" class="pair-item">
-                  <div class="pair-item-label">
-                    <i class="ri-file-list-3-line"></i>
-                    <span>{{ entry.title }}</span>
-                  </div>
-                  <span class="pair-item-val" :class="amountClassForDirection(entry.direction, entry.amount)">
-                    {{ formatMoney(signedInvoiceAmount(entry)) }}
+                <div class="pending-entry-meta">
+                  <span>用途分类：{{ entry.category || '日常经营' }}</span>
+                  <span v-if="findStatementCandidateForEntry(entry)" class="pending-entry-hint">
+                    {{ statementCandidateText(findStatementCandidateForEntry(entry)) }}
+                  </span>
+                  <span v-else class="pending-entry-hint muted">
+                    {{ entry.direction === 'income' ? '公户未查到该笔收款，请确认款项去向：' : '公户未查到该笔扣款，请确认谁付的钱：' }}
                   </span>
                 </div>
-
-                <div class="pair-account-review" :class="{ warning: pairNeedsCategoryReview(pair) }">
-                  <div class="pair-account-label">
-                    <i class="ri-price-tag-3-line"></i>
-                    <span>分类/科目</span>
-                  </div>
-                  <span>{{ pairCategoryPreview(pair) }}</span>
-                </div>
-                
-                <div class="pair-divider">
-                  <div class="pair-divider-icon"><i class="ri-arrow-up-down-line"></i></div>
-                </div>
-
-                <div class="pair-item">
-                  <div class="pair-item-label">
-                    <i class="ri-bank-card-line"></i>
-                    <span>{{ pair.bank.title }}</span>
-                  </div>
-                  <span class="pair-item-val" :class="pair.bank.amount >= 0 ? 'income' : 'expense'">{{ formatMoney(pair.bank.amount) }}</span>
-                </div>
               </div>
+              <div class="pending-entry-amount" :class="entryIsOutflow(entry) ? 'expense' : 'income'">
+                {{ entryIsOutflow(entry) ? '-' : '+' }}{{ formatMoney(Math.abs(Number(entry.amount) || 0)) }}
+              </div>
+              <div class="pending-entry-actions">
+                <NButton
+                  v-if="findStatementCandidateForEntry(entry)"
+                  size="tiny"
+                  round
+                  type="primary"
+                  secondary
+                  @click="handleEntryPaid(entry)"
+                >关联疑似流水</NButton>
 
-              <div v-if="pair.settlement" class="pair-actions">
-                <NTag size="small" :type="pair.settlement.voucherStatus === 'posted' ? 'success' : 'warning'">
-                  {{ pair.settlement.voucherStatus === 'posted' ? '结算凭证已过账' : '结算凭证待过账' }}
-                </NTag>
-                <NButton size="tiny" text type="primary" @click="openVoucherModal(pair.settlement.id)">查看结算凭证</NButton>
-              </div>
-              <div class="pair-actions" v-if="pair.status !== 'confirmed'">
-                <NButton size="tiny" tertiary @click="deletePair(pair.id)">拆开</NButton>
-                <NButton v-if="!pair.entries || pair.entries.length === 1" size="tiny" secondary @click="openPairCategoryDialog(pair)">修改分类</NButton>
-                <NButton size="tiny" type="primary" secondary @click="confirmPair(pair.id)">确认匹配并认可分类</NButton>
-              </div>
-              <div class="pair-actions" v-else>
-                <NButton v-if="!pair.entries || pair.entries.length === 1" size="tiny" text @click="openPairCategoryDialog(pair)">修改分类</NButton>
-                <NButton size="tiny" text type="error" @click="deletePair(pair.id)">取消匹配</NButton>
+                <!-- 支出（进项发票 / 日常支出手工账）胶囊选项 -->
+                <template v-if="entry.direction === 'expense'">
+                  <NButton size="tiny" round secondary @click="confirmEntryDisposition(entry, { payer: 'boss_personal', label: '老板个人垫付（计入公司欠老板款，可免税转回私卡）' })">老板垫付</NButton>
+                  <NDropdown
+                    trigger="click"
+                    :options="employeePayerOptions"
+                    @select="(key: string) => confirmEntryDisposition(entry, { payer: key, label: key.includes(':') ? `员工垫付（计入公司欠${key.split(':')[1]}报销款）` : '员工垫付（计入员工待报销款）' })"
+                  >
+                    <NButton size="tiny" round secondary>
+                      员工垫付 <i class="ri-arrow-down-s-line" style="font-size: 11px; margin-left: 2px;"></i>
+                    </NButton>
+                  </NDropdown>
+                  <NButton size="tiny" round secondary @click="confirmEntryDisposition(entry, { paymentStatus: 'unpaid', label: '还没付款（计入应付供应商挂账）' })">还没付款</NButton>
+                  <NButton size="tiny" round quaternary @click="confirmEntryDisposition(entry, { payer: 'prepaid_deduct', label: '预存扣款（冲减前期预付余额）' })">预存扣款</NButton>
+                </template>
+
+                <!-- 收入（销项发票 / 日常收入手工账）胶囊选项 -->
+                <template v-else>
+                  <NButton size="tiny" round secondary @click="confirmEntryDisposition(entry, { paymentStatus: 'unpaid', label: '客户未付款（计入客户应收欠款）' })">客户未付款</NButton>
+                  <NButton size="tiny" round secondary @click="confirmEntryDisposition(entry, { payer: 'boss_personal', label: '老板私户代收（计入老板暂存公款）' })">老板私户收</NButton>
+                  <NButton size="tiny" round secondary @click="confirmEntryDisposition(entry, { payer: 'platform_balance', label: '在平台未提现（计入平台待提现余额）' })">在平台未提现</NButton>
+                  <NButton size="tiny" round quaternary @click="confirmEntryDisposition(entry, { payer: 'advance_offset', label: '冲前期预收（核销前期预收客户款）' })">冲前期预收</NButton>
+                </template>
               </div>
             </div>
           </div>
+        </template>
 
-          <!-- Right: Unmatched Bank Statements -->
-          <div class="canvas-column">
-            <div class="column-header"><i class="ri-bank-line"></i> 本月未匹配流水 ({{ unmatchedStatements.length }})</div>
-            <div v-if="unmatchedStatements.length === 0" style="padding: 28px 0; text-align: center; color: var(--solo-text-muted); font-size: 12px;">
-              本月银行流水已匹配完成
-            </div>
-            <div
-              v-for="stmt in unmatchedStatements"
-              :key="stmt.id"
-              :data-statement-id="stmt.id"
-              class="canvas-card"
-              :class="{ selected: selectedBank === stmt.id, 'candidate-match': isCandidateBank(stmt) }"
-              role="radio"
-              :aria-checked="selectedBank === stmt.id"
-              tabindex="0"
-              @click="selectBankCard(stmt.id)"
-              @keydown.enter.prevent="selectBankCard(stmt.id)"
-              @keydown.space.prevent="selectBankCard(stmt.id)"
-            >
-              <div class="card-header-row">
-                <span class="card-selection-indicator radio" :class="{ active: selectedBank === stmt.id }">
-                  <i v-if="selectedBank === stmt.id" class="ri-check-line"></i>
-                </span>
-                <span class="card-title-text">{{ stmt.description }}</span>
-                <NTag v-if="isCandidateBank(stmt)" size="tiny" type="success" :bordered="false" class="match-candidate-tag">金额吻合</NTag>
-                <span class="card-amount" :class="stmt.amount >= 0 ? 'income' : 'expense'">{{ formatMoney(stmt.amount) }}</span>
+        <!-- 已确认去向的单据（展示大白话入账结果，消灭糊涂账） -->
+        <div v-if="confirmedExceptionEntries.length > 0" style="margin-bottom: 20px;">
+          <NCollapse>
+            <NCollapseItem :title="`已确认入账去向的单据 (${confirmedExceptionEntries.length})`" name="confirmed_dispositions">
+              <template #header-extra>
+                <span style="font-size: 12px; color: var(--solo-text-muted);">已自动归入对应往来账本，点击可重新选择</span>
+              </template>
+              <div class="pending-entry-list" style="margin-top: 8px;">
+                <div v-for="entry in confirmedExceptionEntries" :key="entry.id" class="pending-entry-card" style="opacity: 0.92; background: var(--solo-card-bg, #fff);">
+                  <div class="pending-entry-main">
+                    <div class="pending-entry-title">
+                      <NTag size="small" :bordered="false" type="info">{{ entry.source === 'invoice_import' ? '发票' : '账目' }}</NTag>
+                      <span class="pending-entry-date">{{ entry.date }}</span>
+                      <strong>{{ entry.title }}</strong>
+                      <NTag size="small" type="success" :bordered="false" style="margin-left: 8px;">
+                        {{ formatDispositionTag(entry) }}
+                      </NTag>
+                    </div>
+                    <div class="pending-entry-meta">
+                      <span>{{ entry.category || '日常经营' }}</span>
+                      <span style="color: var(--solo-primary); font-weight: 500;">
+                        · {{ formatDispositionExplanation(entry) }}
+                      </span>
+                    </div>
+                  </div>
+                  <div class="pending-entry-amount" :class="entryIsOutflow(entry) ? 'expense' : 'income'">
+                    {{ entryIsOutflow(entry) ? '-' : '+' }}{{ formatMoney(Math.abs(Number(entry.amount) || 0)) }}
+                  </div>
+                  <div class="pending-entry-actions">
+                    <NButton size="tiny" text @click="resetEntryDisposition(entry)">重新选择</NButton>
+                  </div>
+                </div>
               </div>
-              <div class="card-meta">
-                <span>{{ stmt.transaction_date?.slice(0, 10) || '日期缺失' }}</span>
-                <NTag size="tiny" :type="stmt.amount >= 0 ? 'success' : 'error'" :bordered="false" style="font-size: 10px; padding: 0 5px;">
+            </NCollapseItem>
+          </NCollapse>
+        </div>
+
+        <!-- Pending Statements Feed -->
+        <div class="feed-section-header" style="flex-wrap: wrap; gap: 10px;">
+          <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+            <div style="font-weight: 600; font-size: 14px; color: var(--solo-text-primary); display: flex; align-items: center; gap: 6px;">
+              <i class="ri-time-line" style="color: var(--solo-primary);"></i>
+              <span>待处理银行流水 ({{ unmatchedStatements.length }})</span>
+            </div>
+            <div v-if="unmatchedStatements.length > 0" class="tier-filter-pills">
+              <button
+                type="button"
+                class="tier-pill"
+                :class="{ active: statementTierFilter === 'all' }"
+                @click="statementTierFilter = 'all'"
+              >
+                全部 ({{ unmatchedStatements.length }})
+              </button>
+              <button
+                type="button"
+                class="tier-pill"
+                :class="{ active: statementTierFilter === 'ready' }"
+                @click="statementTierFilter = 'ready'"
+              >
+                已识别 ({{ unmatchedStatements.length - attentionStatements.length }})
+              </button>
+              <button
+                v-if="attentionStatements.length > 0"
+                type="button"
+                class="tier-pill attention"
+                :class="{ active: statementTierFilter === 'attention' }"
+                @click="statementTierFilter = 'attention'"
+              >
+                疑义待定 ({{ attentionStatements.length }})
+              </button>
+            </div>
+          </div>
+          <div v-if="unmatchedStatements.length > 0" style="display: flex; align-items: center; gap: 14px; flex-wrap: wrap;">
+            <NCheckbox
+              v-if="selectableBatchStatements.length > 0"
+              size="small"
+              :checked="allSelectableChecked"
+              :indeterminate="someSelectableChecked"
+              @update:checked="toggleSelectAllStatements"
+            >
+              <span style="font-size: 12px; color: var(--solo-text-secondary);">全选可确认 ({{ selectableBatchStatements.length }})</span>
+            </NCheckbox>
+            <NTooltip trigger="hover" placement="top" :style="{ maxWidth: '320px' }">
+              <template #trigger>
+                <span>
+                  <NCheckbox v-model:checked="rememberRuleOnConfirm" size="small">
+                    <span style="font-size: 12px; color: var(--solo-text-secondary);">记住此规则（相同对方/摘要自动入账）</span>
+                  </NCheckbox>
+                </span>
+              </template>
+              勾选后，确认或调整某笔流水的入账科目时，系统会自动记住该对方户名或摘要特征；后续导入同类流水将直接按 98% 记忆规则自动归类。
+            </NTooltip>
+          </div>
+        </div>
+
+        <!-- Empty state -->
+        <div v-if="unmatchedStatements.length === 0" class="feed-empty-box">
+          <i class="ri-shield-check-line feed-empty-icon"></i>
+          <div style="font-size: 15px; font-weight: 600; color: var(--solo-text-primary); margin-top: 8px;">
+            本月所有银行流水已处理完成
+          </div>
+          <div style="font-size: 12px; color: var(--solo-text-muted); margin-top: 4px;">
+            资金进出已 100% 对应入账，可直接进入下一步进行关账合规检查。
+          </div>
+        </div>
+
+        <!-- Statement Cards List (Compact Reconcile Feed) -->
+        <div v-else class="feed-card-list">
+          <div
+            v-for="stmt in filteredUnmatchedStatements"
+            :key="stmt.id"
+            class="feed-card reconcile-row"
+            :class="{
+              'high-conf': (getAiSuggestion(stmt.id)?.confidence || 0) >= 0.95 && !isNeedsAttentionStatement(stmt),
+              'needs-attention': isNeedsAttentionStatement(stmt),
+            }"
+          >
+            <!-- 事实区：批量勾选 + 方向Tag + 日期 + 交易对方与附言 + 金额 -->
+            <div class="reconcile-cell-fact">
+              <div class="fact-lead">
+                <NCheckbox
+                  size="small"
+                  :checked="selectedStatementIds.includes(stmt.id)"
+                  :disabled="!isSelectableForBatch(stmt)"
+                  @update:checked="(val: boolean) => toggleStatementSelection(stmt.id, val)"
+                />
+                <NTag
+                  size="small"
+                  :type="stmt.amount >= 0 ? 'success' : 'error'"
+                  :bordered="false"
+                  style="font-weight: 600; flex-shrink: 0;"
+                >
                   {{ stmt.amount >= 0 ? '收款' : '付款' }}
                 </NTag>
+                <span class="fact-date">{{ stmt.transaction_date ? stmt.transaction_date.slice(0, 10) : '未指定日期' }}</span>
+                <span class="fact-desc" :title="stmt.description">{{ stmt.description }}</span>
               </div>
-              <div v-if="getAiSuggestion(stmt.id)" style="margin-top: 6px; padding: 5px 8px; border-radius: 6px; background: rgba(99,102,241,0.05); border: 1px dashed rgba(99,102,241,0.2); font-size: 11px; color: var(--solo-text-secondary);">
-                <i class="ri-sparkling-2-fill" style="color: var(--solo-primary); margin-right: 3px;"></i>
-                <span>{{ getAiSuggestion(stmt.id)?.type === 'new' ? 'AI 分类建议' : '对账建议' }}：{{ getAiSuggestion(stmt.id)?.suggestedEntry?.category || getAiSuggestion(stmt.id)?.reason }}</span>
-                <span v-if="getAiSuggestion(stmt.id)?.type === 'new'" style="margin-left: 4px; color: var(--solo-text-muted);">置信度 {{ Math.round((getAiSuggestion(stmt.id)?.confidence || 0) * 100) }}%</span>
-              </div>
-              <div v-if="aiDraftLoadingStatementId === stmt.id" class="ai-draft-loading-hint">
-                <i class="ri-loader-4-line ai-draft-spinner"></i>
-                <span>AI 正在生成分类草稿，通常需要几秒</span>
-              </div>
-              <div class="card-meta" style="margin-top: 6px; justify-content: flex-end; gap: 6px;">
-                <NButton size="tiny" secondary :disabled="!!aiDraftLoadingStatementId" @click.stop="openManualClassify(stmt)">
-                  <i class="ri-edit-line" style="margin-right: 2px;"></i> 手动分类
-                </NButton>
-                <NButton
-                  size="tiny"
-                  type="warning"
-                  text
-                  :loading="aiDraftLoadingStatementId === stmt.id"
-                  :disabled="!!aiDraftLoadingStatementId && aiDraftLoadingStatementId !== stmt.id"
-                  @click.stop="handleAutoPostStatement(stmt.id)"
-                >
-                  <i v-if="aiDraftLoadingStatementId !== stmt.id" class="ri-sparkling-fill" style="margin-right: 2px;"></i>
-                  {{ aiDraftLoadingStatementId === stmt.id ? '生成中' : '生成 AI 草稿' }}
-                </NButton>
+              <div class="fact-amount" :class="stmt.amount >= 0 ? 'income' : 'expense'">
+                {{ stmt.amount >= 0 ? '+' : '' }}{{ formatMoney(stmt.amount) }}
               </div>
             </div>
 
-            <div v-if="historicalUnmatchedStatements.length > 0" style="margin: 14px 0 8px; font-size: 11px; font-weight: 600; color: var(--solo-text-muted);">
-              历史遗留未匹配流水 ({{ historicalUnmatchedStatements.length }})
-            </div>
-            <div
-              v-for="stmt in historicalUnmatchedStatements"
-              :key="`history-${stmt.id}`"
-              class="canvas-card"
-              :class="{ selected: selectedBank === stmt.id }"
-              role="radio"
-              :aria-checked="selectedBank === stmt.id"
-              tabindex="0"
-              @click="selectBankCard(stmt.id)"
-              @keydown.enter.prevent="selectBankCard(stmt.id)"
-              @keydown.space.prevent="selectBankCard(stmt.id)"
-            >
-              <div class="card-header-row">
-                <span class="card-selection-indicator radio" :class="{ active: selectedBank === stmt.id }">
-                  <i v-if="selectedBank === stmt.id" class="ri-check-line"></i>
-                </span>
-                <span class="card-title-text">{{ stmt.description }}</span>
-                <span class="card-amount" :class="stmt.amount >= 0 ? 'income' : 'expense'">{{ formatMoney(stmt.amount) }}</span>
-              </div>
-              <div class="card-meta">
-                <span>{{ stmt.transaction_date?.slice(0, 10) || '日期缺失' }}</span>
-                <NTag size="tiny" type="warning" :bordered="false">历史遗留</NTag>
-              </div>
-              <div v-if="getAiSuggestion(stmt.id)" style="margin-top: 6px; padding: 5px 8px; border-radius: 6px; background: rgba(99,102,241,0.05); border: 1px dashed rgba(99,102,241,0.2); font-size: 11px; color: var(--solo-text-secondary);">
-                <i class="ri-sparkling-2-fill" style="color: var(--solo-primary); margin-right: 3px;"></i>
-                <span>{{ getAiSuggestion(stmt.id)?.type === 'new' ? 'AI 分类建议' : '对账建议' }}：{{ getAiSuggestion(stmt.id)?.suggestedEntry?.category || getAiSuggestion(stmt.id)?.reason }}</span>
-              </div>
-              <div v-if="aiDraftLoadingStatementId === stmt.id" class="ai-draft-loading-hint">
-                <i class="ri-loader-4-line ai-draft-spinner"></i>
-                <span>AI 正在生成分类草稿，通常需要几秒</span>
-              </div>
-              <div class="card-meta" style="margin-top: 6px; justify-content: flex-end; gap: 6px;">
-                <NButton size="tiny" secondary :disabled="!!aiDraftLoadingStatementId" @click.stop="openManualClassify(stmt)">手动分类</NButton>
+            <!-- 方案与核算依据区 -->
+            <div class="reconcile-cell-plan">
+              <!-- Case 1: 匹配记账单据 -->
+              <div v-if="getAiSuggestion(stmt.id)?.type === 'match'" class="plan-badge match">
+                <i class="ri-link-m" style="font-size: 14px; color: var(--solo-primary);"></i>
+                <span class="plan-label">匹配单据：</span>
                 <NButton
-                  size="tiny"
-                  type="warning"
                   text
-                  :loading="aiDraftLoadingStatementId === stmt.id"
-                  :disabled="!!aiDraftLoadingStatementId && aiDraftLoadingStatementId !== stmt.id"
-                  @click.stop="handleAutoPostStatement(stmt.id)"
+                  size="tiny"
+                  type="primary"
+                  class="feed-rec-link"
+                  @click="openVoucherModal(getAiSuggestion(stmt.id)?.matchedEntryId || getAiSuggestion(stmt.id)?.matchedEntryIds?.[0])"
                 >
-                  {{ aiDraftLoadingStatementId === stmt.id ? '生成中' : '生成 AI 草稿' }}
+                  <strong>{{ getAiSuggestion(stmt.id)?.matchedEntry?.title || getAiSuggestion(stmt.id)?.reason }}</strong>
                 </NButton>
               </div>
+
+              <!-- Case 2: 匹配未关联发票 -->
+              <div v-else-if="findMatchingInvoiceForStatement(stmt)" class="plan-badge match">
+                <i class="ri-file-list-3-line" style="font-size: 14px; color: var(--solo-primary);"></i>
+                <span class="plan-label">吻合发票：</span>
+                <strong class="ellipsis" :title="findMatchingInvoiceForStatement(stmt)?.title" style="max-width: 180px;">
+                  {{ findMatchingInvoiceForStatement(stmt)?.title }}
+                </strong>
+                <span style="font-size: 11px; color: var(--solo-text-muted);">({{ formatMoney(findMatchingInvoiceForStatement(stmt)?.amount || 0) }})</span>
+              </div>
+
+              <!-- Case 3: 建议分类（带 Tooltip 解释） -->
+              <div
+                v-else-if="getAiSuggestion(stmt.id)?.suggestedEntry?.category"
+                class="plan-badge"
+                :class="isFallbackSuggestion(stmt) ? 'fallback' : 'standard'"
+              >
+                <span class="plan-label">{{ isFallbackSuggestion(stmt) ? '系统兜底分类：' : '建议分类：' }}</span>
+                <strong class="plan-category">{{ getAiSuggestion(stmt.id)?.suggestedEntry?.category }}</strong>
+                
+                <NTooltip trigger="hover" placement="top" :style="{ maxWidth: '360px' }">
+                  <template #trigger>
+                    <span
+                      class="plan-evidence-pill"
+                      :class="
+                        isFallbackSuggestion(stmt)
+                          ? 'attention'
+                          : getAiSuggestion(stmt.id)?.rule === 'company_memory_rule'
+                            ? 'memory-rule'
+                            : 'verified'
+                      "
+                    >
+                      <i
+                        :class="
+                          isFallbackSuggestion(stmt)
+                            ? 'ri-alert-line'
+                            : getAiSuggestion(stmt.id)?.rule === 'company_memory_rule'
+                              ? 'ri-bookmark-3-line'
+                              : 'ri-shield-check-line'
+                        "
+                        style="font-size: 11px;"
+                      ></i>
+                      <span>{{ suggestionBadgeLabel(stmt) }}</span>
+                    </span>
+                  </template>
+                  <div style="font-size: 12px; line-height: 1.5;">
+                    <div style="font-weight: 600; margin-bottom: 3px; color: var(--solo-primary);">记账依据分析</div>
+                    <div>{{ getAiSuggestion(stmt.id)?.reason || '系统根据往来特征与账目特征智能匹配' }}</div>
+                  </div>
+                </NTooltip>
+              </div>
+
+              <!-- Case 4: 无推荐分类 -->
+              <div v-else class="plan-badge none">
+                <i class="ri-question-line" style="font-size: 13px;"></i>
+                <span class="plan-label">待指定核算科目</span>
+              </div>
+            </div>
+
+            <!-- 操作与调整区 -->
+            <div class="reconcile-cell-action">
+              <!-- 快捷选择科目 -->
+              <template v-if="!hasExistingEntrySuggestion(stmt)">
+                <NSelect
+                  size="small"
+                  class="reconcile-category-select"
+                  placeholder="调整科目..."
+                  :options="stmt.amount >= 0 ? bossIncomeOptions : bossExpenseOptions"
+                  :disabled="quickSubmittingId === stmt.id"
+                  @update:value="(val: string) => handleQuickSelectCategory(stmt, val)"
+                />
+              </template>
+
+              <!-- 主确认按钮 -->
+              <NButton
+                v-if="getAiSuggestion(stmt.id)?.type === 'match'"
+                size="small"
+                type="primary"
+                secondary
+                :loading="quickSubmittingId === stmt.id"
+                @click="handleAcceptSuggested(stmt)"
+              >
+                确认配对
+              </NButton>
+              <NButton
+                v-else-if="findMatchingInvoiceForStatement(stmt)"
+                size="small"
+                type="primary"
+                secondary
+                :loading="quickSubmittingId === stmt.id"
+                @click="handleMatchInvoiceDirect(stmt, findMatchingInvoiceForStatement(stmt)!)"
+              >
+                关联发票
+              </NButton>
+              <NButton
+                v-else-if="getAiSuggestion(stmt.id)?.suggestedEntry?.category"
+                size="small"
+                type="primary"
+                :loading="quickSubmittingId === stmt.id"
+                @click="handleAcceptSuggested(stmt)"
+              >
+                <template #icon><i class="ri-check-line" /></template>
+                {{ isFallbackSuggestion(stmt) ? '按此入账' : '认可入账' }}
+              </NButton>
+
+              <!-- 次级操作/手动核算 -->
+              <NButton
+                size="small"
+                quaternary
+                class="reconcile-detail-btn"
+                @click="openManualClassify(stmt, getAiSuggestion(stmt.id)?.suggestedEntry)"
+              >
+                <template #icon><i :class="hasExistingEntrySuggestion(stmt) ? 'ri-link-m' : 'ri-edit-line'" /></template>
+                {{ hasExistingEntrySuggestion(stmt) ? '核对已有账目' : '核算明细' }}
+              </NButton>
             </div>
           </div>
+        </div>
+
+        <!-- Historical Unmatched (Collapsible) -->
+        <div v-if="historicalUnmatchedStatements.length > 0" style="margin-top: 16px;">
+          <NCollapse>
+            <NCollapseItem :title="`历史月份遗留未认领流水 (${historicalUnmatchedStatements.length})`" name="history">
+              <div class="feed-card-list">
+                <div v-for="stmt in historicalUnmatchedStatements" :key="stmt.id" class="feed-card reconcile-row" style="opacity: 0.92;">
+                  <div class="reconcile-cell-fact">
+                    <div class="fact-lead">
+                      <NTag size="small" type="warning" :bordered="false" style="flex-shrink: 0;">历史遗留</NTag>
+                      <span class="fact-date">{{ stmt.transaction_date ? stmt.transaction_date.slice(0, 10) : '' }}</span>
+                      <span class="fact-desc" :title="stmt.description">{{ stmt.description }}</span>
+                    </div>
+                    <div class="fact-amount" :class="stmt.amount >= 0 ? 'income' : 'expense'">
+                      {{ stmt.amount >= 0 ? '+' : '' }}{{ formatMoney(stmt.amount) }}
+                    </div>
+                  </div>
+                  <div class="reconcile-cell-plan">
+                    <span class="plan-label" style="font-size: 12px; color: var(--solo-text-muted);">往期未结流水，确认补记期间后入账</span>
+                  </div>
+                  <div class="reconcile-cell-action">
+                    <NSelect
+                      size="small"
+                      class="reconcile-category-select"
+                      placeholder="补记归类入账..."
+                      :options="stmt.amount >= 0 ? bossIncomeOptions : bossExpenseOptions"
+                      @update:value="(val: string) => handleQuickSelectCategory(stmt, val)"
+                    />
+                    <NButton size="small" quaternary class="reconcile-detail-btn" @click="openManualClassify(stmt)">
+                      <template #icon><i class="ri-edit-line" /></template>
+                      详情记账
+                    </NButton>
+                  </div>
+                </div>
+              </div>
+            </NCollapseItem>
+          </NCollapse>
+        </div>
+
+        <!-- Completed Statements (Collapsible) -->
+        <div v-if="matchedPairs.length > 0" style="margin-top: 20px;">
+          <NCollapse>
+            <NCollapseItem :title="`已认领并完成流水 (${matchedPairs.length} 笔)`" name="completed">
+              <div class="feed-completed-list">
+                <div v-for="pair in matchedPairs" :key="pair.id" class="feed-completed-item">
+                  <div style="display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0;">
+                    <i class="ri-checkbox-circle-fill" style="color: var(--solo-income); font-size: 16px;"></i>
+                    <span style="font-size: 12px; color: var(--solo-text-muted);">{{ pair.bank?.date || pair.bank?.transaction_date?.slice(0, 10) }}</span>
+                    <span style="font-weight: 500; font-size: 13px; color: var(--solo-text-primary);" class="ellipsis">{{ pair.bank?.title || pair.bank?.description }}</span>
+                    <i class="ri-arrow-right-line" style="color: var(--solo-text-muted); font-size: 12px;"></i>
+                    <NTag size="tiny" type="info" :bordered="false">{{ pairCategoryPreview(pair) || '已配平' }}</NTag>
+                  </div>
+                  <div style="display: flex; align-items: center; gap: 12px;">
+                    <span style="font-weight: 600; font-size: 13px;" :class="pair.bank?.amount >= 0 ? 'income' : 'expense'">
+                      {{ formatMoney(pair.bank?.amount) }}
+                    </span>
+                    <NButton size="tiny" quaternary type="primary" @click="openPairCategoryDialog(pair)">修改分类</NButton>
+                    <NButton size="tiny" quaternary type="error" @click="deletePair(pair.id)">撤销</NButton>
+                  </div>
+                </div>
+              </div>
+            </NCollapseItem>
+          </NCollapse>
         </div>
       </NCard>
     </div>
 
-    <!-- Step 5 Layout: Closing audit & ceremony / Closed CFO diagnostic report -->
-    <div v-if="currentStep === 5">
-      <!-- 5.1 未结账视图：合规体检与关账确认 -->
+    <!-- Step 3 Layout: Closing audit & ceremony / Closed CFO diagnostic report -->
+    <div v-if="currentStep === 3">
+      <!-- 3.1 未结账视图：合规体检与关账确认 -->
       <div v-if="!closed" class="closing-step-container">
         <NCard :bordered="false" class="report-card mb-4 readiness-overview">
           <NSpin :show="loading || closingLoading">
             <div class="readiness-heading">
               <div>
-                <p class="eyebrow">第五步：关账前合规检查</p>
-                <h3>{{ targetMonth }} 结账体检清单</h3>
-                <p class="report-subtitle">检查凭证状态、借贷平衡、银行核对及财务报表关系，全部通过后可封账。</p>
+                <p class="eyebrow">第三步：检查并锁账</p>
+                <h3>{{ targetMonth }} 关账检查</h3>
+                <p class="report-subtitle">系统会核对凭证、银行流水与报表是否对得上，全部通过后即可封账。</p>
               </div>
               <div class="readiness-count" :class="{ ready: closingReady && !hasBlockingReconciliationRisk, zero: isZeroRecordMonth }">
                 <template v-if="isZeroRecordMonth">
@@ -2904,12 +3945,12 @@ function prevStep() {
               </div>
               <div class="zero-record-actions">
                 <NButton size="small" type="primary" secondary @click="currentStep = 1">
-                  <template #icon><i class="ri-file-add-line" /></template>
-                  去录入发票/单据 (Step 1)
+                  <template #icon><i class="ri-folder-shared-line" /></template>
+                  去归集发票与流水 (Step 1)
                 </NButton>
-                <NButton size="small" secondary @click="currentStep = 2">
-                  <template #icon><i class="ri-bank-card-line" /></template>
-                  去导入银行流水 (Step 2)
+                <NButton size="small" @click="router.push('/copilot')">
+                  <template #icon><i class="ri-sparkling-line" /></template>
+                  先记一笔
                 </NButton>
                 <div class="zero-record-confirm">
                   <NCheckbox v-model:checked="confirmZeroActivity">
@@ -2963,24 +4004,67 @@ function prevStep() {
               </div>
             </div>
 
+            <!-- 跨期与补记提示：不阻断结账，但必须让用户看见并知情 -->
+            <div v-if="closingNotices.length > 0" class="closing-notice-list mb-4" aria-label="跨期与补记提示">
+              <NAlert
+                v-for="notice in closingNotices"
+                :key="notice.code"
+                type="warning"
+                :title="noticeTitle(notice)"
+                class="closing-notice"
+              >
+                <p class="notice-message">{{ notice.message }}</p>
+                <NCollapse v-if="notice.records?.length" class="notice-records">
+                  <NCollapseItem :title="`查看 ${notice.records.length} 条明细`" name="notice-records">
+                    <div
+                      v-for="(record, index) in notice.records"
+                      :key="index"
+                      class="notice-record-row"
+                    >
+                      <span class="notice-record-date">{{ record.businessDate }}</span>
+                      <span class="notice-record-title">{{ noticeRecordTitle(record) }}</span>
+                      <span class="notice-record-amount">¥{{ noticeRecordAmount(record) }}</span>
+                      <small class="notice-record-meta">{{ noticeRecordMeta(record) }}</small>
+                    </div>
+                  </NCollapseItem>
+                </NCollapse>
+                <div class="notice-actions">
+                  <!-- 启用前数据没有补记台账可导出（导出的会是空表，误导人） -->
+                  <NButton
+                    v-if="notice.code !== 'PRE_BOOK_START_ACTIVITY'"
+                    size="tiny"
+                    secondary
+                    @click="exportBackfillNotice(notice)"
+                  >
+                    <template #icon><i class="ri-download-2-line" /></template>
+                    导出清单
+                  </NButton>
+                  <NButton
+                    v-if="notice.code === 'PRE_BOOK_START_ACTIVITY'"
+                    size="tiny"
+                    secondary
+                    type="primary"
+                    @click="router.push('/mine/companies')"
+                  >
+                    去改启用日期
+                  </NButton>
+                  <NButton
+                    v-if="notice.code === 'CROSS_PERIOD_PENDING'"
+                    size="tiny"
+                    secondary
+                    type="primary"
+                    @click="currentStep = 1"
+                  >
+                    去补记
+                  </NButton>
+                </div>
+              </NAlert>
+            </div>
+
             <!-- 五项核验详细状态（原检查框架，折叠保留） -->
             <NCollapse class="readiness-detail-collapse mb-4">
-              <NCollapseItem title="查看检查项明细（凭证与来源 / 账账核对 / 银行流水核对 / 账表核对 / 申报校验）" name="checks">
+              <NCollapseItem title="展开专业核验明细（凭证与来源 / 账账核对 / 银行流水核对 / 账表核对 / 申报校验）" name="checks">
             <div class="readiness-list" aria-label="结账准备清单">
-              <!-- 员工薪酬发放阻断项 -->
-              <div v-if="hasBlockingPayroll" class="readiness-row blocked">
-                <span class="readiness-row-icon"><i class="ri-error-warning-line" /></span>
-                <span class="readiness-row-copy">
-                  <strong>员工薪酬与社保发放</strong>
-                  <small>本月有 {{ employees.length }} 名在职员工薪酬尚未完成计提或发放确认。</small>
-                </span>
-                <span class="readiness-row-status">需要处理</span>
-                <NButton size="tiny" secondary type="warning" @click="currentStep = 3">
-                  去计提与发放 (Step 3)
-                  <template #icon><i class="ri-arrow-right-line" /></template>
-                </NButton>
-              </div>
-
               <div
                 v-for="item in readinessItems"
                 :key="item.code"
@@ -3015,7 +4099,7 @@ function prevStep() {
             <div v-if="hasBlockingReconciliationRisk" class="closing-risk-lock mb-4" style="margin-top: 12px; padding: 12px 16px; background: rgba(239, 68, 68, 0.08); border-radius: 8px; border: 1px solid rgba(239, 68, 68, 0.2); display: flex; align-items: center; gap: 10px; color: var(--solo-expense);">
               <i class="ri-error-warning-fill" style="font-size: 18px;"></i>
               <span>检测到 {{ reconciliationHealthSummary.highRiskCount }} 项高风险对账问题（如金额不符或未核对），修复后方可关账。</span>
-              <NButton size="tiny" type="error" secondary @click="currentStep = 4">前往对账修复</NButton>
+              <NButton size="tiny" type="error" secondary @click="currentStep = 2">前往流水认领</NButton>
             </div>
 
             <!-- 关账操作栏 -->
@@ -3030,7 +4114,7 @@ function prevStep() {
               >
                 <template #icon><i class="ri-lock-line" /></template>
                 <template v-if="hasBlockingPayroll">
-                  尚有 {{ employees.length }} 名员工薪酬待确认发放，暂无法结账
+                  尚有 {{ employees.length }} 名员工工资待计提，暂无法结账
                 </template>
                 <template v-else-if="isZeroRecordMonth && !confirmZeroActivity">
                   本月暂无记账，请先补录或确认零申报
@@ -3047,7 +4131,7 @@ function prevStep() {
                 </template>
               </NButton>
               <p style="font-size: 12px; color: var(--solo-text-muted); margin-top: 8px;">
-                {{ canBatchPostAndClose ? `确认后将批量过账本月 ${closeDraftCount} 张待过账凭证，再完成关账；如有凭证需复核或其他核验未通过，整次操作会回滚。` : isZeroRecordMonth ? '以零业务结账后，本期资产负债表与利润表将以零收支锁定归档' : '结账后本期账册将锁定归档，并自动生成 AI 财务体检与经营诊断报告' }}
+                {{ canBatchPostAndClose ? `确认后将批量过账本月 ${closeDraftCount} 张待过账凭证，自动生成期末损益结转凭证后完成关账；如有凭证需复核或其他核验未通过，整次操作会回滚。` : isZeroRecordMonth ? '以零业务结账后，本期资产负债表与利润表将以零收支锁定归档' : '结账后本期账册将锁定归档，自动生成期末损益结转凭证（12 月含年度利润结转），并生成 AI 财务体检与经营诊断报告' }}
               </p>
             </div>
           </NSpin>
@@ -3063,6 +4147,17 @@ function prevStep() {
           <div style="text-align: center; margin-bottom: 24px;">
             <h3 class="ceremony-title">{{ targetMonth }} 结账成功</h3>
             <p class="ceremony-desc">本期账册已顺利归档，财务报表和凭证已锁定，AI 财务点评生成完毕。</p>
+            <p v-if="closingVoucherRefs.length" class="ceremony-vouchers">
+              本次自动生成期末损益结转凭证：{{ closingVoucherRefs.join('、') }}（已纳入凭证归档）
+            </p>
+            <p class="ceremony-book-hint">
+              <i class="ri-book-2-line"></i>
+              本期账簿已可导出：<a class="book-link" @click="router.push(`/ledger/book?month=${targetMonth}`)">电子账簿（余额表、明细账、日记账、总账）</a>
+            </p>
+            <p class="ceremony-book-hint">
+              <i class="ri-shield-check-line"></i>
+              想请会计师复核本月账？<a class="book-link" @click="router.push('/mine/audit-share')">生成专家协审链接</a>（免注册只读体检报告 + 批注意见回流）
+            </p>
           </div>
 
           <div class="metrics-row mb-4">
@@ -3105,11 +4200,11 @@ function prevStep() {
             <div class="relay-icon">🏛️</div>
             <div class="relay-copy">
               <h4>本月为季度末月（{{ targetMonth }}），{{ closedQuarter }} 季度财务数据已封账固化</h4>
-              <p>增值税免税额度、小型微利企业所得税测算与三方核对已具备法定申报条件，建议立即前往【税报 · 申报作业包】进行电子税务局抄报。</p>
+              <p>增值税免税额度、小型微利企业所得税测算与三方核对已具备法定申报条件，建议立即前往【税务申报】进行电子税务局抄报。</p>
             </div>
           </div>
           <NButton type="primary" size="medium" @click="router.push(`/tax-filing?period=${closedQuarter}`)">
-            前往 {{ closedQuarter }} 税报作业包 →
+            前往 {{ closedQuarter }} 税务申报 →
           </NButton>
         </div>
 
@@ -3119,26 +4214,85 @@ function prevStep() {
             <template #icon><i class="ri-file-zip-line" /></template>
             导出本月凭证与财务报告包 (PDF)
           </NButton>
+          <NButton size="medium" secondary type="primary" @click="router.push(`/ledger/book?month=${targetMonth}`)">
+            <template #icon><i class="ri-book-2-line" /></template>
+            查看本期电子账簿
+          </NButton>
           <NButton size="medium" type="primary" @click="router.push('/')">
             返回首页工作台
           </NButton>
         </NSpace>
+        <div class="reopen-entry">
+          <NButton size="tiny" quaternary type="warning" @click="reopenVisible = true">
+            <template #icon><i class="ri-lock-unlock-line" /></template>
+            反结账本期
+          </NButton>
+          <span class="reopen-entry-hint">补记或更正时使用，将红冲本期结转凭证并解锁账册</span>
+        </div>
       </div>
     </div>
 
-    <!-- Step Navigation Buttons -->
-    <div v-if="!closed" class="no-print" style="display: flex; justify-content: space-between; align-items: center; margin-top: 24px;">
+    <!-- Step Navigation Buttons (第一步的下一步入口在步骤条汇总行，避免重复) -->
+    <div v-if="!closed && currentStep > 1" class="no-print" style="display: flex; justify-content: space-between; align-items: center; margin-top: 12px;">
       <NButton :disabled="currentStep === 1" @click="prevStep">
         <template #icon><i class="ri-arrow-left-line" /></template>
         上一步
       </NButton>
-      <div v-if="currentStep < 5" style="display: flex; gap: 8px;">
+      <div v-if="currentStep < 3" style="display: flex; gap: 8px;">
         <NButton type="primary" @click="nextStep">
-          {{ currentStep === 4 ? '下一步：前往关账检查' : '下一步' }}
+          {{ currentStep === 2 ? '下一步：前往关账检查' : '下一步：流水认领与薪酬' }}
           <template #icon><i class="ri-arrow-right-line" /></template>
         </NButton>
       </div>
     </div>
+    <!-- ── Reopen Period Dialog ──────────────────────────────────── -->
+    <NModal
+      v-model:show="reopenVisible"
+      :mask-closable="true"
+      style="width: 480px; max-width: 96vw;"
+      :auto-focus="false"
+    >
+      <div class="manual-dialog reopen-dialog">
+        <div class="manual-dialog-header">
+          <div class="manual-dialog-icon reopen-icon"><i class="ri-lock-unlock-line"></i></div>
+          <div>
+            <div class="manual-dialog-title">反结账 {{ targetMonth }}</div>
+            <div class="manual-dialog-subtitle">解锁本期账册，补记或更正后需重新结账</div>
+          </div>
+        </div>
+
+        <div class="reopen-warning">
+          <i class="ri-error-warning-line"></i>
+          <span>反结账将自动红冲本期的期末损益结转凭证并解锁账册；如后续月份已关账，需先反结账最新月份。反结账原因将留痕。</span>
+        </div>
+
+        <div class="reopen-field">
+          <label>反结账原因（必填）</label>
+          <NInput
+            v-model:value="reopenReason"
+            type="textarea"
+            :autosize="{ minRows: 2, maxRows: 4 }"
+            placeholder="例如：补记遗漏的银行手续费"
+          />
+        </div>
+
+        <div class="reopen-field">
+          <label>安全验证（仅账套所有者可反结账）</label>
+          <div class="reopen-verify">
+            <NInput v-model:value="reopenPhone" placeholder="绑定手机号" />
+            <NInput v-model:value="reopenCode" placeholder="短信验证码" />
+            <NButton size="small" :loading="reopenSending" @click="sendReopenCode">发送验证码</NButton>
+          </div>
+        </div>
+
+        <div class="reopen-actions">
+          <NButton size="small" @click="reopenVisible = false">取消</NButton>
+          <NButton size="small" type="warning" :loading="reopenSubmitting" @click="submitReopen">
+            确认反结账
+          </NButton>
+        </div>
+      </div>
+    </NModal>
 
     <!-- ── Manual Classify Dialog ─────────────────────────────────── -->
     <NModal
@@ -3209,6 +4363,12 @@ function prevStep() {
           <div v-if="manualSuggestionMeta.reason" class="manual-account-preview">
             <span>AI 理由：{{ manualSuggestionMeta.reason }}</span>
             <span v-if="manualSuggestionMeta.confidence !== undefined" style="margin-left: 12px;">置信度：<b>{{ Math.round((manualSuggestionMeta.confidence || 0) * 100) }}%</b></span>
+          </div>
+
+          <div v-if="manualForm.suggestedSubAccount" class="manual-account-preview" style="margin-top: 12px;">
+            <NCheckbox v-model:checked="manualForm.useSuggestedSubAccount">
+              建议新建二级科目 <b>{{ manualForm.suggestedSubAccount.name }}</b>（父科目 {{ manualForm.suggestedSubAccount.parentCode }}）
+            </NCheckbox>
           </div>
 
           <div class="manual-form-item">
@@ -3464,8 +4624,12 @@ function prevStep() {
                   </td>
                 </tr>
                 <tr v-if="modalVoucherLines.length === 0">
-                  <td colspan="4" style="text-align: center; color: var(--solo-text-muted); padding: 16px;">
-                    暂无借贷分录明细
+                  <td colspan="4" style="text-align: center;">
+                    <SoloEmpty
+                      variant="hint"
+                      title="暂无借贷分录"
+                      description="该凭证还没有分录行。"
+                    />
                   </td>
                 </tr>
               </tbody>
@@ -3509,6 +4673,45 @@ function prevStep() {
         </NSpin>
       </div>
     </NModal>
+    <NModal
+      v-model:show="backfillConfirm.state.show"
+      preset="card"
+      title="这批业务要补记到下个月"
+      style="max-width: 460px;"
+      :mask-closable="false"
+    >
+      <div class="backfill-copy">
+        <p v-if="backfillConfirm.state.businessPeriod">
+          <strong>{{ backfillConfirm.state.businessPeriod }}</strong> 已经关账，这批业务将按
+          <strong>{{ backfillConfirm.state.targetPeriod }}</strong> 记账，原始单据日期不变。
+        </p>
+        <p v-else>
+          单据所属期间已关账，这批业务将补记到
+          <strong>{{ backfillConfirm.state.targetPeriod }}</strong>，原始单据日期不变。
+        </p>
+        <p style="color: var(--solo-text-muted); font-size: 12px;">
+          依据《小企业会计准则》第 88 条，差错在发现当期更正，不追溯调整已关账月份。
+        </p>
+        <p v-if="backfillConfirm.state.crossQuarter" class="backfill-warn">
+          注意：这次补记跨越季度，会同时影响两个季度的所得税预缴；小规模纳税人的季度
+          30 万免税判断也可能因此变化。
+        </p>
+      </div>
+      <NInput
+        v-model:value="backfillConfirm.state.reason"
+        type="textarea"
+        placeholder="补记原因（必填，例如：8 月单据 9 月才拿到）"
+        :autosize="{ minRows: 2, maxRows: 4 }"
+      />
+      <template #footer>
+        <div class="backfill-actions">
+          <NButton size="small" quaternary @click="backfillConfirm.cancel">取消</NButton>
+          <NButton size="small" type="primary" @click="backfillConfirm.submit">
+            确认补记到 {{ backfillConfirm.state.targetPeriod }}
+          </NButton>
+        </div>
+      </template>
+    </NModal>
   </div>
 </template>
 
@@ -3521,6 +4724,64 @@ function prevStep() {
 .expense { color: var(--solo-expense); }
 .cost-color { color: var(--solo-expense); }
 .money-color { color: var(--solo-income); }
+
+.boss-closing-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 16px;
+  padding: 14px 18px;
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius);
+  background: var(--solo-bg-blue-soft);
+}
+
+.boss-closing-main {
+  min-width: 0;
+}
+
+.boss-closing-kicker {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--solo-text-muted);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 1.2px;
+}
+
+.boss-closing-main strong {
+  color: var(--solo-text-primary);
+  font-size: 15px;
+}
+
+.boss-closing-main p {
+  margin: 3px 0 0;
+  color: var(--solo-text-secondary);
+  font-size: 12px;
+}
+
+.boss-closing-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+  color: var(--solo-text-secondary);
+  font-size: 12px;
+}
+
+@media (max-width: 720px) {
+  .boss-closing-summary {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .boss-closing-meta {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+  }
+}
 
 .quarter-tax-relay-card {
   display: flex;
@@ -3544,21 +4805,106 @@ function prevStep() {
   margin: 0 0 4px;
   font-size: 15px;
   font-weight: 600;
-  color: var(--solo-text-primary, #1d2129);
+  color: var(--solo-text-primary, #182230);
 }
 .relay-copy p {
   margin: 0;
   font-size: 13px;
-  color: var(--solo-text-secondary, #4e5969);
+  color: var(--solo-text-secondary, #586474);
   line-height: 1.5;
 }
 
 /* Manual Classify Dialog */
 .manual-dialog {
   background: var(--solo-bg-card);
-  border-radius: 16px;
+  border-radius: 12px;
   padding: 24px;
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.18);
+}
+
+/* Reopen Period Dialog + completion voucher note */
+.reopen-icon {
+  background: rgba(240, 153, 123, 0.12);
+  color: #d85a30;
+}
+
+.reopen-warning {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  background: rgba(230, 162, 60, 0.08);
+  border: 1px solid rgba(230, 162, 60, 0.25);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--solo-text-secondary, #586474);
+  margin-bottom: 16px;
+}
+
+.reopen-warning i {
+  color: #ba7517;
+  font-size: 15px;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.reopen-field {
+  margin-bottom: 14px;
+}
+
+.reopen-field > label {
+  display: block;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--solo-text-primary);
+  margin-bottom: 6px;
+}
+
+.reopen-verify {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.reopen-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.reopen-entry {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.reopen-entry-hint {
+  font-size: 12px;
+  color: var(--solo-text-muted);
+}
+
+.ceremony-vouchers {
+  margin: 8px 0 0;
+  font-size: 12.5px;
+  color: var(--solo-text-secondary);
+}
+/* F4：结账完成页引导到电子账簿（账簿的读者是会计/税务，给入口不给老板视图） */
+.ceremony-book-hint {
+  margin: 6px 0 0;
+  font-size: 12.5px;
+  color: var(--solo-text-secondary);
+}
+.ceremony-book-hint .book-link {
+  color: var(--solo-primary);
+  cursor: pointer;
+}
+.ceremony-book-hint .book-link:hover {
+  text-decoration: underline;
 }
 .manual-dialog-header {
   display: flex;
@@ -3591,7 +4937,7 @@ function prevStep() {
 .manual-stmt-info {
   background: rgba(99, 102, 241, 0.03);
   border: 1px solid rgba(99, 102, 241, 0.1);
-  border-radius: 10px;
+  border-radius: 8px;
   padding: 12px 14px;
   display: flex;
   flex-direction: column;
@@ -3658,7 +5004,7 @@ function prevStep() {
   color: var(--solo-text-muted);
   padding: 6px 10px;
   background: rgba(0,0,0,0.02);
-  border-radius: 6px;
+  border-radius: 4px;
   border: 1px solid var(--solo-border);
   display: flex;
   align-items: center;
@@ -3679,7 +5025,7 @@ function prevStep() {
   align-items: center;
   gap: 8px;
   padding: 6px 8px;
-  border-radius: 6px;
+  border-radius: 4px;
   background: rgba(16, 185, 129, 0.06);
   border: 1px solid rgba(16, 185, 129, 0.14);
   color: var(--solo-text-secondary);
@@ -3805,7 +5151,7 @@ function prevStep() {
   min-width: 116px;
   padding: 12px 16px;
   border: 1px solid var(--solo-border);
-  border-radius: 10px;
+  border-radius: 8px;
   background: var(--solo-bg-soft);
   text-align: right;
 }
@@ -3836,7 +5182,7 @@ function prevStep() {
   gap: 16px;
   padding: 20px;
   border: 1px solid rgba(22, 93, 255, 0.24);
-  border-radius: 14px;
+  border-radius: 12px;
   background: var(--solo-bg-blue-soft);
 }
 
@@ -3882,7 +5228,7 @@ function prevStep() {
   margin-top: 20px;
   overflow: hidden;
   border: 1px solid var(--solo-border);
-  border-radius: 14px;
+  border-radius: 12px;
 }
 
 .readiness-row {
@@ -4023,7 +5369,7 @@ function prevStep() {
 }
 .zero-record-icon {
   font-size: 22px;
-  color: var(--solo-primary, #165dff);
+  color: var(--solo-primary, #1747b0);
   flex-shrink: 0;
   margin-top: 2px;
 }
@@ -4059,5 +5405,507 @@ function prevStep() {
     margin-left: 0;
     width: 100%;
   }
+}
+
+.backfill-copy {
+  margin-bottom: 10px;
+  font-size: 13px;
+  line-height: 1.7;
+}
+.backfill-copy p {
+  margin: 0 0 6px;
+}
+.backfill-warn {
+  padding: 8px 10px;
+  border-radius: 4px;
+  background: var(--solo-warning-bg, #fff5e8);
+  color: var(--solo-warning, #a05c10);
+  font-size: 12px;
+}
+.backfill-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* ── 本期申报义务条（结账按月、申报按税种，两者不同维度） ── */
+.filing-obligation-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 12px;
+}
+
+.filing-obligation-lead {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--solo-text-secondary);
+  font-weight: 600;
+}
+
+.filing-obligation-chip {
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: var(--solo-primary-soft, rgba(99, 102, 241, 0.08));
+  color: var(--solo-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.filing-obligation-chip.is-filed {
+  opacity: 0.55;
+  text-decoration: line-through;
+}
+
+.filing-obligation-link {
+  margin-left: 2px;
+}
+
+/* Bank Feed Categorization Workbench (Step 4) */
+.feed-summary-hero {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+  padding: 16px 20px;
+  border-radius: var(--solo-radius-lg, 12px);
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.05) 0%, rgba(16, 185, 129, 0.05) 100%);
+  border: 1px solid rgba(99, 102, 241, 0.15);
+  margin-bottom: 20px;
+}
+
+.feed-hero-left {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex-wrap: wrap;
+}
+
+.feed-hero-stat-circle {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 58px;
+  height: 58px;
+  border-radius: 50%;
+  background: var(--solo-bg-card);
+  border: 2px solid var(--solo-primary);
+  box-shadow: 0 2px 8px rgba(99, 102, 241, 0.15);
+}
+
+.feed-hero-stat-circle .stat-number {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--solo-primary);
+  line-height: 1.1;
+}
+
+.feed-hero-stat-circle .stat-label {
+  font-size: 9px;
+  color: var(--solo-text-muted);
+  transform: scale(0.9);
+}
+
+.feed-hero-metrics {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.metric-pill {
+  padding: 6px 12px;
+  border-radius: 8px;
+  background: var(--solo-bg-card);
+  border: 1px solid var(--solo-border-light);
+  font-size: 12px;
+  color: var(--solo-text-secondary);
+}
+
+.metric-pill.success {
+  background: rgba(16, 185, 129, 0.08);
+  border-color: rgba(16, 185, 129, 0.25);
+  color: var(--solo-income);
+}
+
+.metric-pill.warning {
+  background: rgba(245, 158, 11, 0.08);
+  border-color: rgba(245, 158, 11, 0.25);
+  color: #a05c10;
+}
+
+.feed-section-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 14px;
+}
+
+.feed-empty-box {
+  padding: 48px 24px;
+  text-align: center;
+  background: rgba(16, 185, 129, 0.02);
+  border: 1px dashed rgba(16, 185, 129, 0.2);
+  border-radius: 12px;
+}
+
+.feed-empty-icon {
+  font-size: 40px;
+  color: var(--solo-income);
+}
+
+.feed-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* 商业化紧凑型对账行 (Compact Reconcile Row) */
+.reconcile-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 8px 14px;
+  background: var(--solo-bg-card);
+  border: 1px solid var(--solo-border-light);
+  border-radius: 8px;
+  transition: all 0.2s ease;
+}
+
+.reconcile-row:hover {
+  border-color: rgba(99, 102, 241, 0.3);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+}
+
+.reconcile-row.high-conf {
+  border-left: 3px solid var(--solo-primary);
+}
+
+.reconcile-row.needs-attention {
+  border-left: 3px solid var(--solo-warning);
+  background: var(--solo-warning-bg);
+}
+
+.tier-filter-pills {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tier-pill {
+  padding: 2px 10px;
+  font-size: 12px;
+  border-radius: 999px;
+  border: 1px solid var(--solo-border-light);
+  background: var(--solo-bg-soft);
+  color: var(--solo-text-secondary);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.tier-pill.active {
+  background: var(--solo-info-bg);
+  border-color: var(--solo-primary);
+  color: var(--solo-primary);
+  font-weight: 600;
+}
+
+.tier-pill.attention {
+  color: var(--solo-warning);
+  background: var(--solo-warning-bg);
+}
+
+.tier-pill.attention.active {
+  border-color: var(--solo-warning);
+  font-weight: 600;
+}
+
+.reconcile-cell-fact {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex: 1.2;
+  min-width: 320px;
+}
+
+.fact-lead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.fact-date {
+  font-size: 12px;
+  color: var(--solo-text-muted);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.fact-desc {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--solo-text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fact-amount {
+  font-size: 15px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+  min-width: 80px;
+  text-align: right;
+}
+
+.reconcile-cell-plan {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 220px;
+}
+
+.plan-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  max-width: 100%;
+}
+
+.plan-badge.standard {
+  background: rgba(99, 102, 241, 0.06);
+  border: 1px solid rgba(99, 102, 241, 0.16);
+  color: var(--solo-text-primary);
+}
+
+.plan-badge.match {
+  background: rgba(16, 185, 129, 0.06);
+  border: 1px solid rgba(16, 185, 129, 0.2);
+  color: var(--solo-text-primary);
+}
+
+.plan-badge.fallback {
+  background: rgba(0, 0, 0, 0.02);
+  border: 1px dashed var(--solo-border-light);
+  color: var(--solo-text-muted);
+}
+
+.plan-badge.none {
+  background: rgba(0, 0, 0, 0.02);
+  border: 1px dashed var(--solo-border-light);
+  color: var(--solo-text-muted);
+}
+
+.plan-label {
+  color: var(--solo-text-muted);
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+.plan-category {
+  font-weight: 600;
+  color: var(--solo-text-primary);
+  font-size: 12px;
+}
+
+.plan-evidence-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  cursor: help;
+  user-select: none;
+}
+
+.plan-evidence-pill.verified {
+  background: var(--solo-info-bg);
+  color: var(--solo-primary);
+}
+
+.plan-evidence-pill.memory-rule {
+  background: var(--solo-income-bg);
+  color: var(--solo-income);
+}
+
+.plan-evidence-pill.attention {
+  background: var(--solo-warning-bg);
+  color: var(--solo-warning);
+}
+
+.plan-evidence-pill.fallback {
+  background: rgba(0, 0, 0, 0.04);
+  color: var(--solo-text-muted);
+}
+
+.reconcile-cell-action {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.reconcile-category-select {
+  width: 170px;
+}
+
+.reconcile-detail-btn {
+  color: var(--solo-text-muted);
+  font-size: 12px;
+}
+
+/* 旧卡片样式向下兼容 */
+.feed-card {
+  padding: 14px 18px;
+  background: var(--solo-bg-card);
+  border: 1px solid var(--solo-border-light);
+  border-radius: 8px;
+  transition: all 0.2s ease;
+}
+
+.feed-card:hover {
+  border-color: rgba(99, 102, 241, 0.3);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.04);
+}
+
+.feed-card.high-conf {
+  border-left: 4px solid var(--solo-primary);
+}
+
+.feed-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.feed-card-lead {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 240px;
+}
+
+.feed-card-date {
+  font-size: 12px;
+  color: var(--solo-text-muted);
+}
+
+.feed-card-title {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--solo-text-primary);
+}
+
+.feed-card-amount {
+  font-size: 16px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.feed-card-recommendation {
+  margin-top: 10px;
+}
+
+.feed-rec-badge {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+.feed-rec-badge.ai {
+  background: rgba(99, 102, 241, 0.05);
+  border: 1px solid rgba(99, 102, 241, 0.18);
+  color: var(--solo-text-primary);
+}
+
+/* 兜底草稿（AI 没判出来）：灰底虚线，不冒充建议 */
+.feed-rec-badge.fallback {
+  background: rgba(0, 0, 0, 0.02);
+  border: 1px dashed var(--solo-border-light);
+  color: var(--solo-text-muted);
+}
+
+.feed-rec-badge.match {
+  background: rgba(16, 185, 129, 0.06);
+  border: 1px solid rgba(16, 185, 129, 0.2);
+  color: var(--solo-text-primary);
+}
+
+/* 匹配凭证标题：点击可打开凭证详情 */
+.feed-rec-link {
+  font-size: 12px;
+  padding: 0;
+  height: auto;
+}
+.feed-rec-link:hover strong {
+  text-decoration: underline;
+}
+
+.feed-rec-badge.none {
+  background: rgba(0, 0, 0, 0.02);
+  border: 1px dashed var(--solo-border-light);
+  color: var(--solo-text-muted);
+}
+
+.feed-card-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--solo-border-light);
+  flex-wrap: wrap;
+}
+
+.feed-quick-select-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.feed-select-label {
+  font-size: 12px;
+  color: var(--solo-text-muted);
+}
+
+.feed-completed-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.feed-completed-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  background: rgba(0, 0, 0, 0.02);
+  border-radius: 4px;
+}
+
+.ellipsis {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 </style>

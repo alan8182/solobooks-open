@@ -1,0 +1,82 @@
+{
+  "source": "solobooks-accounting",
+  "name": "梭罗记账",
+  "name_zh": "梭罗记账",
+  "name_en": "SoloBooks",
+  "description": "面向小微企业与一人公司的 AI 数字会计连接器。支持月度收支汇总、流水与发票核对、结账五项检查、纳税申报作业包及凭证草稿提议。严格遵循「AI 起草、人工确认」安全红线，所有写入操作仅生成待办草稿，账本终审牢牢掌握在老板手中。",
+  "description_zh": "面向小微企业与一人公司的 AI 数字会计连接器。支持月度收支汇总、流水与发票核对、结账五项检查、纳税申报作业包及凭证草稿提议。严格遵循「AI 起草、人工确认」安全红线，所有写入操作仅生成待办草稿，账本终审牢牢掌握在老板手中。",
+  "description_en": "AI digital accounting connector for solopreneurs and micro-enterprises. Supports monthly balance summaries, bank statement reconciliation, month-end close checks, tax filing preparation, and voucher drafting. Adheres to human-in-the-loop review.",
+  "examples_zh": [
+    "帮我查一下上个月的收支汇总与净利润",
+    "核对一下招商银行最近未对账的流水明细",
+    "运行 9 月份结账五项检查，看看是否满足关账条件",
+    "准备本季度的增值税与所得税纳税申报作业包"
+  ],
+  "examples_en": [
+    "Show me the revenue, cost, and net profit summary for last month",
+    "Check unmatched bank statements and reconciliation suggestions",
+    "Run month-end close compliance checks for September",
+    "Generate the quarterly VAT and corporate income tax filing package"
+  ],
+  "icon": "icon.png",
+  "version": "1.1.0",
+  "category": "finance",
+  "tags": ["记账", "财税", "一人公司", "纳税申报", "流水对账"],
+  "homepage": "https://solobooks.cn",
+  "protocol": {
+    "type": "mcp",
+    "transport": "streamable-http",
+    "endpoint_url": "https://solobooks.cn/mcp",
+    "endpoint_path": "/mcp"
+  },
+  "authentication": {
+    "type": "bearer_token",
+    "header_name": "Authorization",
+    "header_prefix": "Bearer ",
+    "token_pattern": "^sbk_[A-Za-z0-9_-]{43}$",
+    "token_source_hint": "请登录梭罗记账网页端 (https://solobooks.cn)，在「我的 → AI 连接（MCP）」中创建并复制个人访问令牌 (PAT)。"
+  },
+  "safety_policy": {
+    "audit_trail": true,
+    "human_in_the_loop": true,
+    "disallowed_operations": [
+      "direct_ledger_write",
+      "company_profile_write",
+      "user_management",
+      "close_period_execution"
+    ]
+  },
+  "tools_overview": {
+    "read_only": [
+      "get_month_summary",
+      "list_entries",
+      "list_invoice_entries",
+      "list_bank_statements",
+      "list_fixed_assets",
+      "list_intangible_assets",
+      "get_advance_balances",
+      "get_aging",
+      "list_todos",
+      "search_books",
+      "get_company_profile",
+      "get_entry_detail",
+      "run_close_checks",
+      "list_unmatched",
+      "preview_accruals",
+      "preview_asset_actions",
+      "get_filing_deadlines",
+      "generate_close_report",
+      "generate_filing_package"
+    ],
+    "draft_proposals": [
+      "propose_voucher",
+      "propose_vouchers",
+      "propose_match",
+      "propose_accrual",
+      "propose_asset_closure"
+    ]
+  },
+  "recommended_skills": [
+    "skills/solobooks-tax-filing"
+  ]
+}

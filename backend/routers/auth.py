@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Authentication routes."""
 from __future__ import annotations
 
@@ -6,6 +9,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import JWT_EXPIRES_IN, WECHAT_APPID
@@ -41,6 +45,7 @@ from services.account_service import (
     bind_phone,
     update_user_profile,
     create_company,
+    get_company,
     update_company,
 )
 from services.token_service import create_access_token
@@ -55,12 +60,39 @@ from services.password_service import (
 )
 from services.wechat_auth_service import exchange_code_for_openid
 from services.audit_service import log_action
+from services import demo_book_service
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 logger = logging.getLogger(__name__)
 
 DEFAULT_TOS_VERSION = "v1.0"
 DEFAULT_PRIVACY_VERSION = "v1.0"
+
+
+async def _prepare_signup_company(
+    user: dict, company: dict | None, is_new: bool
+) -> dict:
+    """新注册用户：生成演示账套并设为当前账套。
+
+    演示账套生成失败时回退一本空白正式账套——登录必须始终有账可用，
+    否则 JWT 签发不出 company_id，用户会卡在无法进入系统的状态。
+    """
+    if company is not None:
+        return company
+    if is_new:
+        try:
+            demo = await demo_book_service.create_demo_company(user["user_id"])
+            demo_company = await get_company(demo["companyId"])
+            if demo_company:
+                await set_user_current_company(user["user_id"], demo["companyId"])
+                return demo_company
+        except Exception:  # noqa: BLE001 - 演示失败不能阻断注册
+            logger.exception("注册生成演示账套失败，回退空账套 user_id=%s", user["user_id"])
+    fallback = await create_company(
+        user["user_id"], demo_book_service.EMPTY_COMPANY_NAME
+    )
+    await set_user_current_company(user["user_id"], fallback["company_id"])
+    return fallback
 
 
 @router.post("/step-up", response_model=StepUpResponse)
@@ -160,7 +192,8 @@ async def wechat_login(req: WechatLoginRequest, request: Request):
     logger.info("wechat login start, trace_id=%s client_ip=%s", trace_id, client_ip)
     session = await _exchange_wechat_session(req.code, request, trace_id)
     openid = session["openid"]
-    user, company = await get_or_create_user(openid)
+    user, company, is_new = await get_or_create_user(openid)
+    company = await _prepare_signup_company(user, company, is_new)
 
     await save_privacy_consent(
         user_id=user["user_id"],
@@ -210,7 +243,8 @@ async def phone_login(req: PhoneLoginRequest):
         pass
     else:
         await check_verify_code(req.phone, req.code, req.biz_id or req.bizId)
-    user, company = await get_or_create_user_by_phone(req.phone)
+    user, company, is_new = await get_or_create_user_by_phone(req.phone)
+    company = await _prepare_signup_company(user, company, is_new)
     token = create_access_token(
         {
             "sub": user["user_id"],
@@ -253,7 +287,8 @@ async def password_login(req: PasswordLoginRequest, request: Request):
         raise HTTPException(status_code=400, detail="手机号或密码错误")
     clear_failures(*keys)
 
-    user, company = await get_or_create_user_by_phone(phone)
+    user, company, is_new = await get_or_create_user_by_phone(phone)
+    company = await _prepare_signup_company(user, company, is_new)
     token = create_access_token(
         {
             "sub": user["user_id"],
@@ -394,14 +429,16 @@ async def switch_company(req: SwitchCompanyRequest, ctx: AuthContext = Depends(r
         raise HTTPException(status_code=403, detail="无权访问该 company 或主体不存在")
 
     user, company = pair
-    token = create_access_token({"sub": user["user_id"], "company_id": company["company_id"]})
-    await log_action(company["company_id"], user["user_id"], "switch_company", "user", user["user_id"],
+    # payload 可能缺少 company_id（历史/精简创建），目标 id 以请求参数为准
+    resolved_id = company.get("company_id") or cid
+    token = create_access_token({"sub": user["user_id"], "company_id": resolved_id})
+    await log_action(resolved_id, user["user_id"], "switch_company", "user", user["user_id"],
                      {"to_company_id": cid})
     return {
         "access_token": token,
         "token_type": "Bearer",
         "user_id": user["user_id"],
-        "company_id": company["company_id"],
+        "company_id": resolved_id,
         "expires_in": str(JWT_EXPIRES_IN),
     }
 
@@ -430,9 +467,86 @@ async def auth_create_company(req: dict, ctx: AuthContext = Depends(require_auth
 
 @router.put("/companies/{company_id}")
 async def auth_update_company(company_id: str, req: dict, ctx: AuthContext = Depends(require_auth)):
-    """Update company details."""
+    """Update company details.
+
+    申报周期（vatFilingCycle / businessIncomeIitFilingCycle）变更会连带影响征期：
+    重算当年待办，并写审计事件留痕——小规模纳税人的纳税期限一经选择，
+    一个会计年度内不得变更，事后追溯必须有据可查。
+    """
+    before = await get_company(company_id) or {}
     try:
         company = await update_company(ctx.user_id, company_id, req)
     except ValueError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    await _apply_filing_cycle_change(ctx, company_id, before, company)
     return company
+
+
+CYCLE_FIELDS = ("vatFilingCycle", "businessIncomeIitFilingCycle")
+CYCLE_DEFAULTS = {"vatFilingCycle": "quarter", "businessIncomeIitFilingCycle": "quarter"}
+
+
+async def _apply_filing_cycle_change(
+    ctx: AuthContext, company_id: str, before: dict, after: dict
+) -> None:
+    """周期变更后重算征期并留痕（失败只记日志，不影响主体保存本身）。"""
+    changed = {
+        field: {
+            "before": str(before.get(field) or CYCLE_DEFAULTS[field]),
+            "after": str(after.get(field) or CYCLE_DEFAULTS[field]),
+        }
+        for field in CYCLE_FIELDS
+        if str(before.get(field) or CYCLE_DEFAULTS[field])
+        != str(after.get(field) or CYCLE_DEFAULTS[field])
+    }
+    if not changed:
+        return
+    try:
+        from db.session import session_scope
+        from services.accounting_core_service import record_audit
+        from services import filing_deadline_service
+
+        async with session_scope() as session:
+            await record_audit(
+                session,
+                company_id=company_id,
+                user_id=ctx.user_id,
+                action="change_filing_cycle",
+                entity_type="company",
+                entity_id=company_id,
+                request_id=str(uuid4()),
+                before={k: v["before"] for k, v in changed.items()},
+                after={k: v["after"] for k, v in changed.items()},
+                reason="filing_cycle_changed",
+            )
+        await filing_deadline_service.refresh_deadlines(company_id)
+    except Exception:  # noqa: BLE001 —— 征期重算失败不回滚主体配置
+        logger.exception("filing cycle change post-processing failed company=%s", company_id)
+
+
+class DeleteCompanyRequest(BaseModel):
+    confirmName: str
+
+
+@router.delete("/companies/{company_id}")
+async def auth_delete_company(
+    company_id: str,
+    req: DeleteCompanyRequest,
+    ctx: AuthContext = Depends(require_auth),
+):
+    """永久删除主体及全部业务数据（不可恢复，需精确输入主体名称）。"""
+    from services.company_delete_service import (
+        CompanyDeleteError,
+        CompanyNotFoundError,
+        CurrentCompanyDeleteError,
+        purge_company,
+    )
+
+    try:
+        return await purge_company(ctx.user_id, company_id, req.confirmName)
+    except CompanyNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except CurrentCompanyDeleteError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except CompanyDeleteError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

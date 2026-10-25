@@ -1,5 +1,12 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+/**
+ * Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+ * Licensed under the SoloBooks License v2.0.
+ */
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
+import { createPinia, setActivePinia } from 'pinia'
+import { NInput, NSelect } from 'naive-ui'
 import EntryDetail from '@/pages/ledger/detail.vue'
 import VoucherList from '@/pages/voucher/index.vue'
 
@@ -41,6 +48,10 @@ vi.mock('naive-ui', async importOriginal => ({
   useDialog: () => ({ info: h.dialogInfo, warning: h.dialogWarning, error: vi.fn() }),
 }))
 
+beforeEach(() => {
+  setActivePinia(createPinia())
+})
+
 afterEach(() => vi.clearAllMocks())
 
 describe('voucher posting workflow', () => {
@@ -49,7 +60,7 @@ describe('voucher posting workflow', () => {
     ['pending_review', { canApprove: true }, '复核并过账', 'approve'],
     ['draft', { canSubmit: true, canPost: false }, '提交复核', 'submit'],
   ] as const)('reviews %s through the permitted action %s', async (status, options, label, action) => {
-    const entry = { id: 'draft', title: '测试收入', amount: 5, direction: 'income', category: '主营业务收入', occurDate: '2026-07-14', voucherStatus: status, voucherLines: { debit: [{ accountCode: '1012', accountName: '微信待结算', amount: 5 }], credit: [{ accountCode: '6001', accountName: '主营业务收入', amount: 5 }] } }
+    const entry = { id: 'draft', title: '测试收入', amount: 5, direction: 'income', category: '主营业务收入', occurDate: '2026-07-14', voucherStatus: status, voucherLines: { debit: [{ accountCode: '1012001', accountName: '微信待结算', amount: 5 }], credit: [{ accountCode: '5001', accountName: '主营业务收入', amount: 5 }] } }
     h.store = { activeEntries: [entry], fetchEntries: vi.fn(async () => {}) }
     h.options.mockResolvedValue(options)
     h[action].mockResolvedValue({ entry: { ...entry, voucherStatus: action === 'submit' ? 'pending_review' : 'posted', voucherRef: action === 'submit' ? '' : 'VOU-202607-000001' } })
@@ -60,8 +71,8 @@ describe('voucher posting workflow', () => {
     await button.trigger('click')
     expect(h[action]).not.toHaveBeenCalled()
     const modal = wrapper.find('.test-modal')
-    expect(modal.text()).toContain('1012')
-    expect(modal.text()).toContain('6001')
+    expect(modal.text()).toContain('1012001')
+    expect(modal.text()).toContain('5001')
     await modal.findAll('button').find(matchAction)!.trigger('click')
     await flushPromises()
     expect(h[action]).toHaveBeenCalledExactlyOnceWith('draft')
@@ -146,9 +157,10 @@ describe('voucher posting workflow', () => {
     const wrapper = mount(VoucherList)
     await flushPromises()
 
-    const checkboxes = wrapper.findAll('.n-checkbox')
-    expect(checkboxes.length).toBeGreaterThanOrEqual(3)
-    await checkboxes[1].trigger('click')
+    // 列表为数据表格，行序随排序变化，所以按内容定位而不是索引
+    const targetRow = wrapper.findAll('.n-data-table-tr').find((row) => row.text().includes('选中的凭证'))
+    expect(targetRow).toBeDefined()
+    await targetRow!.find('.n-checkbox').trigger('click')
     await flushPromises()
 
     expect(wrapper.text()).toContain('已勾选 1 笔')
@@ -160,6 +172,44 @@ describe('voucher posting workflow', () => {
 
     expect(h.batchPost).toHaveBeenCalledWith({ entryIds: ['sel-1'] })
     expect(h.success).toHaveBeenCalledWith(expect.stringContaining('成功批量过账 1 笔'))
+
+    wrapper.unmount()
+  })
+
+  it('filters the table by status and keyword', async () => {
+    const entries = [
+      { id: 'd-1', title: '草稿凭证', amount: 10, occurDate: '2026-07-01', voucherStatus: 'draft' },
+      { id: 'p-1', title: '已过账凭证', amount: 20, occurDate: '2026-07-02', voucherStatus: 'posted', voucherRef: 'VOU-202607-000001' },
+      { id: 'r-1', title: '已冲销凭证', amount: 30, occurDate: '2026-07-03', voucherStatus: 'reversed', voucherRef: 'VOU-202607-000002' },
+    ]
+    h.store = { activeEntries: entries, fetchEntries: vi.fn(async () => {}) }
+    h.checks.mockResolvedValue({ checks: [] })
+
+    const wrapper = mount(VoucherList)
+    await flushPromises()
+    const visibleRows = () => wrapper.findAll('tbody .n-data-table-tr').length
+    expect(visibleRows()).toBe(3)
+
+    // 状态筛选：已过账只剩一行
+    const statusSelect = wrapper.findComponent(NSelect)
+    await statusSelect.vm.$emit('update:value', 'posted')
+    await flushPromises()
+    expect(visibleRows()).toBe(1)
+    expect(wrapper.text()).toContain('已过账凭证')
+    expect(wrapper.text()).not.toContain('草稿凭证')
+
+    // 关键词搜索：按凭证号命中（页面里有多个 NInput，须按 placeholder 定位搜索框）
+    const searchInput = wrapper.findAllComponents(NInput)
+      .find(c => c.props('placeholder') === '搜摘要 / 分类 / 凭证号')
+    expect(searchInput).toBeDefined()
+    await searchInput!.vm.$emit('update:value', 'VOU-202607-000002')
+    await flushPromises()
+    expect(visibleRows()).toBe(0)
+
+    await statusSelect.vm.$emit('update:value', '')
+    await flushPromises()
+    expect(visibleRows()).toBe(1)
+    expect(wrapper.text()).toContain('已冲销凭证')
 
     wrapper.unmount()
   })

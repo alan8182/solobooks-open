@@ -1,19 +1,85 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NAV_ITEMS, type NavItem } from '@/utils/constants'
+import { NAV_ITEMS, type BossGroup, type NavGroup, type NavItem } from '@/utils/constants'
+import { useWorkspaceViewStore } from '@/stores/workspaceView'
+import { itemVisible } from '@/utils/workspace'
 
-defineProps<{ collapsed: boolean }>()
-const emit = defineEmits<{ toggle: [] }>()
+const props = withDefaults(defineProps<{ collapsed: boolean; mobile?: boolean }>(), {
+  mobile: false,
+})
+const emit = defineEmits<{ toggle: []; navigate: [] }>()
 
 const route = useRoute()
 const router = useRouter()
-const expandedMenus = ref<string[]>([])
+const viewStore = useWorkspaceViewStore()
+const expandedMenu = ref<string | null>(null)
+const visibleItems = computed<NavItem[]>(() => {
+  return NAV_ITEMS
+    .filter((item) => itemVisible(item.workspace, viewStore.mode))
+    .map((item) => ({
+      ...item,
+      children: item.children?.filter((child) => itemVisible(child.workspace, viewStore.mode)),
+    }))
+    .filter((item) => Boolean(item.path) || Boolean(item.children?.length))
+})
+const BOSS_GROUPS: BossGroup[] = ['每天', '每月', '复盘', '设置']
+const WORKSPACE_GROUPS: NavGroup[] = ['日常', '账务', '周期', '工具']
+
+// 设置收纳：老板视图折进左下角小图标（低频入口不占主航）；
+// 会计视图必须留在导航里——会计科目、期初设置、备份与归档这些"不配就用不了"，
+// 藏进 36px 图标后新用户根本不知道它们存在。
+// 移动端抽屉本来就没有左下角图标位，设置一律留在导航里。
+const SETTINGS_LABEL = '设置'
+const navPool = computed<NavItem[]>(() => {
+  if (props.mobile || viewStore.isAccounting) return visibleItems.value
+  return visibleItems.value.filter((item) => item.label !== SETTINGS_LABEL)
+})
+const settingsItem = computed<NavItem | null>(
+  () => visibleItems.value.find((item) => item.label === SETTINGS_LABEL) ?? null,
+)
+// 会计视图已把设置放回导航，左下角图标不再重复出现
+const showSettingsLauncher = computed(
+  () => !props.mobile && !viewStore.isAccounting && settingsItem.value !== null,
+)
+const settingsOpen = ref(false)
+const settingsAnchorRef = ref<HTMLElement | null>(null)
+const settingsActive = computed(
+  () => settingsItem.value?.children?.some((child) => isActive(child.path)) ?? false,
+)
+
+// 菜单只由点击开关（不再悬停触发）；点别处或按 Esc 都收起。
+function onDocClick(e: MouseEvent) {
+  if (!settingsOpen.value) return
+  const anchor = settingsAnchorRef.value
+  if (anchor && !anchor.contains(e.target as Node)) settingsOpen.value = false
+}
+
+function onDocKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape' && settingsOpen.value) settingsOpen.value = false
+}
+
+onMounted(() => {
+  document.addEventListener('click', onDocClick)
+  document.addEventListener('keydown', onDocKeydown)
+})
+onBeforeUnmount(() => {
+  document.removeEventListener('click', onDocClick)
+  document.removeEventListener('keydown', onDocKeydown)
+})
+
 const navGroups = computed(() => {
-  return ['日常', '周期', '管理'].map((label) => ({
+  if (viewStore.isBoss) {
+    return BOSS_GROUPS.map((label) => ({
+      label,
+      items: navPool.value.filter((item) => item.bossGroup === label),
+    })).filter((group) => group.items.length > 0)
+  }
+  return WORKSPACE_GROUPS.map((label) => ({
     label,
-    items: NAV_ITEMS.filter((item) => item.group === label),
-  }))
+    items: navPool.value.filter((item) => item.group === label),
+  })).filter((group) => group.items.length > 0)
 })
 
 function isActive(path: string) {
@@ -25,34 +91,37 @@ function isParentActive(item: NavItem) {
   return item.children?.some((child) => isActive(child.path)) ?? false
 }
 
+function itemDisplayLabel(item: NavItem) {
+  return viewStore.isBoss && item.bossLabel ? item.bossLabel : item.label
+}
+
 function isExpanded(label: string) {
-  return expandedMenus.value.includes(label)
+  return expandedMenu.value === label
 }
 
 function toggleMenu(label: string) {
-  expandedMenus.value = isExpanded(label)
-    ? expandedMenus.value.filter((item) => item !== label)
-    : [...expandedMenus.value, label]
+  expandedMenu.value = isExpanded(label) ? null : label
 }
 
 function navigate(path: string) {
+  settingsOpen.value = false
   router.push(path)
+  emit('navigate')
 }
 
 watch(
-  () => route.path,
+  [() => route.path, () => viewStore.mode],
   () => {
-    const activeParents = NAV_ITEMS
-      .filter((item) => isParentActive(item))
-      .map((item) => item.label)
-    expandedMenus.value = Array.from(new Set([...expandedMenus.value, ...activeParents]))
+    settingsOpen.value = false
+    const activeParent = navPool.value.find((item) => isParentActive(item))
+    expandedMenu.value = activeParent?.label ?? null
   },
   { immediate: true },
 )
 </script>
 
 <template>
-  <aside class="sidebar" :class="{ collapsed }">
+  <aside class="sidebar" :class="{ collapsed, mobile }">
     <div class="sidebar-header">
       <div class="logo-area" @click="router.push('/')">
         <div class="logo-icon">
@@ -63,7 +132,12 @@ watch(
           <span class="logo-sub">SoloBooks</span>
         </div>
       </div>
-      <button class="toggle-btn" @click="emit('toggle')" :title="collapsed ? '展开' : '收起'">
+      <button
+        v-if="!mobile"
+        class="toggle-btn"
+        @click="emit('toggle')"
+        :title="collapsed ? '展开' : '收起'"
+      >
         <i :class="collapsed ? 'ri-arrow-right-s-line' : 'ri-arrow-left-s-line'" />
       </button>
     </div>
@@ -86,13 +160,13 @@ watch(
             type="button"
             class="nav-item"
             :class="{ active: isParentActive(item) }"
-            :title="collapsed ? item.label : undefined"
+            :title="collapsed ? itemDisplayLabel(item) : undefined"
             :aria-expanded="isExpanded(item.label)"
             @click="toggleMenu(item.label)"
           >
             <span class="nav-item-inner">
               <i :class="[item.icon, 'nav-icon']" />
-              <span v-if="!collapsed" class="nav-label">{{ item.label }}</span>
+              <span v-if="!collapsed" class="nav-label">{{ itemDisplayLabel(item) }}</span>
             </span>
             <i
               v-if="!collapsed"
@@ -107,12 +181,12 @@ watch(
             type="button"
             class="nav-item"
             :class="{ active: isActive(item.path) }"
-            :title="collapsed ? item.label : undefined"
+            :title="collapsed ? itemDisplayLabel(item) : undefined"
             @click="navigate(item.path)"
           >
             <span class="nav-item-inner">
               <i :class="[item.icon, 'nav-icon']" />
-              <span v-if="!collapsed" class="nav-label">{{ item.label }}</span>
+              <span v-if="!collapsed" class="nav-label">{{ itemDisplayLabel(item) }}</span>
             </span>
           </button>
 
@@ -139,6 +213,48 @@ watch(
       </div>
     </nav>
 
+    <div v-if="!mobile" class="view-switch-footer">
+      <div v-if="showSettingsLauncher" ref="settingsAnchorRef" class="settings-anchor" :class="{ open: settingsOpen }">
+        <button
+          type="button"
+          class="settings-btn"
+          :class="{ active: settingsActive }"
+          :title="settingsActive ? '设置（当前所在）' : '设置'"
+          aria-label="设置菜单"
+          aria-haspopup="menu"
+          :aria-expanded="settingsOpen"
+          @click="settingsOpen = !settingsOpen"
+        >
+          <i class="ri-settings-4-line" />
+          <span v-if="!collapsed" class="settings-btn-label">设置</span>
+        </button>
+        <div class="settings-flyout" :aria-label="`设置二级菜单`">
+          <span class="subnav-title">设置</span>
+          <button
+            v-for="child in settingsItem?.children ?? []"
+            :key="child.path"
+            type="button"
+            class="subnav-item"
+            :class="{ active: isActive(child.path) }"
+            @click="navigate(child.path)"
+          >
+            <i :class="[child.icon, 'subnav-icon']" />
+            <span>{{ child.label }}</span>
+          </button>
+        </div>
+      </div>
+      <button
+        type="button"
+        class="view-switch-hint"
+        :title="viewStore.isBoss ? '切换到会计视图' : '切换到老板视图'"
+        @click="viewStore.toggleMode()"
+      >
+        <i :class="viewStore.isBoss ? 'ri-file-list-3-line' : 'ri-dashboard-3-line'" />
+        <span v-if="!collapsed">
+          {{ viewStore.isBoss ? '需要做凭证？切换到会计视图' : '查看老板摘要' }}
+        </span>
+      </button>
+    </div>
   </aside>
 </template>
 
@@ -160,6 +276,21 @@ watch(
 }
 .sidebar.collapsed {
   width: var(--sidebar-collapsed-width);
+}
+.sidebar.mobile {
+  position: static;
+  width: 100%;
+  height: auto;
+  min-height: 0;
+  flex: 1;
+  border-right: 0;
+  box-shadow: none;
+}
+.sidebar.mobile .nav-list {
+  overflow-y: auto;
+}
+.sidebar.mobile .sidebar-header {
+  padding-inline: 16px;
 }
 .sidebar-header {
   position: relative;
@@ -257,6 +388,112 @@ watch(
 .sidebar.collapsed .nav-list {
   overflow: visible;
 }
+.view-switch-footer {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  padding: 10px 12px 14px;
+  border-top: 1px solid var(--solo-border-sidebar);
+}
+.settings-anchor {
+  position: relative;
+  flex-shrink: 0;
+}
+.settings-btn {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: 34px;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--solo-text-muted);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 550;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 160ms ease-out, color 160ms ease-out;
+}
+.settings-btn > i {
+  font-size: 18px;
+  width: 20px;
+  text-align: center;
+  flex-shrink: 0;
+}
+.sidebar.collapsed .settings-btn {
+  width: 32px;
+  justify-content: center;
+  padding-inline: 0;
+}
+.settings-btn:hover {
+  color: var(--solo-primary);
+  background: var(--solo-bg-soft);
+}
+.settings-btn.active {
+  color: var(--solo-primary);
+  background: var(--solo-bg-blue-soft);
+}
+.settings-flyout {
+  position: absolute;
+  bottom: calc(100% + 12px);
+  left: 0;
+  z-index: 130;
+  display: none;
+  width: 184px;
+  max-height: 62vh;
+  overflow-y: auto;
+  padding: 8px;
+  border: 1px solid var(--solo-border);
+  border-radius: 8px;
+  background: var(--solo-bg-sidebar);
+  box-shadow: var(--solo-shadow);
+  flex-direction: column;
+  gap: 2px;
+}
+.settings-anchor.open > .settings-flyout {
+  display: flex;
+}
+.sidebar.collapsed .settings-flyout {
+  bottom: 0;
+  left: calc(100% + 12px);
+}
+.sidebar.collapsed .settings-anchor {
+  align-self: center;
+}
+.view-switch-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--solo-text-muted);
+  font: inherit;
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 160ms ease-out, color 160ms ease-out;
+}
+.view-switch-hint:hover {
+  background: var(--solo-bg-soft);
+  color: var(--solo-primary);
+}
+.view-switch-hint:focus-visible {
+  outline: 2px solid var(--solo-primary);
+  outline-offset: -2px;
+}
+.sidebar.collapsed .view-switch-hint {
+  justify-content: center;
+  padding-inline: 0;
+}
 .nav-entry {
   position: relative;
 }
@@ -334,7 +571,7 @@ watch(
   min-height: 34px;
   padding: 7px 9px;
   border: 0;
-  border-radius: 7px;
+  border-radius: 8px;
   background: transparent;
   color: var(--solo-text-muted);
   cursor: pointer;
@@ -374,7 +611,7 @@ watch(
   margin: 0;
   padding: 8px;
   border: 1px solid var(--solo-border);
-  border-radius: 10px;
+  border-radius: 8px;
   background: var(--solo-bg-sidebar);
   box-shadow: var(--solo-shadow);
 }
@@ -393,6 +630,9 @@ watch(
   .sidebar,
   .sidebar.collapsed {
     display: none;
+  }
+  .sidebar.mobile {
+    display: flex;
   }
 }
 </style>

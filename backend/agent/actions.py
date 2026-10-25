@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """ActionQueue：agent 写操作一律落成"待确认动作"，人确认后才走现有写路径。
 
 approve 路径复用 record/confirm 的确定性管线（compute_vat → get_voucher_hint →
@@ -13,11 +16,13 @@ from fastapi import HTTPException
 from sqlalchemy import select
 
 from agent.prompts import ACTION_EXPIRE_HOURS
+from core.errors import AccountingError
 from db.models import AgentAction, new_id
 from db.session import session_scope
-from services.account_mapper import get_voucher_hint
+from services.account_mapper import get_voucher_hint, normalize_payer
 from services.audit_service import log_action
 from services.tax_rules import compute_vat, get_risk_tags, is_tax_deductible
+from services.vat_service import get_vat_config_from_session, is_vat_sales_entry, split_income_vat
 
 logger = logging.getLogger(__name__)
 
@@ -72,8 +77,13 @@ async def create_action(
         raise ValueError("propose_vouchers payload items is empty")
     if action_type == "propose_match" and not (payload.get("statementId") and payload.get("entryIds")):
         raise ValueError("propose_match 需要 statementId 与 entryIds")
-    if action_type == "propose_accrual" and payload.get("kind") not in ("depreciation", "salary"):
-        raise ValueError("propose_accrual.kind 必须是 depreciation 或 salary")
+    if action_type == "propose_accrual" and payload.get("kind") not in (
+        "depreciation",
+        "amortization",
+        "salary",
+        "asset_closure",
+    ):
+        raise ValueError("propose_accrual.kind 必须是 depreciation、amortization 或 salary")
     async with session_scope() as session:
         row = AgentAction(
             id=new_id(),
@@ -135,12 +145,16 @@ async def approve_action(
     company_id: str,
     exclude_indexes: Optional[List[int]] = None,
     edits: Optional[Dict[str, Dict[str, Any]]] = None,
+    allow_backfill: bool = False,
+    backfill_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     """人工确认动作。
 
     - exclude_indexes：批量清单中用户取消勾选的行（不入账，记录为 excluded）；
     - edits：用户在卡片上修正的字段（按行索引），修正后的分类会作为更高权重
       的信号写回公司画像（agent 越用越准的来源）。
+    - allow_backfill / backfill_reason：单据所属期间已关账时，用户在前端确认
+      「补记到哪个期间」后才会带上；不带则维持 PERIOD_CLOSED，绝不静默换期。
     """
     exclude_set = {int(i) for i in (exclude_indexes or [])}
     edit_map = {int(k): dict(v) for k, v in (edits or {}).items()}
@@ -171,6 +185,8 @@ async def approve_action(
                 exclude_set=exclude_set,
                 edit_map=edit_map,
                 on_profile_update=profile_updates.append,
+                allow_backfill=allow_backfill,
+                backfill_reason=backfill_reason,
             )
         elif row.action_type == "propose_match":
             from services.bank_service import apply_statement_match
@@ -194,17 +210,49 @@ async def approve_action(
             month = str(payload.get("month") or "")
             if not month:
                 raise HTTPException(status_code=422, detail="缺少计提月份")
-            if kind == "depreciation":
-                from services.depreciation_engine import run_depreciation
+            if kind == "asset_closure":
+                from services.asset_closure_service import execute_asset_closure
 
-                summary = await run_depreciation(company_id, month, user_id=user_id)
+                result = {
+                    "assetClosure": await execute_asset_closure(
+                        session,
+                        payload,
+                        company_id=company_id,
+                        user_id=user_id,
+                        request_id=f"agent-action-{row.id}",
+                    )
+                }
+            elif kind == "amortization":
+                from services.amortization_engine import run_amortization
+
+                summary = await run_amortization(
+                    session,
+                    month,
+                    company_id=company_id,
+                    user_id=user_id,
+                    request_id=f"agent-action-{row.id}",
+                )
+                from services.accounting_core_service import _json_safe
+
+                result = {"accrual": {"kind": kind, "month": month, "summary": _json_safe(summary)}}
             else:
-                from services.salary_service import accrue_salary_sheet
+                if kind == "depreciation":
+                    from services.depreciation_engine import run_depreciation
 
-                summary = await accrue_salary_sheet(company_id, user_id, month)
-            from services.accounting_core_service import _json_safe
+                    summary = await run_depreciation(
+                        session,
+                        month,
+                        company_id=company_id,
+                        user_id=user_id,
+                        request_id=f"agent-action-{row.id}",
+                    )
+                else:
+                    from services.salary_service import accrue_salary_sheet
 
-            result = {"accrual": {"kind": kind, "month": month, "summary": _json_safe(summary)}}
+                    summary = await accrue_salary_sheet(company_id, user_id, month)
+                from services.accounting_core_service import _json_safe
+
+                result = {"accrual": {"kind": kind, "month": month, "summary": _json_safe(summary)}}
         else:  # pragma: no cover — create_action 已限制类型
             raise HTTPException(status_code=422, detail=f"不支持的动作类型：{row.action_type}")
 
@@ -275,6 +323,8 @@ async def _approve_voucher_items(
     exclude_set: set,
     edit_map: Dict[int, Dict[str, Any]],
     on_profile_update,
+    allow_backfill: bool = False,
+    backfill_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     """凭证类动作（单笔/批量）的逐行确定性入账；返回 result.items。"""
     booked_results: List[Dict[str, Any]] = []
@@ -291,6 +341,8 @@ async def _approve_voucher_items(
                 user_id=user_id,
                 company_id=company_id,
                 request_id=f"agent-action-{row.id}-{index}",
+                allow_backfill=allow_backfill,
+                backfill_reason=backfill_reason,
             )
             booking.update({"index": index, "status": "booked"})
             booked_results.append(booking)
@@ -304,6 +356,15 @@ async def _approve_voucher_items(
                 )
         except HTTPException as exc:
             booked_results.append({"index": index, "status": "failed", "error": exc.detail})
+        except AccountingError as exc:
+            # 带上错误码与上下文：前端据此提示「该期间已关账，是否补记到 X 月」
+            booked_results.append({
+                "index": index,
+                "status": "failed",
+                "error": exc.message,
+                "code": exc.code,
+                "context": exc.context,
+            })
         except Exception as exc:  # 单行失败不拖垮整批
             logger.exception("batch item %s booking failed", index)
             booked_results.append({"index": index, "status": "failed", "error": str(exc)})
@@ -311,7 +372,14 @@ async def _approve_voucher_items(
 
 
 async def _book_voucher_payload(
-    session, raw: Dict[str, Any], *, user_id: str, company_id: str, request_id: str
+    session,
+    raw: Dict[str, Any],
+    *,
+    user_id: str,
+    company_id: str,
+    request_id: str,
+    allow_backfill: bool = False,
+    backfill_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     """确定性管线入账：与 POST /api/record/confirm 完全同构。"""
     from services.accounting_core_service import create_entry, ensure_tenant
@@ -322,22 +390,47 @@ async def _book_voucher_payload(
     if direction not in ("income", "expense", "owner_transfer"):
         raise HTTPException(status_code=422, detail="草稿缺少有效的收支方向")
     category = payload.get("category") or "其他支出"
-    payer = payload.get("payer") or "company_account"
+    # 用户在确认卡里改过的付款方也走这里归一，保证落库的 payer 是标准三值
+    payer = normalize_payer(payload.get("payer"))
 
     vat = compute_vat(payload.get("amount"), category, direction)
-    voucher = get_voucher_hint(direction, category, payload.get("amount"), payer=payer)
+    if direction == "income" and is_vat_sales_entry(category):
+        try:
+            vat_config = await get_vat_config_from_session(session, company_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        net_amount, tax_amount = split_income_vat(payload.get("amount"), vat_config.rate)
+        vat = {
+            "vatRate": vat_config.rate,
+            "vatAmount": tax_amount,
+            "amountExcludingTax": net_amount,
+            "vatExempt": False,
+        }
+        voucher = get_voucher_hint(direction, category, payload.get("amount"), payer=payer, vat_rate=vat_config.rate)
+    else:
+        voucher = get_voucher_hint(direction, category, payload.get("amount"), payer=payer)
     payload.update(
         {
             "id": new_id(),
             "payer": payer,
             "vatRate": vat.get("vatRate"),
             "vatAmount": vat.get("vatAmount"),
-            "taxDeductible": is_tax_deductible(category, direction),
+            "vatSeparated": bool(direction == "income" and is_vat_sales_entry(category)),
+            "amountExcludingTax": vat.get("amountExcludingTax"),
+            "taxDeductible": is_tax_deductible(
+                category,
+                direction,
+                billing_status=payload.get("billingStatus"),
+                has_invoice_number=bool(str(payload.get("invoiceNumber") or "").strip()),
+            ),
             "riskTags": get_risk_tags(category, direction),
             "voucherLines": voucher,
             "source": "agent",
         }
     )
+    if allow_backfill:
+        payload["allowBackfill"] = True
+        payload["backfillReason"] = backfill_reason or ""
 
     await ensure_tenant(session, company_id, user_id)
     entry = await create_entry(

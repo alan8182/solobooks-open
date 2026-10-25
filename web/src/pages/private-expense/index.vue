@@ -1,4 +1,6 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
+import { usePageRefresh } from '@/composables/usePageRefresh'
 import { h, ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { NCard, NButton, NTag, NSpace, NDataTable, NModal, useMessage, NStatistic, NSpin, NPagination } from 'naive-ui'
@@ -204,6 +206,9 @@ const columns = [
     }),
   },
 ]
+
+// 从别的标签切回来时静默重拉，避免对着旧数字干活
+usePageRefresh(loadData)
 </script>
 
 <template>

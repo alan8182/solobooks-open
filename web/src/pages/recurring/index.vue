@@ -1,9 +1,12 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
+import { usePageRefresh } from '@/composables/usePageRefresh'
 import { ref, h, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { NCard, NButton, NTag, NSpace, NDataTable, useMessage, NSpin } from 'naive-ui'
 import { getTemplates, deleteTemplate, applyTemplate, type RecurringTemplate } from '@/api/recurring'
 import { useDeleteConfirm } from '@/composables/useDeleteConfirm'
+import { SoloEmpty } from '@/components/ui'
 
 const router = useRouter()
 const message = useMessage()
@@ -94,14 +97,21 @@ async function handleDelete(id: string) {
 }
 
 onMounted(loadTemplates)
+
+// 从别的标签切回来时静默重拉，避免对着旧数字干活
+usePageRefresh(loadTemplates)
 </script>
 
 <template>
   <div class="recurring-page">
     <div class="page-header">
-      <NButton text @click="router.push('/mine')">← 返回</NButton>
-      <div class="header-row">
-        <h2>周期性交易模板</h2>
+      <div class="page-header-left">
+        <div class="title-section">
+          <h2>周期性交易模板</h2>
+          <p class="subtitle">管理按月、按季或按年重复发生的固定收支规则</p>
+        </div>
+      </div>
+      <div class="page-header-right">
         <NButton size="small" type="primary" @click="router.push('/recurring/create')">新建模板</NButton>
       </div>
     </div>
@@ -116,9 +126,12 @@ onMounted(loadTemplates)
           :single-line="true"
           size="small"
         />
-        <div v-if="templates.length === 0 && !loading" class="empty-state">
-          <p>暂无周期性模板。点击"新建模板"创建一个。</p>
-        </div>
+        <SoloEmpty
+          v-if="templates.length === 0 && !loading"
+          variant="hint"
+          title="还没有周期性模板"
+          description="房租、订阅费这类每月固定支出，设一次模板每月自动生成草稿。点上方「新建模板」创建。"
+        />
       </NCard>
     </NSpin>
   </div>

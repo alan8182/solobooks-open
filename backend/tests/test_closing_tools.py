@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Month isolation, grouped matches and unavailable-data reporting."""
 import pytest
 from agent import tools
@@ -157,3 +160,157 @@ async def test_report_does_not_treat_query_failure_as_no_differences(monkeypatch
     assert result["canClose"] is False
     assert "未完成核验" in result["report"]
     assert "不能将查询失败理解为没有差异" in result["report"]
+
+
+@pytest.mark.asyncio
+async def test_report_includes_amortization_and_depreciation(monkeypatch):
+    async def checks(*_):
+        return {"canClose": True, "periodStatus": "open", "blockingCount": 0, "checks": []}
+    async def diff(*_):
+        return {"status": "available", "unmatchedStatements": [], "aiSuggestions": []}
+    async def accruals(*_):
+        return {
+            "depreciation": {"pendingCount": 2, "pendingTotal": 1200.0},
+            "amortization": {"pendingCount": 1, "pendingTotal": 500.0},
+            "salary": {"message": "工资表已审核"},
+        }
+    async def audit(*_):
+        pass
+    monkeypatch.setattr(tools, "_run_close_checks", checks)
+    monkeypatch.setattr(tools, "_list_unmatched", diff)
+    monkeypatch.setattr(tools, "_preview_accruals", accruals)
+    monkeypatch.setattr("services.audit_service.log_action", audit)
+    result = await tools._generate_close_report(tools.ToolContext("owner", "c-tools"), "2026-07")
+    assert "- 折旧：待计提 2 项，合计 1200.0 元" in result["report"]
+    assert "- 摊销：待计提 1 项，合计 500.0 元" in result["report"]
+    assert "- 工资：工资表已审核" in result["report"]
+
+
+@pytest.mark.asyncio
+async def test_get_advance_balances_tool(monkeypatch):
+    """测试股东/员工垫付台账工具调用与账期默认值。"""
+    captured = {}
+
+    async def fake_query_advance_balances(company_id, month):
+        captured["company_id"] = company_id
+        captured["month"] = month
+        return {
+            "accountCode": "2241",
+            "month": month,
+            "asOf": f"{month}-30",
+            "items": [
+                {
+                    "payer": "boss_personal",
+                    "kind": "boss",
+                    "name": "老板本人垫付",
+                    "opening": "1000.00",
+                    "advance": "500.00",
+                    "reimbursed": "200.00",
+                    "closing": "1300.00",
+                    "count": 3,
+                    "lastDate": f"{month}-15",
+                }
+            ],
+            "totals": {
+                "opening": "1000.00",
+                "advance": "500.00",
+                "reimbursed": "200.00",
+                "closing": "1300.00",
+            },
+            "other": {"count": 0, "advance": "0.00", "reimbursed": "0.00", "note": "勾稽说明"},
+        }
+
+    monkeypatch.setattr("services.ledger_service.query_advance_balances", fake_query_advance_balances)
+
+    ctx = tools.ToolContext(user_id="u1", company_id="c-advance")
+
+    # 1. 指定月份
+    res = await tools._get_advance_balances(ctx, "2026-09")
+    assert captured["company_id"] == "c-advance"
+    assert captured["month"] == "2026-09"
+    assert res["totals"]["closing"] == "1300.00"
+    assert len(res["items"]) == 1
+    assert res["items"][0]["kind"] == "boss"
+
+    # 2. 未指定月份，默认当前 UTC 月
+    res_default = await tools._get_advance_balances(ctx)
+    assert len(captured["month"]) == 7
+    assert captured["month"].count("-") == 1
+
+
+@pytest.mark.asyncio
+async def test_list_intangible_assets_tool(monkeypatch):
+    """测试无形资产台账工具调用与字段紧凑投影。"""
+    captured = {}
+
+    async def fake_list_assets(session, **kwargs):
+        captured.update(kwargs)
+        return {
+            "items": [
+                {
+                    "id": "asset-1",
+                    "code": "IP-001",
+                    "name": "梭罗记账软件V1.0",
+                    "category": "software",
+                    "categoryName": "软件",
+                    "status": "active",
+                    "originalValue": "12000.00",
+                    "accumulatedAmortization": "2000.00",
+                    "netValue": "10000.00",
+                    "usefulLifeMonths": 24,
+                    "remainingMonths": 20,
+                    "lastAmortizedPeriod": "2026-08",
+                    "amortizationEndPeriod": "2028-04",
+                    "legalCertNo": "2026SR123456",
+                    "expiryDate": "2036-12-31",
+                    "rdProjectId": "rd-1",
+                    "sourceEntryId": "entry-1",  # 不在投影中
+                    "custodian": "张三",  # 不在投影中
+                    "departmentId": "dep-1",  # 不在投影中
+                }
+            ],
+            "total": 1,
+            "page": kwargs.get("page", 1),
+            "pageSize": kwargs.get("page_size", 50),
+        }
+
+    # 伪造 session_scope 上下文管理器
+    class DummySessionScope:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    monkeypatch.setattr("db.session.session_scope", lambda: DummySessionScope())
+    monkeypatch.setattr("services.intangible_asset_service.list_assets", fake_list_assets)
+
+    ctx = tools.ToolContext(user_id="u-ip", company_id="c-ip")
+    res = await tools._list_intangible_assets(
+        ctx,
+        keyword="记账",
+        category="software",
+        status="active",
+        expiring_in_days=90,
+        page=1,
+        page_size=20,
+    )
+
+    assert captured["company_id"] == "c-ip"
+    assert captured["user_id"] == "u-ip"
+    assert captured["keyword"] == "记账"
+    assert captured["category"] == "software"
+    assert captured["status"] == "active"
+    assert captured["expiring_in_days"] == 90
+    assert captured["page"] == 1
+    assert captured["page_size"] == 20
+
+    assert res["total"] == 1
+    assert res["count"] == 1
+    assert len(res["assets"]) == 1
+    asset = res["assets"][0]
+    assert asset["code"] == "IP-001"
+    assert asset["netValue"] == "10000.00"
+    assert asset["legalCertNo"] == "2026SR123456"
+    assert "sourceEntryId" not in asset
+    assert "custodian" not in asset

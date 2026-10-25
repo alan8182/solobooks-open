@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Account and company persistence (async SQLite)."""
 from __future__ import annotations
 
@@ -7,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
 from db.session import database_url
+from core.errors import AccountingError, START_DATE_CONFLICT
 from services.database import get_conn
 
 
@@ -22,6 +26,52 @@ def _json_object(value: Any) -> Dict:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# 小规模征收率只允许 1%（优惠期）与 3%（法定）；申报周期只允许月报/季报。
+_ALLOWED_VAT_RATES = {"0.01", "0.03", "1%", "3%", "0.010000", "0.030000"}
+
+
+def _normalize_vat_fields(payload: Dict) -> Dict:
+    """把前端传来的增值税配置收敛成可计算的值，不做纳税人身份校验。
+
+    纳税人身份（小规模/一般）在凭证生成与申报底稿处校验：档案可以先填写，
+    但用错口径出账必须失败。
+    """
+    out: Dict[str, Any] = {}
+    raw_rate = payload.get("vatRate")
+    if raw_rate not in (None, ""):
+        text = str(raw_rate).strip()
+        if text.endswith("%"):
+            text = format(float(text[:-1]) / 100, ".6f")
+        try:
+            value = float(text)
+        except ValueError:
+            value = -1
+        if value <= 0 or value > 0.03:
+            raise ValueError("小规模征收率只支持 1% 或 3%")
+        out["vatRate"] = round(value, 6)
+    raw_cycle = payload.get("vatFilingCycle")
+    if raw_cycle not in (None, ""):
+        text = str(raw_cycle).strip().lower()
+        if text.startswith("month") or text in {"月", "月报", "月度"}:
+            out["vatFilingCycle"] = "month"
+        elif text.startswith("quarter") or text in {"季", "季报", "季度"}:
+            out["vatFilingCycle"] = "quarter"
+        else:
+            raise ValueError("增值税申报周期只支持月报或季报")
+    # 经营所得 A 表预缴周期：由用户按税局核定的征收方式设置（月/季），
+    # 与增值税周期独立（两税种核定节奏可能不一致）。
+    raw_iit_cycle = payload.get("businessIncomeIitFilingCycle")
+    if raw_iit_cycle not in (None, ""):
+        text = str(raw_iit_cycle).strip().lower()
+        if text.startswith("month") or text in {"月", "月报", "月度"}:
+            out["businessIncomeIitFilingCycle"] = "month"
+        elif text.startswith("quarter") or text in {"季", "季报", "季度"}:
+            out["businessIncomeIitFilingCycle"] = "quarter"
+        else:
+            raise ValueError("经营所得税预缴周期只支持月报或季报")
+    return out
 
 
 async def _ensure_schema() -> None:
@@ -196,6 +246,19 @@ async def _get_company(conn, company_id: str) -> Dict | None:
         return None
 
 
+async def get_company(company_id: str) -> Dict | None:
+    """读取主体档案（含 taxpayerType / vatRate / vatFilingCycle 等税务口径字段）。
+
+    仅供内部服务读取配置使用；对外接口仍需走成员权限校验。
+    """
+    await _ensure_db_ready()
+    conn = await get_conn()
+    try:
+        return await _get_company(conn, company_id)
+    finally:
+        await conn.close()
+
+
 async def _insert_company(conn, company: Dict) -> None:
     now = _now_iso()
     created = company.get("created_at") or now
@@ -231,31 +294,31 @@ async def _update_company_payload(conn, company: Dict) -> None:
     )
 
 
-async def _ensure_user_company(conn, user: Dict) -> Dict:
+async def _ensure_user_company(conn, user: Dict) -> Dict | None:
+    """返回当前账套；没有就返回 None。
+
+    不再自动补一本「默认账本」：新用户由注册链路生成演示账套，
+    删除演示账套时由删除逻辑补一本空白正式账套，系统始终保证有账可用。
+    """
     companies = await _list_companies_for_user(conn, user["user_id"])
-    company = None
     cid = user.get("current_company_id") or ""
-    if cid:
-        company = next((c for c in companies if c.get("company_id") == cid), None)
-    if company is None:
-        company = {
-            "company_id": _new_id("c"),
-            "name": "默认账本",
-            "owner_user_id": user["user_id"],
-            "created_at": _now_iso(),
-        }
-        await _insert_company(conn, company)
+    company = next((c for c in companies if c.get("company_id") == cid), None)
+    if company is None and companies:
+        # 当前账套失效（如被删除）时回到第一本，避免登录后无账套
+        company = companies[0]
         user["current_company_id"] = company["company_id"]
         await _persist_user(conn, user)
     return company
 
 
-async def get_or_create_user(openid: str) -> Tuple[Dict, Dict]:
+async def get_or_create_user(openid: str) -> Tuple[Dict, Dict | None, bool]:
+    """返回 ``(user, company, is_new)``；company 可能为 None（新用户尚未建账套）。"""
     await _ensure_db_ready()
     conn = await get_conn()
     try:
         cursor = await conn.execute("SELECT * FROM auth_users WHERE openid = ?", (openid,))
         row = await cursor.fetchone()
+        is_new = row is None
         if row is None:
             user = {
                 "user_id": _new_id("u"),
@@ -280,17 +343,19 @@ async def get_or_create_user(openid: str) -> Tuple[Dict, Dict]:
 
         company = await _ensure_user_company(conn, user)
         await conn.commit()
-        return user, company
+        return user, company, is_new
     finally:
         await conn.close()
 
 
-async def get_or_create_user_by_phone(phone: str) -> Tuple[Dict, Dict]:
+async def get_or_create_user_by_phone(phone: str) -> Tuple[Dict, Dict | None, bool]:
+    """返回 ``(user, company, is_new)``；company 可能为 None（新用户尚未建账套）。"""
     await _ensure_db_ready()
     conn = await get_conn()
     try:
         cursor = await conn.execute("SELECT * FROM auth_users WHERE phone = ?", (phone,))
         row = await cursor.fetchone()
+        is_new = row is None
         if row is None:
             user = {
                 "user_id": _new_id("u"),
@@ -315,7 +380,7 @@ async def get_or_create_user_by_phone(phone: str) -> Tuple[Dict, Dict]:
 
         company = await _ensure_user_company(conn, user)
         await conn.commit()
-        return user, company
+        return user, company, is_new
     finally:
         await conn.close()
 
@@ -461,7 +526,8 @@ async def set_user_current_company(user_id: str, company_id: str) -> Tuple[Dict,
         except Exception:
             return None
         user = _row_to_user(row)
-        user["current_company_id"] = co["company_id"]
+        # payload 可能是空对象（历史数据/精简创建路径），公司 id 以列值为准
+        user["current_company_id"] = co.get("company_id") or company_id
         await _persist_user(conn, user)
         await conn.commit()
         return user, co
@@ -496,18 +562,55 @@ async def create_company(user_id: str, name: str, extra: dict | None = None) -> 
     await _ensure_db_ready()
     conn = await get_conn()
     try:
+        # employeeCount 已废弃（人数从员工名册派生），老客户端传入时静默忽略
+        extra_clean = {k: v for k, v in (extra or {}).items() if k != "employeeCount"}
+        extra_clean.update(_normalize_vat_fields(extra_clean))
         company = {
             "company_id": _new_id("c"),
             "name": name,
             "owner_user_id": user_id,
             "created_at": _now_iso(),
-            **(extra or {}),
+            **extra_clean,
         }
         await _insert_company(conn, company)
         await conn.commit()
         return company
     finally:
         await conn.close()
+
+
+async def _assert_start_date_not_before_entries(conn, company_id: str, start_date: Any) -> None:
+    """启用日期后移不得越过已有最早分录，否则会出现"账未启用已有账"的矛盾口径。
+
+    期初凭证（opening）承载启用日之前的历史，不参与比较。
+    """
+    raw = str(start_date or "").strip()
+    if not raw:
+        return
+    try:
+        new_start = datetime.strptime(raw[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return
+    cursor = await conn.execute(
+        "SELECT MIN(occurred_on) FROM journal_entries WHERE company_id = ? AND entry_type != 'opening'",
+        (company_id,),
+    )
+    row = await cursor.fetchone()
+    earliest = row[0] if row else None
+    if not earliest:
+        return
+    try:
+        earliest_date = datetime.strptime(str(earliest)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return
+    if earliest_date < new_start:
+        raise AccountingError(
+            START_DATE_CONFLICT,
+            f"启用日期不能晚于已有记账记录的最早日期 {earliest_date.isoformat()}："
+            "如需此后开始记账，请先冲销或调整启用日之前的凭证",
+            422,
+            {"startDate": new_start.isoformat(), "earliestEntryDate": earliest_date.isoformat()},
+        )
 
 
 async def update_company(user_id: str, company_id: str, updates: dict) -> Dict:
@@ -526,13 +629,23 @@ async def update_company(user_id: str, company_id: str, updates: dict) -> Dict:
         except Exception as e:
             raise ValueError("主体数据损坏") from e
 
+        if company.get("isDemo"):
+            raise AccountingError(
+                "DEMO_READONLY",
+                "演示账套仅供体验，不能修改账套信息。需要正式记账请新建账套",
+                403,
+            )
+
         for key in [
             "name", "type", "taxpayerType", "startDate", "taxId",
-            "restrictedIndustry", "employeeCount",
+            "restrictedIndustry", "industry",
+            "vatRate", "vatFilingCycle", "businessIncomeIitFilingCycle",
         ]:
             if key in updates:
                 company[key] = updates[key]
+        company.update(_normalize_vat_fields(company))
 
+        await _assert_start_date_not_before_entries(conn, company_id, company.get("startDate"))
         company["updated_at"] = _now_iso()
         await _update_company_payload(conn, company)
         await conn.commit()

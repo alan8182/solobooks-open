@@ -1,21 +1,50 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
-import { NCard, NTag, NSpin, NButton, useMessage } from 'naive-ui'
+import { useRoute, useRouter } from 'vue-router'
+import { NCard, NTag, NSpin, NButton, NSelect, useMessage } from 'naive-ui'
 import { useEntryStore } from '@/stores/entry'
 import { getHealthScore, getAIDiagnosis } from '@/api/report'
+import { getCurrentMonth } from '@/utils/format'
 import type { HealthScoreResponse } from '@/api/types'
 
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
 import { GaugeChart, BarChart } from 'echarts/charts'
 import VChart from 'vue-echarts'
+import { SoloEmpty } from '@/components/ui'
 
 use([CanvasRenderer, GaugeChart, BarChart])
 
+const route = useRoute()
 const router = useRouter()
 const message = useMessage()
 const entryStore = useEntryStore()
+
+const requestedMonth = String(route.query.month || '')
+const hasRequestedMonth = /^\d{4}-(0[1-9]|1[0-2])$/.test(requestedMonth)
+const month = ref(hasRequestedMonth ? requestedMonth : getCurrentMonth())
+
+const monthOptions = computed(() => {
+  const options: { label: string; value: string }[] = []
+  const now = new Date()
+  for (let i = 0; i < 12; i++) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1)
+    const val = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+    const label = `${d.getFullYear()}年${d.getMonth() + 1}月`
+    options.push({ label, value: val })
+  }
+  return options
+})
+
+function handleMonthChange() {
+  router.replace({ query: { ...route.query, month: month.value } })
+  load()
+}
+
+function handleBack() {
+  router.push({ path: '/reports', query: { month: month.value } })
+}
 
 const loading = ref(false)
 const result = ref<HealthScoreResponse | null>(null)
@@ -32,12 +61,12 @@ const dimensionLabels: Record<string, string> = {
 
 function getLevelColor(level: string) {
   const map: Record<string, string> = {
-    excellent: '#10b981',
-    good: '#3b82f6',
-    fair: '#f59e0b',
-    poor: '#ef4444',
+    excellent: '#0f7354',
+    good: '#1747b0',
+    fair: '#a05c10',
+    poor: '#bd3d3d',
   }
-  return map[level] || '#64748b'
+  return map[level] || '#586474'
 }
 
 function getLevelLabel(level: string) {
@@ -112,7 +141,7 @@ const dimensionOption = computed(() => {
       data: dims.map(([, v]) => ({
         value: v,
         itemStyle: {
-          color: v >= 80 ? '#10b981' : v >= 60 ? '#f59e0b' : '#ef4444',
+          color: v >= 80 ? '#0f7354' : v >= 60 ? '#a05c10' : '#bd3d3d',
           borderRadius: [0, 4, 4, 0],
         },
       })),
@@ -127,9 +156,7 @@ async function load() {
     if (entryStore.activeEntries.length === 0) {
       await entryStore.fetchEntries()
     }
-    const now = new Date()
-    const month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
-    result.value = await getHealthScore(month)
+    result.value = await getHealthScore(month.value)
   } catch {
     message.error('加载健康评分失败')
   } finally {
@@ -140,9 +167,7 @@ async function load() {
 async function generateDiagnosis() {
   diagnosisLoading.value = true
   try {
-    const now = new Date()
-    const month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
-    diagnosis.value = await getAIDiagnosis(month)
+    diagnosis.value = await getAIDiagnosis(month.value)
   } catch {
     message.error('生成 AI 诊断失败')
   } finally {
@@ -157,19 +182,29 @@ onMounted(load)
   <div class="report-container">
     <div class="report-header">
       <div class="report-header-left">
-        <NButton text class="report-back-btn" @click="router.push('/reports')">
+        <NButton text class="report-back-btn" @click="handleBack">
           <template #icon><i class="ri-arrow-left-line" /></template>
-          返回
+          返回报表中心
         </NButton>
         <div class="report-title-section">
           <h2>健康评分</h2>
           <p class="report-subtitle">结合系统记账数据和 AI 深度审计，全方位评估财务合规与风险</p>
         </div>
       </div>
+      <div class="report-header-right">
+        <NSelect
+          v-model:value="month"
+          :options="monthOptions"
+          size="small"
+          style="width: 140px;"
+          @update:value="handleMonthChange"
+        />
+      </div>
     </div>
 
     <NSpin :show="loading">
       <template v-if="result">
+
         <!-- Score gauge -->
         <NCard :bordered="false" class="report-card mb-4 score-card">
           <VChart :option="gaugeOption" autoresize style="height: 200px" />
@@ -265,7 +300,14 @@ onMounted(load)
             </div>
           </div>
         </NCard>
-      </template>
+            </template>
+      <SoloEmpty
+        v-else-if="!loading"
+        title="还打不出健康分"
+        description="先记满一个月的账，健康分才有依据。"
+        icon="ri-pulse-line"
+      />
+
     </NSpin>
   </div>
 </template>

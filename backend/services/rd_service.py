@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
@@ -29,13 +32,13 @@ from services.accounting_core_service import (
 
 
 RD_EXPENSE_TYPES = [
-    {"value": "personnel", "label": "人员人工", "accountCode": "530101"},
-    {"value": "direct_input", "label": "直接投入", "accountCode": "530102"},
-    {"value": "depreciation_amortization", "label": "折旧与摊销", "accountCode": "530103"},
-    {"value": "design", "label": "设计费", "accountCode": "530104"},
-    {"value": "testing", "label": "试验费", "accountCode": "530105"},
-    {"value": "outsourced", "label": "委外研发费", "accountCode": "530106"},
-    {"value": "other", "label": "其他研发费用", "accountCode": "530199"},
+    {"value": "personnel", "label": "人员人工", "accountCode": "430100101"},
+    {"value": "direct_input", "label": "直接投入", "accountCode": "430100102"},
+    {"value": "depreciation_amortization", "label": "折旧与摊销", "accountCode": "430100103"},
+    {"value": "design", "label": "设计费", "accountCode": "430100104"},
+    {"value": "testing", "label": "试验费", "accountCode": "430100105"},
+    {"value": "outsourced", "label": "委外研发费", "accountCode": "430100106"},
+    {"value": "other", "label": "其他研发费用", "accountCode": "430100199"},
 ]
 RD_POLICY_VERSION = "cn-rd-subsidy-generic-2026-v1"
 RD_EVIDENCE_TYPES = [
@@ -313,7 +316,7 @@ async def unallocated_rd_lines(
                 JournalEntry.status.in_(("draft", "pending_review", "posted")),
                 JournalEntry.entry_type != "reversal",
                 JournalLine.company_id == company_id,
-                JournalLine.account_code.startswith("5301"),
+                JournalLine.account_code.startswith("4301"),
                 RdJournalLineDetail.journal_line_id.is_(None),
             )
             .order_by(JournalEntry.occurred_on.desc(), JournalEntry.voucher_no.desc())
@@ -347,7 +350,7 @@ async def correct_unallocated_entry(
     reason: str,
     request_id: str,
 ) -> dict[str, Any]:
-    """Replace an unallocated 5301 line with one or more project allocations."""
+    """Replace an unallocated 4301 line with one or more project allocations."""
     entry = await get_journal(session, entry_id, company_id=company_id, lock=True)
     if entry.entry_type == "reversal" or entry.status == "reversed":
         raise AccountingError("RD_CORRECTION_NOT_ALLOWED", "冲销凭证或已冲销凭证不能再次归集", 409)
@@ -364,7 +367,7 @@ async def correct_unallocated_entry(
     )).scalars().all()) if original_lines else set()
     target_lines = [
         line for line in original_lines
-        if line.direction == "debit" and line.account_code.startswith("5301") and line.id not in existing_detail_ids
+        if line.direction == "debit" and line.account_code.startswith("4301") and line.id not in existing_detail_ids
     ]
     if not target_lines:
         raise AccountingError("RD_UNALLOCATED_LINE_NOT_FOUND", "该凭证没有可补充归集的研发费用行", 409)
@@ -592,7 +595,7 @@ async def rd_reconciliation_summary(
             JournalEntry.status.in_(("posted", "reversed")),
             JournalEntry.occurred_on >= start_date,
             JournalEntry.occurred_on <= end_date,
-            JournalLine.account_code.startswith("5301"),
+            JournalLine.account_code.startswith("4301"),
         )
     )).scalar_one()
     ledger_total = money(ledger["total"])

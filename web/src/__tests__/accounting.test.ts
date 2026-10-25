@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+ * Licensed under the SoloBooks License v2.0.
+ */
+
 import { describe, expect, it } from 'vitest'
 import { amountSignForDirection, generateVoucherLines } from '@/utils/accounting'
 import { EXPENSE_CATEGORIES, OWNER_TRANSFER_CATEGORIES } from '@/utils/constants'
@@ -13,8 +18,24 @@ describe('generateVoucherLines', () => {
 
     expect(lines).toEqual([
       { code: '1002', name: '银行存款', side: 'debit', amount: 4.15 },
-      { code: '6603', name: '财务费用-利息收入', side: 'credit', amount: 4.15 },
+      { code: '5603005', name: '财务费用-利息收入', side: 'credit', amount: 4.15 },
     ])
+  })
+
+  it('maps 税费缴纳 to the small-scale taxpayer VAT leaf account', () => {
+    const lines = generateVoucherLines({
+      type: 'expense',
+      category: '税费缴纳',
+      amount: 300,
+      payer: 'company_account',
+    })
+
+    expect(lines[0]).toEqual({
+      code: '2221026',
+      name: '应交增值税（小规模纳税人专用）',
+      side: 'debit',
+      amount: 300,
+    })
   })
 
   it('maps backend expense categories without falling back to generic other expense', () => {
@@ -31,7 +52,7 @@ describe('generateVoucherLines', () => {
       payer: 'company_account',
     })
 
-    expect(rdLines[0]).toEqual({ code: '5301', name: '研发支出-费用化支出', side: 'debit', amount: 1200 })
+    expect(rdLines[0]).toEqual({ code: '4301', name: '研发支出-费用化支出', side: 'debit', amount: 1200 })
     expect(prepayLines[0]).toEqual({ code: '1123', name: '预付账款', side: 'debit', amount: 500 })
   })
 
@@ -44,7 +65,7 @@ describe('generateVoucherLines', () => {
     })
 
     expect(lines).toEqual([
-      { code: '5605', name: '管理费用-信息技术服务费', side: 'debit', amount: 300 },
+      { code: '5602015', name: '管理费用-信息技术服务费', side: 'debit', amount: 300 },
       { code: '2241', name: '其他应付款-员工往来(杨云飞)', side: 'credit', amount: 300 },
     ])
   })
@@ -59,7 +80,7 @@ describe('generateVoucherLines', () => {
 
     expect(lines).toEqual([
       { code: '1002', name: '银行存款', side: 'debit', amount: 50000 },
-      { code: '4001', name: '实收资本', side: 'credit', amount: 50000 },
+      { code: '3001', name: '实收资本', side: 'credit', amount: 50000 },
     ])
   })
 
@@ -70,7 +91,7 @@ describe('generateVoucherLines', () => {
       amount: 10000,
     })
 
-    expect(lines[1]).toEqual({ code: '4001', name: '实收资本', side: 'credit', amount: 10000 })
+    expect(lines[1]).toEqual({ code: '3001', name: '实收资本', side: 'credit', amount: 10000 })
   })
 
   it('maps 股东取现 as a bank outflow receivable from shareholder', () => {
@@ -81,9 +102,23 @@ describe('generateVoucherLines', () => {
     })
 
     expect(lines).toEqual([
-      { code: '1221', name: '其他应收款-股东', side: 'debit', amount: 2000 },
+      { code: '122102', name: '其他应收款-股东', side: 'debit', amount: 2000 },
       { code: '1002', name: '银行存款', side: 'credit', amount: 2000 },
     ])
+  })
+
+  it('never emits container codes (1221/2211/2221) in reconstructed voucher lines', () => {
+    const categories = ['股东取现', '老板取现', '其他应收款', '往来款', '税费缴纳']
+    for (const category of categories) {
+      const lines = generateVoucherLines({
+        type: category === '税费缴纳' ? 'expense' : category === '其他应付款' ? 'income' : 'owner_transfer',
+        category,
+        amount: 100,
+      } as any)
+      for (const line of lines) {
+        expect(['1221', '2211', '2221']).not.toContain(line.code)
+      }
+    }
   })
 })
 

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 from __future__ import annotations
 
 import os
@@ -30,6 +33,7 @@ def get_engine() -> AsyncEngine:
     kwargs = {"pool_pre_ping": True}
     if url.startswith("sqlite+"):
         kwargs.pop("pool_pre_ping", None)
+        kwargs["connect_args"] = {"timeout": 30}
     return create_async_engine(url, **kwargs)
 
 

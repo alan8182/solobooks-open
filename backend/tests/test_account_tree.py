@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 from __future__ import annotations
 
 from uuid import uuid4
@@ -22,10 +25,12 @@ def test_account_tree_initializes_tenant_and_returns_rd_children(client, auth_he
     roots = response.json()
     assert roots
     cost_group = next(node for node in roots if node["code"] == "成本类")
-    rd_parent = next(node for node in cost_group["children"] if node["code"] == "5301")
-    assert {child["code"] for child in rd_parent["children"]} == {
-        "530101", "530102", "530103", "530104", "530105", "530106", "530199",
+    rd_parent = next(node for node in cost_group["children"] if node["code"] == "4301")
+    expensed = next(node for node in rd_parent["children"] if node["code"] == "4301001")
+    assert {child["code"] for child in expensed["children"]} == {
+        "430100101", "430100102", "430100103", "430100104", "430100105", "430100106", "430100199",
     }
+    assert any(node["code"] == "4301002" for node in rd_parent["children"])
 
 
 def test_account_tree_keeps_accounts_with_legacy_persisted_group_nodes(client, auth_headers):
@@ -66,4 +71,4 @@ def test_account_tree_keeps_accounts_with_legacy_persisted_group_nodes(client, a
         pending.extend(node.get("children") or [])
     assert account_count >= 48
     cost_group = next(node for node in roots if node["code"] == "成本类")
-    assert any(node["code"] == "5301" for node in cost_group["children"])
+    assert any(node["code"] == "4301" for node in cost_group["children"])

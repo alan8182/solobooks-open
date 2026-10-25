@@ -1,3 +1,4 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { computed, h, onMounted, ref } from 'vue'
 import {
@@ -19,6 +20,7 @@ import {
 import { createMcpToken, listMcpTokens, revokeMcpToken } from '@/api/mcpTokens'
 import type { McpTokenItem } from '@/api/mcpTokens'
 import { useAuthStore } from '@/stores/auth'
+import { SoloEmpty } from '@/components/ui'
 
 const message = useMessage()
 const dialog = useDialog()
@@ -218,6 +220,16 @@ onMounted(fetchTokens)
       可以查询账目、流水、结账检查等。即使授予「读写草稿」，AI 也只能起草——所有入账仍需你在产品内确认。
     </NAlert>
 
+    <!-- 常驻横幅：令牌页只解决「签发」，配置怎么填在公开指南页 -->
+    <router-link class="guide-banner" to="/ai-connect">
+      <span class="guide-banner-icon"><i class="ri-book-read-line" /></span>
+      <span class="guide-banner-text">
+        <b>不知道令牌该往哪填？看各客户端详细配置教程</b>
+        <em>WorkBuddy / Claude / 通义千问·百炼 / Trae·Cursor / CLI 自托管，含路径高亮与一键复制</em>
+      </span>
+      <span class="guide-banner-cta">接入指南 <i class="ri-arrow-right-line" /></span>
+    </router-link>
+
     <NDataTable
       :columns="columns"
       :data="tokens"
@@ -225,15 +237,29 @@ onMounted(fetchTokens)
       :bordered="false"
       striped
       size="small"
-    />
+    >
+      <template #empty>
+        <SoloEmpty
+          variant="hint"
+          title="还没有创建令牌"
+          description="点上方「新建令牌」签发一个，AI 就能帮你查账。"
+        />
+      </template>
+    </NDataTable>
 
     <div class="config-hint">
       <div class="config-hint-header">
         <h3>客户端配置示例</h3>
-        <NButton size="tiny" quaternary @click="copyConfigExample">
-          <template #icon><i class="ri-file-copy-line" /></template>
-          复制
-        </NButton>
+        <div class="config-hint-actions">
+          <router-link class="guide-link" to="/ai-connect">
+            完整接入指南
+            <i class="ri-arrow-right-line" />
+          </router-link>
+          <NButton size="tiny" quaternary @click="copyConfigExample">
+            <template #icon><i class="ri-file-copy-line" /></template>
+            复制
+          </NButton>
+        </div>
       </div>
       <pre>{{ configExample }}</pre>
     </div>
@@ -320,6 +346,88 @@ onMounted(fetchTokens)
 
 .intro-alert {
   margin-bottom: 16px;
+}
+
+/* 常驻横幅：令牌页 → 公开接入指南 */
+.guide-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  margin-bottom: 16px;
+  border: 1px solid #d6e2fb;
+  border-radius: var(--solo-radius);
+  background: linear-gradient(96deg, #f5f8ff 0%, #ffffff 70%);
+  text-decoration: none;
+  transition: border-color 0.18s, box-shadow 0.18s;
+}
+
+.guide-banner:hover {
+  border-color: var(--solo-primary);
+  box-shadow: 0 2px 12px rgba(23, 71, 176, 0.08);
+}
+
+.guide-banner-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  background: var(--solo-bg-blue-soft);
+  color: var(--solo-primary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 17px;
+  flex-shrink: 0;
+}
+
+.guide-banner-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.guide-banner-text b {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--solo-text-primary);
+}
+
+.guide-banner-text em {
+  font-style: normal;
+  font-size: 11.5px;
+  color: var(--solo-text-muted);
+  line-height: 1.55;
+}
+
+.guide-banner-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--solo-primary);
+  flex-shrink: 0;
+}
+
+.config-hint-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.guide-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 12px;
+  color: var(--solo-primary);
+  text-decoration: none;
+}
+
+.guide-link:hover {
+  text-decoration: underline;
 }
 
 .mb-3 {

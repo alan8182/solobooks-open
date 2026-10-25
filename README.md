@@ -1,39 +1,53 @@
-# 梭罗记账 SoloBooks · 小微企业智能记账
+# 梭罗记账 SoloBooks · 面向一人公司与小微企业的 AI 智能记账报税系统
 
-SoloBooks（梭罗记账）是一套面向**小微企业**的智能记账与财税管理系统。以「记录 + 智能 → 记账 + 对账」为核心，帮助个体经营者、小微公司把日常收支、发票、银行流水管理成规范的会计账目，并自动生成凭证与经营报表。
+<p align="center">
+  <img src="brand/solo-lockup.png" alt="梭罗记账 SoloBooks" width="420" /><br/>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-SoloBooks_v2.0-blue.svg" alt="SoloBooks License v2.0" /></a>
+  <a href="#技术栈"><img src="https://img.shields.io/badge/Python-3.13-brightgreen.svg" alt="Python 3.13" /></a>
+  <a href="#技术栈"><img src="https://img.shields.io/badge/Vue-3.x-42b883.svg" alt="Vue 3" /></a>
+  <a href="MCP接入方案.md"><img src="https://img.shields.io/badge/MCP-Supported-purple.svg" alt="MCP Supported" /></a>
+</p>
 
-> **为什么做 SoloBooks？**
-> 传统代记账机构往往只帮你「把账记下来」，停留在流水登记，并不会真正去分析、管理你的财务。SoloBooks 的初衷，是让 OPC（一人公司）和小微企业拥有一套**真正管好财务**的工具——不只是记录，而是对账、生成报表、做结账检查，让经营者自己也能看懂、掌控经营。
+梭罗记账（SoloBooks）是一套面向**一人公司（OPC）与小微企业**的 AI 智能记账与自助报税系统。以「智能记账 + 规范对账 + 结账检查 + 自助报税」为完整闭环，帮助创业者把日常收支、全电发票、银行与微信流水沉淀为标准会计账簿，并通过 AI 报税副驾与电子税务局申报作业包，让经营者零财务门槛也能自己轻松完成记账与报税。
 
-> ⚠️ **授权说明**：本项目采用自定义**非商业开源许可**（`LICENSE`），允许个人学习与研究用途，**禁止商业使用**。商业授权请联系作者。
+> **为什么做梭罗记账？**
+> 梭罗一个人在瓦尔登湖畔独立生活、劳作与记录——一个人的公司，更值得一套清晰透明、自主可控的账税体系。
+>
+> 过去，小微企业找外部代账机构，往往只是因为“报税门槛高、怕填错表”；但传统代账一年收取数千元，绝大多数只做机械的流水记录，既不帮你看懂经营数据，遇到税收政策变化也难以深度跟进。
+>
+> **在 AI 时代，记账报税完全可以由创业者自己掌控。**
+> 随着数电发票与新版电子税务局的全面推行，记账与报税的规则正在变得高度结构化。借助大模型与确定性复式记账引擎，AI 能够自动完成票据分类、凭证归集、对账平账，并一键生成电子税务局小抄与申报底稿。梭罗记账的初衷，正是把**“记账的主动权”**与**“报税的自由度”**真正交还给每一位超级个体与小微经营者——不用受制于外部代账中介，自己也能轻松管好账、独立报好税！
+
+> 📌 **授权说明**：本项目采用**源码可用许可**（[SoloBooks License v2.0](LICENSE)）：个人、个体工商户、一人公司与小微企业可**永久免费自托管**用于本企业内部记账与报税（含产生经营收入的日常记账）；未经书面授权，**不得**对外提供 SaaS 托管、付费云平台或第三方商业代账服务。商业授权（Partner License）与合作请联系：**founder@jiezixingchen.com**。
 
 ---
 
 ## 功能特性
 
-- **智能记账**：AI 识别文字/语音/单据 → 自动判断收支方向、金额与费用分类，生成记账凭证草稿
-- **AI 智能副驾（Copilot）**：对话式记账与结账助手——批量起草凭证、多模态输入、经营画像记忆、结账预检与票流账差异分析
-- **MCP 接入**：内置 MCP Server，Claude Desktop / ZCode 等 AI 客户端可经工具调用直接查账、记账、对账（见下文）
-- **发票管理**：税务局全量发票 Excel 导入（标准列名自动映射）、AI 智能分类、发票明细查看、对账状态跟踪
-- **银行/微信流水**：银行流水 CSV / 微信支付账单导入，自动识别收支方向，AI 辅助与账目对账匹配
-- **结账向导**：月度结账流程——待办任务队列、发票/流水对账、工资计提、批量过账、结账检查与账册锁定
-- **待办闭环**：发票催办、流水待处理、股东垫付确认等事项分组呈现，就地处理
-- **申报作业包**（小规模纳税人）：征期日历、增值税/企业所得税申报表草稿、账↔票↔流水三方核对、官方模板 XLS 导出
-- **财务报表**：利润表、资产负债表、现金流量表、往来账龄、增值税/所得税测算、税务申报导出
-- **固定资产**：资产录入、自动折旧、凭证生成
-- **薪酬管理**：工资表导入、社保公积金计提（费率/基数可配）、工资发放凭证
+- **老板 / 会计双视图**：顶部一键切换经营视角与专业视角，同一套账、同一个 URL；视图只改变导航与信息密度，不改变权限
+- **智能记账**：AI 识别文字/语音/单据 → 自动判断收支方向、金额与费用分类，生成记账凭证草稿；AI 只起草，入账必须人工确认
+- **自助报税与申报小抄**：增值税、企业所得税预缴/汇算、经营所得个税（A 表预缴 / B 表汇算 / C 表提示，仅查账征收）测算；一键生成电子税务局申报数据包，自主申报不求人
+- **发票全流程**：全电发票 Excel 导入（标准列名自动映射）、AI 智能分类、发票台账、明细查验与进销项核对
+- **流水智能认领**：银行流水 / 微信账单导入后，以流水为客观事实认领到发票或凭证；月结第 4 步统一「认领 + 配平」，历史遗留流水单独列出
+- **微信账单月度汇总**：微信支付账单支持逐笔导入或按月度汇总生成 1 张综合凭证
+- **月度结账向导**：五步向导 + 五项结账检查 + 跨期补记/暂估闭环，未配平不允许关账
+- **标准财税报表**：资产负债表、利润表、现金流量表、所有者权益变动表、三表季报、试算平衡、科目余额表、总账/明细账/序时账/多栏账、往来账龄与税务申报底稿导出
+- **数量金额式核算**：科目级开关、凭证数量录入、余额表数量结存、旧账数量透传
+- **固定资产 / 无形资产**：卡片、自动折旧/摊销、处置与总账核对
+- **薪酬管理**：工资表导入、社保公积金计提、工资四凭证、研发工时分配
+- **通用归集与分摊**：辅助核算维度、归集规则、待归集清单、归集报表与报表口径对比
 - **老板私账**：个人收支记录（收入/支出/垫付）与公司账目联动
-- **多账本 / 多主体**：支持多公司账本切换
+- **账套迁移与归档**：旧账导入、期初建账、电子账簿打印、数据备份归档
+- **多账本 / 多主体**：支持多公司账本切换，owner / accountant / preparer / viewer 角色权限
 
 ## 技术栈
 
 | 层 | 技术 |
 |---|---|
 | 后端 | Python 3.13 · FastAPI · SQLAlchemy(async) · Alembic |
-| LLM | OpenAI 兼容协议（供应商无关）：通义千问 / DeepSeek / 智谱 GLM 仅换环境变量 |
-| 数据库 | PostgreSQL 16（本地开发可用 SQLite） |
+| 数据库 | PostgreSQL 16 |
 | 前端 Web | Vue 3 · TypeScript · Vite · Naive UI · Pinia · Tailwind |
-| AI 连接 | MCP（fastmcp）：Streamable HTTP `/mcp` + stdio |
+| 小程序 | uni-app（**默认不公开，另行处理**） |
 | 部署 | Docker Compose · Nginx |
 
 ## 目录结构
@@ -41,26 +55,37 @@ SoloBooks（梭罗记账）是一套面向**小微企业**的智能记账与财�
 ```
 .
 ├── backend/            # FastAPI 后端
-│   ├── routers/        # API 路由
-│   ├── services/       # 业务服务（记账/分类/对账/报表/申报…）
-│   ├── agent/          # AI 副驾工具循环 + MCP Server
+│   ├── routers/        # API 路由（记账/账簿/报表/发票/银行/资产/税务/MCP…）
+│   ├── services/       # 业务服务（记账/分类/对账/折旧/税表/归集…）
 │   ├── models/         # Pydantic 模型
 │   ├── db/             # SQLAlchemy 引擎/会话/模型
 │   ├── core/           # 金额、错误等基础设施
-│   ├── assets/         # 税务报表 XLS 官方模板
 │   ├── alembic/        # 数据库迁移
-│   ├── scripts/        # MCP 令牌签发 / stdio 入口等工具
 │   └── tests/          # 后端测试
 ├── web/                # Vue 前端
 │   ├── src/
-│   │   ├── pages/      # 页面（账本/结账向导/申报/智能副驾/落地页…）
+│   │   ├── pages/      # 页面（工作台/AI 会计/账本/报表/结账/归集…）
 │   │   ├── components/ # 组件
 │   │   ├── api/        # API 客户端
 │   │   ├── stores/     # Pinia 状态
 │   │   └── utils/      # 工具函数
+│   ├── docs/           # 前端设计规范与页面交互文档
 │   └── vite.config.ts  # 含 dev 代理
-└── deploy/             # Docker/生产部署配置
+├── deploy/             # Docker/生产部署配置
+├── docs/               # 开发与运维文档
+└── 梭罗记账_PRD_v4.md   # 当前产品需求文档（v4.1）
 ```
+
+## 文档索引
+
+| 文档 | 说明 |
+|---|---|
+| [梭罗记账_PRD_v4.md](梭罗记账_PRD_v4.md) | 产品需求文档 v4.1：功能现状、边界、税务口径与路线图 |
+| [web/docs/pages-and-interactions.md](web/docs/pages-and-interactions.md) | 前端页面、路由与交互逻辑总览 |
+| [DESIGN.md](DESIGN.md) / [DESIGN_SYSTEM.md](DESIGN_SYSTEM.md) | 视觉与设计系统规范 |
+| [docs/development-workflow.md](docs/development-workflow.md) | 本地热更新、Docker 构建与数据库变更流程 |
+| [docs/finance-core-runbook.md](docs/finance-core-runbook.md) | 财务核心运维与排障手册 |
+| [MCP接入方案.md](MCP接入方案.md) / [docs/mcp-integration.md](docs/mcp-integration.md) | 外部 AI 接入设计与使用说明；在线版图文指南见 [AI 连接中心](https://solobooks.cn/ai-connect)（源码 `web/src/pages/mcp-guide/`） |
 
 ## 快速开始（本地开发）
 
@@ -92,8 +117,6 @@ DASHSCOPE_API_KEY=sk-xxx                # 阿里云百炼（通义千问），�
 DATABASE_URL=postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/solobooks
 ```
 
-所有文本/多模态 LLM 调用统一走 **OpenAI 兼容端点**，切换供应商只需改 `LLM_BASE_URL` / `LLM_API_KEY` / 模型名三项（详见 `.env.example` 注释），业务代码零改动。`DASHSCOPE_API_KEY` 未配置 `LLM_API_KEY` 时自动复用。
-
 ### 3. 初始化数据库表
 
 ```bash
@@ -124,36 +147,7 @@ npm run dev
 
 ### 6. 登录
 
-浏览器打开 `http://localhost:5173`，使用**测试账号一键登录**（手机号 `13800000000` / 验证码 `123456`）；也可在「我的」页设置密码后改用密码登录。
-
-## MCP 接入（AI 客户端直连记账）
-
-SoloBooks 内置 MCP Server，Claude Desktop、ZCode 等 AI 客户端可以工具形式直接查账、记账草稿、对账与生成申报作业包。
-
-1. **签发个人访问令牌（PAT）**：
-
-   ```bash
-   cd backend
-   python scripts/make_mcp_token.py --user <user_id> --company <company_id> \
-     --name "Claude Desktop" --scopes read
-   ```
-
-   明文令牌（`sbk_…`）仅在签发时打印一次。`--list` / `--revoke` 可列出与吊销。
-
-2. **接入 AI 客户端**（Streamable HTTP，PAT 鉴权）：
-
-   ```json
-   {
-     "mcpServers": {
-       "solobooks": {
-         "url": "http://localhost:8001/mcp",
-         "headers": { "Authorization": "Bearer sbk_..." }
-       }
-     }
-   }
-   ```
-
-3. **本地 stdio 调试**：`MCP_STDIO_TOKEN=<sbk_…> python scripts/mcp_stdio.py`（单进程，启动时校验一次令牌）。
+浏览器打开 `http://localhost:5173`，注册后会自动生成一本演示账套。本地调试仍可用测试账号（手机号 `13800000000` / 验证码 `123456`），官网与登录页不再单独展示该入口。
 
 ---
 
@@ -173,8 +167,8 @@ cd web && npm run test
 
 ```bash
 cd deploy
-cp .env.staging.example .env.staging.local   # 填入真实密钥
-docker compose --env-file .env.staging.local up -d
+cp .env.staging.example .env.staging.local   # 填入真实密钥后重命名为 .env.staging.local
+docker compose up -d
 ```
 
 后端启动时会自动执行 `alembic upgrade head`。
@@ -183,9 +177,12 @@ docker compose --env-file .env.staging.local up -d
 
 欢迎通过 Issue 报告问题、提出建议或提交 PR。请阅读 [CONTRIBUTING.md](CONTRIBUTING.md) 了解贡献规范。
 
-## 许可证
+## 许可证与商业授权
 
-本项目采用 [SoloBooks 非商业开源许可](LICENSE)：**允许个人学习/非商业用途，禁止商用**。详见 `LICENSE`。
+本项目核心开源底座采用 [SoloBooks 源码可用许可 v2.0](LICENSE)：
+- **个人与企业自用**：个人、个体工商户、一人公司与小微企业可**永久免费自托管**用于本企业内部记账（包括产生经营收入的真实记账场景），享有阅读源码、自用修改与部署运行的完整自由。
+- **商业使用限制**：未经芥子星辰（杭州）智能科技有限公司书面授权，**禁止**将本软件用于对外 SaaS 托管经营、按用户/多租户收费、或持牌代账机构向客户提供商业记账/报税服务。
+- **商业授权（Partner License）**：如需多租户云端连接器、代账批量管户平台或商业联合运营授权，请联系商务邮箱：**founder@jiezixingchen.com**。
 
 ## 免责声明
 

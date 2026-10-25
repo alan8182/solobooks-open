@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """微信支付账单解析与导入服务"""
 from __future__ import annotations
 
@@ -13,11 +16,11 @@ from services.database import get_conn
 from services.entry_service import save_entries_bulk
 from core.money import ZERO, money
 
-WECHAT_CLEARING_CODE = "1012"
+WECHAT_CLEARING_CODE = "1012001"
 WECHAT_CLEARING_NAME = "微信支付待结算"
-REVENUE_CODE = "6001"
+REVENUE_CODE = "5001"
 REVENUE_NAME = "主营业务收入"
-FEE_CODE = "6602"
+FEE_CODE = "5603002"
 FEE_NAME = "财务费用-手续费"
 
 
@@ -261,11 +264,17 @@ async def parse_wechat_bill(content: bytes, company_id: str = "") -> Dict[str, A
             ).strip()
             product = row.get("商品名称", "").strip()
             order_amount = _money(row.get("订单金额", "0"))
-            settled_amount = _money(row.get("应结订单金额", "0"))
             fee_raw = row.get("手续费", "0") or "0"
             fee = abs(_money(fee_raw))
             fee_rate = row.get("费率", "").strip()
             refund_amount = _money(row.get("退款金额", "0"))
+            # 账单"应结订单金额"只扣免充值券、不扣手续费（退款行恒为 0.00），
+            # 到账净额按系统口径统一计算，与已导入记录接口一致：
+            # 收款 = 订单金额 - 手续费；退款 = -(退款金额 - 手续费)
+            if status == "REFUND":
+                settled_amount = -abs(refund_amount or order_amount) + fee
+            else:
+                settled_amount = order_amount - fee
             order_no = row.get("微信订单号", "").strip()
             merchant_order_no = row.get("商户订单号", "").strip()
             refund_order_no = row.get("微信退款单号", "").strip()
@@ -302,10 +311,116 @@ async def parse_wechat_bill(content: bytes, company_id: str = "") -> Dict[str, A
     return {"valid": valid, "errors": errors, "summary": summary, "total": len(valid)}
 
 
+async def import_wechat_bill_summary(
+    company_id: str,
+    user_id: str,
+    summary: Dict[str, Any],
+    *,
+    occur_date: str = "",
+    allow_backfill: bool = False,
+    backfill_reason: str | None = None,
+    revenue_code: str = REVENUE_CODE,
+    revenue_name: str = REVENUE_NAME,
+    fee_code: str = FEE_CODE,
+    fee_name: str = FEE_NAME,
+) -> Dict[str, Any]:
+    """按月度汇总记账（生成一张月度综合凭证）。
+
+    借：1012001 微信支付待结算  （净结算金额 = 订单金额 - 退款金额 - 手续费）
+    借：5603002 财务费用-手续费  （总手续费）
+    贷：5001    主营业务收入      （净收入 = 订单总额 - 退款总额）
+    """
+    total_count = int(_money(summary.get("总交易单数") or summary.get("total_count") or 0))
+    order_amount = _money(summary.get("订单总金额") or summary.get("应结订单总金额") or summary.get("order_amount") or 0)
+    refund_amount = _money(summary.get("退款总金额") or summary.get("refund_amount") or 0)
+    fee_amount = _money(summary.get("手续费总金额") or summary.get("fee_amount") or 0)
+
+    net_revenue = order_amount - refund_amount
+    net_clearing = net_revenue - fee_amount
+
+    if not occur_date:
+        occur_date = datetime.now().strftime("%Y-%m-%d")
+
+    month_str = occur_date[:7]
+    transaction_key = f"monthly_summary:{month_str}"
+
+    existing_wechat = await _load_existing_wechat_transaction_keys(company_id)
+    if transaction_key in existing_wechat:
+        return {
+            "imported": 0,
+            "failed": 0,
+            "ignored_duplicates": 1,
+            "results": [{"status": "duplicate", "title": f"微信支付月度汇总-{month_str}", "error": "当月汇总凭证已存在"}],
+        }
+
+    debit_lines: List[Dict[str, Any]] = []
+    credit_lines: List[Dict[str, Any]] = []
+
+    # 1. 微信待结算 (1012001)
+    if net_clearing > ZERO:
+        debit_lines.append({"accountCode": WECHAT_CLEARING_CODE, "accountName": WECHAT_CLEARING_NAME, "amount": net_clearing})
+    elif net_clearing < ZERO:
+        credit_lines.append({"accountCode": WECHAT_CLEARING_CODE, "accountName": WECHAT_CLEARING_NAME, "amount": abs(net_clearing)})
+
+    # 2. 手续费 (5603002)
+    if fee_amount > ZERO:
+        debit_lines.append({"accountCode": fee_code, "accountName": fee_name, "amount": fee_amount})
+    elif fee_amount < ZERO:
+        credit_lines.append({"accountCode": fee_code, "accountName": fee_name, "amount": abs(fee_amount)})
+
+    # 3. 主营业务收入 (5001)
+    if net_revenue > ZERO:
+        credit_lines.append({"accountCode": revenue_code, "accountName": revenue_name, "amount": net_revenue})
+    elif net_revenue < ZERO:
+        debit_lines.append({"accountCode": revenue_code, "accountName": revenue_name, "amount": abs(net_revenue)})
+
+    summary_entry = {
+        "title": f"微信支付月度汇总-{month_str}",
+        "amount": net_revenue,
+        "direction": "income" if net_revenue >= ZERO else "expense",
+        "category": revenue_name,
+        "occurDate": occur_date,
+        "merchant": "微信支付",
+        "source": "wechat_bill",
+        "voucherAuthority": "system",
+        "wechat_order_no": f"SUMMARY-{month_str}",
+        "wechat_transaction_key": transaction_key,
+        "is_monthly_summary": True,
+        "remark": f"微信支付月度对账汇总（共 {total_count} 笔交易，订单总额 {order_amount}，退款 {refund_amount}，手续费 {fee_amount}）",
+        "voucherLines": _voucher(debit_lines, credit_lines),
+    }
+
+    try:
+        await save_entries_bulk(
+            [summary_entry],
+            user_id=user_id,
+            company_id=company_id,
+            trusted_voucher=True,
+            allow_backfill=allow_backfill,
+            backfill_reason=backfill_reason,
+        )
+        return {
+            "imported": 1,
+            "failed": 0,
+            "ignored_duplicates": 0,
+            "results": [{"status": "success", "title": summary_entry["title"], "amount": net_revenue}],
+        }
+    except Exception as e:
+        return {
+            "imported": 0,
+            "failed": 1,
+            "ignored_duplicates": 0,
+            "results": [{"status": "failed", "title": summary_entry["title"], "error": str(e)}],
+        }
+
+
 async def import_wechat_bill(
     company_id: str,
     user_id: str,
     rows: List[Dict[str, Any]],
+    *,
+    allow_backfill: bool = False,
+    backfill_reason: str | None = None,
 ) -> Dict[str, Any]:
     """将解析后的微信账单行批量保存为记账条目。
 
@@ -507,9 +622,16 @@ async def import_wechat_bill(
                     user_id=user_id,
                     company_id=company_id,
                     existing_entry_updates=existing_entry_updates,
+                    trusted_voucher=True,
+                    allow_backfill=allow_backfill,
+                    backfill_reason=backfill_reason,
                 )
             else:
-                await save_entries_bulk(pending_entries, user_id=user_id, company_id=company_id)
+                await save_entries_bulk(
+                    pending_entries, user_id=user_id, company_id=company_id,
+                    trusted_voucher=True,
+                    allow_backfill=allow_backfill, backfill_reason=backfill_reason,
+                )
             imported += len(pending_results)
             results.extend(pending_results)
         except Exception as e:
@@ -526,7 +648,7 @@ async def list_wechat_bill_records(company_id: str, month: str) -> Dict[str, Any
     """当月已导入微信账单的只读记录，按订单号聚合收入、退款与手续费条目。
 
     导入时每笔交易拆成收入+手续费（或退款+手续费退还）多条 entry，
-    这里聚合回 CSV 视图：订单金额、手续费、到账净额（1012 清算净额）。
+    这里聚合回 CSV 视图：订单金额、手续费、到账净额（1012001 清算净额）。
     """
     month = str(month or "").strip()
     if not re.fullmatch(r"\d{4}-\d{2}", month):
@@ -565,6 +687,24 @@ async def list_wechat_bill_records(company_id: str, month: str) -> Dict[str, Any
         amount = _money(payload.get("amount"))
         category = str(payload.get("category") or "")
         title = str(payload.get("title") or "")
+        if payload.get("is_monthly_summary") or payload.get("isMonthlySummary"):
+            # 月度汇总凭证单行显示
+            remark = str(payload.get("remark") or "")
+            voucher = payload.get("voucherLines") or {}
+            # 从分录行还原手续费和结算额
+            fee_lines = [l for l in (voucher.get("debit") or []) if str(l.get("accountCode")) == FEE_CODE or "手续费" in str(l.get("accountName") or "")]
+            fee_val = sum((_money(l.get("amount")) for l in fee_lines), ZERO)
+            bucket = {
+                "orderNo": order_no,
+                "date": occur_date,
+                "title": title or "微信支付月度汇总",
+                "status": "SUMMARY",
+                "orderAmount": amount,
+                "fee": fee_val,
+            }
+            orders[order_no] = bucket
+            continue
+
         bucket = orders.get(order_no)
         if bucket is None:
             bucket = {

@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+ * Licensed under the SoloBooks License v2.0.
+ */
+
 import { describe, expect, it } from 'vitest'
 import {
   amountClassForDirection,
@@ -5,7 +10,11 @@ import {
   getStatementMatchedEntryIds,
   getMatchedEntryIdSets,
   groupedEntryTotal,
+  invoiceDisplayAmount,
   isReconciledEntry,
+  isNonBankSettledEntry,
+  formatDispositionTag,
+  formatDispositionExplanation,
   reconciliationDifference,
   signedInvoiceAmount,
 } from '@/utils/closingWizard'
@@ -33,7 +42,7 @@ describe('closing wizard invoice display helpers', () => {
     }, entries)).toBeNull()
   })
 
-  it('shows expense invoices as negative amounts', () => {
+  it('signs expense invoices negative for reconciliation math only', () => {
     expect(signedInvoiceAmount({ direction: 'expense', amount: 500 })).toBe(-500)
     expect(amountClassForDirection('expense', 500)).toBe('expense')
   })
@@ -45,6 +54,13 @@ describe('closing wizard invoice display helpers', () => {
 
   it('preserves negative income amounts for refunds', () => {
     expect(signedInvoiceAmount({ direction: 'income', amount: -5 })).toBe(-5)
+  })
+
+  it('displays invoices with their raw amount so only red-letter ones read negative', () => {
+    expect(invoiceDisplayAmount({ direction: 'expense', amount: 431.25 })).toBe(431.25)
+    expect(invoiceDisplayAmount({ direction: 'income', amount: 300 })).toBe(300)
+    expect(invoiceDisplayAmount({ direction: 'expense', amount: -5 })).toBe(-5)
+    expect(invoiceDisplayAmount(null)).toBe(0)
   })
 
   it('only treats linked statements as confirmed when the entry is reconciled', () => {
@@ -81,20 +97,20 @@ describe('closing wizard invoice display helpers', () => {
     expect(reconciliationDifference(58.5, entries)).toBe(0.03)
   })
 
-  it('uses the WeChat 1012 clearing effect for a net settlement', () => {
+  it('uses the WeChat clearing effect for a net settlement', () => {
     const entries = [
       {
         id: 'sale', direction: 'income', amount: 59,
         voucherLines: {
-          debit: [{ accountCode: '1012', amount: 59 }],
-          credit: [{ accountCode: '6001', amount: 59 }],
+          debit: [{ accountCode: '1012001', amount: 59 }],
+          credit: [{ accountCode: '5001', amount: 59 }],
         },
       },
       {
         id: 'fee', direction: 'expense', amount: 0.53,
         voucherLines: {
-          debit: [{ accountCode: '5608', amount: 0.53 }],
-          credit: [{ accountCode: '1012', amount: 0.53 }],
+          debit: [{ accountCode: '5603002', amount: 0.53 }],
+          credit: [{ accountCode: '1012001', amount: 0.53 }],
         },
       },
     ]
@@ -184,9 +200,9 @@ describe('closing wizard invoice display helpers', () => {
 
 it('counts bank settlement once alongside original receipts and fees', () => {
   const entries = [
-    { voucherLines: { debit: [{ accountCode: '1012', amount: '100.00' }], credit: [{ accountCode: '6001', amount: '100.00' }] } },
-    { voucherLines: { debit: [{ accountCode: '5608', amount: '0.60' }], credit: [{ accountCode: '1012', amount: '0.60' }] } },
-    { voucherLines: { debit: [{ accountCode: '1002', amount: '99.40' }], credit: [{ accountCode: '1012', amount: '99.40' }] } },
+    { voucherLines: { debit: [{ accountCode: '1012001', amount: '100.00' }], credit: [{ accountCode: '5001', amount: '100.00' }] } },
+    { voucherLines: { debit: [{ accountCode: '5603002', amount: '0.60' }], credit: [{ accountCode: '1012001', amount: '0.60' }] } },
+    { voucherLines: { debit: [{ accountCode: '1002', amount: '99.40' }], credit: [{ accountCode: '1012001', amount: '99.40' }] } },
   ]
   expect(groupedEntryTotal(entries.slice(0, 2))).toBe(99.4)
   expect(groupedEntryTotal(entries)).toBe(99.4)
@@ -292,24 +308,38 @@ describe('reversed originals in reconciliation candidates', () => {
   })
 })
 
-describe('semantic grouping of reconciliation candidates', () => {
-  const split = (entries: Array<Record<string, unknown>>) => ({
-    invoices: entries.filter(e => e.source === 'invoice_import'),
-    ledger: entries.filter(e => e.source !== 'invoice_import'),
+describe('non-bank settled entries disposition check', () => {
+  it('correctly identifies non-bank settled entries', () => {
+    expect(isNonBankSettledEntry({ paymentStatus: 'unpaid' })).toBe(true)
+    expect(isNonBankSettledEntry({ payer: 'boss_personal' })).toBe(true)
+    expect(isNonBankSettledEntry({ payer: 'employee_personal:张三' })).toBe(true)
+    expect(isNonBankSettledEntry({ payer: 'employee_personal' })).toBe(true)
+    expect(isNonBankSettledEntry({ payer: 'prepaid_deduct' })).toBe(true)
+    expect(isNonBankSettledEntry({ payer: 'platform_balance' })).toBe(true)
+    expect(isNonBankSettledEntry({ payer: 'advance_offset' })).toBe(true)
+
+    expect(isNonBankSettledEntry({ payer: 'company_account', paymentStatus: null })).toBe(false)
+    expect(isNonBankSettledEntry(null)).toBe(false)
   })
 
-  it('separates invoice-pending-payment from ledger entries', () => {
-    const { invoices, ledger } = split([
-      { id: 'a', source: 'invoice_import' },
-      { id: 'b', source: 'wechat_bill' },
-      { id: 'c', source: 'manual' },
-    ])
-    expect(invoices.map(e => e.id)).toEqual(['a'])
-    expect(ledger.map(e => e.id)).toEqual(['b', 'c'])
+  it('formats human readable disposition tags accurately', () => {
+    expect(formatDispositionTag({ paymentStatus: 'unpaid', direction: 'expense' })).toBe('还没付款')
+    expect(formatDispositionTag({ paymentStatus: 'unpaid', direction: 'income' })).toBe('客户未付款')
+    expect(formatDispositionTag({ payer: 'boss_personal', direction: 'expense' })).toBe('老板个人垫付')
+    expect(formatDispositionTag({ payer: 'boss_personal', direction: 'income' })).toBe('老板私户代收')
+    expect(formatDispositionTag({ payer: 'employee_personal:李四', direction: 'expense' })).toBe('员工垫付 · 李四')
+    expect(formatDispositionTag({ payer: 'employee_personal', direction: 'expense' })).toBe('员工垫付')
+    expect(formatDispositionTag({ payer: 'prepaid_deduct' })).toBe('预存扣款')
+    expect(formatDispositionTag({ payer: 'platform_balance' })).toBe('平台未提现')
+    expect(formatDispositionTag({ payer: 'advance_offset' })).toBe('冲前期预收')
   })
 
-  it('handles all-invoice or no-invoice months', () => {
-    expect(split([{ id: 'x', source: 'invoice_import' }]).ledger).toEqual([])
-    expect(split([{ id: 'y', source: 'wechat_bill' }]).invoices).toEqual([])
+  it('formats boss-friendly accounting explanations accurately', () => {
+    expect(formatDispositionExplanation({ payer: 'boss_personal', direction: 'expense' })).toContain('公司欠老板垫付款')
+    expect(formatDispositionExplanation({ paymentStatus: 'unpaid', direction: 'income' })).toContain('客户欠款')
+    expect(formatDispositionExplanation({ paymentStatus: 'unpaid', direction: 'expense' })).toContain('待付供应商款')
+    expect(formatDispositionExplanation({ payer: 'employee_personal:王五', direction: 'expense' })).toContain('公司欠王五报销款')
+    expect(formatDispositionExplanation({ payer: 'platform_balance', direction: 'income' })).toContain('平台待提现余额')
   })
 })
+

@@ -1,3 +1,4 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, watch, onUnmounted } from 'vue'
 import {
@@ -19,8 +20,11 @@ import {
 } from '@/api/auth'
 import { useAuthStore } from '@/stores/auth'
 
-// ICP 备案通过后在此填入备案号（如"苏ICP备XXXXXXXX号"），页脚会自动展示并链接工信部网站
-const ICP_LICENSE = ''
+// ICP 备案号，页脚自动展示并链接工信部网站
+const ICP_LICENSE = '浙ICP备2025195764号-7'
+// 公安备案号，链接公安部备案查询网站
+const PSB_RECORD = '浙公网安备 33011002020894号'
+const PSB_RECORD_URL = 'https://beian.mps.gov.cn/#/query/webSearch?code=33011002020894'
 
 const message = useMessage()
 const authStore = useAuthStore()
@@ -123,13 +127,6 @@ async function handleCodeLogin() {
   } finally {
     loading.value = false
   }
-}
-
-async function handleQuickLogin() {
-  activeTab.value = 'code'
-  phone.value = '13800000000'
-  code.value = '123456'
-  await handleCodeLogin()
 }
 
 // ── 密码登录 ──
@@ -325,21 +322,7 @@ async function handleForgotReset() {
               @click="handleCodeLogin"
               class="login-btn"
             >
-              登录 / 注册
-            </NButton>
-
-            <NButton
-              secondary
-              block
-              size="large"
-              :disabled="loading"
-              @click="handleQuickLogin"
-              class="quick-login-btn"
-            >
-              <template #icon>
-                <i class="ri-flashlight-line" />
-              </template>
-              免注册 · 测试账号一键试用
+              {{ loading ? '正在登录 / 注册，首次将生成演示账套…' : '登录 / 注册' }}
             </NButton>
           </NForm>
         </NTabPane>
@@ -359,7 +342,13 @@ async function handleForgotReset() {
               </NInput>
             </NFormItem>
 
-            <NFormItem label="密码">
+            <NFormItem>
+              <template #label>
+                <div class="label-row">
+                  <span>密码</span>
+                  <a class="forgot-link" @click="openForgot">忘记密码？</a>
+                </div>
+              </template>
               <NInput
                 v-model:value="pwPassword"
                 type="password"
@@ -384,13 +373,13 @@ async function handleForgotReset() {
             >
               登 录
             </NButton>
-
-            <div class="forgot-row">
-              <a class="forgot-link" @click="openForgot">忘记密码？</a>
-            </div>
           </NForm>
         </NTabPane>
       </NTabs>
+
+      <p class="register-hint">
+        未注册的手机号验证通过后将自动创建账号，并为你准备一本带样本数据的演示账套（首次约 10 秒）。
+      </p>
 
       <p class="login-footer">
         登录即表示同意
@@ -404,6 +393,7 @@ async function handleForgotReset() {
       <a href="/agreement" target="_blank">服务协议</a>
       <a href="/privacy" target="_blank">隐私政策</a>
       <a v-if="ICP_LICENSE" href="https://beian.miit.gov.cn" target="_blank" rel="noreferrer">{{ ICP_LICENSE }}</a>
+      <a v-if="PSB_RECORD" :href="PSB_RECORD_URL" target="_blank" rel="noreferrer">{{ PSB_RECORD }}</a>
     </footer>
 
     <NModal
@@ -471,7 +461,7 @@ async function handleForgotReset() {
   justify-content: center;
   background:
     radial-gradient(circle at 50% -15%, rgba(23, 71, 176, 0.09) 0%, rgba(30, 127, 251, 0.03) 45%, transparent 75%),
-    linear-gradient(180deg, #f8fafc 0%, #ffffff 100%);
+    linear-gradient(180deg, #f1f4f8 0%, #ffffff 100%);
   position: relative;
   overflow: hidden;
   padding: 20px;
@@ -515,7 +505,7 @@ async function handleForgotReset() {
 .brand-desc {
   font-size: 15px;
   line-height: 1.8;
-  color: var(--solo-text-secondary, #64748b);
+  color: var(--solo-text-secondary, #586474);
   margin: 0;
   max-width: 380px;
 }
@@ -576,7 +566,7 @@ async function handleForgotReset() {
   max-width: 400px;
   background: #ffffff;
   border: 1px solid rgba(226, 232, 240, 0.9);
-  border-radius: 20px;
+  border-radius: 12px;
   padding: 44px 36px;
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 1),
@@ -725,22 +715,21 @@ async function handleForgotReset() {
   box-shadow: 0 4px 12px rgba(22, 93, 255, 0.2);
 }
 
-.quick-login-btn {
-  margin-top: 12px;
-  height: 44px;
-  font-size: 15px;
-  font-weight: 600;
-  border-radius: var(--solo-radius);
-  transition: all 0.2s ease;
-}
-.quick-login-btn:hover {
-  transform: translateY(-1px);
+.register-hint {
+  margin: 14px 0 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--solo-text-muted);
+  text-align: center;
 }
 
-.forgot-row {
-  margin-top: 14px;
-  text-align: right;
+.label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
 }
+
 .forgot-link {
   font-size: 13px;
   color: var(--solo-primary);

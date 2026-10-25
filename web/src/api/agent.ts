@@ -1,11 +1,16 @@
 /**
+ * Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+ * Licensed under the SoloBooks License v2.0.
+ */
+
+/**
  * Agent API：SSE 流式对话 + 待确认动作审批。
  * 流式通道使用原生 fetch（绕过 axios），auth header 手动附加。
  */
 import apiClient from './client'
 
 export interface AgentStreamEvent {
-  type: 'meta' | 'token' | 'tool_call' | 'tool_result' | 'action' | 'final' | 'done' | 'error'
+  type: 'meta' | 'token' | 'reasoning' | 'tool_call' | 'tool_result' | 'action' | 'final' | 'done' | 'error'
   content?: string
   message?: string
   step?: number
@@ -35,12 +40,21 @@ export function chatAgentStream(
   onEvent: (ev: AgentStreamEvent) => void,
   signal?: AbortSignal,
   conversationId?: string,
+  enableThinking?: boolean,
+  workspaceView?: 'boss' | 'accounting',
 ): Promise<void> {
   const base = import.meta.env.VITE_API_BASE || ''
   const token = localStorage.getItem('auth_token') || ''
   return (async () => {
-    const payload: { messages: typeof messages; conversationId?: string } = { messages }
+    const payload: {
+      messages: typeof messages
+      conversationId?: string
+      enableThinking?: boolean
+      workspaceView?: 'boss' | 'accounting'
+    } = { messages }
     if (conversationId) payload.conversationId = conversationId
+    if (enableThinking != null) payload.enableThinking = enableThinking
+    if (workspaceView) payload.workspaceView = workspaceView
     const resp = await fetch(`${base}/api/agent/chat`, {
       method: 'POST',
       headers: {
@@ -99,6 +113,10 @@ export interface AgentApproveOptions {
   excludeIndexes?: number[]
   /** 用户修正的字段，按行索引（单笔动作索引用 "0"） */
   edits?: Record<string, { category?: string; title?: string; payer?: string }>
+  /** 单据所属期间已关账、用户确认补记到后续期间时为 true */
+  allowBackfill?: boolean
+  /** 补记原因，写进 period_backfills 台账 */
+  backfillReason?: string
 }
 
 export async function approveAgentAction(
@@ -108,6 +126,8 @@ export async function approveAgentAction(
   return (await apiClient.post(`/api/agent/actions/${id}/approve`, {
     excludeIndexes: opts.excludeIndexes?.length ? opts.excludeIndexes : undefined,
     edits: Object.keys(opts.edits || {}).length ? opts.edits : undefined,
+    allowBackfill: opts.allowBackfill || undefined,
+    backfillReason: opts.backfillReason || undefined,
   })) as unknown as AgentActionDecision
 }
 

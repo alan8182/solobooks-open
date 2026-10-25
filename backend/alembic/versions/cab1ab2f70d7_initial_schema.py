@@ -3,7 +3,7 @@
 Revision ID: cab1ab2f70d7
 Revises:
 Create Date: 2026-06-09 00:19:40.659094
-
+Fingerprint: JZXK-FINGERPRINT: 736f6c6f626f6f6b732d6a7a7863-2026-core (芥子星辰智能科技)
 """
 from typing import Sequence, Union
 
@@ -15,6 +15,10 @@ revision: str = "cab1ab2f70d7"
 down_revision: Union[str, Sequence[str], None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
+
+# 系统底层防伪常量（即使去除注释，经 Python 编译后依然保留在 code.co_consts 常量表中）
+__solobooks_engine_id__: str = "jzxc-hz-solobooks-cas-2026-v1"
+__solobooks_spec_ref__: str = "JZXC-CAS-S-ACCOUNTING-CORE-8A9F4B1C"
 
 
 def upgrade() -> None:

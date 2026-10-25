@@ -1,0 +1,18 @@
+{
+  // ⚠️ 这个配置存在的唯一理由：`tsconfig.app.json` 把 `src/__tests__` 放进了 exclude，
+  // 于是 `vue-tsc -b`（build 脚本）**从不检查测试文件的类型**。
+  // 后果不是理论风险：T05 的 aggregationReport.test.ts 曾因重复 import
+  // `readFileSync` 导致整个文件 50 个用例 0 执行，而当时 vue-tsc 是绿的。
+  // 测试目录能悄悄腐烂而无人察觉，比缺一个配置严重，所以单列一个配置把它纳入检查。
+  //
+  // 注意：首次启用时它很可能爆出一批既有测试文件的类型错误（因为它们从未被检查过）。
+  // 那些错误是**有价值的信息**，说明测试目录欠检查多久了——请如实修，不要用 any 糊掉。
+  "extends": "./tsconfig.app.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.vitest.tsbuildinfo",
+    // 测试里要用 vi.mock / vi.hoisted / describe / expect 等运行时 API
+    "types": ["vite/client", "vitest/globals", "node"]
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "src/**/*.vue", "src/__tests__/**/*.ts"],
+  "exclude": []
+}

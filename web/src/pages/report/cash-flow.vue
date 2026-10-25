@@ -1,14 +1,21 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
-import { NCard, NSpin, useMessage, NSelect, NButton, NTag } from 'naive-ui'
+import { useRoute, useRouter } from 'vue-router'
+import { NCard, NSpin, useMessage, NSelect, NButton, NTag, NRadioGroup, NRadioButton } from 'naive-ui'
 import { getCashFlow } from '@/api/report'
 import { formatMoney, getCurrentMonth } from '@/utils/format'
 import type { CashFlowResponse } from '@/api/types'
+import { SoloEmpty } from '@/components/ui'
 
+const route = useRoute()
 const router = useRouter()
 const message = useMessage()
-const month = ref(getCurrentMonth())
+
+const requestedMonth = String(route.query.month || '')
+const hasRequestedMonth = /^\d{4}-(0[1-9]|1[0-2])$/.test(requestedMonth)
+const month = ref(hasRequestedMonth ? requestedMonth : getCurrentMonth())
+const periodType = ref<'month' | 'quarter'>('month')
 const loading = ref(false)
 const result = ref<CashFlowResponse | null>(null)
 
@@ -24,10 +31,24 @@ const monthOptions = computed(() => {
   return options
 })
 
+function handleMonthChange() {
+  router.replace({ query: { ...route.query, month: month.value } })
+  load()
+}
+
+function handlePeriodTypeChange() {
+  router.replace({ query: { ...route.query, month: month.value } })
+  load()
+}
+
+function handleBack() {
+  router.push({ path: '/reports', query: { month: month.value } })
+}
+
 async function load() {
   loading.value = true
   try {
-    result.value = await getCashFlow(month.value)
+    result.value = await getCashFlow(month.value, periodType.value)
   } catch {
     message.error('加载现金流量表失败')
   } finally {
@@ -42,9 +63,9 @@ onMounted(load)
   <div class="report-container">
     <div class="report-header">
       <div class="report-header-left">
-        <NButton text class="report-back-btn" @click="router.push('/reports')">
+        <NButton text class="report-back-btn" @click="handleBack">
           <template #icon><i class="ri-arrow-left-line" /></template>
-          返回
+          返回报表中心
         </NButton>
         <div class="report-title-section">
           <h2>现金流量表</h2>
@@ -52,18 +73,28 @@ onMounted(load)
         </div>
       </div>
       <div class="report-header-right">
+        <NRadioGroup
+          v-model:value="periodType"
+          size="small"
+          style="margin-right: 8px;"
+          @update:value="handlePeriodTypeChange"
+        >
+          <NRadioButton value="month">月报</NRadioButton>
+          <NRadioButton value="quarter">季报</NRadioButton>
+        </NRadioGroup>
         <NSelect
           v-model:value="month"
           :options="monthOptions"
           size="small"
           style="width: 140px;"
-          @update:value="load"
+          @update:value="handleMonthChange"
         />
       </div>
     </div>
 
     <NSpin :show="loading">
       <template v-if="result">
+
         <!-- 经营活动 -->
         <NCard :bordered="false" class="report-card mb-4">
           <h3 class="report-section-title">经营活动现金流</h3>
@@ -162,7 +193,14 @@ onMounted(load)
             </div>
           </div>
         </NCard>
-      </template>
+            </template>
+      <SoloEmpty
+        v-else-if="!loading"
+        title="本期没有资金流水"
+        description="去记账或导入银行流水后，这里会展示钱从哪来到哪去。"
+        icon="ri-exchange-funds-line"
+      />
+
     </NSpin>
   </div>
 </template>

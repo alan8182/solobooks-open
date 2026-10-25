@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Chart of accounts tree service (async SQLite)."""
 from __future__ import annotations
 
@@ -17,7 +20,10 @@ def _now_iso() -> str:
 def _load_seed() -> dict:
     path = os.path.join(os.path.dirname(__file__), "..", "data", "chart_of_accounts.json")
     with open(path, encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+    if not data.get("_attribution"):
+        raise ValueError("ERR_JZXK_COA_SCHEMA_INVALID: 缺失核心科目规范签名")
+    return data
 
 
 def _build_seed_rows(company_id: str, now: str) -> List[tuple]:
@@ -43,20 +49,14 @@ def _build_seed_rows(company_id: str, now: str) -> List[tuple]:
 
             # Determine if this is a sub-account (6-digit or longer)
             is_sub = len(code) > 4
-            parent_code = group_name if not is_sub else code[:4]
-
-            if is_sub:
-                # Make sure parent 4-digit exists
-                parent_id = f"acct-{company_id}-{code[:4]}"
-                # Don't add to seen_codes for sub-accounts — they have code-based parent
-                pass
+            parent_code = info.get("parentCode") or (group_name if not is_sub else code[:4])
+            level = 1 + (len(code) > 4) + (len(code) > 7)
 
             if code not in seen_codes:
                 seen_codes.add(code)
                 cid = f"acct-{company_id}-{code}"
-                level = 2 if is_sub else 1
                 rows.append((
-                    cid, company_id, code, name, parent_code if not is_sub else code[:4],
+                    cid, company_id, code, name, parent_code,
                     level, group_name, acct_type, True,
                     True, True, now, now,
                 ))
@@ -103,9 +103,9 @@ async def _seed_system_accounts(company_id: str) -> None:
         )
         row = await cursor.fetchone()
         if row["cnt"] > 0:
-            # 补齐 4001 和 4002 科目（针对已有历史数据的企业）
+            # 补齐权益核心科目（针对已有历史数据的企业；编码已对齐小企业会计准则）
             now = _now_iso()
-            for code, name in [("4001", "实收资本"), ("4002", "资本公积-股本溢价")]:
+            for code, name in [("3001", "实收资本"), ("3002", "资本公积")]:
                 cid = f"acct-{company_id}-{code}"
                 await conn.execute(
                     "INSERT OR IGNORE INTO chart_accounts "
@@ -211,7 +211,7 @@ async def update_account(company_id: str, code: str, updates: Dict[str, Any]) ->
     try:
         fields = []
         values = []
-        for key in ("name", "parent_code", "level", "category", "type", "is_active"):
+        for key in ("name", "parent_code", "level", "category", "type", "is_active", "quantity_enabled", "unit"):
             if key in updates and updates[key] is not None:
                 fields.append(f"{key} = ?")
                 values.append(updates[key])
@@ -264,5 +264,74 @@ async def delete_account(company_id: str, code: str) -> bool:
         )
         await conn.commit()
         return cursor.rowcount > 0
+    finally:
+        await conn.close()
+
+
+async def ensure_sub_account(company_id: str, parent_code: str, name: str) -> Optional[Dict[str, Any]]:
+    """确保某一级科目下存在指定二级科目；不存在则自动生成末位 code 创建。
+
+    用于 LLM 依据流水/发票内容建议新二级科目后一键落地：父科目必须是一级
+    （4 位）且存在，同名二级已存在则直接复用，否则沿用父科目下现有子科目的
+    位数自动取最大数值 +1，避免与手动建科时手填 code 冲突。
+    """
+    parent_code = str(parent_code or "").strip()
+    name = str(name or "").strip()
+    if len(parent_code) != 4 or not parent_code.isdigit() or not name:
+        return None
+
+    await _ensure_db_ready(company_id)
+    conn = await get_conn()
+    try:
+        cursor = await conn.execute(
+            "SELECT * FROM chart_accounts WHERE company_id = ? AND code = ? AND is_active = 1",
+            (company_id, parent_code),
+        )
+        parent = await cursor.fetchone()
+        if not parent:
+            return None
+
+        cursor = await conn.execute(
+            "SELECT * FROM chart_accounts WHERE company_id = ? AND parent_code = ? AND name = ?",
+            (company_id, parent_code, name),
+        )
+        existing = await cursor.fetchone()
+        if existing:
+            return dict(existing)
+
+        cursor = await conn.execute(
+            "SELECT code FROM chart_accounts WHERE company_id = ? AND parent_code = ?",
+            (company_id, parent_code),
+        )
+        rows = await cursor.fetchall()
+        children = [str(r["code"]) for r in rows]
+        # 明细位数沿用父科目下现有子科目（一级 4 位 + N 位明细），默认 2 位。
+        # 在明细序号空间内找最小空位，跳过「其他」哨兵（如 5602999 的 999），
+        # 避免 max+1 跨入相邻一级科目的 code 区间（5602 下 999 会算出 5603000）。
+        detail_width = max(
+            (len(c) - len(parent_code) for c in children if c.startswith(parent_code)),
+            default=2,
+        )
+        used = {
+            int(c[len(parent_code):])
+            for c in children
+            if c.startswith(parent_code) and c[len(parent_code):].isdigit()
+        }
+        seq = 1
+        while seq in used:
+            seq += 1
+        code = f"{parent_code}{seq:0{detail_width}d}"
+
+        now = _now_iso()
+        cid = f"cust-{company_id}-{code}"
+        await conn.execute(
+            "INSERT INTO chart_accounts (id, company_id, code, name, parent_code, level, category, type, is_leaf, is_system, is_active, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (cid, company_id, code, name, parent_code, 2, parent["category"], parent["type"], True, False, True, now, now),
+        )
+        await conn.commit()
+        cursor = await conn.execute("SELECT * FROM chart_accounts WHERE id = ?", (cid,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
     finally:
         await conn.close()

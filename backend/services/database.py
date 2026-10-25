@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Database compatibility layer.
 
 The accounting core uses SQLAlchemy sessions directly. Remaining operational
@@ -8,7 +11,9 @@ test mode and as a migration source.
 from __future__ import annotations
 
 import re
+import sqlite3
 from collections.abc import Iterable, Mapping
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -23,6 +28,29 @@ from services.sqlite_db import APP_DB_FILE, DATA_DIR
 
 
 DB_FILE = APP_DB_FILE
+
+
+def _adapt_decimal(value: Decimal) -> str:
+    """按原样写文本：NUMERIC 亲和列会自动转成数值，TEXT 列则保留两位小数精度。"""
+    return format(value, "f")
+
+
+def _register_sqlite_adapters() -> None:
+    """补齐 SQLite 的 Python 类型适配器。
+
+    SQLite 没有 decimal 类型，Python 3.12 又移除了 datetime 的默认适配器，所以
+    未经适配的 ``Decimal`` / ``datetime`` 参数会让 aiosqlite 直接抛
+    ``ProgrammingError``；而生产 PostgreSQL 走 SQLAlchemy 类型系统完全正常。
+    这种「本地挂、线上好」的差异极难排查——演示账套的银行流水就是因为整批
+    Decimal 绑定失败被静默吞掉，最终一条流水都没进库。统一在方言入口注册，
+    保证两条路径的绑定行为一致。
+    """
+    sqlite3.register_adapter(Decimal, _adapt_decimal)
+    sqlite3.register_adapter(datetime, lambda value: value.isoformat())
+    sqlite3.register_adapter(date, lambda value: value.isoformat())
+
+
+_register_sqlite_adapters()
 
 
 def _sqlite_target(url: str) -> str:

@@ -1,7 +1,12 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """V3 记账路由：文字/语音/拍单据/确认"""
 import base64
 import httpx
+from decimal import Decimal
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Header, Request
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from deps.auth import AuthContext, require_auth
 from models.schemas import (
@@ -10,6 +15,7 @@ from models.schemas import (
     RecordBatchRequest, RecordBatchResponse,
     ConfirmRequest, ConfirmResponse,
     EntryUpdateRequest,
+    VoucherLinesAdjustRequest,
     SpeechTextResponse,
     CloudFileRequest,
 )
@@ -24,11 +30,13 @@ from services.zhipu_ocr import (
     zhipu_handwriting_ocr_bytes,
 )
 from services.account_mapper import get_voucher_hint
+from services.vat_service import get_vat_config_from_session, is_vat_sales_entry, split_income_vat
 from core.money import ZERO, money
 from services.tax_rules import compute_vat, get_risk_tags, is_tax_deductible, sanitize_risk_tags
 from db.session import get_db_session
 from services.accounting_core_service import (
     RD_ACCOUNT_BY_TYPE,
+    adjust_voucher_lines,
     create_entry,
     delete_draft,
     ensure_tenant,
@@ -102,6 +110,80 @@ def _clean_entry_payload(entry: dict) -> dict:
     data = dict(entry or {})
     data["riskTags"] = sanitize_risk_tags(data.get("riskTags", []))
     return data
+
+
+def _attach_auxiliary(voucher: dict, auxiliary: dict[str, str | None]) -> dict:
+    """把辅助核算挂到允许的科目行上（白名单见 core.chart_policy）。
+
+    客户端只传 id；name 由服务端在落库时按主数据回填（accounting_core._add_lines），
+    这里不复制任何客户端文案。
+    """
+    from core.chart_policy import auxiliary_kinds_for_account
+
+    requested = {key: value for key, value in auxiliary.items() if value}
+    if not requested:
+        return voucher
+    output: dict = {}
+    for side in ("debit", "credit"):
+        lines = []
+        for line in voucher.get(side) or []:
+            allowed = auxiliary_kinds_for_account(str(line.get("accountCode") or ""))
+            matched = {key: value for key, value in requested.items() if key.removesuffix("_id") in allowed}
+            lines.append({**line, "auxiliary": {**(line.get("auxiliary") or {}), **matched}} if matched else line)
+        output[side] = lines
+    return output
+
+
+async def _attach_quantity(
+    session: AsyncSession,
+    company_id: str,
+    voucher: dict,
+    quantity: Decimal | None,
+    unit_price: Decimal | None,
+    unit: str | None,
+) -> dict:
+    """把数量/单价/单位挂到勾选了数量核算的科目行上（P1 WP-D）。
+
+    confirm 的金额行走确定性凭证生成，数量没有行级入口，所以在服务端按科目
+    配置挂到第一行数量科目（采购/销售凭证通常只有一行存货）；没有数量就不挂，
+    非数量科目不挂，单价/单位不单独触发。
+    """
+    from sqlalchemy import select
+
+    from db.models import ChartAccount
+
+    if quantity is None:
+        return voucher
+    codes = [
+        str(line.get("accountCode") or "")
+        for side in ("debit", "credit")
+        for line in voucher.get(side) or []
+    ]
+    codes = [code for code in codes if code]
+    if not codes:
+        return voucher
+    rows = await session.execute(
+        select(ChartAccount.code).where(
+            ChartAccount.company_id == company_id,
+            ChartAccount.code.in_(set(codes)),
+            ChartAccount.quantity_enabled.is_(True),
+        )
+    )
+    enabled = set(rows.scalars().all())
+    if not enabled:
+        return voucher
+    output: dict = {}
+    attached = False
+    extra = {key: value for key, value in (("quantity", quantity), ("unitPrice", unit_price), ("unit", unit)) if value is not None}
+    for side in ("debit", "credit"):
+        lines = []
+        for line in voucher.get(side) or []:
+            if not attached and str(line.get("accountCode") or "") in enabled:
+                line = {**line, **extra}
+                attached = True
+            lines.append(line)
+        output[side] = lines
+    return output
 
 
 async def _fetch_cloud_file(file_url: str) -> tuple[bytes, str]:
@@ -382,10 +464,34 @@ async def record_confirm(
     if cached is not None:
         return ConfirmResponse(**cached)
 
-    vat = compute_vat(req.amount, req.category, req.direction)
+    # 增值税口径唯一来源：小规模征收率、起征点、申报周期都从公司档案读。
+    # 一般纳税人直接抛错，避免以错误口径生成凭证与底稿。
+    try:
+        vat_config = await get_vat_config_from_session(session, ctx.company_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    income_with_vat = req.direction == "income" and is_vat_sales_entry(req.category)
+    if income_with_vat:
+        net_amount, tax_amount = split_income_vat(req.amount, vat_config.rate)
+        vat = {
+            "vatRate": vat_config.rate,
+            "vatAmount": tax_amount,
+            "amountExcludingTax": net_amount,
+            "vatExempt": False,
+        }
+        voucher = get_voucher_hint(
+            req.direction, req.category, req.amount, payer=req.payer, vat_rate=vat_config.rate
+        )
+    else:
+        vat = compute_vat(req.amount, req.category, req.direction)
+        voucher = get_voucher_hint(req.direction, req.category, req.amount, payer=req.payer)
     risk_tags = get_risk_tags(req.category, req.direction)
-    deductible = is_tax_deductible(req.category, req.direction)
-    voucher = get_voucher_hint(req.direction, req.category, req.amount, payer=req.payer)
+    deductible = is_tax_deductible(
+        req.category,
+        req.direction,
+        billing_status=req.billingStatus,
+        has_invoice_number=bool(str(req.invoiceNumber or "").strip()),
+    )
     is_rd = req.category == "研发支出-费用化支出" or bool(req.rdProjectId or req.rdExpenseType)
     if is_rd:
         if not req.rdProjectId or not req.rdExpenseType:
@@ -412,9 +518,25 @@ async def record_confirm(
         "payer": req.payer or "company_account",
         "vatRate": vat.get("vatRate"),
         "vatAmount": vat.get("vatAmount"),
+        "vatSeparated": bool(income_with_vat),
+        "amountExcludingTax": net_amount if income_with_vat else None,
         "taxDeductible": deductible,
         "riskTags": risk_tags,
-        "voucherLines": voucher,
+        "voucherLines": await _attach_quantity(
+            session,
+            ctx.company_id,
+            _attach_auxiliary(
+                voucher,
+                {
+                    "partner_id": req.partner_id or req.partnerId,
+                    "department_id": req.department_id or req.departmentId,
+                    "project_id": req.project_id or req.projectId,
+                },
+            ),
+            req.quantity,
+            req.unitPrice,
+            req.unit,
+        ),
     }
     entry = await create_entry(
         session,
@@ -442,6 +564,35 @@ async def record_confirm(
         response=response.model_dump(),
     )
     return response
+
+
+class EntryAuxiliaryRequest(BaseModel):
+    partner_id: Optional[str] = None
+    department_id: Optional[str] = None
+    project_id: Optional[str] = None
+
+
+@router.put("/entries/{entry_id}/auxiliary")
+async def assign_entry_auxiliary_route(
+    entry_id: str,
+    req: EntryAuxiliaryRequest,
+    ctx: AuthContext = Depends(require_auth),
+):
+    """给草稿凭证补挂辅助核算（已过账凭证不可改，只能红冲后重做）。"""
+    from services.auxiliary_service import assign_entry_auxiliary
+
+    auxiliary = {
+        key: value
+        for key, value in {
+            "partner_id": req.partner_id,
+            "department_id": req.department_id,
+            "project_id": req.project_id,
+        }.items()
+        if value
+    }
+    if not auxiliary:
+        raise HTTPException(status_code=422, detail="请至少选择一个辅助核算项")
+    return await assign_entry_auxiliary(ctx.company_id, ctx.user_id, entry_id, auxiliary)
 
 
 @router.get("/entries")
@@ -479,6 +630,54 @@ async def patch_entry(
         session,
         entry_id,
         payload,
+        company_id=ctx.company_id,
+        user_id=ctx.user_id,
+        request_id=request.headers.get("X-Request-ID") or _uid(),
+    )
+    response = {"entry": _clean_entry_payload(await serialize_journal(session, updated))}
+    await save_idempotent_response(
+        session,
+        company_id=ctx.company_id,
+        key=idempotency_key,
+        operation=operation,
+        payload=payload,
+        status=200,
+        response=response,
+    )
+    return response
+
+
+@router.patch("/entries/{entry_id}/voucher-lines")
+async def adjust_entry_voucher_lines(
+    entry_id: str,
+    req: VoucherLinesAdjustRequest,
+    request: Request,
+    ctx: AuthContext = Depends(require_auth),
+    session: AsyncSession = Depends(get_db_session),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    """会计手工调整分录（科目/方向/金额/增删行）。
+
+    只对未过账凭证开放；借贷平衡、「借方合计 = 交易金额」、末级可用科目三项
+    由服务端复核，前端校验只是提前反馈。每次调整写审计留痕。
+    """
+    payload = req.model_dump(exclude_unset=True)
+    operation = f"adjust_voucher_lines:{entry_id}"
+    cached = await get_idempotent_response(
+        session,
+        company_id=ctx.company_id,
+        key=idempotency_key,
+        operation=operation,
+        payload=payload,
+    )
+    if cached is not None:
+        return cached
+    updated = await adjust_voucher_lines(
+        session,
+        entry_id,
+        lines=[line.model_dump() for line in req.lines] if req.lines else None,
+        reason=req.reason or "",
+        reset_to_system=bool(req.resetToSystem),
         company_id=ctx.company_id,
         user_id=ctx.user_id,
         request_id=request.headers.get("X-Request-ID") or _uid(),

@@ -15,13 +15,17 @@
   --solo-bg-soft: #f1f4f8;
   --solo-bg-blue-soft: #edf3ff;
 
-  /* Text colors */
+  /* Text colors
+     muted 旧值 8a95a3 在页面底 #f6f7f9 上只有 2.84:1，而它承载日期、说明、
+     副文案这类 11–12px 小字，全站不达 WCAG AA 4.5:1。现值 #636e7c 在本项目
+     用到的全部浅底上都过 4.5:1（页面底 4.83 / soft 4.70 / border-light 4.53 /
+     白 5.18），同时仍明显浅于 text-secondary（同底 5.26）。 */
   --solo-text-primary: #182230;
   --solo-text-secondary: #586474;
-  --solo-text-muted: #8a95a3;
-  --solo-text-sidebar: #667281;
+  --solo-text-muted: #636e7c;
+  --solo-text-sidebar: #636e7c;
   --solo-text-sidebar-hover: #182230;
-  --solo-text-sidebar-active: #165dff;
+  --solo-text-sidebar-active: #1747b0;
 
   /* Borders & Dividers */
   --solo-border: #dde3ea;
@@ -29,29 +33,77 @@
   --solo-border-glass: #e5e9ef;
   --solo-border-sidebar: #e8ecf1;
 
-  /* Status colors */
-  --solo-income: #12805c;
+  /* Status colors
+     语义色同时用作低饱和底上的标签文字，原值在各自浅底上仅 3.85–4.47:1，
+     统一压深一档使其在「浅底 + 白底」两种场景都过 4.5:1。 */
+  --solo-income: #0f7354; /* on #eaf7f1 5.30 / on #fff 5.83 */
   --solo-income-bg: #eaf7f1;
-  --solo-expense: #c74444;
+  --solo-expense: #bd3d3d; /* on #fbeeee 4.76 / on #fff 5.39 */
   --solo-expense-bg: #fbeeee;
-  --solo-warning: #b46b17;
+  --solo-warning: #a05c10; /* on #fff5e8 4.83 / on #fff 5.21 */
   --solo-warning-bg: #fff5e8;
-  --solo-info: #165dff;
+  --solo-info: #1747b0;
   --solo-info-bg: #edf3ff;
+  --solo-neutral: #586474;
+  --solo-neutral-bg: #f1f4f8;
+
+  /* 股东投入（资本）——与品牌蓝区分，避免和"链接/主操作"混淆 */
+  --solo-capital: #4c3fa8; /* on #f1eefe 7.05 / on #fff 6.95 */
+  --solo-capital-bg: #f1eefe;
 
   /* Shadows */
   --solo-shadow-sm: 0 1px 2px rgba(24, 34, 48, 0.04);
   --solo-shadow: 0 8px 24px rgba(24, 34, 48, 0.06);
   --solo-shadow-lg: 0 16px 40px rgba(24, 34, 48, 0.09);
 
-  /* Border Radius */
-  --solo-radius-sm: 6px;
-  --solo-radius: 10px;
-  --solo-radius-lg: 14px;
-  --solo-radius-xl: 18px;
+  /* Border Radius —— 只有四档，没有中间值。
+     4   内嵌小块（标签、徽章、小图标底）
+     8   控件与卡片（按钮、输入框、普通卡片）
+     12  大容器（页面级面板、抽屉、大卡）
+     999 胶囊（分段控件、头像、pill）
+     6/10/14/16/18 这些中间值已于 2026-10-20 全站归并，新代码只准用这四档。 */
+  --solo-radius-sm: 4px;
+  --solo-radius-control: 8px;
+  --solo-radius: 8px;
+  --solo-radius-lg: 12px;
+  --solo-radius-xl: 12px;
+  --solo-radius-pill: 999px;
 
   /* Layout dimensions */
   --sidebar-width: 224px;
   --sidebar-collapsed-width: 72px;
   --navbar-height: 68px;
+  /* 页内标签栏。按视口算高度的页面（如 AI 会计）必须一起减掉它，
+     否则底部会被撑出 44px 的滚动条。窄屏标签栏隐藏时归零，见文件末尾。 */
+  --page-tabs-height: 44px;
+
+  /* --- 兼容别名 ---------------------------------------------------------
+     以下名字在全站被 var(--solo-xxx) 引用过，但此前从未定义。var() 不带兜底
+     时是「静默失效」：color 会继承父级、box-shadow 会变 none，不报错也查不出。
+     这里把它们指向既有真值，不改视觉，只把洞补上。
+     新代码请直接用左侧的正式 token，不要再用这一组。 */
+  --solo-primary-50: #f0f7ff;
+  --solo-primary-soft: var(--solo-bg-blue-soft);
+  --solo-primary-hover: var(--solo-primary-light);
+  --solo-income-soft: var(--solo-income-bg);
+  --solo-expense-soft: var(--solo-expense-bg);
+  --solo-warning-soft: var(--solo-warning-bg);
+  --solo-success: var(--solo-income);
+  --solo-risk: var(--solo-expense);
+  --solo-surface: var(--solo-bg-card);
+  --solo-surface-soft: var(--solo-bg-soft);
+  --solo-bg-muted: var(--solo-bg-soft);
+  --solo-border-color: var(--solo-border);
+  --solo-text: var(--solo-text-primary);
+  --solo-text-tertiary: var(--solo-text-muted);
+  --solo-shadow-md: var(--solo-shadow);
+  --solo-radius-md: var(--solo-radius);
+  --solo-font-mono: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+}
+
+/* 窄屏交给抽屉导航：页内标签栏隐藏，按视口算高度的页面就不用再减这 44px */
+@media (max-width: 1024px) {
+  :root {
+    --page-tabs-height: 0px;
+  }
 }

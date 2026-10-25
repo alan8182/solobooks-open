@@ -1,15 +1,19 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Server-derived todo list with persisted handling state (async SQLite)."""
 from __future__ import annotations
 
+import asyncio
 import json
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+import re
+from datetime import date, datetime, timezone
+from typing import Any, Dict, List, Optional, Set, Tuple
 from decimal import Decimal
 
 from config import TODO_SMALL_AMOUNT_THRESHOLD
 from services.database import get_conn
 from services.entry_service import list_entries
-from services.fixed_asset_service import list_fixed_assets
 from core.money import ZERO, money, money_text
 
 # 待办按事项分类（rule_id -> category），前端据此分组展示。
@@ -24,6 +28,9 @@ TODO_CATEGORIES: Dict[str, str] = {
     "entertainment_limit": "risk",
     "ad_limit": "risk",
     "fixed_asset_depreciation": "risk",
+    "intangible_asset_amortization": "intangible",
+    "intangible_review": "intangible",
+    "intangible_expiry": "intangible",
 }
 
 
@@ -78,6 +85,204 @@ def _has_invoice(entry: Dict[str, Any]) -> bool:
     return bool(entry.get("invoiceType") or entry.get("invoiceNumber"))
 
 
+# ponytail: 平台提现、银行结息、注资及往来款不属于增值税应税销售收入，静默豁免开票确认，避免误导无财务背景老板
+NON_INVOICING_INCOME_CATEGORIES: Set[str] = {
+    "微信支付结算",
+    "支付宝结算",
+    "平台提现结算",
+    "利息收入",
+    "股东投入",
+    "老板投入",
+    "资本公积",
+    "收到退税",
+    "税费返还",
+    "其他应付款",
+    "其他应收款",
+    "往来款",
+    "政府补助",
+}
+NON_INVOICING_ACCOUNT_PREFIXES = ("1012", "5603", "4001", "4002", "2241", "1221")
+NON_INVOICING_TITLE_RE = re.compile(r"提现到账|平台提现|银行结息|存款利息|股东投入|股东注资|退税")
+
+# 常见商户简称与发票开票方全称同义词映射（用于无票支出 ↔ 待报销发票自动撮合）
+VENDOR_SYNONYM_GROUPS: Tuple[Tuple[str, ...], ...] = (
+    ("deepseek", "深度求索"),
+    ("微信", "腾讯", "财付通", "wechat", "tenpay"),
+    ("支付宝", "蚂蚁", "阿里巴巴", "阿里云", "淘宝", "天猫"),
+    ("飞书", "字节", "火山引擎", "抖音"),
+    ("高德", "滴滴", "打车", "出行"),
+    ("京东", "网银在线"),
+    ("百度", "文心"),
+    ("智谱", "华章", "bigmodel", "glm"),
+)
+
+# 进程级 LLM 建议缓存：(company_id, todo_key) -> aiSuggestion dict（免 DDL 迁移，兼容 SQLite/PG）
+_AI_SUGGESTION_CACHE: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+
+def _silent_non_invoice_income_reason(entry: Dict[str, Any]) -> Optional[str]:
+    """若该笔收入属于内部资金划转/结息/注资等非开票收入，返回静默处理原因；否则返回 None。"""
+    category = str(entry.get("category") or "").strip()
+    account_code = str(entry.get("accountCode") or "").strip()
+    title = str(entry.get("title") or entry.get("merchant") or "").strip()
+    if (
+        category in ("微信支付结算", "支付宝结算", "平台提现结算")
+        or account_code.startswith("1012")
+        or re.search(r"提现到账|平台提现", title)
+    ):
+        return "属于第三方支付平台提现到银行卡的内部资金划转，并非新增销售收入，已自动豁免开票确认"
+    if (
+        category == "利息收入"
+        or account_code.startswith("5603")
+        or re.search(r"银行结息|存款利息", title)
+    ):
+        return "属于银行存款结息收入，无需向银行开具发票，已自动静默核验"
+    if (
+        category in NON_INVOICING_INCOME_CATEGORIES
+        or account_code.startswith(NON_INVOICING_ACCOUNT_PREFIXES)
+        or NON_INVOICING_TITLE_RE.search(title)
+    ):
+        return "属于非经营性往来或资本金流入，不属于应税销售收入，已自动豁免开票确认"
+    return None
+
+
+def _parse_iso_date(val: Any) -> Optional[date]:
+    text = str(val or "").strip()[:10]
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _semantic_match_score(exp_entry: Dict[str, Any], inv_entry: Dict[str, Any]) -> Tuple[int, str]:
+    """计算同金额支出与发票的语义匹配得分及匹配依据说明。"""
+    exp_text = " ".join(
+        str(exp_entry.get(k) or "") for k in ("title", "merchant", "remark", "category")
+    ).lower()
+    inv_text = " ".join(
+        str(inv_entry.get(k) or "") for k in ("title", "merchant", "seller_name", "item_name", "remark", "category")
+    ).lower()
+    score = 10  # 金额完全相等基础分
+    matched_cues: List[str] = []
+
+    for group in VENDOR_SYNONYM_GROUPS:
+        exp_hits = [w for w in group if w in exp_text]
+        inv_hits = [w for w in group if w in inv_text]
+        if exp_hits and inv_hits:
+            score += 50
+            matched_cues.append(f"业务关键词「{exp_hits[0]} ↔ {inv_hits[0]}」高度吻合")
+            break
+
+    # 中文二字以上词块重合
+    exp_tokens = {m.group(0) for m in re.finditer(r"[\u4e00-\u9fa5]{2,4}|[a-z0-9]{3,}", exp_text)}
+    stop_words = {"发票", "有限公司", "科技", "技术", "支出", "相关", "费用", "报销", "业务", "说明", "支付"}
+    common_tokens = (exp_tokens - stop_words) & {
+        m.group(0) for m in re.finditer(r"[\u4e00-\u9fa5]{2,4}|[a-z0-9]{3,}", inv_text)
+    }
+    if common_tokens:
+        score += 20 * len(common_tokens)
+        if not matched_cues:
+            matched_cues.append(f"包含共同业务特征词「{'/'.join(sorted(common_tokens)[:2])}」")
+
+    d_exp = _parse_iso_date(exp_entry.get("occurDate") or exp_entry.get("date"))
+    d_inv = _parse_iso_date(inv_entry.get("occurDate") or inv_entry.get("invoice_date") or inv_entry.get("date"))
+    if d_exp and d_inv:
+        day_diff = abs((d_inv - d_exp).days)
+        if day_diff > 65:
+            return (-1, "")
+        score += max(0, 30 - day_diff)
+    return (score, "；".join(matched_cues))
+
+
+def _default_ai_suggestion(todo: Dict[str, Any], entry: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """为每条待办生成零延迟的默认智能建议与大白话理由（无 LLM 时亦可直接使用）。"""
+    meta = todo.get("meta") or {}
+    rule_id = str(meta.get("ruleId") or "")
+    amount = str(todo.get("amount") or "0.00")
+    title = str((entry or {}).get("title") or todo.get("title") or "")
+
+    if rule_id == "invoice_unpaid":
+        if meta.get("candidateExpenseId"):
+            exp_title = str(meta.get("candidateExpenseTitle") or "同金额支出")
+            exp_date = str(meta.get("candidateExpenseDate") or "")
+            exp_remark = str(meta.get("candidateExpenseRemark") or "").strip()
+            cue = str(meta.get("candidateMatchCue") or "").strip()
+            remark_snippet = f"（备注：{exp_remark[:45]}）" if exp_remark else ""
+            cue_snippet = f"，且{cue}" if cue else ""
+            return {
+                "action": "link_invoice_expense",
+                "label": f"关联「{exp_title}」并核销",
+                "reason": (
+                    f"系统发现账套中有一笔同金额无票支出「{exp_title}」（¥{amount}，{exp_date}）{remark_snippet}"
+                    f"与本张发票金额完全一致{cue_snippet}。一键关联后将自动把发票号补齐到该笔支出，并冲销重复的发票挂账。"
+                ),
+                "confidence": "high",
+                "source": "rule",
+            }
+        return {
+            "action": "set_payer_boss",
+            "label": "记为老板垫付",
+            "reason": (
+                f"公户流水中未找到 ¥{amount} 的对应扣款，小微企业常见由老板个人微信/支付宝直接扫码支付；"
+                "记为「老板垫付」后即完成核销，后续公户可随时免税打款报销给老板。"
+            ),
+            "confidence": "medium",
+            "source": "rule",
+        }
+
+    if rule_id == "missing_document":
+        return {
+            "action": "mark_no_invoice",
+            "label": "按无票支出入账",
+            "reason": (
+                f"该笔支出（¥{amount}）已从银行或账面发生，若短期内无法补开发票，可一键标记为「无票支出」凭付款记录入账，"
+                "系统将不再反复催办（小微企业微利/亏损区间通常不影响当期现金税负）。"
+            ),
+            "confidence": "medium",
+            "source": "rule",
+        }
+
+    if rule_id == "income_invoice":
+        return {
+            "action": "mark_no_invoice_income",
+            "label": "按未开票收入申报（不开票）",
+            "reason": (
+                f"若客户未索要发票，可直接标记为「不开票（未开票收入）」。小规模纳税人季度销售额 30 万元以内，"
+                "无论开具普票还是按未开票收入申报，均全额免征增值税。"
+            ),
+            "confidence": "high",
+            "source": "rule",
+        }
+
+    if rule_id == "owner_transfer_nature":
+        return {
+            "action": "set_owner_loan",
+            "label": "记为股东往来",
+            "reason": f"将「{title}」定性为股东往来款，清晰记录老板与公司的资金拆借关系。",
+            "confidence": "medium",
+            "source": "rule",
+        }
+
+    if rule_id == "unmatched_statement":
+        return {
+            "action": "go_match_wizard",
+            "label": "去结账向导一键确认",
+            "reason": "该笔银行流水尚未生成记账凭证，前往结账向导点选用途即可完成入账。",
+            "confidence": "medium",
+            "source": "rule",
+        }
+
+    return {
+        "action": "default",
+        "label": "按指引处理",
+        "reason": str(todo.get("desc") or "请根据实际业务情况确认该事项。"),
+        "confidence": "medium",
+        "source": "rule",
+    }
+
+
 def _todo(entry: Dict[str, Any], rule_id: str, type_: str, level: str, title: str, desc: str, **extra: Any) -> Dict[str, Any]:
     entry_id = str(entry.get("id") or "")
     todo_key = f"entry:{entry_id}:{rule_id}"
@@ -99,9 +304,18 @@ def _todo(entry: Dict[str, Any], rule_id: str, type_: str, level: str, title: st
     }
 
 
-def _derive_entry_todos(entries: List[Dict[str, Any]], matched_entry_ids: Set[str] = None) -> List[Dict[str, Any]]:
+def _derive_entry_todos(
+    entries: List[Dict[str, Any]],
+    matched_entry_ids: Set[str] = None,
+    linked_asset_entry_ids: Set[str] = None,
+    linked_intangible_entry_ids: Set[str] = None,
+) -> List[Dict[str, Any]]:
     if matched_entry_ids is None:
         matched_entry_ids = set()
+    if linked_asset_entry_ids is None:
+        linked_asset_entry_ids = set()
+    if linked_intangible_entry_ids is None:
+        linked_intangible_entry_ids = set()
     todos: List[Dict[str, Any]] = []
     # 冲销红字凭证与原凭证完全抵消：红字本身不产生待办，原凭证也不再催办
     reversed_ids = {
@@ -110,11 +324,20 @@ def _derive_entry_todos(entries: List[Dict[str, Any]], matched_entry_ids: Set[st
         if str(e.get("entryType") or "") == "reversal"
     } - {""}
     threshold = Decimal(str(TODO_SMALL_AMOUNT_THRESHOLD))
+
+    # 预先收集潜在的无票支出候选与发票候选，用于同金额/跨名称语义智能撮合
+    missing_doc_candidates: List[Dict[str, Any]] = []
+    invoice_unpaid_candidates: List[Dict[str, Any]] = []
+
     for entry in entries:
         entry_id = str(entry.get("id") or "")
         if not entry_id:
             continue
-        if str(entry.get("entryType") or "") == "reversal" or entry_id in reversed_ids:
+        if (
+            str(entry.get("entryType") or "") in ("reversal", "opening", "closing")
+            or entry.get("isClosingTransfer")
+            or entry_id in reversed_ids
+        ):
             continue
         title = str(entry.get("title") or entry.get("merchant") or "这笔业务")
         category = str(entry.get("category") or "")
@@ -125,40 +348,153 @@ def _derive_entry_todos(entries: List[Dict[str, Any]], matched_entry_ids: Set[st
         source = str(entry.get("source") or "")
 
         small_amount = abs(amount) < threshold
+        is_archive_only = bool(entry.get("is_archive_only") or entry.get("isArchiveOnly"))
+
+        # 1. 待补票据（支出缺少发票）候选
         if (direction == "expense" and source != "invoice_import"
                 and not _has_document(entry) and not small_amount):
-            todos.append(_todo(entry, "missing_document", "receipt", "high",
-                               f"{title} - 补充票据", f"¥{amount:,.0f}，这笔支出需要补齐发票或注明无票原因。"))
-        is_archive_only = bool(entry.get("is_archive_only") or entry.get("isArchiveOnly"))
-        # 垫付报销只把新建的「报销垫付款」条目挂进匹配表，原发票条目仅回写
-        # billingStatus=reconciled——reconciled 必须视为已付款/已报销，否则待办永不消失。
+            missing_doc_candidates.append(entry)
+
+        # 2. 待报销/付款（发票未关联流水支出）候选
         if (source == "invoice_import" and entry_id not in matched_entry_ids
                 and not is_archive_only and str(entry.get("billingStatus") or "") != "reconciled"):
-            todos.append(_todo(entry, "invoice_unpaid", "task", "high",
-                               f"{title} - 发票待付款/报销", f"¥{amount:,.0f}，此发票在流水中未找到对应支出。请确认是否已付款，或将其与银行流水匹配。"))
+            invoice_unpaid_candidates.append(entry)
+
+        # 3. 待开票（经营性收入确认）：静默豁免平台提现、银行结息、股东注资及往来款
         if direction == "income" and not _has_invoice(entry) \
                 and str(entry.get("billingStatus") or "") != "no_invoice" and not small_amount:
-            todos.append(_todo(entry, "income_invoice", "tax", "medium",
-                               f"{title} - 开票状态确认", "收入流水需要确认是否已开票，便于后续申报。"))
-        if category == "固定资产" or account_code.startswith("1601"):
-            todos.append(_todo(entry, "fixed_asset_depreciation", "task", "high",
-                               f"{title} - 固定资产需确认折旧方案", f"¥{amount:,.0f}，固定资产需要按使用年限计提折旧。",
-                               meta={"action": "confirm_asset"}))
+            # 若属于非经营性流入，静默跳过不生成待办，防无财务背景老板误点开票
+            if not _silent_non_invoice_income_reason(entry):
+                t = _todo(entry, "income_invoice", "tax", "medium",
+                          f"{title} - 开票状态确认", "收入流水需要确认是否已开票，便于后续申报。")
+                t["meta"]["aiSuggestion"] = _default_ai_suggestion(t, entry)
+                todos.append(t)
+
+        if (category == "固定资产" or account_code.startswith("1601")) and entry_id not in linked_asset_entry_ids:
+            t = _todo(entry, "fixed_asset_depreciation", "task", "high",
+                      f"{title} - 固定资产需确认折旧方案", f"¥{amount:,.0f}，固定资产需要按使用年限计提折旧。",
+                      meta={"action": "confirm_asset"})
+            t["meta"]["aiSuggestion"] = _default_ai_suggestion(t, entry)
+            todos.append(t)
+
+        if (category == "无形资产" or account_code.startswith("1701")) and entry_id not in linked_intangible_entry_ids:
+            t = _todo(entry, "intangible_asset_amortization", "task", "high",
+                      f"{title} - 无形资产需确认摊销方案", f"¥{amount:,.0f}，无形资产需要按使用年限摊销。",
+                      meta={"action": "confirm_intangible"})
+            t["meta"]["aiSuggestion"] = _default_ai_suggestion(t, entry)
+            todos.append(t)
+
         if "招待" in category and amount >= 500:
-            todos.append(_todo(entry, "entertainment_limit", "risk", "medium",
-                               f"{title} - 招待费税前扣除复核", "招待费扣除比例受限，建议补充业务招待对象和事由。"))
+            t = _todo(entry, "entertainment_limit", "risk", "medium",
+                      f"{title} - 招待费税前扣除复核", "招待费扣除比例受限，建议补充业务招待对象和事由。")
+            t["meta"]["aiSuggestion"] = _default_ai_suggestion(t, entry)
+            todos.append(t)
+
         if "广告" in category and amount >= 10000:
-            todos.append(_todo(entry, "ad_limit", "risk", "medium",
-                               f"{title} - 广告费扣除比例复核", "广告宣传费金额较高，建议复核税前扣除比例。"))
-        # 性质确认只问「还没定性」的股东垫付：发票导入的由发票待付款卡承载同一生命周期，
-        # 已配对报销（reconciled）性质自明，分类已记往来的说明用户已定性——都不再重复催问。
+            t = _todo(entry, "ad_limit", "risk", "medium",
+                      f"{title} - 广告费扣除比例复核", "广告宣传费金额较高，建议复核税前扣除比例。")
+            t["meta"]["aiSuggestion"] = _default_ai_suggestion(t, entry)
+            todos.append(t)
+
         if (payer == "boss_personal"
                 and source != "invoice_import"
                 and str(entry.get("billingStatus") or "") != "reconciled"
                 and category not in ("其他应收款", "其他应付款", "往来款")):
-            todos.append(_todo(entry, "owner_transfer_nature", "risk", "medium",
-                               f"{title} - 股东垫付性质确认", "请确认这笔款项是报销、借款还是资本投入。"))
+            t = _todo(entry, "owner_transfer_nature", "risk", "medium",
+                      f"{title} - 股东垫付性质确认", "请确认这笔款项是报销、借款还是资本投入。")
+            t["meta"]["aiSuggestion"] = _default_ai_suggestion(t, entry)
+            todos.append(t)
+
+    # ── 跨单据智能撮合：无票支出 ↔ 待报销发票 ───────────────────────────────
+    # 同金额且在合理时间窗口（<=65天）内，二合一为单一发票待办卡片，抑制重复的待补票据待办
+    suppressed_missing_doc_ids: Set[str] = set()
+    matched_expense_for_invoice: Dict[str, Tuple[Dict[str, Any], str]] = {}
+
+    for inv in invoice_unpaid_candidates:
+        inv_amt = _amount(inv.get("amount"))
+        best_exp = None
+        best_score = -1
+        best_cue = ""
+        for exp in missing_doc_candidates:
+            if str(exp.get("id")) in suppressed_missing_doc_ids:
+                continue
+            if abs(inv_amt - _amount(exp.get("amount"))) <= Decimal("0.01"):
+                score, cue = _semantic_match_score(exp, inv)
+                if score > best_score:
+                    best_score = score
+                    best_exp = exp
+                    best_cue = cue
+        if best_exp is not None and best_score >= 10:
+            suppressed_missing_doc_ids.add(str(best_exp.get("id")))
+            matched_expense_for_invoice[str(inv.get("id"))] = (best_exp, best_cue)
+
+    # 生成待付款/待报销发票待办（若撮合到无票支出，携带候选支出信息与一键关联建议）
+    for inv in invoice_unpaid_candidates:
+        inv_id = str(inv.get("id"))
+        inv_title = str(inv.get("title") or inv.get("merchant") or "发票")
+        inv_amount = _amount(inv.get("amount"))
+        meta_extra: Dict[str, Any] = {}
+        paired_info = matched_expense_for_invoice.get(inv_id)
+        if paired_info:
+            exp_entry, cue = paired_info
+            exp_title = str(exp_entry.get("title") or exp_entry.get("merchant") or "支出")
+            exp_date = str(exp_entry.get("occurDate") or exp_entry.get("date") or "")[:10]
+            exp_remark = str(exp_entry.get("remark") or "").strip()
+            meta_extra = {
+                "candidateExpenseId": str(exp_entry.get("id")),
+                "candidateExpenseTitle": exp_title,
+                "candidateExpenseDate": exp_date,
+                "candidateExpenseRemark": exp_remark,
+                "candidateMatchCue": cue,
+            }
+            desc = f"¥{inv_amount:,.2f}，发现同金额无票支出「{exp_title}」（{exp_date}），疑似同一笔业务，可一键关联核销。"
+        else:
+            desc = f"¥{inv_amount:,.0f}，此发票在流水中未找到对应支出。请确认是否已付款，或将其与银行流水匹配。"
+
+        t = _todo(inv, "invoice_unpaid", "task", "high",
+                  f"{inv_title} - 发票待付款/报销", desc, meta=meta_extra)
+        t["meta"]["aiSuggestion"] = _default_ai_suggestion(t, inv)
+        todos.append(t)
+
+    # 未被发票撮合的独立支出，正常保留待补票据待办
+    for exp in missing_doc_candidates:
+        exp_id = str(exp.get("id"))
+        if exp_id in suppressed_missing_doc_ids:
+            continue
+        exp_title = str(exp.get("title") or exp.get("merchant") or "这笔业务")
+        exp_amount = _amount(exp.get("amount"))
+        t = _todo(exp, "missing_document", "receipt", "high",
+                  f"{exp_title} - 补充票据", f"¥{exp_amount:,.0f}，这笔支出需要补齐发票或注明无票原因。")
+        t["meta"]["aiSuggestion"] = _default_ai_suggestion(t, exp)
+        todos.append(t)
+
     return todos
+
+
+def derive_silent_resolved_items(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """提取已由系统确定性规则静默核验/豁免的事项清单（供前端轻量透出留痕）。"""
+    items: List[Dict[str, Any]] = []
+    for entry in entries:
+        if str(entry.get("entryType") or "") in ("reversal", "opening", "closing") or entry.get("isClosingTransfer"):
+            continue
+        direction = str(entry.get("direction") or "")
+        if direction == "income":
+            reason = _silent_non_invoice_income_reason(entry)
+            if reason:
+                amount = float(abs(_amount(entry.get("amount"))))
+                date_str = str(entry.get("occurDate") or entry.get("date") or "")[:10]
+                title = str(entry.get("title") or entry.get("merchant") or "平台流入")
+                items.append({
+                    "id": f"silent:{entry.get('id')}",
+                    "entryId": entry.get("id"),
+                    "title": title,
+                    "amount": amount,
+                    "date": date_str,
+                    "reason": reason,
+                    "category": str(entry.get("category") or "资金划转"),
+                    "categoryLabel": "自动免开票核验",
+                })
+    return items
 
 
 async def _load_states(conn, user_id: str, company_id: str) -> Dict[str, Dict[str, Any]]:
@@ -173,12 +509,102 @@ async def _load_states(conn, user_id: str, company_id: str) -> Dict[str, Dict[st
     }
 
 
+
+
+async def _derive_intangible_todos(company_id: str) -> List[Dict[str, Any]]:
+    """无形资产待办（P2）：待复核资产卡 + 90 天内权利到期。
+
+    与 designs 方案一致：状态只读派生，不新增手工入口；用户可 dismiss。
+    """
+    from datetime import date, timedelta
+
+    deadline = (date.today() + timedelta(days=90)).isoformat()
+    todos: List[Dict[str, Any]] = []
+    conn = await get_conn()
+    try:
+        cursor = await conn.execute(
+            "SELECT id, code, name, updated_at FROM intangible_assets "
+            "WHERE company_id = ? AND status = 'pending_review' AND deleted_at IS NULL "
+            "ORDER BY updated_at ASC LIMIT 50",
+            (company_id,),
+        )
+        for row in await cursor.fetchall():
+            todo_key = f"intangible-review:{row['id']}"
+            todos.append({
+                "id": todo_key, "todoKey": todo_key, "type": "task",
+                "category": TODO_CATEGORIES["intangible_review"],
+                "level": "high", "priority": "high",
+                "title": f"无形资产待复核 - {row['name']}（{row['code']}）",
+                "desc": "资产卡已提交，取得凭证待复核过账；过账后开始按月摊销。",
+                "done": False, "dismissed": False, "amount": "0.00",
+                "deadline": None, "companyId": company_id,
+                "meta": {"assetId": row["id"], "ruleId": "intangible_review", "action": "review_intangible"},
+            })
+        cursor = await conn.execute(
+            "SELECT id, code, name, expiry_date FROM intangible_assets "
+            "WHERE company_id = ? AND deleted_at IS NULL AND expiry_date IS NOT NULL "
+            "AND expiry_date <= ? AND status IN ('active','idle','fully_amortized') "
+            "ORDER BY expiry_date ASC LIMIT 50",
+            (company_id, deadline),
+        )
+        for row in await cursor.fetchall():
+            todo_key = f"intangible-expiry:{row['id']}"
+            todos.append({
+                "id": todo_key, "todoKey": todo_key, "type": "risk",
+                "category": TODO_CATEGORIES["intangible_expiry"],
+                "level": "medium", "priority": "medium",
+                "title": f"无形资产权利即将到期 - {row['name']}（{row['code']}）",
+                "desc": f"权利将于 {str(row['expiry_date'])[:10]} 到期，请评估续展/减值迹象或发起核销。",
+                "done": False, "dismissed": False, "amount": "0.00",
+                "deadline": str(row["expiry_date"])[:10], "companyId": company_id,
+                "meta": {"assetId": row["id"], "ruleId": "intangible_expiry", "action": "view_intangible", "expiryDate": str(row["expiry_date"])[:10]},
+            })
+    finally:
+        await conn.close()
+    return todos
+
+
+async def _load_linked_fixed_asset_entry_ids(company_id: str) -> Set[str]:
+    conn = await get_conn()
+    try:
+        try:
+            cursor = await conn.execute(
+                "SELECT source_entry_id FROM fixed_assets "
+                "WHERE company_id = ? AND source_entry_id IS NOT NULL AND deleted_at IS NULL",
+                (company_id,),
+            )
+            rows = await cursor.fetchall()
+        except Exception:
+            return set()
+    finally:
+        await conn.close()
+    return {str(row["source_entry_id"]) for row in rows if row["source_entry_id"]}
+
+
+async def _load_linked_intangible_entry_ids(company_id: str) -> Set[str]:
+    conn = await get_conn()
+    try:
+        try:
+            cursor = await conn.execute(
+                "SELECT source_entry_id FROM intangible_assets "
+                "WHERE company_id = ? AND source_entry_id IS NOT NULL AND deleted_at IS NULL",
+                (company_id,),
+            )
+            rows = await cursor.fetchall()
+        except Exception:
+            return set()
+    finally:
+        await conn.close()
+    return {str(row["source_entry_id"]) for row in rows if row["source_entry_id"]}
+
+
 async def list_todos(user_id: str, company_id: str) -> List[Dict[str, Any]]:
     entries = await list_entries(user_id, company_id)
-    await list_fixed_assets(user_id, company_id)
     from services.bank_service import get_matched_entry_ids
 
     matched_entry_ids = await get_matched_entry_ids(company_id)
+    linked_asset_entry_ids = await _load_linked_fixed_asset_entry_ids(company_id)
+    linked_intangible_entry_ids = await _load_linked_intangible_entry_ids(company_id)
     
     conn = await get_conn()
     try:
@@ -195,7 +621,15 @@ async def list_todos(user_id: str, company_id: str) -> List[Dict[str, Any]]:
     finally:
         await conn.close()
 
-    derived = _derive_entry_todos(entries, matched_entry_ids)
+    derived = _derive_entry_todos(
+        entries, matched_entry_ids, linked_asset_entry_ids, linked_intangible_entry_ids
+    )
+
+    # 无形资产（P2）：待复核资产卡 + 权利即将到期提醒
+    try:
+        derived.extend(await _derive_intangible_todos(company_id))
+    except Exception:
+        pass  # 无形资产表未就绪时不阻塞账务待办
 
     # 征期提醒（M3）：临近/逾期的申报事项注入待办
     try:
@@ -245,8 +679,205 @@ async def list_todos(user_id: str, company_id: str) -> List[Dict[str, Any]]:
         # 与 todoKey 保持同值下发，否则 undefined 会让全部卡片的 loading/忽略互相串。
         item = {**todo, "key": todo["todoKey"], **state}
         if not item.get("dismissed"):
+            # 优先复用已缓存的深度 LLM 建议
+            cached_ai = _AI_SUGGESTION_CACHE.get((company_id, item["todoKey"]))
+            if cached_ai:
+                item["meta"]["aiSuggestion"] = cached_ai
             merged.append(item)
     return merged
+
+
+async def list_todos_bundle(user_id: str, company_id: str) -> Dict[str, Any]:
+    """返回待办全量数据，包含待办列表与系统静默处理完成的留痕事项。"""
+    todos = await list_todos(user_id, company_id)
+    entries = await list_entries(user_id, company_id)
+    auto_resolved = derive_silent_resolved_items(entries)
+    return {
+        "todos": todos,
+        "autoResolved": auto_resolved,
+        "autoResolvedCount": len(auto_resolved),
+    }
+
+
+async def advise_todos_with_llm(user_id: str, company_id: str) -> List[Dict[str, Any]]:
+    """批量调用 LLM 为当前待办提供专业、大白话的处置建议与决策理由。"""
+    from services.llm import safe_chat_text_json
+
+    todos = await list_todos(user_id, company_id)
+    pending_todos = [t for t in todos if not t.get("done") and not t.get("dismissed")]
+    if not pending_todos:
+        return todos
+
+    # 过滤出尚未获得 LLM 建议（仅有默认 rule 建议）的条目
+    need_llm = [
+        t for t in pending_todos
+        if (t.get("meta") or {}).get("aiSuggestion", {}).get("source") != "llm"
+    ]
+    if not need_llm:
+        return todos
+
+    items_prompt = []
+    for t in need_llm[:10]:  # 控制单次请求规模
+        meta = t.get("meta") or {}
+        items_prompt.append({
+            "todoKey": t["todoKey"],
+            "title": t.get("title"),
+            "amount": t.get("amount"),
+            "ruleId": meta.get("ruleId"),
+            "desc": t.get("desc"),
+            "candidateExpenseTitle": meta.get("candidateExpenseTitle"),
+            "candidateExpenseRemark": meta.get("candidateExpenseRemark"),
+        })
+
+    system_prompt = (
+        "你是一个专为完全懂不懂财务的个体户/微型企业老板服务的AI财务顾问。"
+        "请根据待办条目信息，给出对小白老板最省事、最合规的处置建议（推荐动作）和大白话理由（消除顾虑、解释为什么这么做）。"
+        "返回格式为 JSON 字典，键为各条目的 todoKey，值为包含 action (推荐英文标识), label (按钮文案不超过10字), reason (大白话解释，50字左右) 的对象。"
+    )
+    user_prompt = f"待办清单：\n{json.dumps(items_prompt, ensure_ascii=False)}"
+
+    try:
+        res = await asyncio.to_thread(
+            safe_chat_text_json,
+            system_prompt,
+            user_prompt,
+            fallback={},
+            max_retries=1,
+            scene="todo_advice",
+        )
+        if isinstance(res, dict):
+            for t in need_llm:
+                k = t["todoKey"]
+                advice = res.get(k)
+                if isinstance(advice, dict) and advice.get("label") and advice.get("reason"):
+                    enriched = {
+                        "action": str(advice.get("action") or t.get("meta", {}).get("aiSuggestion", {}).get("action") or "default"),
+                        "label": str(advice["label"]),
+                        "reason": str(advice["reason"]),
+                        "confidence": "high",
+                        "source": "llm",
+                    }
+                    _AI_SUGGESTION_CACHE[(company_id, k)] = enriched
+                    t["meta"]["aiSuggestion"] = enriched
+    except Exception:
+        pass  # LLM 不可用时优雅保留默认 rule 建议
+
+    return todos
+
+
+async def link_invoice_to_expense(
+    invoice_entry_id: str,
+    expense_entry_id: str,
+    *,
+    user_id: str,
+    company_id: str,
+) -> Dict[str, Any]:
+    """将待报销发票凭证与已有支出流水凭证关联核销（解决一笔业务两张卡且重复挂账问题）。"""
+    from db.session import session_scope
+    from db.models import Invoice, LegacyEntryProjection, JournalEntry
+    from services.accounting_core_service import (
+        get_journal,
+        update_draft,
+        reverse_journal,
+        delete_draft,
+        _locked_entry_context,
+    )
+    from core.errors import AccountingError
+    from uuid import uuid4
+
+    async with session_scope() as session:
+        inv_journal = await get_journal(session, invoice_entry_id, company_id=company_id)
+        exp_journal = await get_journal(session, expense_entry_id, company_id=company_id)
+        if not inv_journal or not exp_journal:
+            raise AccountingError("NOT_FOUND", "未找到对应的发票凭证或支出凭证", 404)
+
+        # 提取发票凭证的关键发票信息
+        inv_meta = dict(inv_journal.metadata_json or {})
+        inv_proj = await session.get(LegacyEntryProjection, inv_journal.id)
+        if inv_proj and inv_proj.payload:
+            try:
+                p_data = json.loads(inv_proj.payload) if isinstance(inv_proj.payload, str) else dict(inv_proj.payload)
+                inv_meta.update(p_data)
+            except Exception:
+                pass
+
+        inv_number = str(inv_meta.get("invoiceNumber") or inv_meta.get("invoice_number") or "")
+        inv_type = str(inv_meta.get("invoiceType") or inv_meta.get("invoice_type") or "")
+        seller = str(inv_meta.get("merchant") or inv_meta.get("seller_name") or "")
+
+        # 1. 把发票元数据反写到实际支出凭证上（已过账凭证走更新跟踪投影字段）
+        exp_updates = {
+            "billingStatus": "has_invoice",
+            "invoiceNumber": inv_number,
+            "invoiceType": inv_type,
+            "linkedInvoiceEntryId": invoice_entry_id,
+        }
+        # merchant 不在 POSTED_PROJECTION_FIELDS 里，如果已过账不能加进去，否则会触发已过账不可改拦截
+        if exp_journal.status in ("draft", "pending_review") and seller and not (exp_journal.metadata_json or {}).get("merchant"):
+            exp_updates["merchant"] = seller
+
+        await update_draft(
+            session,
+            expense_entry_id,
+            exp_updates,
+            company_id=company_id,
+            user_id=user_id,
+            request_id=f"link-exp-{uuid4()}",
+        )
+
+        # 2. 将 invoices 表台账的 entry_id 切换指向实际支出凭证
+        from sqlalchemy import select, update
+        await session.execute(
+            update(Invoice)
+            .where(Invoice.company_id == company_id, Invoice.entry_id == invoice_entry_id)
+            .values(entry_id=expense_entry_id)
+        )
+
+        # 3. 消除重复的发票凭证（若草稿则删除，若已过账且未冲销且期间未关则红冲，并在投影标归档）
+        if inv_journal.status in ("draft", "pending_review"):
+            await delete_draft(
+                session, invoice_entry_id, company_id=company_id, user_id=user_id,
+                request_id=f"del-dup-inv-{uuid4()}",
+            )
+        elif inv_journal.status == "posted":
+            # 检查发票凭证所属期间状态
+            from services.accounting_core_service import get_or_create_period
+            period = await get_or_create_period(session, company_id, inv_journal.period_start)
+            if period and period.status == "open":
+                await reverse_journal(
+                    session,
+                    invoice_entry_id,
+                    company_id=company_id,
+                    user_id=user_id,
+                    request_id=f"rev-dup-inv-{uuid4()}",
+                    reason="已关联银行实际支出凭证，自动冲销重复发票挂账",
+                )
+            # 在发票投影上回写已核销与归档标记，确保待办和对账彻底消卡
+            inv_updates = {
+                "billingStatus": "reconciled",
+                "is_archive_only": True,
+                "isArchiveOnly": True,
+                "linkedExpenseEntryId": expense_entry_id,
+            }
+            await update_draft(
+                session,
+                invoice_entry_id,
+                inv_updates,
+                company_id=company_id,
+                user_id=user_id,
+                request_id=f"archive-dup-inv-{uuid4()}",
+            )
+
+    # 4. 同步更新待办状态表中对应的 todoKey 为已完成
+    await update_todo_state(f"entry:{invoice_entry_id}:invoice_unpaid", user_id=user_id, company_id=company_id, done=True)
+    await update_todo_state(f"entry:{expense_entry_id}:missing_document", user_id=user_id, company_id=company_id, done=True)
+
+    return {
+        "status": "linked",
+        "invoiceEntryId": invoice_entry_id,
+        "expenseEntryId": expense_entry_id,
+        "invoiceNumber": inv_number,
+    }
 
 
 async def update_todo_state(

@@ -1,62 +1,1093 @@
 {
-  "_description": "梭罗记账 小微企业简化科目表（基于《小企业会计准则》）",
+  "_description": "梭罗记账 小微企业科目表（编码对齐《小企业会计准则》财会〔2011〕17号；4位总账+7位明细+9位二级明细；direction 为余额方向）",
+  "_attribution": "芥子星辰（杭州）智能科技有限公司 · SoloBooks Core 2026",
+  "_engine_hash": "jzxc-solobooks-cas-s-2026",
   "accounts": {
     "资产类": {
-      "1001": { "name": "库存现金", "type": "流动资产" },
-      "1002": { "name": "银行存款", "type": "流动资产" },
-      "1012": { "name": "微信支付待结算", "type": "流动资产" },
-      "1122": { "name": "应收账款", "type": "流动资产" },
-      "1123": { "name": "预付账款", "type": "流动资产" },
-      "1221": { "name": "其他应收款", "type": "流动资产" },
-      "1601": { "name": "固定资产", "type": "非流动资产" },
-      "1602": { "name": "累计折旧", "type": "非流动资产" }
+      "1001": {
+        "name": "库存现金",
+        "type": "流动资产",
+        "direction": "debit"
+      },
+      "1002": {
+        "name": "银行存款",
+        "type": "流动资产",
+        "direction": "debit"
+      },
+      "1012": {
+        "name": "其他货币资金",
+        "type": "流动资产",
+        "direction": "debit",
+        "isLeaf": false
+      },
+      "1012001": {
+        "name": "微信支付待结算",
+        "type": "流动资产",
+        "direction": "debit",
+        "parentCode": "1012"
+      },
+      "1012002": {
+        "name": "支付宝待结算",
+        "type": "流动资产",
+        "direction": "debit",
+        "parentCode": "1012"
+      },
+      "1012099": {
+        "name": "其他平台待结算",
+        "type": "流动资产",
+        "direction": "debit",
+        "parentCode": "1012"
+      },
+      "1122": {
+        "name": "应收账款",
+        "type": "流动资产",
+        "direction": "debit"
+      },
+      "1123": {
+        "name": "预付账款",
+        "type": "流动资产",
+        "direction": "debit"
+      },
+      "1221": {
+        "name": "其他应收款",
+        "type": "流动资产",
+        "direction": "debit",
+        "isLeaf": false
+      },
+      "122101": {
+        "name": "其他应收款-代扣代缴社保",
+        "type": "流动资产",
+        "direction": "debit",
+        "parentCode": "1221"
+      },
+      "122102": {
+        "name": "其他应收款-股东",
+        "type": "流动资产",
+        "direction": "debit",
+        "parentCode": "1221"
+      },
+      "122103": {
+        "name": "其他应收款-员工往来",
+        "type": "流动资产",
+        "direction": "debit",
+        "parentCode": "1221"
+      },
+      "1403": {
+        "name": "原材料",
+        "type": "流动资产",
+        "direction": "debit"
+      },
+      "1405": {
+        "name": "库存商品",
+        "type": "流动资产",
+        "direction": "debit"
+      },
+      "1601": {
+        "name": "固定资产",
+        "type": "非流动资产",
+        "direction": "debit"
+      },
+      "1602": {
+        "name": "累计折旧",
+        "type": "非流动资产",
+        "direction": "credit"
+      },
+      "1604": {
+        "name": "在建工程",
+        "type": "非流动资产",
+        "direction": "debit"
+      },
+      "1701": {
+        "name": "无形资产",
+        "type": "非流动资产",
+        "direction": "debit"
+      },
+      "1702": {
+        "name": "累计摊销",
+        "type": "非流动资产",
+        "direction": "credit"
+      },
+      "1801": {
+        "name": "长期待摊费用",
+        "type": "非流动资产",
+        "direction": "debit"
+      },
+      "1101": {
+        "name": "短期投资",
+        "type": "流动资产",
+        "direction": "debit",
+        "isLeaf": false
+      },
+      "1101001": {
+        "name": "股票",
+        "type": "流动资产",
+        "direction": "debit",
+        "parentCode": "1101"
+      },
+      "1101002": {
+        "name": "债券",
+        "type": "流动资产",
+        "direction": "debit",
+        "parentCode": "1101"
+      },
+      "1101003": {
+        "name": "基金",
+        "type": "流动资产",
+        "direction": "debit",
+        "parentCode": "1101"
+      },
+      "1121": {
+        "name": "应收票据",
+        "type": "流动资产",
+        "direction": "debit"
+      },
+      "1131": {
+        "name": "应收股利",
+        "type": "流动资产",
+        "direction": "debit"
+      },
+      "1132": {
+        "name": "应收利息",
+        "type": "流动资产",
+        "direction": "debit"
+      },
+      "1401": {
+        "name": "材料采购",
+        "type": "流动资产",
+        "direction": "debit"
+      },
+      "1402": {
+        "name": "在途物资",
+        "type": "流动资产",
+        "direction": "debit"
+      },
+      "1404": {
+        "name": "材料成本差异",
+        "type": "流动资产",
+        "direction": "debit"
+      },
+      "1407": {
+        "name": "商品进销差价",
+        "type": "流动资产",
+        "direction": "credit"
+      },
+      "1408": {
+        "name": "委托加工物资",
+        "type": "流动资产",
+        "direction": "debit"
+      },
+      "1411": {
+        "name": "周转材料",
+        "type": "流动资产",
+        "direction": "debit"
+      },
+      "1421": {
+        "name": "消耗性生物资产",
+        "type": "流动资产",
+        "direction": "debit"
+      },
+      "1501": {
+        "name": "长期债券投资",
+        "type": "流动资产",
+        "direction": "debit"
+      },
+      "1511": {
+        "name": "长期股权投资",
+        "type": "流动资产",
+        "direction": "debit"
+      },
+      "1605": {
+        "name": "工程物资",
+        "type": "流动资产",
+        "direction": "debit"
+      },
+      "1606": {
+        "name": "固定资产清理",
+        "type": "流动资产",
+        "direction": "debit"
+      },
+      "1621": {
+        "name": "生产性生物资产",
+        "type": "流动资产",
+        "direction": "debit"
+      },
+      "1622": {
+        "name": "生产性生物资产累计折旧",
+        "type": "流动资产",
+        "direction": "credit"
+      },
+      "1901": {
+        "name": "待处理财产损溢",
+        "type": "流动资产",
+        "direction": "debit"
+      }
     },
     "负债类": {
-      "2001": { "name": "短期借款", "type": "流动负债" },
-      "2202": { "name": "应付账款", "type": "流动负债" },
-      "2211": { "name": "应付职工薪酬", "type": "流动负债" },
-      "2221": { "name": "应交税费", "type": "流动负债" },
-      "222101": { "name": "应交增值税-进项税额", "type": "流动负债" },
-      "222102": { "name": "应交增值税-销项税额", "type": "流动负债" },
-      "2241": { "name": "其他应付款", "type": "流动负债" }
+      "2001": {
+        "name": "短期借款",
+        "type": "流动负债",
+        "direction": "credit"
+      },
+      "2202": {
+        "name": "应付账款",
+        "type": "流动负债",
+        "direction": "credit"
+      },
+      "2203": {
+        "name": "预收账款",
+        "type": "流动负债",
+        "direction": "credit"
+      },
+      "2211": {
+        "name": "应付职工薪酬",
+        "type": "流动负债",
+        "direction": "credit",
+        "isLeaf": false
+      },
+      "221101": {
+        "name": "应付职工薪酬-工资",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2211"
+      },
+      "221102": {
+        "name": "应付职工薪酬-单位社保",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2211"
+      },
+      "221103": {
+        "name": "应付职工薪酬-职工福利费",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2211"
+      },
+      "221104": {
+        "name": "应付职工薪酬-代扣社保公积金",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2211"
+      },
+      "2221": {
+        "name": "应交税费",
+        "type": "流动负债",
+        "direction": "credit",
+        "isLeaf": false
+      },
+      "2221001": {
+        "name": "应交增值税",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221",
+        "isLeaf": false
+      },
+      "222100101": {
+        "name": "进项税额",
+        "type": "流动负债",
+        "direction": "debit",
+        "parentCode": "2221001"
+      },
+      "222100104": {
+        "name": "减免税款",
+        "type": "流动负债",
+        "direction": "debit",
+        "parentCode": "2221001"
+      },
+      "222100105": {
+        "name": "销项税额",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221001"
+      },
+      "2221006": {
+        "name": "应交所得税",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221"
+      },
+      "2221008": {
+        "name": "应交城市维护建设税",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221"
+      },
+      "2221013": {
+        "name": "教育费附加",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221"
+      },
+      "2221014": {
+        "name": "地方教育费附加",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221"
+      },
+      "2221017": {
+        "name": "印花税",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221"
+      },
+      "2241": {
+        "name": "其他应付款",
+        "type": "流动负债",
+        "direction": "credit"
+      },
+      "2501": {
+        "name": "长期借款",
+        "type": "非流动负债",
+        "direction": "credit"
+      },
+      "2201": {
+        "name": "应付票据",
+        "type": "流动负债",
+        "direction": "credit"
+      },
+      "222100102": {
+        "name": "已交税金",
+        "type": "流动负债",
+        "direction": "debit",
+        "parentCode": "2221001"
+      },
+      "222100103": {
+        "name": "转出未交增值税",
+        "type": "流动负债",
+        "direction": "debit",
+        "parentCode": "2221001"
+      },
+      "222100106": {
+        "name": "出口退税",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221001"
+      },
+      "222100107": {
+        "name": "进项税额转出",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221001"
+      },
+      "222100108": {
+        "name": "出口抵减内销产品应纳税额",
+        "type": "流动负债",
+        "direction": "debit",
+        "parentCode": "2221001"
+      },
+      "222100109": {
+        "name": "转出多交增值税",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221001"
+      },
+      "222100110": {
+        "name": "销项税额抵减",
+        "type": "流动负债",
+        "direction": "debit",
+        "parentCode": "2221001"
+      },
+      "2221002": {
+        "name": "未交增值税",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221"
+      },
+      "2221003": {
+        "name": "应交消费税",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221"
+      },
+      "2221004": {
+        "name": "应交营业税",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221"
+      },
+      "2221005": {
+        "name": "应交资源税",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221"
+      },
+      "2221007": {
+        "name": "应交土地增值税",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221"
+      },
+      "2221009": {
+        "name": "应交房产税",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221"
+      },
+      "2221010": {
+        "name": "应交城镇土地使用税",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221"
+      },
+      "2221011": {
+        "name": "应交车船使用税",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221"
+      },
+      "2221012": {
+        "name": "应交个人所得税",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221"
+      },
+      "2221015": {
+        "name": "矿产资源补偿费",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221"
+      },
+      "2221016": {
+        "name": "排污费",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221"
+      },
+      "2221018": {
+        "name": "预交增值税",
+        "type": "流动负债",
+        "direction": "debit",
+        "parentCode": "2221"
+      },
+      "2221019": {
+        "name": "待抵扣进项税额",
+        "type": "流动负债",
+        "direction": "debit",
+        "parentCode": "2221"
+      },
+      "2221020": {
+        "name": "待认证进项税额",
+        "type": "流动负债",
+        "direction": "debit",
+        "parentCode": "2221"
+      },
+      "2221021": {
+        "name": "待转销项税额",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221"
+      },
+      "2221022": {
+        "name": "增值税留抵税额",
+        "type": "流动负债",
+        "direction": "debit",
+        "parentCode": "2221"
+      },
+      "2221023": {
+        "name": "简易计税",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221"
+      },
+      "2221024": {
+        "name": "转让金融商品应交增值税",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221"
+      },
+      "2221025": {
+        "name": "代扣代交增值税",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221"
+      },
+      "2221026": {
+        "name": "应交增值税（小规模纳税人专用）",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2221"
+      },
+      "2231": {
+        "name": "应付利息",
+        "type": "流动负债",
+        "direction": "credit"
+      },
+      "2232": {
+        "name": "应付利润",
+        "type": "流动负债",
+        "direction": "credit"
+      },
+      "2401": {
+        "name": "递延收益",
+        "type": "流动负债",
+        "direction": "credit"
+      },
+      "2701": {
+        "name": "长期应付款",
+        "type": "流动负债",
+        "direction": "credit"
+      }
     },
     "权益类": {
-      "3001": { "name": "实收资本", "type": "所有者权益" },
-      "3101": { "name": "未分配利润", "type": "所有者权益" },
-      "4001": { "name": "实收资本", "type": "所有者权益" },
-      "4002": { "name": "资本公积-股本溢价", "type": "所有者权益" }
+      "3001": {
+        "name": "实收资本",
+        "type": "所有者权益",
+        "direction": "credit"
+      },
+      "3002": {
+        "name": "资本公积",
+        "type": "所有者权益",
+        "direction": "credit"
+      },
+      "3101": {
+        "name": "盈余公积",
+        "type": "所有者权益",
+        "direction": "credit"
+      },
+      "3103": {
+        "name": "本年利润",
+        "type": "所有者权益",
+        "direction": "credit"
+      },
+      "3104": {
+        "name": "利润分配",
+        "type": "所有者权益",
+        "direction": "credit"
+      },
+      "3101001": {
+        "name": "法定盈余公积",
+        "type": "所有者权益",
+        "direction": "credit",
+        "parentCode": "3101"
+      },
+      "3101002": {
+        "name": "任意盈余公积",
+        "type": "所有者权益",
+        "direction": "credit",
+        "parentCode": "3101"
+      },
+      "3101003": {
+        "name": "法定公益金",
+        "type": "所有者权益",
+        "direction": "credit",
+        "parentCode": "3101"
+      },
+      "3104001": {
+        "name": "其他转入",
+        "type": "所有者权益",
+        "direction": "credit",
+        "parentCode": "3104"
+      },
+      "3104002": {
+        "name": "提取法定盈余公积",
+        "type": "所有者权益",
+        "direction": "credit",
+        "parentCode": "3104"
+      },
+      "3104003": {
+        "name": "提取法定公益金",
+        "type": "所有者权益",
+        "direction": "credit",
+        "parentCode": "3104"
+      },
+      "3104004": {
+        "name": "提取任意盈余公积",
+        "type": "所有者权益",
+        "direction": "credit",
+        "parentCode": "3104"
+      },
+      "3104005": {
+        "name": "应付利润",
+        "type": "所有者权益",
+        "direction": "credit",
+        "parentCode": "3104"
+      },
+      "3104006": {
+        "name": "未分配利润",
+        "type": "所有者权益",
+        "direction": "credit",
+        "parentCode": "3104"
+      }
     },
     "成本类": {
-      "5001": { "name": "主营业务成本", "type": "成本" },
-      "5301": { "name": "研发支出-费用化支出（待归集）", "type": "成本", "isLeaf": true },
-      "530101": { "name": "研发支出-人员人工", "type": "成本", "parentCode": "5301" },
-      "530102": { "name": "研发支出-直接投入", "type": "成本", "parentCode": "5301" },
-      "530103": { "name": "研发支出-折旧与摊销", "type": "成本", "parentCode": "5301" },
-      "530104": { "name": "研发支出-设计费", "type": "成本", "parentCode": "5301" },
-      "530105": { "name": "研发支出-试验费", "type": "成本", "parentCode": "5301" },
-      "530106": { "name": "研发支出-委外研发费", "type": "成本", "parentCode": "5301" },
-      "530199": { "name": "研发支出-其他研发费用", "type": "成本", "parentCode": "5301" }
+      "4001": {
+        "name": "生产成本",
+        "type": "成本",
+        "direction": "debit"
+      },
+      "4101": {
+        "name": "制造费用",
+        "type": "成本",
+        "direction": "debit"
+      },
+      "4301": {
+        "name": "研发支出",
+        "type": "成本",
+        "direction": "debit",
+        "isLeaf": true
+      },
+      "4301001": {
+        "name": "研发支出-费用化支出",
+        "type": "成本",
+        "direction": "debit",
+        "parentCode": "4301",
+        "isLeaf": false
+      },
+      "430100101": {
+        "name": "研发支出-人员人工",
+        "type": "成本",
+        "direction": "debit",
+        "parentCode": "4301001"
+      },
+      "430100102": {
+        "name": "研发支出-直接投入",
+        "type": "成本",
+        "direction": "debit",
+        "parentCode": "4301001"
+      },
+      "430100103": {
+        "name": "研发支出-折旧与摊销",
+        "type": "成本",
+        "direction": "debit",
+        "parentCode": "4301001"
+      },
+      "430100104": {
+        "name": "研发支出-设计费",
+        "type": "成本",
+        "direction": "debit",
+        "parentCode": "4301001"
+      },
+      "430100105": {
+        "name": "研发支出-试验费",
+        "type": "成本",
+        "direction": "debit",
+        "parentCode": "4301001"
+      },
+      "430100106": {
+        "name": "研发支出-委外研发费",
+        "type": "成本",
+        "direction": "debit",
+        "parentCode": "4301001"
+      },
+      "430100199": {
+        "name": "研发支出-其他研发费用",
+        "type": "成本",
+        "direction": "debit",
+        "parentCode": "4301001"
+      },
+      "4301002": {
+        "name": "研发支出-资本化支出",
+        "type": "成本",
+        "direction": "debit",
+        "parentCode": "4301"
+      },
+      "4401": {
+        "name": "工程施工",
+        "type": "成本",
+        "direction": "debit"
+      },
+      "4403": {
+        "name": "机械作业",
+        "type": "成本",
+        "direction": "debit"
+      }
     },
     "损益-收入类": {
-      "6001": { "name": "主营业务收入", "type": "收入" },
-      "6051": { "name": "其他业务收入", "type": "收入" },
-      "6301": { "name": "营业外收入", "type": "收入" }
+      "5001": {
+        "name": "主营业务收入",
+        "type": "收入",
+        "direction": "credit"
+      },
+      "5051": {
+        "name": "其他业务收入",
+        "type": "收入",
+        "direction": "credit"
+      },
+      "5111": {
+        "name": "投资收益",
+        "type": "收入",
+        "direction": "credit"
+      },
+      "5301": {
+        "name": "营业外收入",
+        "type": "收入",
+        "direction": "credit"
+      },
+      "5301001": {
+        "name": "非流动资产处置净收益",
+        "type": "收入",
+        "direction": "credit",
+        "parentCode": "5301"
+      },
+      "5301002": {
+        "name": "政府补助",
+        "type": "收入",
+        "direction": "credit",
+        "parentCode": "5301"
+      },
+      "5301003": {
+        "name": "捐赠收益",
+        "type": "收入",
+        "direction": "credit",
+        "parentCode": "5301"
+      },
+      "5301004": {
+        "name": "盘盈收益",
+        "type": "收入",
+        "direction": "credit",
+        "parentCode": "5301"
+      }
     },
     "损益-费用类": {
-      "5601": { "name": "管理费用-差旅费", "type": "费用" },
-      "5602": { "name": "管理费用-办公费", "type": "费用" },
-      "5603": { "name": "管理费用-业务招待费", "type": "费用" },
-      "5604": { "name": "管理费用-租赁物业", "type": "费用" },
-      "5605": { "name": "管理费用-信息技术服务费", "type": "费用" },
-      "5606": { "name": "管理费用-运费及物流", "type": "费用" },
-      "5607": { "name": "管理费用-水电通讯费", "type": "费用" },
-      "5608": { "name": "管理费用-银行及金融手续费", "type": "费用" },
-      "5609": { "name": "管理费用-福利费", "type": "费用" },
-      "5699": { "name": "管理费用-其他", "type": "费用" },
-      "6601": { "name": "销售费用-推广费", "type": "费用" },
-      "6603": { "name": "财务费用-利息收入", "type": "费用" },
-      "6401": { "name": "税金及附加", "type": "费用" },
-      "6711": { "name": "营业外支出", "type": "费用" }
+      "5401": {
+        "name": "主营业务成本",
+        "type": "成本",
+        "direction": "debit",
+        "isLeaf": false
+      },
+      "5401001": {
+        "name": "主营业务成本-人力",
+        "type": "成本",
+        "direction": "debit",
+        "parentCode": "5401"
+      },
+      "5401002": {
+        "name": "主营业务成本-生产",
+        "type": "成本",
+        "direction": "debit",
+        "parentCode": "5401"
+      },
+      "5402": {
+        "name": "其他业务成本",
+        "type": "费用",
+        "direction": "debit"
+      },
+      "5403": {
+        "name": "税金及附加",
+        "type": "费用",
+        "direction": "debit"
+      },
+      "5601": {
+        "name": "销售费用",
+        "type": "费用",
+        "direction": "debit",
+        "isLeaf": false
+      },
+      "5601001": {
+        "name": "销售人员职工薪酬",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5601"
+      },
+      "5601006": {
+        "name": "差旅费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5601"
+      },
+      "5601011": {
+        "name": "运输费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5601"
+      },
+      "5601015": {
+        "name": "广告费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5601"
+      },
+      "5601016": {
+        "name": "业务宣传费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5601"
+      },
+      "5602": {
+        "name": "管理费用",
+        "type": "费用",
+        "direction": "debit",
+        "isLeaf": false
+      },
+      "5602001": {
+        "name": "管理人员职工薪酬",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5602"
+      },
+      "5602002": {
+        "name": "业务招待费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5602"
+      },
+      "5602004": {
+        "name": "办公费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5602"
+      },
+      "5602005": {
+        "name": "水电费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5602"
+      },
+      "5602006": {
+        "name": "差旅费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5602"
+      },
+      "5602007": {
+        "name": "折旧费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5602"
+      },
+      "5602011": {
+        "name": "咨询费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5602"
+      },
+      "5602013": {
+        "name": "租赁费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5602"
+      },
+      "5602014": {
+        "name": "管理费用-职工福利费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5602"
+      },
+      "5602015": {
+        "name": "管理费用-信息技术服务费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5602"
+      },
+      "5602016": {
+        "name": "管理费用-单位社保",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5602"
+      },
+      "5602999": {
+        "name": "管理费用-其他",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5602"
+      },
+      "5603": {
+        "name": "财务费用",
+        "type": "费用",
+        "direction": "debit",
+        "isLeaf": false
+      },
+      "5603001": {
+        "name": "利息费用",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5603"
+      },
+      "5603002": {
+        "name": "手续费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5603"
+      },
+      "5603003": {
+        "name": "汇兑损益",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5603"
+      },
+      "5603004": {
+        "name": "现金折扣",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5603"
+      },
+      "5711": {
+        "name": "营业外支出",
+        "type": "费用",
+        "direction": "debit"
+      },
+      "5801": {
+        "name": "所得税费用",
+        "type": "费用",
+        "direction": "debit"
+      },
+      "5601002": {
+        "name": "业务招待费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5601"
+      },
+      "5601003": {
+        "name": "修理费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5601"
+      },
+      "5601004": {
+        "name": "办公费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5601"
+      },
+      "5601005": {
+        "name": "水电费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5601"
+      },
+      "5601007": {
+        "name": "折旧费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5601"
+      },
+      "5601008": {
+        "name": "摊销费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5601"
+      },
+      "5601009": {
+        "name": "展览费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5601"
+      },
+      "5601010": {
+        "name": "商品维修费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5601"
+      },
+      "5601012": {
+        "name": "装卸费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5601"
+      },
+      "5601013": {
+        "name": "包装费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5601"
+      },
+      "5601014": {
+        "name": "保险费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5601"
+      },
+      "5602003": {
+        "name": "修理费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5602"
+      },
+      "5602008": {
+        "name": "摊销费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5602"
+      },
+      "5602009": {
+        "name": "开办费",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5602"
+      },
+      "5602010": {
+        "name": "研究费用",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5602"
+      },
+      "5602012": {
+        "name": "长期待摊费用摊销",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5602"
+      },
+      "5711001": {
+        "name": "非流动资产处置净损失",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5711"
+      },
+      "5711002": {
+        "name": "赞助支出",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5711"
+      },
+      "5711003": {
+        "name": "捐赠支出",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5711"
+      },
+      "5711004": {
+        "name": "盘亏损失",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5711"
+      },
+      "5711005": {
+        "name": "坏账损失",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5711"
+      },
+      "5711006": {
+        "name": "存货毁损报废损失",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5711"
+      },
+      "5711007": {
+        "name": "无法收回的长期债券投资损失",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5711"
+      },
+      "5711008": {
+        "name": "无法收回的长期股权投资损失",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5711"
+      },
+      "5711009": {
+        "name": "自然灾害等不可抗力因素造成的损失",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5711"
+      },
+      "5711010": {
+        "name": "税收滞纳金",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5711"
+      },
+      "5711011": {
+        "name": "罚款支出",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5711"
+      },
+      "5603005": {
+        "name": "财务费用-利息收入",
+        "type": "损益-费用",
+        "direction": "credit",
+        "parentCode": "5603"
+      }
     }
   }
 }

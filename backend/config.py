@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 import os
 import json
 from dotenv import load_dotenv
@@ -26,8 +29,8 @@ LLM_API_KEY = os.getenv("LLM_API_KEY", "").strip() or DASHSCOPE_API_KEY
 LLM_SEND_ENABLE_THINKING = os.getenv("LLM_SEND_ENABLE_THINKING", "1").strip().lower() in (
     "1", "true", "yes", "on",
 )
-# 深度思考开关：agent 流式循环建议开启；同步 JSON 调用（分类器等）固定关闭以保时延
-QWEN_ENABLE_THINKING = os.getenv("QWEN_ENABLE_THINKING", "true").strip().lower() == "true"
+# 深度思考开关：默认关闭以保证日常记账低时延；需要深度分析时可通过前端动态开启或在 .env 设置
+QWEN_ENABLE_THINKING = os.getenv("QWEN_ENABLE_THINKING", "false").strip().lower() == "true"
 
 # 服务配置
 HOST = os.getenv("HOST", "0.0.0.0")

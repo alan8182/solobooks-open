@@ -64,22 +64,21 @@
   flex-shrink: 0;
 }
 
-/* Card wrappers */
+/* Card wrappers
+   平面优先：静止表面靠背景差 + 1px 边框分层，不用毛玻璃、不用阴影。
+   （旧实现有 backdrop-filter + 静止阴影，与 DESIGN.md「Flat at Rest / No Glass」冲突。） */
 .report-card {
   background: var(--solo-bg-card);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border: 1px solid var(--solo-border-glass);
+  border: 1px solid var(--solo-border);
   border-radius: var(--solo-radius-lg);
-  box-shadow: var(--solo-shadow-sm);
+  box-shadow: none;
   margin-bottom: 16px;
-  transition: all 0.2s ease;
+  transition: border-color 0.2s ease;
   padding: 4px; /* Default inner Naive UI Padding handles content */
   overflow-x: auto;
 }
 .report-card:hover {
   border-color: var(--solo-primary-light);
-  box-shadow: var(--solo-shadow-md);
 }
 
 /* Summary Grid/Rows */
@@ -155,6 +154,11 @@
   font-size: 12.5px;
   color: var(--solo-text-secondary);
   width: 100px;
+}
+/* 日期列同样不许折行：2026-09-27 被拆成两行时，核对流水会直接看错日子 */
+.report-table th.date-cell,
+.report-table td.date-cell {
+  white-space: nowrap;
 }
 .report-table tr.total-row td {
   font-weight: 700;

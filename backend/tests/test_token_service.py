@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Tests for token_service.py — pure function tests, no DB, no mock."""
 import pytest
 from services.token_service import create_access_token, decode_access_token

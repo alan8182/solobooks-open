@@ -16,6 +16,7 @@ backend/data/*.db-*
 backend/data/tax_exports/
 backend/data/backups/
 backend/data/migration_reports/
+backend/data/legacy_tables/
 !backend/data/chart_of_accounts.json
 
 # IDE
@@ -77,7 +78,22 @@ opc_llm记账工具_prd_v_2.md
 
 # 本地运行产物
 backend/data/*.db.*
+backend/data/*.stale*
 backend/uvicorn.log
+# 归档导出（用户数据，不入库）
+backend/data/archives/
+# 本地测试校验器与构建产物
+backend/pytest_tmp/
+web/dist-verify/
 
 # ZCode 本地配置（含 MCP token，勿提交）
 .zcode/
+
+# 本地工具与临时文件
+.workbuddy/
+*.docx.tmp
+.slidep/
+.workbuddy-ai/
+
+# Office 锁文件（Word/WPS 打开时的 ~$ 临时文件）
+~$*

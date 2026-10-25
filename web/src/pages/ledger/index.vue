@@ -1,11 +1,12 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
-import { computed, h, reactive, ref, watch } from 'vue'
+import { usePageRefresh } from '@/composables/usePageRefresh'
+import { computed, h, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NButton,
   NCard,
   NDataTable,
-  NEmpty,
   NInput,
   NSelect,
   NSpace,
@@ -15,6 +16,7 @@ import {
   type DataTableSortState,
 } from 'naive-ui'
 import { useEntryStore } from '@/stores/entry'
+import { useWorkspaceViewStore } from '@/stores/workspaceView'
 import { formatDate, formatMoney } from '@/utils/format'
 import { moneyPresentation } from '@/utils/accounting'
 import { exportLedgerToExcel } from '@/utils/export'
@@ -24,6 +26,7 @@ import {
   type EntryNatureFilter,
 } from '@/utils/entryNature'
 import { normalizedPostingStatus, postingStatusPresentation } from '@/utils/postingStatus'
+import { SoloEmpty, SoloStatusBadge } from '@/components/ui'
 import type { Entry } from '@/api/types'
 
 type TimeFilter = 'week' | 'month' | 'quarter' | 'year' | 'all'
@@ -31,18 +34,31 @@ type TimeFilter = 'week' | 'month' | 'quarter' | 'year' | 'all'
 const router = useRouter()
 const entryStore = useEntryStore()
 const message = useMessage()
+const viewStore = useWorkspaceViewStore()
 
 const keyword = ref('')
-const timeFilter = ref<TimeFilter>('month')
+const timeFilter = ref<TimeFilter>('year')
 const natureFilter = ref<EntryNatureFilter>('all')
 const categoryFilter = ref<string | null>(null)
 const billingStatusFilter = ref<string | null>(null)
 const postingStatusFilter = ref<string | null>(null)
+const voucherKindFilter = ref<string | null>(null)
 const sorter = ref<DataTableSortState | null>({
   columnKey: 'occurDate',
   order: 'descend',
   sorter: 'default',
 })
+
+/* 表体高度按视口算：表头吸顶后，滚过去的每一行上方始终有列名。
+   340 是导航 68 + 页面上下 padding 56 + 页头/筛选/卡片 padding/分页 的估算，
+   带 360 下限，免得小窗口把表体压成一条缝。 */
+const viewportHeight = ref(typeof window === 'undefined' ? 900 : window.innerHeight)
+function syncViewportHeight() {
+  viewportHeight.value = window.innerHeight
+}
+onMounted(() => window.addEventListener('resize', syncViewportHeight))
+onBeforeUnmount(() => window.removeEventListener('resize', syncViewportHeight))
+const tableMaxHeight = computed(() => Math.max(360, viewportHeight.value - 340))
 
 const timeOptions = [
   { key: 'week' as const, label: '本周' },
@@ -70,6 +86,16 @@ const postingStatusOptions = [
   { label: '已过账', value: 'posted' },
   { label: '草稿', value: 'draft' },
 ]
+
+const voucherKindOptions = [
+  { label: '业务凭证', value: 'business' },
+  { label: '期末结转凭证', value: 'closing' },
+]
+
+/** 期末损益结转凭证：结账时系统自动生成，反结账时自动红冲 */
+function isClosingEntry(entry: Entry): boolean {
+  return entry.entryType === 'closing' || Boolean(entry.isClosingTransfer)
+}
 
 const pagination = reactive({
   page: 1,
@@ -99,11 +125,19 @@ function isInRange(entry: Entry, range: TimeFilter): boolean {
   if (!timestamp) return true
 
   const now = new Date()
+  if (range === 'year') {
+    const start = new Date(now.getFullYear(), 0, 1, 0, 0, 0, 0).getTime()
+    const end = new Date(now.getFullYear(), 11, 31, 23, 59, 59, 999).getTime()
+    return timestamp >= start && timestamp <= end
+  }
+
   const start = new Date(now)
   start.setHours(0, 0, 0, 0)
-  const days = { week: 7, month: 30, quarter: 90, year: 365 }[range]
+  const days = { week: 7, month: 30, quarter: 90 }[range]
   start.setDate(start.getDate() - days)
-  return timestamp >= start.getTime() && timestamp <= now.getTime()
+  const end = new Date(now)
+  end.setHours(23, 59, 59, 999)
+  return timestamp >= start.getTime() && timestamp <= end.getTime()
 }
 
 function hasDocument(entry: Entry): boolean {
@@ -131,6 +165,8 @@ const filteredEntries = computed(() => entryStore.activeEntries.filter((entry) =
   if (billingStatusFilter.value === 'pending' && hasDocument(entry)) return false
   if (billingStatusFilter.value === 'complete' && !hasDocument(entry)) return false
   if (postingStatusFilter.value && normalizedPostingStatus(entry.voucherStatus) !== postingStatusFilter.value) return false
+  if (voucherKindFilter.value === 'closing' && !isClosingEntry(entry)) return false
+  if (voucherKindFilter.value === 'business' && isClosingEntry(entry)) return false
   return true
 }))
 
@@ -151,11 +187,12 @@ const categoryOptions = computed(() => Array.from(new Set(
 
 const hasActiveFilters = computed(() => Boolean(
   keyword.value.trim()
-  || timeFilter.value !== 'month'
+  || timeFilter.value !== 'year'
   || natureFilter.value !== 'all'
   || categoryFilter.value
   || billingStatusFilter.value
-  || postingStatusFilter.value,
+  || postingStatusFilter.value
+  || voucherKindFilter.value,
 ))
 
 function dateLabel(entry: Entry): string {
@@ -172,6 +209,10 @@ const columns = computed<DataTableColumns<Entry>>(() => [
     title: '日期',
     key: 'occurDate',
     width: 112,
+    // 这张表可以按金额/摘要排序，按日期分组反而会跟排序打架
+    // （按金额排序时"天"就失去意义了）。所以这里不做分组，
+    // 改成把日期列钉在左侧 + 表头吸顶，滚动时同样有锚点。
+    fixed: 'left',
     sorter: (a, b) => entryTimestamp(a) - entryTimestamp(b),
     sortOrder: sorter.value?.columnKey === 'occurDate' ? sorter.value.order : false,
     render: (row) => h('span', { class: 'date-cell' }, dateLabel(row)),
@@ -184,7 +225,16 @@ const columns = computed<DataTableColumns<Entry>>(() => [
     sorter: (a, b) => a.title.localeCompare(b.title, 'zh-CN'),
     sortOrder: sorter.value?.columnKey === 'title' ? sorter.value.order : false,
     render: (row) => h('div', { class: 'summary-cell' }, [
-      h('span', { class: 'entry-title' }, row.title || '未命名记录'),
+      h('div', { class: 'entry-title-row' }, [
+        h('span', { class: 'entry-title' }, row.title || '未命名记录'),
+        isClosingEntry(row)
+          ? h(NTag, {
+              size: 'tiny',
+              bordered: false,
+              title: '期末损益结转凭证：结账时系统自动生成，反结账时自动红冲',
+            }, { default: () => '结转' })
+          : null,
+      ]),
       h('span', { class: 'entry-meta' }, row.merchant || row.accountName || '暂无交易方'),
     ]),
   },
@@ -214,10 +264,11 @@ const columns = computed<DataTableColumns<Entry>>(() => [
     title: '单据',
     key: 'billingStatus',
     width: 100,
-    render: (row) => h(NTag, {
-      size: 'small',
-      bordered: false,
-      type: hasDocument(row) ? 'success' : 'warning',
+    // 正常态（已有单据）不出彩：一屏十几行都标绿，等于用颜色把"没事"重复十几遍，
+    // 真正「待补单据」的那几行就淹掉了。只有缺单据才用 warning。
+    render: (row) => h(SoloStatusBadge, {
+      tone: hasDocument(row) ? 'neutral' : 'warning',
+      plain: true,
     }, { default: () => billingStatusLabel(row) }),
   },
   {
@@ -227,10 +278,10 @@ const columns = computed<DataTableColumns<Entry>>(() => [
     render: (row) => {
       const presentation = postingStatusPresentation(row.voucherStatus)
       if (!presentation) return null
-      return h(NTag, {
-        size: 'small',
-        bordered: false,
-        type: presentation.tagType,
+      return h(SoloStatusBadge, {
+        tone: presentation.tone,
+        // 待复核这类要人动手的状态保留胶囊底色，正常态只留点 + 灰字
+        plain: !presentation.needsAttention,
       }, { default: () => presentation.label })
     },
   },
@@ -265,7 +316,7 @@ const columns = computed<DataTableColumns<Entry>>(() => [
 ])
 
 watch(
-  [keyword, timeFilter, natureFilter, categoryFilter, billingStatusFilter, postingStatusFilter],
+  [keyword, timeFilter, natureFilter, categoryFilter, billingStatusFilter, postingStatusFilter, voucherKindFilter],
   () => { pagination.page = 1 },
 )
 
@@ -284,11 +335,12 @@ function handleSorterChange(nextSorter: DataTableSortState | DataTableSortState[
 
 function resetFilters() {
   keyword.value = ''
-  timeFilter.value = 'month'
+  timeFilter.value = 'year'
   natureFilter.value = 'all'
   categoryFilter.value = null
   billingStatusFilter.value = null
   postingStatusFilter.value = null
+  voucherKindFilter.value = null
 }
 
 function handleExportExcel() {
@@ -299,6 +351,9 @@ function handleExportExcel() {
     message.error('导出失败，请稍后重试')
   }
 }
+
+// 从别的标签切回来时静默重拉，避免对着旧数字干活
+usePageRefresh(() => entryStore.fetchEntries())
 </script>
 
 <template>
@@ -371,12 +426,22 @@ function handleExportExcel() {
           :options="billingStatusOptions.filter(option => option.value !== 'all')"
         />
         <NSelect
+          v-if="!viewStore.isBoss"
           v-model:value="postingStatusFilter"
           clearable
           class="filter-select posting-status-select"
           placeholder="全部过账状态"
           :input-props="{ name: 'ledger-posting-status' }"
           :options="postingStatusOptions"
+        />
+        <NSelect
+          v-if="!viewStore.isBoss"
+          v-model:value="voucherKindFilter"
+          clearable
+          class="filter-select voucher-kind-select"
+          placeholder="全部凭证类型"
+          :input-props="{ name: 'ledger-voucher-kind' }"
+          :options="voucherKindOptions"
         />
         <NButton v-if="hasActiveFilters" quaternary @click="resetFilters">重置</NButton>
       </div>
@@ -415,6 +480,7 @@ function handleExportExcel() {
         :pagination="pagination"
         :row-key="(row: Entry) => row.id"
         :scroll-x="920"
+        :max-height="tableMaxHeight"
         :row-props="(row: Entry) => ({
           tabindex: 0,
           role: 'link',
@@ -430,15 +496,21 @@ function handleExportExcel() {
         @update:sorter="handleSorterChange"
       >
         <template #empty>
-          <NEmpty :description="hasActiveFilters ? '没有符合条件的记录' : '还没有账本记录'">
-            <template #extra>
+          <SoloEmpty
+            :icon="hasActiveFilters ? 'ri-filter-off-line' : 'ri-book-open-line'"
+            :title="hasActiveFilters ? '没有符合条件的记录' : '还没有账本记录'"
+            :description="hasActiveFilters
+              ? '换个筛选条件，或清掉当前筛选看看全部记录。'
+              : '用一句话记下第一笔，AI 会自动匹配科目并生成凭证。'"
+          >
+            <template #action>
               <NButton v-if="hasActiveFilters" @click="resetFilters">清除筛选</NButton>
               <NButton v-else type="primary" @click="router.push('/copilot')">
                 <template #icon><i class="ri-sparkling-fill" /></template>
                 AI 记第一笔
               </NButton>
             </template>
-          </NEmpty>
+          </SoloEmpty>
         </template>
       </NDataTable>
     </section>
@@ -556,6 +628,7 @@ function handleExportExcel() {
 .filter-select { width: 168px; }
 .status-select { width: 156px; }
 .posting-status-select { width: 132px; }
+.voucher-kind-select { width: 148px; }
 
 .quick-filters {
   display: flex;
@@ -637,6 +710,13 @@ function handleExportExcel() {
   min-width: 0;
   flex-direction: column;
   gap: 2px;
+}
+
+.entry-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
 }
 
 .entry-title,

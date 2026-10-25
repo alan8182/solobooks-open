@@ -78,11 +78,25 @@
 .closing-wizard-container.closing-wizard--wide {
   max-width: 1240px;
 }
+/* 一屏优先：页头与步骤条压缩 */
+.closing-wizard-container {
+  padding-bottom: 8px !important;
+  margin-bottom: -16px !important;
+}
+.closing-wizard-container .report-header {
+  margin-bottom: 8px !important;
+}
+.closing-wizard-container .report-header .report-subtitle {
+  display: none;
+}
+.steps-card .n-step-content__description {
+  display: none;
+}
 .steps-card {
   background: var(--solo-bg-card);
   border: 1px solid var(--solo-border);
   border-radius: var(--solo-radius-lg);
-  margin-bottom: 20px;
+  margin-bottom: 12px;
 }
 
 /* 3. Drag and Drop Zones */
@@ -129,6 +143,280 @@
 .upload-subtitle {
   font-size: 12.5px;
   color: var(--solo-text-muted);
+}
+
+/* 本月进度条：与步骤导航分离的信息带（资料汇总 + 下一步） */
+.step-status-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  border-radius: 10px;
+  background: var(--solo-bg-soft, #f1f4f8);
+  border: 1px solid var(--solo-border-light, #edf0f4);
+}
+
+.step-status-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.step-status-icon {
+  font-size: 16px;
+  color: var(--solo-primary);
+  flex-shrink: 0;
+}
+
+.step-status-label {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--solo-text-primary);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.step-status-text {
+  font-size: 12px;
+  color: var(--solo-text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 第一步发票表：疑似流水提示 / 无操作占位 */
+.invoice-candidate-hint {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--solo-text-muted);
+}
+
+.invoice-no-action {
+  color: var(--solo-text-muted);
+}
+
+/* 第二步：待确认账目（发票/手工账）卡片 */
+.pending-entry-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.pending-entry-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border: 1px solid var(--solo-border-light, #edf0f4);
+  border-left: 4px solid var(--solo-primary);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.pending-entry-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.pending-entry-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  color: var(--solo-text-primary);
+  min-width: 0;
+}
+
+.pending-entry-title strong {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pending-entry-date {
+  font-size: 12px;
+  color: var(--solo-text-muted);
+}
+
+.pending-entry-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--solo-text-secondary);
+}
+
+.pending-entry-hint {
+  color: var(--solo-primary);
+}
+
+.pending-entry-hint.muted {
+  color: var(--solo-text-muted);
+}
+
+.pending-entry-amount {
+  font-size: 16px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.pending-entry-amount.income {
+  color: var(--solo-income, #0f7354);
+}
+
+.pending-entry-amount.expense {
+  color: var(--solo-expense, #bd3d3d);
+}
+
+.pending-entry-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 3.1 Step 1 三列导入卡片：默认紧凑单行放下，导入后展开的卡片横跨整行 */
+.step-import-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.step-import-head .report-section-title {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 卡片序号：老板一眼看出先做哪件 */
+.step-import-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--solo-primary);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.step-import-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.step1-import-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 14px;
+  align-items: start;
+}
+.step1-import-grid .n-card {
+  margin-bottom: 0;
+  grid-column: span 2;
+}
+.step1-import-grid .n-card-content {
+  padding: 12px 14px 14px;
+}
+/* 微信账单「已导入记录」表：卡片只有 1/3 屏宽，6 列表格若任由压缩，
+   金额列 nowrap 会顶出横向滚动条、商品名被挤成一字一行竖排。
+   给表格最小可读宽度走 wrapper 的横向滚动，收紧单元格 padding，
+   除商品名（给足宽度正常断词）与日期外一律不折行。 */
+.step1-import-grid .report-table {
+  min-width: 460px;
+}
+.step1-import-grid .report-table th,
+.step1-import-grid .report-table td {
+  padding: 8px 10px;
+  white-space: nowrap;
+}
+.step1-import-grid .report-table th:nth-child(2),
+.step1-import-grid .report-table td:nth-child(2) {
+  white-space: normal;
+  word-break: break-all;
+  min-width: 8em;
+}
+.step1-import-grid .report-subtitle {
+  margin: 4px 0 10px !important;
+  font-size: 12px !important;
+}
+.step1-import-grid .file-dropzone {
+  margin-bottom: 0;
+}
+.step1-import-grid .uploader-zone {
+  padding: 10px 12px;
+}
+.step1-import-grid .upload-icon {
+  font-size: 20px;
+  margin-bottom: 3px;
+}
+.step1-import-grid .upload-title {
+  font-size: 13.5px;
+}
+.step1-import-grid .upload-subtitle {
+  font-size: 11.5px;
+}
+/* 展开态（已导入数据）隐藏说明文案，标题行已带状态标签与重新上传 */
+.step1-card-expanded .report-subtitle {
+  display: none;
+}
+.step1-import-grid .step1-card-expanded,
+.step1-import-grid .step1-card-expanded ~ .step1-card-expanded {
+  grid-column: 1 / -1;
+}
+/* 展开卡片之后未展开的兄弟卡片各占半行，填满整行不留空档 */
+.step1-import-grid .step1-card-expanded ~ .n-card:not(.step1-card-expanded) {
+  grid-column: span 3;
+}
+/* 展开态的拖拽区压成横排一行：图标 + 标题 + 说明 */
+.step1-card-expanded .uploader-zone {
+  flex-direction: row;
+  justify-content: flex-start;
+  gap: 12px;
+  padding: 10px 16px;
+  text-align: left;
+}
+.step1-card-expanded .upload-icon {
+  font-size: 26px;
+  margin-bottom: 0;
+}
+.step1-card-expanded .upload-title {
+  margin-bottom: 0;
+  white-space: nowrap;
+}
+.step1-card-expanded .upload-subtitle {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.step1-card-expanded .n-card-content {
+  padding: 10px 14px 12px;
+}
+@media (max-width: 1100px) {
+  .step1-import-grid {
+    grid-template-columns: 1fr;
+  }
+  .step1-import-grid .n-card,
+  .step1-import-grid .step1-card-expanded ~ .n-card:not(.step1-card-expanded) {
+    grid-column: auto;
+  }
+  .step1-card-expanded .uploader-zone {
+    flex-direction: column;
+    justify-content: center;
+    text-align: center;
+  }
 }
 
 /* Split view zone for imports */
@@ -216,7 +504,7 @@
   width: 18px;
   height: 18px;
   border: 1px solid var(--solo-border);
-  border-radius: 5px;
+  border-radius: 4px;
   background: var(--solo-bg-card);
   color: var(--solo-bg-card);
   display: inline-flex;
@@ -345,16 +633,16 @@
   gap: 12px;
   padding: 14px 16px;
   border: 1px solid var(--solo-border-light);
-  border-radius: var(--solo-radius, 10px);
+  border-radius: var(--solo-radius, 8px);
   background: var(--solo-bg-card, #fff);
 }
 
 .closing-task-card.blocked {
-  border-left: 3px solid var(--solo-expense, #c74444);
+  border-left: 3px solid var(--solo-expense, #bd3d3d);
 }
 
 .closing-task-card.needs_review {
-  border-left: 3px solid var(--solo-warning, #b46b17);
+  border-left: 3px solid var(--solo-warning, #a05c10);
 }
 
 .task-index {
@@ -371,11 +659,11 @@
 }
 
 .task-index.blocked {
-  background: var(--solo-expense, #c74444);
+  background: var(--solo-expense, #bd3d3d);
 }
 
 .task-index.needs_review {
-  background: var(--solo-warning, #b46b17);
+  background: var(--solo-warning, #a05c10);
 }
 
 .task-body {
@@ -661,7 +949,7 @@
   grid-template-columns: repeat(2, 1fr);
   gap: 10px;
   padding: 12px 14px;
-  background: var(--solo-bg-soft, #f8fafc);
+  background: var(--solo-bg-soft, #f1f4f8);
   border: 1px solid var(--solo-border-light);
   border-radius: var(--solo-radius);
   margin-bottom: 16px;
@@ -694,7 +982,7 @@
   border-bottom: 1px solid var(--solo-border-light);
 }
 .voucher-table-wrapper th {
-  background: var(--solo-bg-soft, #f8fafc);
+  background: var(--solo-bg-soft, #f1f4f8);
   color: var(--solo-text-secondary);
   font-weight: 600;
   text-align: left;
@@ -702,7 +990,7 @@
 .voucher-table-wrapper tfoot td {
   border-top: 2px solid var(--solo-border);
   font-weight: 700;
-  background: var(--solo-bg-soft, #f8fafc);
+  background: var(--solo-bg-soft, #f1f4f8);
 }
 .voucher-modal-footer {
   display: flex;
@@ -710,4 +998,62 @@
   justify-content: space-between;
   gap: 12px;
   padding-top: 8px;
+}
+
+/* ── 跨期与补记提示（提示项，不阻断结账） ── */
+.closing-notice-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.notice-message {
+  margin: 0 0 8px;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--solo-text-secondary);
+}
+
+.notice-records {
+  margin-bottom: 8px;
+}
+
+.notice-record-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px dashed var(--solo-border-light);
+  font-size: 13px;
+}
+
+.notice-record-row:last-child {
+  border-bottom: 0;
+}
+
+.notice-record-date {
+  flex: none;
+  color: var(--solo-text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.notice-record-title {
+  flex: 1 1 160px;
+  color: var(--solo-text-primary);
+}
+
+.notice-record-amount {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+
+.notice-record-meta {
+  flex: none;
+  color: var(--solo-text-tertiary);
+}
+
+.notice-actions {
+  display: flex;
+  gap: 8px;
 }

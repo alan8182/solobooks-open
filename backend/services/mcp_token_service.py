@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """MCP 个人访问令牌（PAT）签发与校验。
 
 安全模型（见《MCP接入方案.md》§3.2）：
@@ -83,8 +86,37 @@ def _is_active_token_row(row: MCPAccessToken | None) -> bool:
     return True
 
 
+async def has_company_access(session, *, user_id: str, company_id: str) -> bool:
+    """用户对该公司的访问权，与 ensure_tenant 门禁严格同口径。
+
+    ensure_tenant 的判定顺序：成员行**存在**时必须 status == 'active'（owner 的行
+    被停用同样拒绝）；行**缺失**且是 owner 时自动补建放行；其余拒绝。
+    """
+    from sqlalchemy import select
+
+    from db.models import Company, CompanyMember
+
+    member = (
+        await session.execute(
+            select(CompanyMember.status).where(
+                CompanyMember.user_id == user_id,
+                CompanyMember.company_id == company_id,
+            )
+        )
+    ).first()
+    if member is not None:
+        return member[0] == "active"
+
+    owner = (
+        await session.execute(
+            select(Company.owner_user_id).where(Company.company_id == company_id)
+        )
+    ).first()
+    return owner is not None and owner[0] == user_id
+
+
 async def validate_token(raw: str) -> PatIdentity | None:
-    """校验 Bearer 凭证；任何失败（未知/吊销/过期/禁用）返回 None。"""
+    """校验 Bearer 凭证；任何失败（未知/吊销/过期/禁用/公司错绑）返回 None。"""
     if not raw or not raw.strip():
         return None
     digest = hash_token(raw)
@@ -111,6 +143,12 @@ async def validate_token(raw: str) -> PatIdentity | None:
         if flags is None or flags[0]:
             return None
 
+        # 与 ensure_tenant 同口径：持有人必须是绑定公司的 owner/有效成员。
+        # 离线签发路径（如开发脚本）曾造出「测试账号令牌绑到他人公司」的错绑，
+        # 读类工具只按 company_id 过滤，不校验此处就会跨账号读账本（2026-10-20）。
+        if not await has_company_access(session=session, user_id=row.user_id, company_id=row.company_id):
+            return None
+
         row.last_used_at = _utcnow()
         return PatIdentity(
             context=AuthContext(user_id=row.user_id, company_id=row.company_id),
@@ -120,7 +158,7 @@ async def validate_token(raw: str) -> PatIdentity | None:
 
 
 async def verify_token_alive(token_id: str) -> bool:
-    """复核已签发 token_id 是否仍然有效（未吊销/未过期/用户未禁用），并刷新 last_used_at。
+    """复核已签发 token_id 是否仍然有效（未吊销/未过期/用户未禁用/公司未错绑），并刷新 last_used_at。
 
     用于 stdio 模式等长驻进程在工具调用时复核（避免启动后吊销失效）。
     """
@@ -140,6 +178,9 @@ async def verify_token_alive(token_id: str) -> bool:
             )
         ).first()
         if flags is None or flags[0]:
+            return False
+
+        if not await has_company_access(session=session, user_id=row.user_id, company_id=row.company_id):
             return False
 
         row.last_used_at = _utcnow()
@@ -176,28 +217,15 @@ async def list_tokens(*, user_id: str) -> list[dict]:
 
 
 async def is_company_member(*, user_id: str, company_id: str) -> bool:
-    """校验用户是否为该公司的**有效**成员（为其他公司签发令牌时必须）。
+    """校验用户是否可访问该公司（owner 或**有效**成员），签发令牌前必须通过。
 
-    与产品访问门禁同口径：`ensure_tenant` 只放行 `status == 'active'` 的成员，
+    与产品访问门禁同口径：`ensure_tenant` 只放行 owner 与 `status == 'active'` 的成员，
     被 owner 停用（status='disabled'）的成员不应再能签发令牌。仅查行存在会
-    让签发门禁弱于数据门禁（2026-10-12 修正）。
+    让签发门禁弱于数据门禁（2026-10-12 修正）；owner 无成员行时与 ensure_tenant
+    的自动补建口径保持一致放行（2026-10-20 收敛为统一的 has_company_access）。
     """
-    from sqlalchemy import select
-
-    from db.models import CompanyMember
-    from db.session import session_scope
-
     async with session_scope() as session:
-        row = (
-            await session.execute(
-                select(CompanyMember.company_id).where(
-                    CompanyMember.user_id == user_id,
-                    CompanyMember.company_id == company_id,
-                    CompanyMember.status == "active",
-                )
-            )
-        ).first()
-        return row is not None
+        return await has_company_access(session=session, user_id=user_id, company_id=company_id)
 
 
 async def revoke_token(*, token_id: str, user_id: str) -> bool:

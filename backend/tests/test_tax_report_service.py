@@ -1,4 +1,7 @@
-﻿from datetime import date
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
+from datetime import date
 
 from decimal import Decimal
 
@@ -47,7 +50,7 @@ def test_statement_maps_basic_voucher_lines():
             "amount": 1000,
             "voucherLines": {
                 "debit": [{"accountCode": "1002", "accountName": "银行存款", "amount": 1000}],
-                "credit": [{"accountCode": "6001", "accountName": "主营业务收入", "amount": 1000}],
+                "credit": [{"accountCode": "5001", "accountName": "主营业务收入", "amount": 1000}],
             },
         },
         {
@@ -56,7 +59,7 @@ def test_statement_maps_basic_voucher_lines():
             "category": "办公费",
             "amount": 200,
             "voucherLines": {
-                "debit": [{"accountCode": "5602", "accountName": "管理费用-办公费", "amount": 200}],
+                "debit": [{"accountCode": "5602004", "accountName": "管理费用-办公费", "amount": 200}],
                 "credit": [{"accountCode": "1002", "accountName": "银行存款", "amount": 200}],
             },
         },
@@ -82,7 +85,7 @@ def test_cash_map_classifies_operating_and_capital_flows():
     entries = [
         {
             "occurDate": "2026-06-01", "direction": "income", "category": "主营业务收入", "amount": 1000,
-            "voucherLines": {"debit": [{"accountCode": "1012", "amount": 1000}], "credit": [{"accountCode": "6001", "amount": 1000}]},
+            "voucherLines": {"debit": [{"accountCode": "1012", "amount": 1000}], "credit": [{"accountCode": "5001", "amount": 1000}]},
         },
         {
             "occurDate": "2026-06-02", "direction": "expense", "category": "人力成本", "amount": 300,
@@ -94,7 +97,7 @@ def test_cash_map_classifies_operating_and_capital_flows():
         },
         {
             "occurDate": "2026-06-04", "direction": "owner_transfer", "category": "老板投入", "amount": 2000,
-            "voucherLines": {"debit": [{"accountCode": "1002", "amount": 2000}], "credit": [{"accountCode": "4001", "amount": 2000}]},
+            "voucherLines": {"debit": [{"accountCode": "1002", "amount": 2000}], "credit": [{"accountCode": "3001", "amount": 2000}]},
         },
         {
             "occurDate": "2026-06-05", "direction": "income", "category": "微信支付结算", "amount": 1000,
@@ -118,7 +121,7 @@ def test_cash_map_classifies_investment_returns_asset_disposals_and_financing_in
     entries = [
         {
             "occurDate": "2026-06-01",
-            "voucherLines": {"debit": [{"accountCode": "1002", "amount": 20}], "credit": [{"accountCode": "6111", "amount": 20}]},
+            "voucherLines": {"debit": [{"accountCode": "1002", "amount": 20}], "credit": [{"accountCode": "5111", "amount": 20}]},
         },
         {
             "occurDate": "2026-06-02",
@@ -146,13 +149,13 @@ def test_statement_maps_research_interest_capital_reserve_and_totals():
             "occurDate": "2026-06-01",
             "voucherLines": {
                 "debit": [{"accountCode": "1002", "amount": 100000}],
-                "credit": [{"accountCode": "4002", "amount": 30000}, {"accountCode": "4001", "amount": 70000}],
+                "credit": [{"accountCode": "3002", "amount": 30000}, {"accountCode": "3001", "amount": 70000}],
             },
         },
         {
             "occurDate": "2026-06-02",
             "voucherLines": {
-                "debit": [{"accountCode": "5301", "amount": 500}],
+                "debit": [{"accountCode": "4301", "amount": 500}],
                 "credit": [{"accountCode": "1002", "amount": 500}],
             },
         },
@@ -160,7 +163,7 @@ def test_statement_maps_research_interest_capital_reserve_and_totals():
             "occurDate": "2026-06-03",
             "voucherLines": {
                 "debit": [{"accountCode": "1002", "amount": 4.15}],
-                "credit": [{"accountCode": "6603", "amount": 4.15}],
+                "credit": [{"accountCode": "5603005", "amount": 4.15}],
             },
         },
     ]

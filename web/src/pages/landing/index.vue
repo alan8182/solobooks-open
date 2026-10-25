@@ -1,46 +1,93 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { NButton, useMessage } from 'naive-ui'
-import { loginByPhoneCode } from '@/api/auth'
-import { useAuthStore } from '@/stores/auth'
+import { NButton } from 'naive-ui'
 
-// ICP 备案通过后填入备案号，页脚自动呈现
-const ICP_LICENSE = ''
+// ICP 备案号，页脚自动呈现并链接工信部网站
+const ICP_LICENSE = '浙ICP备2025195764号-7'
+// 公安备案号，链接公安部备案查询网站
+const PSB_RECORD = '浙公网安备 33011002020894号'
+const PSB_RECORD_URL = 'https://beian.mps.gov.cn/#/query/webSearch?code=33011002020894'
 
 const router = useRouter()
-const message = useMessage()
-const authStore = useAuthStore()
 
-// ponytail: 原生 CSS Scroll Snap 实现 PPT 式滑动吸附定位
+// ── PPT 式整页翻页：桌面滚轮由 JS 接管 ──
+// Chromium 对 CSS scroll-snap 的补位动画近似瞬移（实测 1024px 约 50ms 走完九成），
+// 滚轮翻页改走平滑滚动才有过渡过程；scroll-snap（proximity）兜底触屏/键盘/滚动条。
+const NAV_HEIGHT = 56 // 与 CSS scroll-padding-top 保持一致
+const FLIP_LOCK_MS = 750 // 大于一次平滑翻页实测时长（约 620ms），锁内吞掉后续滚轮
+let flipLocked = false
+let flipLockTimer: ReturnType<typeof setTimeout> | undefined
+
+function slideEls(): HTMLElement[] {
+  return Array.from(
+    document.querySelectorAll<HTMLElement>(
+      '.landing-page .hero, .landing-page .section, .landing-page .landing-slide-end',
+    ),
+  )
+}
+
+// 所有页都装得进一屏才启用滚轮翻页；存在超高页（小窗口）时回落自由滚动
+function canPageFlip(): boolean {
+  const budget = window.innerHeight - NAV_HEIGHT
+  return slideEls().every((el) => el.offsetHeight <= budget + 1)
+}
+
+// 滚轮落点在内部可滚动容器上时不劫持
+function insideScrollable(e: WheelEvent): boolean {
+  for (const node of e.composedPath()) {
+    if (!(node instanceof HTMLElement)) continue
+    const overflowY = getComputedStyle(node).overflowY
+    if ((overflowY === 'auto' || overflowY === 'scroll') && node.scrollHeight > node.clientHeight) {
+      return true
+    }
+  }
+  return false
+}
+
+function flip(direction: 1 | -1, animate: boolean) {
+  const positions = slideEls().map((el) => Math.max(0, el.offsetTop - NAV_HEIGHT))
+  const y = window.scrollY
+  const eps = 8
+  const target =
+    direction > 0
+      ? positions.find((p) => p > y + eps)
+      : [...positions].reverse().find((p) => p < y - eps)
+  if (target == null) return
+  window.scrollTo({ top: target, behavior: animate ? 'smooth' : 'auto' })
+}
+
+function onLandingWheel(e: WheelEvent) {
+  if (e.deltaY === 0 || Math.abs(e.deltaY) < 2 || e.ctrlKey) return
+  if (flipLocked) {
+    // 翻页动画期间吞掉滚轮，避免原生滚动打断平滑动画
+    e.preventDefault()
+    return
+  }
+  if (insideScrollable(e) || !canPageFlip()) return
+  e.preventDefault()
+  flipLocked = true
+  clearTimeout(flipLockTimer)
+  flipLockTimer = setTimeout(() => {
+    flipLocked = false
+  }, FLIP_LOCK_MS)
+  const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  flip(e.deltaY > 0 ? 1 : -1, !reduceMotion)
+}
+
 onMounted(() => {
   document.documentElement.classList.add('landing-scroll-snap')
+  window.addEventListener('wheel', onLandingWheel, { passive: false })
 })
 
 onUnmounted(() => {
   document.documentElement.classList.remove('landing-scroll-snap')
+  window.removeEventListener('wheel', onLandingWheel)
+  clearTimeout(flipLockTimer)
 })
 
 const isLoggedIn = computed(() => Boolean(localStorage.getItem('auth_token')))
-
-// ── 免注册测试账号一键试用 ──
-const trialLoading = ref(false)
-
-async function startTrial() {
-  if (trialLoading.value) return
-  trialLoading.value = true
-  try {
-    const resp = await loginByPhoneCode({ phone: '13800000000', code: '123456' })
-    authStore.setSession(resp)
-    await authStore.fetchProfile()
-    window.location.replace('/')
-  } catch {
-    message.error('测试账号暂时无法登录，请稍后重试或使用手机号登录')
-    router.push('/login')
-  } finally {
-    trialLoading.value = false
-  }
-}
 
 // ponytail: 遵循极简主义与 YAGNI 原则，页面轻盈无外部重量库负担
 
@@ -76,6 +123,35 @@ const fourPillars = [
   },
 ]
 
+// ── 账本迁移：历史账套导入与全量导出 (Migration) ──
+const migrateIn = {
+  title: '账本导入',
+  icon: 'ri-download-cloud-2-line',
+  items: [
+    { b: '凭证批量导入', t: 'Excel / CSV 三列对齐，自动匹配科目' },
+    { b: '期初余额带入', t: '科目余额表开新账，借贷平衡校验' },
+    { b: '流水与发票', t: '银行、微信、税局发票免模板解析' },
+  ],
+  tags: ['Excel / CSV', '列名智能识别', '失败行逐条提示'],
+}
+
+const migrateOut = {
+  title: '账本导出',
+  icon: 'ri-upload-cloud-2-line',
+  items: [
+    { b: '凭证与账表', t: '凭证、明细账、科目余额表导出 Excel' },
+    { b: '三大报表', t: '资产负债表、利润表、现金流量表' },
+    { b: '完整账套备份', t: '科目、期初、凭证与票据整包带走' },
+  ],
+  tags: ['Excel / CSV', '全量备份'],
+}
+
+const migratePromises = [
+  { icon: 'ri-refresh-line', title: '迁入只需一次导入' },
+  { icon: 'ri-lock-unlock-line', title: '数据所有权归你' },
+  { icon: 'ri-shield-check-line', title: '不做数据锁定' },
+]
+
 // ── 对标企微：深度功能交互展台 (Tab Showcase) ──
 type ShowcaseKey = 'batch' | 'reconcile' | 'closing' | 'dashboard' | 'mcp'
 const activeShowcase = ref<ShowcaseKey>('batch')
@@ -85,19 +161,11 @@ const showcaseTabs = [
   { key: 'reconcile' as ShowcaseKey, num: '02', title: '流水对平', icon: 'ri-git-merge-line' },
   { key: 'closing' as ShowcaseKey, num: '03', title: '月末结账', icon: 'ri-calendar-check-line' },
   { key: 'dashboard' as ShowcaseKey, num: '04', title: '经营报表', icon: 'ri-pie-chart-line' },
-  { key: 'mcp' as ShowcaseKey, num: '05', title: 'AI 直连 (MCP)', icon: 'ri-sparkling-2-line' },
+  { key: 'mcp' as ShowcaseKey, num: '05', title: 'AI 连接 (MCP & Skills)', icon: 'ri-sparkling-2-line' },
 ]
 
 function switchShowcaseTab(key: ShowcaseKey) {
   activeShowcase.value = key
-}
-
-function scrollToTab(key: ShowcaseKey) {
-  activeShowcase.value = key
-  const el = document.getElementById('showcase')
-  if (el) {
-    el.scrollIntoView({ behavior: 'smooth' })
-  }
 }
 
 // ── 视觉化指标对比数据 ──
@@ -200,8 +268,9 @@ const complianceEvidence = [
         <nav class="nav-links">
           <a href="#pillars">核心优势</a>
           <a href="#showcase">功能展台</a>
-          <a href="#showcase" @click.prevent="scrollToTab('mcp')">开放连接 (MCP)</a>
+          <a href="#showcase" @click.prevent="router.push('/ai-connect')">AI 连接 (MCP & Skills)</a>
           <a href="#compare">方案对比</a>
+          <a href="#migrate">账本迁移</a>
           <a href="#personas">适用场景</a>
           <a href="#trust">合规保障</a>
         </nav>
@@ -212,10 +281,6 @@ const complianceEvidence = [
             </NButton>
           </template>
           <template v-else>
-            <NButton secondary size="small" class="btn-trial" :loading="trialLoading" @click="startTrial">
-              <template #icon><i class="ri-flashlight-line" /></template>
-              测试体验
-            </NButton>
             <NButton type="primary" size="small" class="btn-primary" @click="router.push('/login')">
               登录 / 注册
             </NButton>
@@ -244,12 +309,8 @@ const complianceEvidence = [
         <div class="hero-action-block">
           <div class="hero-cta">
             <button class="island-cta-btn" @click="router.push('/login')">
-              <span>免费体验 / 登录</span>
+              <span>免费注册，即得演示账套</span>
               <span class="btn-arrow-icon"><i class="ri-arrow-right-line" /></span>
-            </button>
-            <button class="island-trial-btn" :disabled="trialLoading" @click="startTrial">
-              <i class="ri-flashlight-line" />
-              <span>免注册 · 一键试用</span>
             </button>
           </div>
         </div>
@@ -276,14 +337,14 @@ const complianceEvidence = [
             <p class="proof-desc">财政部《小企业会计准则》科目映射，借贷实时平衡，底稿直通税局。</p>
           </div>
 
-          <div class="proof-card hover-glow" @click="scrollToTab('mcp')">
+          <div class="proof-card hover-glow" @click="router.push('/ai-connect')">
             <div class="proof-card-top">
               <div class="proof-icon-wrap"><i class="ri-terminal-box-line" /></div>
               <span class="proof-badge purple">开放协议</span>
             </div>
-            <div class="proof-val text-gradient">原生 MCP</div>
-            <div class="proof-title">Claude / Cursor 直连</div>
-            <p class="proof-desc">外部智能助手对话查账起草凭证，坚守人机双签底线，数据安全无虞。</p>
+            <div class="proof-val text-gradient">MCP & Skills</div>
+            <div class="proof-title">Claude / Cursor / Agent 直连</div>
+            <p class="proof-desc">24 项原生 MCP 账务工具 + 报税/结账等专属 Skills 技能包，开箱即用，人机双签安全闭环。</p>
           </div>
 
           <div class="proof-card">
@@ -292,8 +353,8 @@ const complianceEvidence = [
               <span class="proof-badge amber">零门槛</span>
             </div>
             <div class="proof-val">¥0</div>
-            <div class="proof-title">免注册即时试用</div>
-            <p class="proof-desc">内置脱敏演练数据账套，无需繁琐注册验证码，一键体验全套做账。</p>
+            <div class="proof-title">注册即得演示账套</div>
+            <p class="proof-desc">内置脱敏演练数据账套，注册后自动生成，直接体验全套做账。</p>
           </div>
         </div>
       </div>
@@ -354,7 +415,7 @@ const complianceEvidence = [
             <span class="tab-btn-num">{{ tab.num }}</span>
             <i :class="tab.icon" />
             <span class="tab-btn-title">{{ tab.title }}</span>
-            <span v-if="tab.key === 'mcp'" class="tab-mcp-badge">MCP 原生</span>
+            <span v-if="tab.key === 'mcp'" class="tab-mcp-badge">MCP + Skills</span>
           </button>
         </div>
 
@@ -622,62 +683,82 @@ const complianceEvidence = [
               </div>
             </div>
 
-            <!-- Tab 05: AI 直连 (MCP) -->
+            <!-- Tab 05: AI 连接 (MCP & Skills) -->
             <div v-else-if="activeShowcase === 'mcp'" key="mcp" class="stage-grid">
               <div class="stage-left">
-                <h3 class="stage-title">原生支持 MCP，<br />直连 Claude / Cursor</h3>
+                <h3 class="stage-title">原生支持 MCP + Skills，<br />打造懂小微财税的数字员工</h3>
                 <p class="stage-desc">
-                  原生实现 Model Context Protocol 协议。在外部 AI 助手里直接对话查账、起草凭证。
+                  全面支持 Model Context Protocol 协议与 Agent Skills 规范。不仅能在 Claude、Cursor 中对话查账起草凭证，更可挂载专属财税技能包，驱动半自动报税核对等端到端高阶工作流。
                 </p>
                 <div class="stage-bullets">
-                  <div class="stage-bullet"><i class="ri-check-line" /><span>对话查账：快速查询利润、账户余额与未平流水</span></div>
-                  <div class="stage-bullet"><i class="ri-check-line" /><span>AI 起草凭证草稿，自动填充并配平借贷科目</span></div>
-                  <div class="stage-bullet"><i class="ri-check-line" /><span>人机双签底线：入账需老板确认，保障账套安全</span></div>
+                  <div class="stage-bullet"><i class="ri-check-line" /><span><b>24 个原生 MCP 工具</b>：覆盖记账起草、三方流水对账、结账五项检查、申报作业包与资产台账</span></div>
+                  <div class="stage-bullet"><i class="ri-check-line" /><span><b>专属 Agent Skills 技能包</b>：挂载半自动报税伴侣，联动浏览器自动比对税局底账、识别无票收入、预填申报表</span></div>
+                  <div class="stage-bullet"><i class="ri-check-line" /><span><b>人机双签安全红线</b>：AI 只产生待确认草稿不直接入账、不碰税局密码与提交按钮，数据可审计</span></div>
+                </div>
+                <div class="stage-cta-row">
+                  <button class="stage-cta-primary" @click="router.push('/ai-connect')">
+                    <i class="ri-book-read-line" />
+                    查看完整接入指南
+                  </button>
+                  <button
+                    class="stage-cta-ghost"
+                    @click="router.push(isLoggedIn ? '/mine/mcp' : '/login')"
+                  >
+                    <i class="ri-key-2-line" />
+                    签发 MCP 令牌
+                  </button>
                 </div>
               </div>
               <div class="stage-right">
                 <div class="mockup-window mcp-window">
                   <div class="window-bar dark-bar">
                     <div class="window-dots"><span class="dot red" /><span class="dot yellow" /><span class="dot green" /></div>
-                    <span class="window-title">Claude Desktop · SoloBooks MCP Server (stdio)</span>
-                    <span class="window-status text-emerald"><i class="ri-broadcast-fill" /> Connected</span>
+                    <span class="window-title">Claude Desktop / Agent · SoloBooks MCP + Tax Filing Skill</span>
+                    <span class="window-status text-emerald"><i class="ri-broadcast-fill" /> Connected (24 Tools + Skills)</span>
                   </div>
                   <div class="mcp-terminal-body">
                     <!-- 用户提问 -->
                     <div class="chat-bubble user-bubble">
                       <div class="bubble-sender">Founder (You)</div>
                       <div class="bubble-text">
-                        帮我看一下上个月的微信流水对平了没有，另外把昨天买云服务器的 899 元起草一张凭证。
+                        帮我准备 Q3 增值税与所得税申报包，并在已打开的电子税务局页面核对开票数据是否一致。
                       </div>
                     </div>
 
                     <!-- AI 响应 -->
                     <div class="chat-bubble assistant-bubble">
                       <div class="bubble-sender">
-                        <i class="ri-sparkling-fill text-purple" /> Claude Assistant (via SoloBooks MCP)
+                        <i class="ri-sparkling-fill text-purple" /> Claude Assistant (via SoloBooks MCP & Skills)
                       </div>
-                      <div class="mcp-call-chip">
-                        <i class="ri-cpu-line" />
-                        <span>调用工具：<code>mcp__solobooks__check_reconcile()</code></span>
-                      </div>
-                      <div class="bubble-text">
-                        ✅ <b>微信流水状态：</b>9 月份微信商户流水共 17 笔已 100% 勾稽对平，无未平差额。
+
+                      <div class="mcp-skill-chip">
+                        <i class="ri-magic-line" />
+                        <span>已激活技能：<code>solobooks-tax-filing</code>（半自动纳税申报伴侣）</span>
                       </div>
 
                       <div class="mcp-call-chip">
                         <i class="ri-cpu-line" />
-                        <span>调用工具：<code>mcp__solobooks__draft_voucher()</code></span>
+                        <span>调用工具：<code>mcp__solobooks__generate_filing_package({ period: "2026-Q3" })</code></span>
+                      </div>
+                      <div class="bubble-text">
+                        📊 <b>账套测算完成：</b>季度销售额 ¥245,800.00 未超 30 万起征点，享受小微免征增值税（应缴 ¥0.00）；企业所得税减按 5% 预缴，应补税额 ¥3,410.00。
+                      </div>
+
+                      <div class="mcp-call-chip">
+                        <i class="ri-window-line" />
+                        <span>联动浏览器：<code>chrome_devtools__take_snapshot()</code> 读取税局底账</span>
                       </div>
                       <div class="mcp-voucher-preview">
-                        <div class="mcp-v-title">已生成待确认凭证草稿：【记字第 2026-0922 号】</div>
+                        <div class="mcp-v-title">🎯 电子税务局金税底账逆向比对结果</div>
                         <div class="mcp-v-lines">
-                          <div>借：管理费用 - 云服务与运维费 899.00</div>
-                          <div>贷：银行存款 - 招商银行基本户 899.00</div>
+                          <div>• 税局归集开票销售额：¥245,800.00（与账套发票池 100% 勾稽一致）</div>
+                          <div>• 申报表预填状态：小微免税销售额、实际利润额已在税局网页填妥</div>
+                          <div>• 视觉标注：已在网页中用黄色边框高亮标注所有已填入输入框</div>
                         </div>
                       </div>
                       <div class="mcp-safety-note">
                         <i class="ri-shield-keyhole-line text-emerald" />
-                        <span><b>人机双签安全机制：</b>凭证已保存为草稿态，AI 无权直接记账，请在 SoloBooks 网页端点击「确认」后正式入账。</span>
+                        <span><b>人机双签安全红线：</b>AI 严禁代点税局「提交申报」按钮。数据已核验无误，请在浏览器中最终由您本人亲手点击提交。</span>
                       </div>
                     </div>
                   </div>
@@ -689,7 +770,7 @@ const complianceEvidence = [
       </div>
     </section>
 
-    <!-- 4. 痛点指标对比 (Visual Comparison Cards) -->
+    <!-- 5. 痛点指标对比 (Visual Comparison Cards) -->
     <section id="compare" class="section section-compare">
       <div class="section-inner">
         <div class="section-top text-center">
@@ -729,7 +810,66 @@ const complianceEvidence = [
       </div>
     </section>
 
-    <!-- 5. 典型场景：指标看板卡片 -->
+    <!-- 6. 账本迁移：历史账套导入与全量导出 (Migration) -->
+    <section id="migrate" class="section section-migrate">
+      <div class="section-inner">
+        <div class="section-top text-center">
+          <p class="section-tag">无痛迁移</p>
+          <h2 class="section-headline">换账不搬家，<br class="hero-br-mobile" />历史账本一键带走</h2>
+          <p class="section-subtitle">
+            从传统代账或其他财务软件迁入，历史凭证不必重录；<br class="hero-br-mobile" />账本随时完整导出，不做锁定。
+          </p>
+        </div>
+
+        <div class="migrate-grid">
+          <div class="migrate-card migrate-in">
+            <div class="migrate-head">
+              <div class="migrate-icon"><i :class="migrateIn.icon" /></div>
+              <h3 class="migrate-title">{{ migrateIn.title }}</h3>
+            </div>
+            <ul class="migrate-list">
+              <li v-for="it in migrateIn.items" :key="it.b">
+                <i class="ri-check-line" />
+                <span><b>{{ it.b }}</b>：{{ it.t }}</span>
+              </li>
+            </ul>
+            <div class="migrate-tags">
+              <span v-for="t in migrateIn.tags" :key="t" class="migrate-tag">{{ t }}</span>
+            </div>
+          </div>
+
+          <div class="migrate-bridge">
+            <div class="bridge-icon"><i class="ri-arrow-left-right-line" /></div>
+            <span class="bridge-label">双向互通</span>
+          </div>
+
+          <div class="migrate-card migrate-out">
+            <div class="migrate-head">
+              <div class="migrate-icon"><i :class="migrateOut.icon" /></div>
+              <h3 class="migrate-title">{{ migrateOut.title }}</h3>
+            </div>
+            <ul class="migrate-list">
+              <li v-for="it in migrateOut.items" :key="it.b">
+                <i class="ri-check-line" />
+                <span><b>{{ it.b }}</b>：{{ it.t }}</span>
+              </li>
+            </ul>
+            <div class="migrate-tags">
+              <span v-for="t in migrateOut.tags" :key="t" class="migrate-tag">{{ t }}</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="migrate-promises">
+          <div v-for="p in migratePromises" :key="p.title" class="promise-item">
+            <i :class="p.icon" />
+            <span>{{ p.title }}</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 7. 典型场景：指标看板卡片 -->
     <section id="personas" class="section">
       <div class="section-inner">
         <div class="section-top text-center">
@@ -762,7 +902,7 @@ const complianceEvidence = [
       </div>
     </section>
 
-    <!-- 6. 合规保障 (Slide 6) -->
+    <!-- 8. 合规保障 (Slide 8) -->
     <section id="trust" class="section section-trust">
       <div class="section-inner">
         <div class="section-top text-center">
@@ -791,21 +931,17 @@ const complianceEvidence = [
       </div>
     </section>
 
-    <!-- 7. 底部精简 CTA 与页脚 (整合为最终幻灯片) -->
+    <!-- 9. 底部精简 CTA 与页脚 (整合为最终幻灯片) -->
     <section class="landing-slide-end">
       <div class="cta-banner">
         <div class="cta-glow-mesh" />
         <div class="cta-inner text-center">
           <h2 class="cta-title">让专属 AI 会计，打理你的公司账目</h2>
-          <p class="cta-sub">免费体验，1 分钟建立企业专属智能账本。</p>
+          <p class="cta-sub">免费注册，1 分钟建立企业专属智能账本。</p>
           <div class="cta-buttons">
             <button class="island-cta-btn" @click="router.push('/login')">
               <span>免费注册 / 登录</span>
               <span class="btn-arrow-icon"><i class="ri-arrow-right-line" /></span>
-            </button>
-            <button class="island-trial-btn" :disabled="trialLoading" @click="startTrial">
-              <i class="ri-flashlight-line" />
-              <span>免注册 · 测试账号试用</span>
             </button>
           </div>
         </div>
@@ -828,7 +964,10 @@ const complianceEvidence = [
         </div>
         <div class="section-inner footer-sub">
           <span>© {{ new Date().getFullYear() }} 梭罗记账 SoloBooks · 保留所有权利</span>
-          <a v-if="ICP_LICENSE" href="https://beian.miit.gov.cn" target="_blank" rel="noreferrer">{{ ICP_LICENSE }}</a>
+          <div class="footer-filings">
+            <a v-if="ICP_LICENSE" href="https://beian.miit.gov.cn" target="_blank" rel="noreferrer">{{ ICP_LICENSE }}</a>
+            <a v-if="PSB_RECORD" :href="PSB_RECORD_URL" target="_blank" rel="noreferrer">{{ PSB_RECORD }}</a>
+          </div>
         </div>
       </footer>
     </section>
@@ -836,11 +975,12 @@ const complianceEvidence = [
 </template>
 
 <style scoped>
-/* ── PPT 幻灯片式整屏滚动吸附 (CSS Scroll Snap) ── */
+/* ── PPT 幻灯片式整屏滚动：JS 接管桌面滚轮翻页，CSS proximity 轻吸附兜底 ──
+   不用 mandatory：Chromium 吸附补位是瞬移，且超高页（小窗口）会被钳制回拽 */
 :global(html:has(.landing-page)),
 :global(html.landing-scroll-snap) {
   scroll-behavior: smooth;
-  scroll-snap-type: y mandatory;
+  scroll-snap-type: y proximity;
   scroll-padding-top: 56px;
 }
 
@@ -877,6 +1017,8 @@ const complianceEvidence = [
   align-items: center;
   gap: 10px;
   text-decoration: none;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .nav-logo-box {
@@ -905,7 +1047,7 @@ const complianceEvidence = [
 
 .nav-sub {
   font-size: 9.5px;
-  color: #64748b;
+  color: #5b6a7c;
   font-weight: 500;
   letter-spacing: 0.5px;
 }
@@ -913,6 +1055,14 @@ const complianceEvidence = [
 .nav-links {
   display: flex;
   gap: 24px;
+  /* 中窄屏空间不足时横向滚动，禁止逐字竖排换行溢出导航条 */
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.nav-links::-webkit-scrollbar {
+  display: none;
 }
 
 .nav-links a {
@@ -922,6 +1072,8 @@ const complianceEvidence = [
   font-weight: 500;
   transition: color 0.2s cubic-bezier(0.16, 1, 0.3, 1);
   position: relative;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .nav-links a:hover {
@@ -932,23 +1084,11 @@ const complianceEvidence = [
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-shrink: 0;
 }
 
 .btn-primary {
   font-weight: 600;
-}
-
-.btn-trial {
-  font-weight: 600;
-  color: #1747b0 !important;
-  background-color: #edf3ff !important;
-  border: 1px solid rgba(23, 71, 176, 0.18) !important;
-  border-radius: 999px !important;
-  transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-}
-
-.btn-trial:active {
-  transform: scale(0.96);
 }
 
 /* ── Hero 区域 (对标企微开阔大厂气度 · Slide 1) ── */
@@ -1055,7 +1195,7 @@ const complianceEvidence = [
 .proof-card {
   background: #ffffff;
   border: 1px solid rgba(226, 232, 240, 0.9);
-  border-radius: 14px;
+  border-radius: 12px;
   padding: 22px 20px;
   display: flex;
   flex-direction: column;
@@ -1119,9 +1259,9 @@ const complianceEvidence = [
 }
 
 .proof-badge.blue { background: #f0f6ff; color: #1d4ed8; border: 1px solid #dbeafe; }
-.proof-badge.emerald { background: #f0fdf4; color: #15803d; border: 1px solid #dcfce7; }
+.proof-badge.emerald { background: #eaf7f1; color: #0f7354; border: 1px solid #dcfce7; }
 .proof-badge.purple { background: #faf5ff; color: #6b21a8; border: 1px solid #f3e8ff; }
-.proof-badge.amber { background: #fffbeb; color: #b45309; border: 1px solid #fef3c7; }
+.proof-badge.amber { background: #fffbeb; color: #a05c10; border: 1px solid #fef3c7; }
 
 .proof-val {
   font-size: 26px;
@@ -1148,7 +1288,7 @@ const complianceEvidence = [
 .proof-desc {
   margin: 0;
   font-size: 12px;
-  color: #64748b;
+  color: #5b6a7c;
   line-height: 1.55;
 }
 
@@ -1173,7 +1313,7 @@ const complianceEvidence = [
 }
 
 .island-cta-btn:hover {
-  background: #153ea0;
+  background: #0d3282;
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.3),
     0 8px 24px rgba(23, 71, 176, 0.35);
@@ -1200,33 +1340,6 @@ const complianceEvidence = [
   transform: translateX(2px);
 }
 
-.island-trial-btn {
-  height: 48px;
-  padding: 0 22px;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  border-radius: 999px;
-  background: #ffffff;
-  color: #1747b0;
-  border: 1px solid #cbd5e1;
-  font-size: 14.5px;
-  font-weight: 600;
-  cursor: pointer;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
-  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
-}
-
-.island-trial-btn:hover {
-  background: #f8fafc;
-  border-color: #94a3b8;
-  transform: translateY(-1px);
-}
-
-.island-trial-btn:active {
-  transform: scale(0.97);
-}
-
 
 
 /* 月末批量凭据拖入组件 */
@@ -1236,7 +1349,7 @@ const complianceEvidence = [
   gap: 8px;
   background: #f8fafc;
   border: 1px solid #e2e8f0;
-  border-radius: 9px;
+  border-radius: 8px;
   padding: 10px 12px;
 }
 
@@ -1252,7 +1365,7 @@ const complianceEvidence = [
   gap: 6px;
   background: #ffffff;
   border: 1px solid #cbd5e1;
-  border-radius: 6px;
+  border-radius: 4px;
   padding: 6px 8px;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
 }
@@ -1262,7 +1375,7 @@ const complianceEvidence = [
   flex-shrink: 0;
 }
 
-.file-icon.excel { color: #059669; }
+.file-icon.excel { color: #0f7354; }
 .file-icon.pdf { color: #e11d48; }
 .file-icon.wechat { color: #0284c7; }
 
@@ -1283,7 +1396,7 @@ const complianceEvidence = [
 
 .file-meta {
   font-size: 10px;
-  color: #64748b;
+  color: #5b6a7c;
 }
 
 .agent-parse-banner {
@@ -1306,7 +1419,7 @@ const complianceEvidence = [
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: #10b981;
+  background: #0f7354;
   box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.2);
   flex-shrink: 0;
 }
@@ -1323,8 +1436,8 @@ const complianceEvidence = [
 .parse-status-badge {
   font-size: 10px;
   font-weight: 600;
-  color: #047857;
-  background: #ecfdf5;
+  color: #0f7354;
+  background: #eaf7f1;
   border: 1px solid #a7f3d0;
   border-radius: 4px;
   padding: 1px 6px;
@@ -1338,7 +1451,7 @@ const complianceEvidence = [
 .voucher-card {
   background: #ffffff;
   border: 1px solid #cbd5e1;
-  border-radius: 9px;
+  border-radius: 8px;
   overflow: hidden;
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.03);
 }
@@ -1359,7 +1472,7 @@ const complianceEvidence = [
 }
 
 .badge-balanced {
-  color: #047857;
+  color: #0f7354;
   font-weight: 600;
   background: #d1fae5;
   padding: 1px 6px;
@@ -1394,7 +1507,7 @@ const complianceEvidence = [
   font-size: 10px;
   font-weight: 700;
   padding: 1px 3px;
-  border-radius: 2px;
+  border-radius: 4px;
   text-align: center;
 }
 
@@ -1412,7 +1525,7 @@ const complianceEvidence = [
   background: #edf3ff;
   color: #1747b0;
   padding: 1px 4px;
-  border-radius: 3px;
+  border-radius: 4px;
   margin-left: 2px;
 }
 
@@ -1433,7 +1546,7 @@ const complianceEvidence = [
 }
 
 .match-hint {
-  color: #047857;
+  color: #0f7354;
   display: flex;
   align-items: center;
   gap: 4px;
@@ -1489,7 +1602,7 @@ const complianceEvidence = [
 
 .tile-text span {
   font-size: 11px;
-  color: #64748b;
+  color: #5b6a7c;
 }
 
 .tile-chip {
@@ -1499,8 +1612,8 @@ const complianceEvidence = [
   border-radius: 4px;
 }
 
-.tile-chip.success { background: #ecfdf5; color: #047857; }
-.tile-chip.warn { background: #fffbeb; color: #b45309; }
+.tile-chip.success { background: #eaf7f1; color: #0f7354; }
+.tile-chip.warn { background: #fffbeb; color: #a05c10; }
 
 /* 结账模式 */
 .closing-sandbox {
@@ -1515,13 +1628,13 @@ const complianceEvidence = [
   gap: 8px;
   padding: 7px 10px;
   border: 1px solid #e2e8f0;
-  border-radius: 6px;
+  border-radius: 4px;
   font-size: 12px;
 }
 
 .close-step-row.done {
-  color: #047857;
-  background: #f0fdf4;
+  color: #0f7354;
+  background: #eaf7f1;
 }
 
 .close-step-row.current {
@@ -1537,7 +1650,7 @@ const complianceEvidence = [
 
 .step-status {
   font-size: 11px;
-  color: #64748b;
+  color: #5b6a7c;
 }
 
 .step-status.highlight {
@@ -1563,7 +1676,7 @@ const complianceEvidence = [
   gap: 4px;
 }
 
-.text-emerald { color: #059669; }
+.text-emerald { color: #0f7354; }
 
 /* ── 通用 Section (幻灯片 Slide 单元) ── */
 .section {
@@ -1610,7 +1723,7 @@ const complianceEvidence = [
 .section-subtitle {
   margin: 0;
   font-size: 15px;
-  color: #64748b;
+  color: #5b6a7c;
 }
 
 /* ── 3. 四大核心支柱 (Four Pillars) ── */
@@ -1627,7 +1740,7 @@ const complianceEvidence = [
 .pillar-card {
   background: #ffffff;
   border: 1px solid #e2e8f0;
-  border-radius: 16px;
+  border-radius: 12px;
   padding: 24px 20px;
   display: flex;
   flex-direction: column;
@@ -1656,7 +1769,7 @@ const complianceEvidence = [
 .pillar-icon-box {
   width: 44px;
   height: 44px;
-  border-radius: 11px;
+  border-radius: 12px;
   background: #edf3ff;
   color: #1747b0;
   display: flex;
@@ -1675,7 +1788,7 @@ const complianceEvidence = [
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 13px;
   font-weight: 800;
-  color: #94a3b8;
+  color: #5f6e80;
 }
 
 .pillar-title {
@@ -1705,7 +1818,7 @@ const complianceEvidence = [
   background: #f8fafc;
   border: 1px solid #e2e8f0;
   padding: 6px 10px;
-  border-radius: 6px;
+  border-radius: 4px;
   color: #334155;
   font-weight: 500;
   display: flex;
@@ -1714,7 +1827,7 @@ const complianceEvidence = [
 }
 
 .pillar-chip i {
-  color: #059669;
+  color: #0f7354;
   font-size: 14px;
 }
 
@@ -1740,7 +1853,7 @@ const complianceEvidence = [
   gap: 8px;
   background: #f1f5f9;
   padding: 6px;
-  border-radius: 14px;
+  border-radius: 12px;
   border: 1px solid #e2e8f0;
   max-width: 860px;
   margin: 0 auto 32px;
@@ -1753,10 +1866,10 @@ const complianceEvidence = [
   padding: 10px 18px;
   background: transparent;
   border: none;
-  border-radius: 10px;
+  border-radius: 8px;
   font-size: 13.5px;
   font-weight: 600;
-  color: #64748b;
+  color: #5b6a7c;
   cursor: pointer;
   transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
   position: relative;
@@ -1837,16 +1950,60 @@ const complianceEvidence = [
 }
 
 .stage-bullet i {
-  color: #059669;
+  color: #0f7354;
   font-size: 16px;
   font-weight: bold;
+}
+
+/* MCP 展台的行动入口：把「演示」接到「接入指南」与「签发令牌」 */
+.stage-cta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 22px;
+}
+
+.stage-cta-primary,
+.stage-cta-ghost {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 8px 15px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.18s, color 0.18s, border-color 0.18s;
+}
+
+.stage-cta-primary {
+  background: #1747b0;
+  color: #ffffff;
+  border: 1px solid #1747b0;
+}
+
+.stage-cta-primary:hover {
+  background: #2b66e2;
+  border-color: #2b66e2;
+}
+
+.stage-cta-ghost {
+  background: #ffffff;
+  color: #182230;
+  border: 1px solid #dde3ea;
+}
+
+.stage-cta-ghost:hover {
+  border-color: #1747b0;
+  color: #1747b0;
 }
 
 /* 展台右侧视窗框架 */
 .mockup-window {
   background: #ffffff;
   border: 1px solid #cbd5e1;
-  border-radius: 14px;
+  border-radius: 12px;
   overflow: hidden;
   box-shadow: 0 20px 48px -12px rgba(15, 23, 42, 0.12);
 }
@@ -1879,7 +2036,7 @@ const complianceEvidence = [
 .window-title {
   font-size: 11.5px;
   font-weight: 600;
-  color: #64748b;
+  color: #5b6a7c;
 }
 
 .window-status {
@@ -1908,7 +2065,7 @@ const complianceEvidence = [
   display: flex;
   gap: 12px;
   padding: 12px 14px;
-  border-radius: 10px;
+  border-radius: 8px;
   border: 1px solid #e2e8f0;
   background: #f8fafc;
   transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
@@ -1959,7 +2116,7 @@ const complianceEvidence = [
 .recon-card-main p {
   margin: 0;
   font-size: 12px;
-  color: #64748b;
+  color: #5b6a7c;
 }
 
 .status-pill {
@@ -1973,8 +2130,8 @@ const complianceEvidence = [
 }
 
 .status-pill.green {
-  background: #ecfdf5;
-  color: #059669;
+  background: #eaf7f1;
+  color: #0f7354;
 }
 
 .status-pill.amber {
@@ -1995,12 +2152,12 @@ const complianceEvidence = [
   gap: 12px;
   padding: 12px 14px;
   border: 1px solid #e2e8f0;
-  border-radius: 10px;
+  border-radius: 8px;
   background: #ffffff;
 }
 
 .wizard-step-item.done {
-  background: #f0fdf4;
+  background: #eaf7f1;
   border-color: rgba(5, 150, 105, 0.25);
 }
 
@@ -2024,7 +2181,7 @@ const complianceEvidence = [
 }
 
 .wizard-step-item.done .w-num {
-  background: #059669;
+  background: #0f7354;
   color: #ffffff;
 }
 
@@ -2046,14 +2203,14 @@ const complianceEvidence = [
 
 .w-info span {
   font-size: 11.5px;
-  color: #64748b;
+  color: #5b6a7c;
 }
 
 .w-tag {
   font-size: 11px;
   font-weight: 600;
-  color: #059669;
-  background: #ecfdf5;
+  color: #0f7354;
+  background: #eaf7f1;
   padding: 2px 8px;
   border-radius: 4px;
 }
@@ -2063,7 +2220,7 @@ const complianceEvidence = [
   color: #ffffff;
   border: none;
   padding: 6px 12px;
-  border-radius: 6px;
+  border-radius: 4px;
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
@@ -2080,7 +2237,7 @@ const complianceEvidence = [
 .board-kpi-card {
   background: #f8fafc;
   border: 1px solid #e2e8f0;
-  border-radius: 10px;
+  border-radius: 8px;
   padding: 14px 16px;
   display: flex;
   flex-direction: column;
@@ -2088,7 +2245,7 @@ const complianceEvidence = [
 
 .kpi-label {
   font-size: 12px;
-  color: #64748b;
+  color: #5b6a7c;
   font-weight: 500;
   margin-bottom: 6px;
 }
@@ -2103,7 +2260,7 @@ const complianceEvidence = [
 .kpi-decimal {
   font-size: 14px;
   font-weight: 600;
-  color: #94a3b8;
+  color: #5f6e80;
 }
 
 .kpi-trend {
@@ -2112,7 +2269,7 @@ const complianceEvidence = [
   font-weight: 600;
 }
 
-.kpi-trend.up { color: #059669; }
+.kpi-trend.up { color: #0f7354; }
 .kpi-trend.neutral { color: #475569; }
 .kpi-trend.warning { color: #d97706; }
 
@@ -2142,7 +2299,7 @@ const complianceEvidence = [
 }
 
 .chat-bubble {
-  border-radius: 10px;
+  border-radius: 8px;
   padding: 10px 12px;
 }
 
@@ -2169,6 +2326,23 @@ const complianceEvidence = [
 }
 
 .text-purple { color: #a855f7; }
+
+.mcp-skill-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(168, 85, 247, 0.15);
+  color: #d8b4fe;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  margin: 4px 0;
+}
+
+.mcp-skill-chip code {
+  color: #c084fc;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
 
 .mcp-call-chip {
   display: inline-flex;
@@ -2214,7 +2388,7 @@ const complianceEvidence = [
   gap: 6px;
   background: rgba(16, 185, 129, 0.1);
   border: 1px solid rgba(16, 185, 129, 0.2);
-  border-radius: 6px;
+  border-radius: 4px;
   padding: 8px 10px;
   font-size: 11px;
   color: #cbd5e1;
@@ -2254,7 +2428,7 @@ const complianceEvidence = [
 .compare-card {
   background: #ffffff;
   border: 1px solid #e2e8f0;
-  border-radius: 14px;
+  border-radius: 12px;
   padding: 20px 18px;
   display: flex;
   flex-direction: column;
@@ -2298,7 +2472,7 @@ const complianceEvidence = [
 .solo-solution {
   background: #f8fbff;
   border: 1.5px solid #1747b0;
-  border-radius: 9px;
+  border-radius: 8px;
   padding: 10px 12px;
   margin-bottom: 14px;
   box-shadow: 0 2px 8px rgba(23, 71, 176, 0.08);
@@ -2335,19 +2509,200 @@ const complianceEvidence = [
   gap: 2px;
   padding: 6px 8px;
   background: #f8fafc;
-  border-radius: 6px;
+  border-radius: 4px;
 }
 
 .legacy-tag {
   font-size: 10.5px;
-  color: #94a3b8;
+  color: #5f6e80;
   font-weight: 600;
 }
 
 .legacy-desc {
   font-size: 11.5px;
-  color: #64748b;
+  color: #5b6a7c;
   line-height: 1.35;
+}
+
+/* ── 账本迁移：导入 / 导出双向互通 ── */
+.section-migrate {
+  background: #ffffff;
+  border-top: 1px solid #e2e8f0;
+}
+
+.migrate-grid {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  gap: 20px;
+  align-items: stretch;
+}
+
+.migrate-card {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 26px 24px;
+  display: flex;
+  flex-direction: column;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.migrate-card:hover {
+  transform: translateY(-3px);
+  border-color: rgba(23, 71, 176, 0.3);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 1),
+    0 16px 32px -8px rgba(23, 71, 176, 0.12);
+}
+
+.migrate-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  margin-bottom: 18px;
+}
+
+.migrate-icon {
+  width: 44px;
+  height: 44px;
+  flex-shrink: 0;
+  border-radius: 12px;
+  background: #edf3ff;
+  color: #1747b0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  box-shadow: 0 2px 8px rgba(23, 71, 176, 0.1);
+}
+
+.migrate-out .migrate-icon {
+  background: #eaf7f1;
+  color: #0f7354;
+  box-shadow: 0 2px 8px rgba(5, 150, 105, 0.12);
+}
+
+.migrate-title {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 800;
+  color: #0f172a;
+  letter-spacing: -0.2px;
+}
+
+.migrate-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.migrate-list li {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #475569;
+}
+
+.migrate-list li i {
+  flex-shrink: 0;
+  margin-top: 3px;
+  font-size: 14px;
+  color: #1747b0;
+}
+
+.migrate-out .migrate-list li i {
+  color: #0f7354;
+}
+
+.migrate-list b {
+  color: #0f172a;
+  font-weight: 700;
+}
+
+.migrate-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: auto;
+  padding-top: 18px;
+}
+
+.migrate-tag {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: #334155;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 4px;
+  padding: 4px 9px;
+}
+
+.migrate-bridge {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 56px;
+}
+
+.bridge-icon {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: #edf3ff;
+  border: 1px solid rgba(23, 71, 176, 0.2);
+  color: #1747b0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 19px;
+}
+
+.bridge-label {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  color: #5f6e80;
+  white-space: nowrap;
+}
+
+.migrate-promises {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+  margin-top: 26px;
+}
+
+.promise-item {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 13px 16px;
+  background: #f0f5ff;
+  border: 1px solid rgba(23, 71, 176, 0.14);
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.promise-item i {
+  flex-shrink: 0;
+  font-size: 15px;
+  color: #1747b0;
+}
+
+.promise-text span {
+  font-size: 11.5px;
+  color: #5b6a7c;
 }
 
 /* ── 典型场景 ── */
@@ -2360,7 +2715,7 @@ const complianceEvidence = [
 .persona-item {
   background: #ffffff;
   border: 1px solid #e2e8f0;
-  border-radius: 14px;
+  border-radius: 12px;
   padding: 20px 18px;
   display: flex;
   flex-direction: column;
@@ -2429,7 +2784,7 @@ const complianceEvidence = [
 
 .p-lbl {
   font-size: 10.5px;
-  color: #64748b;
+  color: #5b6a7c;
   margin-top: 2px;
 }
 
@@ -2448,7 +2803,7 @@ const complianceEvidence = [
 }
 
 .p-tag i {
-  color: #059669;
+  color: #0f7354;
 }
 
 /* ── 合规架构看板与放心报税佐证 ── */
@@ -2471,7 +2826,7 @@ const complianceEvidence = [
 .evidence-card {
   background: #f8fafc;
   border: 1px solid #e2e8f0;
-  border-radius: 16px;
+  border-radius: 12px;
   padding: 32px 26px;
   display: flex;
   flex-direction: column;
@@ -2511,7 +2866,7 @@ const complianceEvidence = [
 .evidence-desc {
   margin: 0 0 20px;
   font-size: 13.5px;
-  color: #64748b;
+  color: #5b6a7c;
   line-height: 1.65;
   flex: 1;
 }
@@ -2530,7 +2885,7 @@ const complianceEvidence = [
   gap: 6px;
   font-size: 12px;
   font-weight: 600;
-  color: #047857;
+  color: #0f7354;
 }
 
 .evidence-point-tag i {
@@ -2595,7 +2950,7 @@ const complianceEvidence = [
 .cta-sub {
   margin: 0 0 32px;
   font-size: 16px;
-  color: #64748b;
+  color: #5b6a7c;
   line-height: 1.6;
 }
 
@@ -2633,7 +2988,7 @@ const complianceEvidence = [
 .footer-logo {
   width: 32px;
   height: 32px;
-  border-radius: 7px;
+  border-radius: 8px;
 }
 
 .footer-brand-info b {
@@ -2645,7 +3000,7 @@ const complianceEvidence = [
 .footer-brand-info p {
   margin: 2px 0 0;
   font-size: 11.5px;
-  color: #64748b;
+  color: #5b6a7c;
 }
 
 .footer-nav {
@@ -2672,15 +3027,36 @@ const complianceEvidence = [
   align-items: center;
   justify-content: space-between;
   font-size: 11.5px;
-  color: #94a3b8;
+  color: #5f6e80;
 }
 
 .footer-sub a {
-  color: #94a3b8;
+  color: #5f6e80;
   text-decoration: none;
 }
 
+.footer-filings {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
 /* ── 响应式适配 ── */
+/* 中窄屏：收紧导航间距并隐藏副标题，避免链接区被挤压 */
+@media (max-width: 1200px) {
+  .nav-inner {
+    gap: 16px;
+  }
+
+  .nav-links {
+    gap: 14px;
+  }
+
+  .nav-sub {
+    display: none;
+  }
+}
+
 @media (max-width: 1024px) {
   .nav-inner {
     padding: 0 16px;
@@ -2743,6 +3119,20 @@ const complianceEvidence = [
   .landing-slide-end {
     min-height: auto;
     padding: 56px 0;
+  }
+
+  .migrate-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .migrate-bridge {
+    width: auto;
+    flex-direction: row;
+    gap: 10px;
+  }
+
+  .migrate-promises {
+    grid-template-columns: 1fr;
   }
 }
 

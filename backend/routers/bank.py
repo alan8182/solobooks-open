@@ -1,6 +1,9 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """银行对账路由"""
-from datetime import datetime, timezone
-from typing import Any, Dict, List
+from datetime import date, datetime, timezone
+from typing import Any, Dict, List, Optional
 import json
 import csv
 import io
@@ -17,9 +20,12 @@ from services.bank_service import (
     classify_single_statement, _direction_matches_statement,
     build_group_reconciliation_check, ensure_bank_schema, get_reconciliation_health,
     _bank_effect_from_voucher, repair_matched_statement_effect,
-    import_statements_core,
-    get_wechat_settlement_candidates,
+    import_statements_core, delete_statements,
+    get_wechat_settlement_candidates, identify_statement_fast_rule, safe_money,
+    is_salary_payment_description, is_payroll_liability_description,
+    find_duplicate_bank_entries, save_company_category_rule,
 )
+import services.salary_service as salary_service
 from services.bank_llm_prompts import BANK_COLUMN_MAPPING_PROMPT
 from services.llm import safe_chat_text_json
 from services.audit_service import log_action
@@ -34,9 +40,31 @@ from services.accounting_core_service import (
 router = APIRouter(prefix="/api/bank", tags=["bank"], dependencies=[Depends(require_auth)])
 
 
+def _looks_like_salary_payment(entry_data: Dict[str, Any], description: str) -> bool:
+    """工资流水不得在银行页直接记费用，否则与工资计提重复。"""
+    if is_salary_payment_description(description):
+        return True
+    category = str(entry_data.get("category") or "")
+    if category in {"工资", "工资支出", "工资发放", "职工薪酬", "薪资", "薪酬"}:
+        return True
+    account_code = str(entry_data.get("accountCode") or "")
+    return account_code in {"5602001", "221101"}
+
+
+def _looks_like_payroll_liability(entry_data: Dict[str, Any], description: str) -> bool:
+    """社保/公积金流水必须走工资模块核销，不能直接记费用导致重复列支。"""
+    if is_payroll_liability_description(description):
+        return True
+    category = str(entry_data.get("category") or "")
+    if category in {"社保公积金", "社保", "公积金", "住房公积金"}:
+        return True
+    return str(entry_data.get("accountCode") or "") in {"221102", "221104"}
+
+
 class ImportRequest(BaseModel):
     csv_content: str
     statement_id: str = ""
+    force_duplicates: bool = False
 
 
 @router.post("/import")
@@ -63,6 +91,7 @@ async def import_bank(
         rows=list(csv.DictReader(io.StringIO(req.csv_content))),
         statement_id=req.statement_id,
         request_id=request.headers.get("X-Request-ID") or str(uuid4()),
+        force_duplicates=req.force_duplicates,
     )
     await save_idempotent_response(
         session, company_id=ctx.company_id, key=idempotency_key,
@@ -129,6 +158,8 @@ async def list_statement_ids(ctx: AuthContext = Depends(require_auth)):
 class ImportJsonRequest(BaseModel):
     rows: List[Dict[str, Any]]
     statement_id: str = ""
+    # 同日+同摘要+同金额可能是真实两笔交易，默认拦截并返回明细，确认后才强制导入
+    force_duplicates: bool = False
 
 
 @router.post("/import-json")
@@ -155,6 +186,7 @@ async def import_bank_json(
         rows=req.rows,
         statement_id=req.statement_id,
         request_id=request.headers.get("X-Request-ID") or str(uuid4()),
+        force_duplicates=req.force_duplicates,
     )
     await save_idempotent_response(
         session, company_id=ctx.company_id, key=idempotency_key,
@@ -205,6 +237,136 @@ class ConfirmSuggestionRequest(BaseModel):
     matched_entry_ids: List[str] = Field(default_factory=list)
     new_entry: Dict[str, Any] = {}
     auto_post: bool = False
+    # 流水所属期间已关账时，用户在前端确认「补记到 X 月」后才带上
+    allowBackfill: bool = False
+    backfillReason: Optional[str] = None
+    # 用户确认"确实是两笔独立付款"时跳过防重复检查
+    skipDuplicateCheck: bool = False
+    # 记住此规则：后续同对方户名/摘要特征自动归入当前科目
+    rememberRule: bool = False
+
+
+class BatchConfirmRulesRequest(BaseModel):
+    statement_ids: Optional[List[str]] = None
+    month: Optional[str] = None
+    allowBackfill: bool = False
+    backfillReason: Optional[str] = None
+
+
+@router.post("/batch-confirm-rules")
+async def batch_confirm_rules(
+    req: BatchConfirmRulesRequest,
+    ctx: AuthContext = Depends(require_auth),
+    request: Request = None,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """批量确认高置信度规则流水（平台提现、结息、实名认证等）"""
+    from services.database import get_conn
+    from services.entry_service import save_entry
+
+    await ensure_bank_schema()
+    conn = await get_conn()
+    try:
+        sql = (
+            "SELECT * FROM bank_statements WHERE company_id = ? "
+            "AND (matched_entry_id IS NULL OR matched_entry_id = '') "
+        )
+        params: list[Any] = [ctx.company_id]
+        if req.statement_ids:
+            placeholders = ",".join("?" for _ in req.statement_ids)
+            sql += f"AND id IN ({placeholders}) "
+            params.extend(req.statement_ids)
+        elif req.month:
+            start = date.fromisoformat(f"{req.month}-01")
+            end = (start.replace(day=28) + timedelta(days=4)).replace(day=1)
+            sql += "AND transaction_date >= ? AND transaction_date < ? "
+            params.extend([start.isoformat(), end.isoformat()])
+        sql += "ORDER BY transaction_date ASC"
+
+        cursor = await conn.execute(sql, tuple(params))
+        statements = [dict(r) for r in await cursor.fetchall()]
+    finally:
+        await conn.close()
+
+    if not statements:
+        return {"status": "ok", "confirmedCount": 0, "confirmedIds": []}
+
+    confirmed_ids = []
+    now = datetime.now(timezone.utc).isoformat()
+
+    for stmt in statements:
+        fast_rule = identify_statement_fast_rule(stmt)
+        if not fast_rule or fast_rule.get("confidence", 0) < 0.95:
+            continue
+
+        stmt_id = stmt["id"]
+        stmt_amount = safe_money(stmt["amount"])
+        entry_id = f"bank-{stmt_id}"
+        entry_data = {
+            "id": entry_id,
+            "title": fast_rule["title"],
+            "category": fast_rule["category"],
+            "amount": abs(stmt_amount),
+            "direction": "income" if stmt_amount > ZERO else "expense",
+            "occurDate": str(stmt["transaction_date"] or "")[:10],
+            "paymentDate": str(stmt["transaction_date"] or "")[:10],
+            "billingStatus": "reconciled",
+            "source": "bank_statement_rule",
+            "reconciliationType": fast_rule.get("rule", "rule_auto"),
+            "linkedStatementId": stmt_id,
+            "payer": "company_account",
+        }
+
+        try:
+            res = await save_entry(
+                entry_data,
+                user_id=ctx.user_id,
+                company_id=ctx.company_id,
+                confirm=True,
+                allow_backfill=req.allowBackfill,
+                backfill_reason=req.backfillReason,
+            )
+            saved_id = res.get("id", entry_id)
+
+            conn = await get_conn()
+            try:
+                await conn.execute(
+                    "UPDATE bank_statements SET matched_entry_id = ? WHERE id = ? AND company_id = ?",
+                    (saved_id, stmt_id, ctx.company_id),
+                )
+                await conn.execute(
+                    "INSERT OR IGNORE INTO bank_statement_matches "
+                    "(statement_id, company_id, entry_id, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (stmt_id, ctx.company_id, saved_id, now),
+                )
+                await conn.commit()
+            finally:
+                await conn.close()
+
+            if isinstance(session, AsyncSession):
+                req_id = (request.headers.get("X-Request-ID") if request else None) or str(uuid4())
+                await sync_bank_reconciliation(
+                    session,
+                    company_id=ctx.company_id,
+                    user_id=ctx.user_id,
+                    statement_id=stmt_id,
+                    entry_ids=[saved_id],
+                    transaction_date=stmt["transaction_date"],
+                    description=str(stmt["description"] or ""),
+                    signed_amount=stmt["amount"],
+                    request_id=req_id,
+                )
+            confirmed_ids.append(stmt_id)
+        except Exception:
+            logger.exception("batch_confirm_rules failed for statement %s", stmt_id)
+            continue
+
+    return {
+        "status": "ok",
+        "confirmedCount": len(confirmed_ids),
+        "confirmedIds": confirmed_ids,
+    }
 
 
 @router.post("/confirm-suggestion")
@@ -282,7 +444,9 @@ async def confirm_suggestion(
                     company_id=ctx.company_id, user_id=ctx.user_id, statement_id=req.statement_id,
                     entry_ids=requested_ids,
                     request_id=(request.headers.get("X-Request-ID") if request else None) or str(uuid4()),
-                    auto_post=bool(req.auto_post)))
+                    auto_post=bool(req.auto_post),
+                    allow_backfill=bool(req.allowBackfill),
+                    backfill_reason=req.backfillReason))
 
         conn = await get_conn()
         try:
@@ -583,16 +747,54 @@ async def confirm_suggestion(
         finally:
             await conn.close()
 
-        settlement_candidates = await get_wechat_settlement_candidates(ctx.company_id, dict(stmt))
-        if settlement_candidates:
+        if money(stmt["amount"] or ZERO) < ZERO and _looks_like_payroll_liability(entry_data, str(stmt["description"] or "")):
+            liability = await salary_service.list_payroll_liability_payment_suggestions(ctx.company_id)
             raise HTTPException(status_code=409, detail={
-                "code": "EXISTING_WECHAT_ENTRIES",
-                "message": "该微信结算已有收入及手续费账目，请合并核销原账目，不能再次记为收入或支出",
-                "candidateEntryGroups": [[entry["id"] for entry in group] for group in settlement_candidates],
+                "code": "PAYROLL_LIABILITY_REQUIRES_PAYROLL",
+                "message": "识别为社保/公积金缴纳，不能在银行页直接记费用。请到工资模块按流水确认缴纳，系统会生成应付职工薪酬核销凭证。",
+                "suggestions": liability.get("suggestions", []),
             })
+
+        if money(stmt["amount"] or ZERO) < ZERO and _looks_like_salary_payment(entry_data, str(stmt["description"] or "")):
+            payroll = await salary_service.list_salary_payment_suggestions(ctx.company_id)
+            raise HTTPException(status_code=409, detail={
+                "code": "SALARY_REQUIRES_PAYROLL",
+                "message": "识别为工资发放，不能在银行页直接记费用。请到工资模块先计提，再按流水确认发放，系统会生成应付职工薪酬核销凭证。",
+                "suggestions": payroll.get("suggestions", []),
+            })
+
+        if entry_data.get("category") not in ("微信支付结算", "支付宝结算", "平台提现结算"):
+            settlement_candidates = await get_wechat_settlement_candidates(ctx.company_id, dict(stmt))
+            if settlement_candidates:
+                raise HTTPException(status_code=409, detail={
+                    "code": "EXISTING_WECHAT_ENTRIES",
+                    "message": "该微信结算已有收入及手续费账目，请合并核销原账目，不能再次记为收入或支出",
+                    "candidateEntryGroups": [[entry["id"] for entry in group] for group in settlement_candidates],
+                })
+
+        # 防重复记账：账上已有等额同向、尚未对账的银行凭证时，应直接配对而不是再记一笔
+        if isinstance(session, AsyncSession) and not req.skipDuplicateCheck:
+            try:
+                stmt_day = date.fromisoformat(str(stmt["transaction_date"])[:10])
+            except (TypeError, ValueError):
+                stmt_day = None
+            if stmt_day is not None:
+                duplicates = await find_duplicate_bank_entries(
+                    session, ctx.company_id, stmt_day, money(stmt["amount"] or ZERO)
+                )
+                if duplicates:
+                    raise HTTPException(status_code=409, detail={
+                        "code": "EXISTING_ENTRY_MATCH",
+                        "message": "账上已有一笔金额相同的凭证，直接配对即可，避免重复记账",
+                        "candidateEntryIds": [item["id"] for item in duplicates],
+                        "entries": duplicates,
+                    })
 
         stmt_amount = money(stmt["amount"] or ZERO)
         direction = str(entry_data.get("direction") or "")
+        if entry_data.get("category") in ("微信支付结算", "支付宝结算", "平台提现结算") and not direction:
+            direction = "income" if stmt_amount > ZERO else "expense"
+            entry_data["direction"] = direction
         if not _direction_matches_statement(stmt_amount, direction):
             if stmt_amount > 0:
                 raise HTTPException(status_code=400, detail="收款流水只能记为收入或股东投入/往来")
@@ -613,7 +815,10 @@ async def confirm_suggestion(
             else:
                 entry_data["amount"] = raw_amount
 
-        await save_entry(entry_data, user_id=ctx.user_id, company_id=ctx.company_id)
+        await save_entry(
+            entry_data, user_id=ctx.user_id, company_id=ctx.company_id,
+            allow_backfill=bool(req.allowBackfill), backfill_reason=req.backfillReason,
+        )
         if isinstance(session, AsyncSession):
             await assert_bank_reconciliable(session, company_id=ctx.company_id, entry_ids=[entry_id])
 
@@ -637,7 +842,18 @@ async def confirm_suggestion(
         await log_action(ctx.company_id, ctx.user_id, "create", "entry", entry_id,
                          {"source": "bank_ai_suggest", "title": entry_data.get("title", "")})
         await sync_core(stmt, [entry_id])
-        return await respond({"status": "created", "entryId": entry_id})
+        saved_rule_pattern = None
+        if req.rememberRule:
+            saved_rule_pattern = await save_company_category_rule(
+                ctx.company_id,
+                str(stmt["description"] or ""),
+                stmt["amount"],
+                str(entry_data.get("category") or ""),
+            )
+        response_data: Dict[str, Any] = {"status": "created", "entryId": entry_id}
+        if saved_rule_pattern:
+            response_data["savedRulePattern"] = saved_rule_pattern
+        return await respond(response_data)
 
     return await respond({"status": "error", "message": "无效的请求"})
 
@@ -659,21 +875,20 @@ async def classify_statement(req: ClassifyStatementRequest, ctx: AuthContext = D
 @router.delete("/statements/{id}")
 async def delete_statement(id: str, ctx: AuthContext = Depends(require_auth)):
     """删除单笔银行流水"""
-    from services.database import get_conn
-    conn = await get_conn()
-    try:
-        cursor = await conn.execute(
-            "SELECT 1 FROM bank_statements WHERE id = ? AND company_id = ?",
-            (id, ctx.company_id)
-        )
-        if not await cursor.fetchone():
-            raise HTTPException(status_code=404, detail="流水不存在")
-            
-        await conn.execute(
-            "DELETE FROM bank_statements WHERE id = ? AND company_id = ?",
-            (id, ctx.company_id)
-        )
-        await conn.commit()
-    finally:
-        await conn.close()
+    await ensure_bank_schema()
+    deleted = await delete_statements(ctx.company_id, [id], user_id=ctx.user_id)
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="流水不存在")
     return {"status": "success", "message": "流水删除成功"}
+
+
+class BatchDeleteRequest(BaseModel):
+    ids: List[str] = Field(..., min_length=1, max_length=1000)
+
+
+@router.post("/statements/batch-delete")
+async def batch_delete_statements(req: BatchDeleteRequest, ctx: AuthContext = Depends(require_auth)):
+    """批量删除银行流水，并同步解除匹配关系、清理来源事实"""
+    await ensure_bank_schema()
+    deleted = await delete_statements(ctx.company_id, req.ids, user_id=ctx.user_id)
+    return {"status": "success", "deleted": deleted, "message": f"已删除 {deleted} 条银行流水"}

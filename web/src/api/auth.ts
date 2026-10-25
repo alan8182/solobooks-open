@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+ * Licensed under the SoloBooks License v2.0.
+ */
+
 import apiClient from './client'
 import type {
   AuthResponse,
@@ -58,6 +63,14 @@ export function createCompany(data: CreateCompanyRequest): Promise<CompanyInfo> 
 
 export function updateCompany(companyId: string, data: Partial<CreateCompanyRequest>): Promise<CompanyInfo> {
   return apiClient.put(`/api/auth/companies/${companyId}`, data)
+}
+
+/** 永久删除主体及其全部业务数据（不可恢复，需精确输入主体名称）。 */
+export function deleteCompany(
+  companyId: string,
+  confirmName: string,
+): Promise<{ deleted: boolean; companyId: string; companyName: string }> {
+  return apiClient.delete(`/api/auth/companies/${companyId}`, { data: { confirmName } })
 }
 
 export function requestStepUp(data: {

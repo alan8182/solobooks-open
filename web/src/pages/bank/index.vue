@@ -1,3 +1,4 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { computed, ref, h, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
@@ -9,8 +10,10 @@ import apiClient from '@/api/client'
 import { getRdExpenseTypes, getRdProjects } from '@/api/rd'
 import type { RdExpenseTypeOption, RdProject } from '@/api/types'
 import { useDeleteConfirm } from '@/composables/useDeleteConfirm'
+import { usePageRefresh } from '@/composables/usePageRefresh'
 import { buildBankStatementDescription } from '@/utils/bankStatementDescription'
 import * as XLSX from 'xlsx'
+import { SoloDrawer, SoloEmpty, SoloStatusBadge } from '@/components/ui'
 
 const router = useRouter()
 const message = useMessage()
@@ -32,6 +35,8 @@ const amountDirection = ref<'all' | 'income' | 'expense'>('all')
 const matchStatus = ref<'all' | 'matched' | 'unmatched'>('all')
 const tablePage = ref(1)
 const tablePageSize = ref(20)
+const checkedRowKeys = ref<Array<string | number>>([])
+const batchDeleting = ref(false)
 const repairingEffects = ref<Record<string, boolean>>({})
 
 const balanceSummary = computed(() => diffReport.value?.balance_reconciliation || null)
@@ -47,14 +52,17 @@ const reconciliationStatusText = computed(() => {
   if (unmatchedCount.value > 0) return `仍有 ${unmatchedCount.value} 项未匹配`
   return '本期仍有待核对项目'
 })
-const monthOptions = computed(() => Array.from(new Set(
-  statements.value
+const monthOptions = computed(() => {
+  const months = new Set(statements.value
     .map(item => String(item.transaction_date || '').slice(0, 7))
-    .filter(Boolean),
-)).sort().reverse().map(value => {
-  const [year, monthNumber] = value.split('-')
-  return { label: `${year}年${Number(monthNumber)}月`, value }
-}))
+    .filter(Boolean))
+  // 当前月永远可选：即使本月还没有流水，也能回到本月查看（选项不随数据为空而消失）
+  months.add(new Date().toISOString().slice(0, 7))
+  return [...months].sort().reverse().map(value => {
+    const [year, monthNumber] = value.split('-')
+    return { label: `${year}年${Number(monthNumber)}月`, value }
+  })
+})
 
 function formatMoney(value: unknown) {
   return `¥${Number(value || 0).toLocaleString('zh-CN', {
@@ -124,6 +132,7 @@ function resetStatementFilters() {
 
 watch([searchKeyword, dateRange, amountDirection, matchStatus], () => {
   tablePage.value = 1
+  checkedRowKeys.value = []
 })
 
 // AI suggest
@@ -170,6 +179,7 @@ const columnMapping = ref<Record<string, string>>({})
 
 
 const statementColumns = [
+  { type: 'selection' as const },
   {
     title: '日期', key: 'transaction_date', width: 110,
     sorter: (a: any, b: any) => String(a.transaction_date || '').localeCompare(String(b.transaction_date || '')),
@@ -188,16 +198,20 @@ const statementColumns = [
   },
   {
     title: '匹配状态', key: 'matched_entry_id', width: 100,
+    // 38 行里通常 38 个「已匹配」。正常态只用灰点 + 灰字，把颜色留给「未匹配」——
+    // 这才是这张表真正需要眼睛停下来的地方。
     render: (row: any) => row.matched_entry_id
-      ? h(NTag, { size: 'tiny', type: 'success', bordered: false }, () => '已匹配')
-      : h(NTag, { size: 'tiny', type: 'warning', bordered: false }, () => '未匹配'),
+      ? h(SoloStatusBadge, { tone: 'neutral', plain: true }, () => '已匹配')
+      : h(SoloStatusBadge, { tone: 'warning', plain: true }, () => '未匹配'),
   },
   {
     title: '操作', key: 'action', width: 90, align: 'center' as const,
+    // 删除是这张表里使用频率最低、后果最重的动作，不该是整页唯一的红色。
+    // 默认灰字静默，鼠标停到这一行才转红——触屏没有 hover，所以不做成 opacity:0。
     render: (row: any) => h(NButton, {
       size: 'tiny',
-      type: 'error',
-      ghost: true,
+      quaternary: true,
+      class: 'row-delete',
       onClick: () => confirmDelete({
         content: `确定删除 ${String(row.transaction_date || '').slice(0, 10)} 的这条银行流水吗？此操作不可撤销。`,
         onConfirm: () => handleDeleteStatement(row.id),
@@ -662,10 +676,36 @@ async function handleDeleteStatement(id: string) {
   try {
     await apiClient.delete(`/api/bank/statements/${id}`)
     message.success('流水删除成功！')
+    checkedRowKeys.value = checkedRowKeys.value.filter(key => key !== id)
     await loadStatements()
   } catch (err) {
     message.error('删除流水失败，请重试')
   } finally {
+    loading.value = false
+  }
+}
+
+function confirmBatchDeleteStatements() {
+  const ids = checkedRowKeys.value.map(String)
+  if (ids.length === 0) return
+  confirmDelete({
+    content: `确定删除选中的 ${ids.length} 条银行流水吗？已建立的匹配关系会一并解除，此操作不可撤销。`,
+    onConfirm: () => handleBatchDeleteStatements(ids),
+  })
+}
+
+async function handleBatchDeleteStatements(ids: string[]) {
+  batchDeleting.value = true
+  loading.value = true
+  try {
+    const result: any = await apiClient.post('/api/bank/statements/batch-delete', { ids })
+    message.success(result.message || `已删除 ${result.deleted} 条流水`)
+    checkedRowKeys.value = []
+    await loadStatements()
+  } catch (err) {
+    message.error('批量删除失败，请重试')
+  } finally {
+    batchDeleting.value = false
     loading.value = false
   }
 }
@@ -680,16 +720,14 @@ function openExcelImport() {
 }
 
 onMounted(() => Promise.all([loadStatements(), loadRdOptions()]))
+// 切回标签时静默重拉流水：凭证那边冲销凭证会改动匹配状态
+usePageRefresh(loadStatements)
 </script>
 
 <template>
   <div class="bank-page">
     <div class="page-header">
       <div class="header-left">
-        <NButton text class="back-btn" @click="router.push('/mine')">
-          <template #icon><i class="ri-arrow-left-line" /></template>
-          返回
-        </NButton>
         <div class="title-section">
           <h2>银行对账</h2>
           <p class="subtitle">核对银行流水并匹配系统记账凭证，所有匹配都需手动确认</p>
@@ -768,7 +806,21 @@ onMounted(() => Promise.all([loadStatements(), loadRdOptions()]))
             </NButton>
           </div>
         </template>
-        <div v-else class="reconciliation-empty">该月份暂无银行流水</div>
+        <SoloEmpty
+          v-else
+          title="这个月还没有银行流水"
+          description="上传网银导出的 CSV 或 Excel，系统会自动配对已记账的收支。"
+          icon="ri-bank-line"
+        >
+          <template #action>
+            <div class="empty-actions">
+              <NButton type="primary" size="small" @click="showImportModal = true">
+                导入 CSV
+              </NButton>
+              <NButton size="small" @click="openExcelImport">导入 Excel</NButton>
+            </div>
+          </template>
+        </SoloEmpty>
       </section>
 
       <section
@@ -884,14 +936,27 @@ onMounted(() => Promise.all([loadStatements(), loadRdOptions()]))
           <NButton v-if="hasActiveFilters" quaternary size="small" @click="resetStatementFilters">
             清除筛选
           </NButton>
+          <!-- 批量删除只在真的选了行之后才出现：平时它是个红色按钮，却没有可作用的对象 -->
+          <NButton
+            v-if="checkedRowKeys.length > 0"
+            size="small"
+            type="error"
+            ghost
+            :loading="batchDeleting"
+            @click="confirmBatchDeleteStatements"
+          >
+            删除选中 ({{ checkedRowKeys.length }})
+          </NButton>
         </div>
         <div class="table-result-meta">
-          共 {{ statements.length }} 条，当前显示 {{ filteredStatements.length }} 条
+          共 {{ statements.length }} 条，当前显示 {{ filteredStatements.length }} 条<template v-if="checkedRowKeys.length">，已选 {{ checkedRowKeys.length }} 条</template>
         </div>
         <NDataTable
           :columns="statementColumns"
           :data="filteredStatements"
           :row-key="(row: any) => row.id"
+          :checked-row-keys="checkedRowKeys"
+          @update:checked-row-keys="(keys: Array<string | number>) => checkedRowKeys = keys"
           :bordered="false"
           :single-line="true"
           :pagination="tablePagination"
@@ -901,16 +966,26 @@ onMounted(() => Promise.all([loadStatements(), loadRdOptions()]))
           @update:page-size="tablePageSize = $event; tablePage = 1"
         >
           <template #empty>
-            <div class="table-empty">
-              {{ statements.length === 0 ? '暂无银行流水数据，请先导入文件' : '没有符合当前条件的流水' }}
-            </div>
+            <SoloEmpty
+              variant="hint"
+              :title="statements.length === 0 ? '暂无流水' : '没有符合当前条件的流水'"
+              :description="
+                statements.length === 0
+                  ? '导入后可按月核对；没有匹配的流水会出现在待办里。'
+                  : ''
+              "
+            >
+              <template v-if="statements.length === 0" #action>
+                <NButton size="small" @click="showImportModal = true">导入</NButton>
+              </template>
+            </SoloEmpty>
           </template>
         </NDataTable>
       </NCard>
     </NSpin>
 
     <!-- Matching suggestions panel -->
-    <NModal v-model:show="showAiPanel" title="匹配候选" preset="card" style="width: 780px; max-width: 95vw;">
+    <SoloDrawer v-model:show="showAiPanel" title="流水匹配与候选建议" :width="720">
       <NSpin :show="aiLoading">
         <div v-if="remainingAfterRules > 0" class="ai-next-step">
           <div>
@@ -922,9 +997,16 @@ onMounted(() => Promise.all([loadStatements(), loadRdOptions()]))
             AI 分析剩余流水
           </NButton>
         </div>
-        <div v-if="aiSuggestions.length === 0 && !aiLoading" class="empty-state">
-          <p>{{ remainingAfterRules > 0 ? '规则未找到候选，可继续使用 AI 分析' : '暂无待确认的匹配候选' }}</p>
-        </div>
+        <SoloEmpty
+          v-if="aiSuggestions.length === 0 && !aiLoading"
+          variant="hint"
+          :title="remainingAfterRules > 0 ? '规则未找到候选' : '没有待确认的候选'"
+          :description="
+            remainingAfterRules > 0
+              ? '可继续用 AI 分析剩余流水。'
+              : '规则匹配已覆盖大部分流水，剩下的可让 AI 逐条分析。'
+          "
+        />
         <div v-else class="ai-suggestions">
           <div v-for="s in aiSuggestions" :key="s.statementId" class="ai-suggestion-card">
             <div class="suggestion-header">
@@ -977,7 +1059,7 @@ onMounted(() => Promise.all([loadStatements(), loadRdOptions()]))
           </div>
         </div>
       </NSpin>
-    </NModal>
+    </SoloDrawer>
 
     <NModal v-model:show="showImportModal" title="导入银行流水" preset="card" style="width: 520px;">
       <NForm>
@@ -1058,6 +1140,12 @@ onMounted(() => Promise.all([loadStatements(), loadRdOptions()]))
 </template>
 
 <style scoped>
+/* 行内删除：默认灰、hover 该行才转红。NDataTable 的行由子组件渲染，要穿透才选中 */
+:deep(tr:hover) .row-delete,
+:deep(tr:focus-within) .row-delete {
+  color: var(--solo-expense, #bd3d3d);
+}
+
 .bank-page {
   max-width: 1240px;
   margin: 0 auto;
@@ -1507,5 +1595,10 @@ onMounted(() => Promise.all([loadStatements(), loadRdOptions()]))
     align-items: flex-start;
     flex-direction: column;
   }
+}
+.empty-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 </style>

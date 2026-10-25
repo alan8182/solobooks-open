@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Deterministic small-scale VAT filing assistance for 2026-2027."""
 from __future__ import annotations
 
@@ -8,6 +11,7 @@ from typing import Any, Literal
 
 from core.money import ZERO, money
 from services.tax_filing_export_service import parse_period
+from services.vat_service import VAT_PAYABLE_ACCOUNT
 
 PeriodType = Literal["month", "quarter"]
 
@@ -16,7 +20,7 @@ REDUCED_RATE = Decimal("0.01")
 STATUTORY_RATE = Decimal("0.03")
 MONTH_THRESHOLD = Decimal("100000.00")
 QUARTER_THRESHOLD = Decimal("300000.00")
-VAT_REVENUE_ACCOUNTS = {"6001", "6051"}
+VAT_REVENUE_ACCOUNTS = {"5001", "5051"}
 GOODS_KEYWORDS = ("货物", "商品", "材料", "加工", "修理", "修配")
 
 
@@ -56,6 +60,33 @@ def _revenue_effect(entry: dict[str, Any]) -> Decimal:
     return _d2(credit - debit)
 
 
+def _booked_vat(entry: dict[str, Any]) -> Decimal:
+    """该笔收入已计提的小规模应交增值税额（未做价税分离的历史数据为 0）。"""
+    voucher = _voucher_lines(entry)
+    credit = sum(
+        (_d2(line.get("amount")) for line in voucher.get("credit", [])
+         if str(line.get("accountCode") or "") == VAT_PAYABLE_ACCOUNT),
+        ZERO,
+    )
+    debit = sum(
+        (_d2(line.get("amount")) for line in voucher.get("debit", [])
+         if str(line.get("accountCode") or "") == VAT_PAYABLE_ACCOUNT),
+        ZERO,
+    )
+    return _d2(credit - debit)
+
+
+def _net_sales(entry: dict[str, Any], revenue: Decimal) -> tuple[Decimal, bool]:
+    """返回（不含税销售额, 是否已由凭证完成价税分离）。
+
+    新凭证在收入确认时已拆分，收入科目贷方就是不含税额；
+    历史凭证按含税全额入收入，需要按征收率还原。
+    """
+    if entry.get("vatSeparated") or _booked_vat(entry) > ZERO:
+        return revenue, True
+    return _round_tax(revenue / (Decimal("1") + REDUCED_RATE)), False
+
+
 def _sales_bucket(entry: dict[str, Any]) -> Literal["goods_labor", "services"]:
     explicit = str(entry.get("vatSalesCategory") or "").strip()
     if explicit in {"goods_labor", "services"}:
@@ -77,6 +108,7 @@ def build_small_scale_vat_assist(
     threshold = MONTH_THRESHOLD if period_type == "month" else QUARTER_THRESHOLD
     goods_sales = ZERO
     service_sales = ZERO
+    booked_vat_total = ZERO
     source_items: list[dict[str, Any]] = []
     missing_invoice_count = 0
     inferred_category_count = 0
@@ -88,17 +120,26 @@ def build_small_scale_vat_assist(
         revenue = _revenue_effect(entry)
         if revenue == ZERO:
             continue
+        # 申报表销售额一律是不含税口径
+        net_revenue, separated = _net_sales(entry, revenue)
+        booked_vat_total += _booked_vat(entry)
         bucket = _sales_bucket(entry)
         if not entry.get("vatSalesCategory"):
             inferred_category_count += 1
         invoice_type = str(entry.get("invoiceType") or "").strip()
         invoice_number = str(entry.get("invoiceNumber") or "").strip()
-        if not invoice_type or not invoice_number:
+        billing_status = str(entry.get("billingStatus") or "").strip()
+        # billingStatus 是老板在待办「开票状态确认」里给出的结论（未开票收入/已开票）：
+        # 已有结论的销售不再计入「缺少发票类型或号码」拦截，否则待办处理完、
+        # 申报页仍反复拦截，两处口径脱节（2026-10-25 真实账套反馈）。
+        if billing_status not in {"no_invoice", "issued", "has_invoice"} and (
+            not invoice_type or not invoice_number
+        ):
             missing_invoice_count += 1
         if bucket == "goods_labor":
-            goods_sales += revenue
+            goods_sales += net_revenue
         else:
-            service_sales += revenue
+            service_sales += net_revenue
         source_items.append({
             "entryId": str(entry.get("id") or ""),
             "occurDate": occurred_on.isoformat(),
@@ -106,22 +147,26 @@ def build_small_scale_vat_assist(
             "salesCategory": bucket,
             "invoiceType": invoice_type or "未获取",
             "invoiceNumber": invoice_number,
-            "salesAmount": revenue,
+            "salesAmount": net_revenue,
+            "vatSeparated": separated,
         })
 
     goods_sales = _d2(goods_sales)
     service_sales = _d2(service_sales)
     total_sales = _d2(goods_sales + service_sales)
+    booked_vat_total = _d2(booked_vat_total)
     below_threshold = total_sales < threshold
 
     if below_threshold:
+        # 销售额未达起征点：全额免征。免税额优先取账面已计提的增值税
+        # （新凭证已做价税分离），历史含税凭证退化为按 3% 征收率还原。
         taxable_base = total_sales
         vat_before_relief = _round_tax(taxable_base * STATUTORY_RATE)
         vat_reduction = ZERO
-        vat_exemption = vat_before_relief
+        vat_exemption = booked_vat_total if booked_vat_total > ZERO else vat_before_relief
         vat_payable = ZERO
     else:
-        taxable_base = _round_tax(total_sales / (Decimal("1") + REDUCED_RATE))
+        taxable_base = total_sales
         vat_before_relief = _round_tax(taxable_base * STATUTORY_RATE)
         vat_reduction = _round_tax(taxable_base * (STATUTORY_RATE - REDUCED_RATE))
         vat_exemption = ZERO
@@ -145,8 +190,8 @@ def build_small_scale_vat_assist(
     if total_sales < ZERO:
         blocking_issues.append("本期销售额为负数，请核对跨期退款和红字发票")
 
-    goods_input_sales = goods_sales if below_threshold else _round_tax(goods_sales / (Decimal("1") + REDUCED_RATE))
-    service_input_sales = service_sales if below_threshold else _round_tax(service_sales / (Decimal("1") + REDUCED_RATE))
+    goods_input_sales = goods_sales
+    service_input_sales = service_sales
     exempt_goods_sales = goods_input_sales if below_threshold else ZERO
     exempt_service_sales = service_input_sales if below_threshold else ZERO
 

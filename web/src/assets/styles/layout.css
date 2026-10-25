@@ -1,10 +1,18 @@
 /* Global layout and typography consistency rules */
 
-/* 1. All routing pages inside AppLayout main content have the exact same container layout */
-.content > * {
-  max-width: 1440px !important;
+/* 1. All routing pages inside AppLayout main content have the exact same container layout
+ *
+ *    `:where()` 让这条规则**特异度为 0**，页面自己的容器宽度（.book-page 940、
+ *    .ledger-page 1180、.page-container 680…）才能真正生效。
+ *    之前这里写的是 `max-width: 1440px !important`，把所有页面的宽度声明都吃掉了：
+ *    聚焦型页面被拉成满宽，电子账簿的操作区还被右侧固定导航压住。
+ */
+:where(.content) > * {
+  max-width: 1440px;
   margin: 0 auto !important;
-  padding: 8px 0 56px !important;
+  /* 顶部 28px 原本由 .content 的 padding 提供，现在移到这里：
+     滚动容器的 padding 会让 sticky 元素吸附在 padding 内侧、露出缝隙。 */
+  padding: 28px 0 56px !important;
   width: 100% !important;
   box-sizing: border-box !important;
 }

@@ -1,6 +1,18 @@
+/**
+ * Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+ * Licensed under the SoloBooks License v2.0.
+ */
+
 export interface PostingStatusPresentation {
   label: string
   tagType: 'success' | 'info' | 'warning' | 'default'
+  /**
+   * 列表里的着色口径。过账成功是"正常态"，正常态不该上色——
+   * 一屏 10 行都标绿，等于用颜色重复说 10 遍"没事"，真正待复核的那行就淹了。
+   */
+  tone: 'success' | 'warning' | 'danger' | 'info' | 'neutral'
+  /** 是否需要用户处理（只有它才值得用彩色） */
+  needsAttention: boolean
 }
 
 /**
@@ -10,11 +22,11 @@ export interface PostingStatusPresentation {
 export function postingStatusPresentation(voucherStatus?: string | null): PostingStatusPresentation | null {
   switch (voucherStatus) {
     case 'posted':
-      return { label: '已过账', tagType: 'success' }
+      return { label: '已过账', tagType: 'success', tone: 'neutral', needsAttention: false }
     case 'pending_review':
-      return { label: '待复核', tagType: 'warning' }
+      return { label: '待复核', tagType: 'warning', tone: 'warning', needsAttention: true }
     case 'reversed':
-      return { label: '已冲销', tagType: 'default' }
+      return { label: '已冲销', tagType: 'default', tone: 'neutral', needsAttention: false }
     default:
       return null
   }

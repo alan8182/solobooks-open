@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """MCP 接入 M0 测试：PAT 服务、工具注册、HTTP 鉴权与工具执行一致性。"""
 import asyncio
 import json
@@ -67,6 +70,65 @@ class TestPatTokenService:
         assert not identity.has_scope("write:draft")
         assert identity.token_id == row.id
 
+    async def test_token_for_foreign_company_rejected(self):
+        """错绑令牌（持有人对公司无 owner/成员关系）必须失效——2026-10-20 生产事故回归。
+
+        开发脚本/离线路径曾把测试账号令牌绑到他人公司，读类工具只按 company_id
+        过滤，validate_token 不查成员关系就会跨账号读账本。
+        """
+        from db.models import AuthUser
+        from db.session import session_scope
+        from services.mcp_token_service import issue_token, validate_token, verify_token_alive
+
+        async with session_scope() as session:
+            if await session.get(AuthUser, "mcp_u_foreigner") is None:
+                session.add(AuthUser(user_id="mcp_u_foreigner", current_company_id="c_other", created_at="2026-01-01T00:00:00Z", last_login_at="2026-01-01T00:00:00Z"))
+
+        raw, row = await issue_token(user_id="mcp_u_foreigner", company_id="c1", name="t")
+        assert await validate_token(raw) is None
+        assert await verify_token_alive(row.id) is False
+
+    async def test_company_owner_without_member_row_validates(self):
+        """owner 无成员行时应放行（与 ensure_tenant 自动补建口径一致）。"""
+        from db.models import AuthUser, Company
+        from db.session import session_scope
+        from services.mcp_token_service import issue_token, validate_token
+
+        async with session_scope() as session:
+            if await session.get(AuthUser, "mcp_u_solo_owner") is None:
+                session.add(AuthUser(user_id="mcp_u_solo_owner", current_company_id="c_mcp_solo", created_at="2026-01-01T00:00:00Z", last_login_at="2026-01-01T00:00:00Z"))
+            if await session.get(Company, "c_mcp_solo") is None:
+                session.add(Company(company_id="c_mcp_solo", owner_user_id="mcp_u_solo_owner", created_at="2026-01-01T00:00:00Z", updated_at="2026-01-01T00:00:00Z"))
+
+        raw, _row = await issue_token(user_id="mcp_u_solo_owner", company_id="c_mcp_solo", name="t")
+        identity = await validate_token(raw)
+        assert identity is not None
+        assert identity.context.company_id == "c_mcp_solo"
+
+    async def test_is_company_member_accepts_owner_and_active_member_only(self):
+        from db.models import AuthUser, Company, CompanyMember
+        from db.session import session_scope
+        from services.mcp_token_service import is_company_member
+
+        async with session_scope() as session:
+            if await session.get(AuthUser, "mcp_u_member2") is None:
+                session.add(AuthUser(user_id="mcp_u_member2", current_company_id="c1", created_at="2026-01-01T00:00:00Z", last_login_at="2026-01-01T00:00:00Z"))
+            if await session.get(Company, "c_mcp_membertest") is None:
+                session.add(Company(company_id="c_mcp_membertest", owner_user_id="mcp_u_member2", created_at="2026-01-01T00:00:00Z", updated_at="2026-01-01T00:00:00Z"))
+            member = (
+                await session.execute(
+                    select(CompanyMember).where(
+                        CompanyMember.user_id == "mcp_u_member2", CompanyMember.company_id == "c1"
+                    )
+                )
+            ).scalars().first()
+            if member is None:
+                session.add(CompanyMember(company_id="c1", user_id="mcp_u_member2", role="viewer", status="disabled"))
+
+        # 被 owner 停用的成员不算；自己 own 的公司（无成员行）算
+        assert await is_company_member(user_id="mcp_u_member2", company_id="c1") is False
+        assert await is_company_member(user_id="mcp_u_member2", company_id="c_mcp_membertest") is True
+
     async def test_unknown_token_rejected(self):
         from services.mcp_token_service import validate_token
 
@@ -119,13 +181,15 @@ class TestPatTokenService:
 
 class TestMcpToolRegistration:
     async def test_open_tools_registered(self):
-        """读 + 写草稿全集注册（19 = 内部 20 - 刻意不开放的 update_company_profile）。"""
+        """读 + 写草稿全集注册（24 = 内部 25 - 刻意不开放的 update_company_profile）。"""
         from agent.mcp_server import MCP_READ_TOOLS, MCP_WRITE_TOOLS, mcp
 
         tools = await mcp.list_tools()
         names = {t.name for t in tools}
         assert names == MCP_READ_TOOLS | MCP_WRITE_TOOLS
-        assert len(names) == 19
+        assert len(names) == 24
+        assert "get_advance_balances" in names
+        assert "list_intangible_assets" in names
 
     async def test_company_profile_write_not_exposed(self):
         """画像写入不对 MCP 开放：工具仍在内部层，但 MCP 侧不可见不可调。"""
@@ -216,6 +280,122 @@ class TestToolExecutionParity:
         # 精确等于紧凑序列化：separators 省字符、ensure_ascii=False 保中文不膨胀
         assert text_block.text == json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
+    async def test_list_unmatched_decimal_serialization(self):
+        """list_unmatched 返回含 Decimal 的 differenceSummary，MCP 单载荷序列化不得崩。"""
+        from agent.mcp_server import _mcp_identity, mcp
+        from services.mcp_token_service import issue_token
+
+        await _ensure_user("mcp_u_unmatched")
+        raw, _row = await issue_token(user_id="mcp_u_unmatched", company_id="c1", name="t")
+        identity = await _validate(raw)
+        token = _mcp_identity.set(identity)
+        try:
+            payload = await _call_mcp_tool(mcp, "list_unmatched", {"month": "2026-08"})
+        finally:
+            _mcp_identity.reset(token)
+        assert isinstance(payload, dict)
+        assert payload["month"] == "2026-08"
+        assert "differenceSummary" in payload
+
+    async def test_list_unmatched_month_optional(self):
+        """month 在 schema 与执行两端都必须可选：schema 声明 required 会被
+        严格校验的 MCP 客户端（如 ZCode）在本地拦截，漏传即调用失败。"""
+        import re
+
+        from agent.mcp_server import _mcp_identity, mcp
+        from agent.tools import TOOLS_BY_NAME
+        from services.mcp_token_service import issue_token
+
+        assert "month" not in TOOLS_BY_NAME["list_unmatched"].parameters.get("required", [])
+
+        await _ensure_user("mcp_u_unmatched2")
+        raw, _row = await issue_token(user_id="mcp_u_unmatched2", company_id="c1", name="t")
+        identity = await _validate(raw)
+        token = _mcp_identity.set(identity)
+        try:
+            payload = await _call_mcp_tool(mcp, "list_unmatched", {})
+        finally:
+            _mcp_identity.reset(token)
+        assert isinstance(payload, dict)
+        assert re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", payload["month"])
+        assert "differenceSummary" in payload
+
+
+class TestAdversarialInputValidation:
+    """对抗测试回归（2026-10-25）：schema 服务端强制 + 写入路径业务校验。
+
+    背景：FastMCP 不执行广播的 inputSchema，脏参数（非法月份/枚举/负金额/
+    日历不存在的日期/未知参数）会直接打进 handler——详见 execute_tool 的
+    _enforce_schema 注释。
+    """
+
+    async def _exec(self, name, args):
+        from agent.tools import ToolContext, execute_tool
+
+        return await execute_tool(name, args, ToolContext(user_id="adv_u", company_id="c1"))
+
+    async def test_month_pattern_enforced(self):
+        for bad_month in ("2026-1", "2026-13", "2026-00", "abcd"):
+            with pytest.raises(ValueError, match="month"):
+                await self._exec("get_month_summary", {"month": bad_month})
+        with pytest.raises(ValueError, match="month"):
+            await self._exec("preview_accruals", {"month": "2026-13"})
+
+    async def test_missing_required_is_clean_error(self):
+        with pytest.raises(ValueError, match="缺少必填字段: month"):
+            await self._exec("get_month_summary", {})
+
+    async def test_unknown_argument_ignored(self):
+        result = await self._exec("get_month_summary", {"month": "2026-01", "hack": 1})
+        assert result["month"] == "2026-01"
+
+    async def test_string_type_enforced(self):
+        with pytest.raises(ValueError, match="month 应为字符串"):
+            await self._exec("get_month_summary", {"month": 123})
+
+    async def test_enum_enforced(self):
+        with pytest.raises(ValueError, match="direction"):
+            await self._exec(
+                "propose_voucher",
+                {"direction": "偷钱", "amount": 10, "title": "t", "category": "办公费"},
+            )
+        with pytest.raises(ValueError, match="kind"):
+            await self._exec("get_aging", {"kind": "all"})
+
+    async def test_amount_positive_and_finite(self):
+        for bad_amount in (0, -100, float("inf"), float("nan")):
+            with pytest.raises(ValueError, match="amount"):
+                await self._exec(
+                    "propose_voucher",
+                    {"direction": "expense", "amount": bad_amount, "title": "t", "category": "办公费"},
+                )
+
+    async def test_occur_date_must_be_real_calendar_date(self):
+        with pytest.raises(ValueError, match="真实存在"):
+            await self._exec(
+                "propose_voucher",
+                {"direction": "expense", "amount": 10, "title": "t", "category": "办公费", "occur_date": "2026-02-30"},
+            )
+
+    async def test_batch_item_rejected_atomically(self):
+        with pytest.raises(ValueError, match=r"proposals\[1\]"):
+            await self._exec(
+                "propose_vouchers",
+                {
+                    "proposals": [
+                        {"direction": "expense", "amount": 10, "title": "好", "category": "办公费"},
+                        {"direction": "expense", "amount": -1, "title": "坏", "category": "办公费"},
+                    ]
+                },
+            )
+
+    async def test_valid_draft_still_created(self):
+        result = await self._exec(
+            "propose_voucher",
+            {"direction": "expense", "amount": 12.5, "title": "对抗回归正向", "category": "办公费"},
+        )
+        assert result["status"] == "pending"
+
 
 async def _validate(raw: str):
     from services.mcp_token_service import validate_token
@@ -265,6 +445,17 @@ class TestMcpMountOrder:
 
 class TestMcpHttpAuth:
     """挂载在 /mcp 上的 PAT 中间件鉴权（401 分支）。"""
+
+    def test_unmatched_api_path_is_404_not_mcp_401(self, client):
+        """未知 /api/* 必须回 404，不能落进 MCP 的 401 JSON-RPC。
+
+        MCP 子应用 mount 在根路径当兜底，未命中的 /api/* 会落到它身上。若 PAT 中间件
+        对非 /mcp 路径也返回 401 JSON-RPC，前端 axios 拦截器会把「接口不存在」判成
+        登录失效并跳登录页——新增路由但后端没重启时，用户点进去就被踢下线。
+        """
+        resp = client.get("/api/definitely-not-a-registered-route")
+        assert resp.status_code == 404
+        assert "jsonrpc" not in resp.text
 
     def test_missing_authorization_401(self, client):
         resp = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
@@ -392,10 +583,13 @@ class TestOptimizations:
             _mcp_identity.reset(token)
 
     async def test_rate_bucket_pruning(self):
+        import time
         from collections import deque
         from agent.mcp_server import _check_rate_limit, _rate_buckets
 
-        now = 1000.0
+        # monotonic 在 Windows 上是开机秒数，必须以真实时钟为基准，
+        # 否则刚开机（< 960s）时伪造的过期 bucket 会被当成新鲜数据
+        now = time.monotonic()
         # 塞入 135 个过期 bucket
         for i in range(135):
             _rate_buckets[f"stale_{i}"] = deque([now - 100.0])
@@ -415,6 +609,12 @@ class TestOptimizations:
 
         close_param = TOOLS_BY_NAME["run_close_checks"].parameters["properties"]["month"]
         assert "pattern" in close_param
+
+        preview_param = TOOLS_BY_NAME["preview_accruals"].parameters["properties"]["month"]
+        assert preview_param["description"] == "月份，格式 YYYY-MM"
+
+        report_param = TOOLS_BY_NAME["generate_close_report"].parameters["properties"]["month"]
+        assert report_param["description"] == "月份，格式 YYYY-MM"
 
     async def test_run_close_checks_ttl_cache(self, monkeypatch):
         from agent import tools
@@ -440,3 +640,71 @@ class TestOptimizations:
         assert r2["count"] == 1  # 命中短缓存
         assert calls == 1
 
+
+
+class TestListFixedAssets:
+    """list_fixed_assets：固定资产台账 MCP 工具（P1 WP-B 能力入 MCP）。"""
+
+    async def _seed_assets(self) -> None:
+        from datetime import date
+        from decimal import Decimal
+
+        from db.models import FixedAsset
+        from db.session import session_scope
+
+        await _ensure_user("test_user_001")
+        async with session_scope() as session:
+            existing = (
+                await session.execute(
+                    select(FixedAsset).where(
+                        FixedAsset.company_id == "c1",
+                        FixedAsset.code.in_(["ZC-MCP-1", "ZC-MCP-2"]),
+                    )
+                )
+            ).scalars().all()
+            if existing:
+                return
+            session.add(FixedAsset(
+                company_id="c1", code="ZC-MCP-1", name="MCP 测试笔记本", category="electronics",
+                acquisition_date=date(2026, 1, 15), available_for_use_date=date(2026, 1, 15),
+                original_value=Decimal("12000"), useful_life_months=36, status="active",
+            ))
+            session.add(FixedAsset(
+                company_id="c1", code="ZC-MCP-2", name="MCP 测试相机", category="electronics",
+                acquisition_date=date(2026, 2, 1), available_for_use_date=date(2026, 2, 1),
+                original_value=Decimal("8000"), useful_life_months=36, status="idle",
+            ))
+
+    async def test_registry_and_read_scope(self):
+        from agent.mcp_server import MCP_READ_TOOLS
+        from agent.tools import TOOLS_BY_NAME
+
+        assert "list_fixed_assets" in MCP_READ_TOOLS
+        tool = TOOLS_BY_NAME["list_fixed_assets"]
+        props = tool.parameters["properties"]
+        assert "in_use" in props["status"]["enum"]
+        assert "scrapped" in props["status"]["enum"]
+
+    async def test_projection_and_filters(self):
+        from agent.tools import ToolContext, execute_tool
+
+        await self._seed_assets()
+        ctx = ToolContext(user_id="test_user_001", company_id="c1")
+
+        result = await execute_tool("list_fixed_assets", {"keyword": "MCP 测试"}, ctx)
+        assert result["total"] >= 2
+        assert result["count"] == result["total"]
+        first = result["assets"][0]
+        assert {"id", "code", "name", "status", "originalValue", "netValue", "monthlyDepreciation"} <= set(first)
+        # 投影裁剪：卡片明细字段不进 MCP 载荷
+        assert "residualValue" not in first
+        assert "custodian" not in first
+
+        only = await execute_tool("list_fixed_assets", {"keyword": "ZC-MCP-2"}, ctx)
+        assert only["count"] == 1
+        assert only["assets"][0]["status"] == "idle"
+
+        paged = await execute_tool("list_fixed_assets", {"keyword": "MCP 测试", "page": 1, "page_size": 1}, ctx)
+        assert paged["count"] == 1
+        assert paged["pageSize"] == 1
+        assert paged["total"] >= 2

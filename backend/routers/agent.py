@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Agent 路由：SSE 对话 + 待确认动作审批。"""
 from __future__ import annotations
 
@@ -27,6 +30,8 @@ class AgentChatMessage(BaseModel):
 class AgentChatRequest(BaseModel):
     messages: list[AgentChatMessage]
     conversationId: Optional[str] = None
+    enableThinking: Optional[bool] = False
+    workspaceView: Optional[str] = None
 
 
 class AgentActionRejectRequest(BaseModel):
@@ -34,9 +39,15 @@ class AgentActionRejectRequest(BaseModel):
 
 
 class AgentActionApproveRequest(BaseModel):
-    """批量清单可传：排除的行索引 + 用户修正的字段（按行索引）。"""
+    """批量清单可传：排除的行索引 + 用户修正的字段（按行索引）。
+
+    allowBackfill / backfillReason：单据所属期间已关账时，前端确认补记期间后带上；
+    不带则后端维持 PERIOD_CLOSED，不会静默把凭证换到别的月份。
+    """
     excludeIndexes: Optional[List[int]] = None
     edits: Optional[Dict[str, Dict[str, Any]]] = None
+    allowBackfill: bool = False
+    backfillReason: Optional[str] = None
 
 
 def _sse(event: dict) -> str:
@@ -55,11 +66,16 @@ async def agent_chat(req: AgentChatRequest, ctx: AuthContext = Depends(require_a
         user_id=ctx.user_id,
         company_id=ctx.company_id,
         conversation_id=req.conversationId or uuid.uuid4().hex[:12],
+        workspace_view=req.workspaceView,
     )
 
     async def event_stream():
         try:
-            async for event in run_agent_stream(loop_ctx, [m.model_dump() for m in req.messages]):
+            async for event in run_agent_stream(
+                loop_ctx,
+                [m.model_dump() for m in req.messages],
+                enable_thinking=bool(req.enableThinking),
+            ):
                 yield _sse(event)
         except Exception:
             logger.exception("agent chat stream failed")
@@ -98,6 +114,8 @@ async def approve_action(
         company_id=ctx.company_id,
         exclude_indexes=req.excludeIndexes if req else None,
         edits=req.edits if req else None,
+        allow_backfill=bool(req.allowBackfill) if req else False,
+        backfill_reason=req.backfillReason if req else None,
     )
 
 

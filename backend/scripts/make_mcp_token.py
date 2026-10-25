@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """签发 MCP 个人访问令牌（PAT）。
 
 用法（本地 SQLite 测试模式；生产配 DATABASE_URL 指向 PG）：
@@ -53,7 +56,7 @@ async def _revoke(token_id: str, user_id: str) -> None:
 async def _issue(args: argparse.Namespace) -> None:
     from db.models import AuthUser
     from db.session import session_scope
-    from services.mcp_token_service import issue_token, validate_token
+    from services.mcp_token_service import has_company_access, issue_token, validate_token
 
     async with session_scope() as session:
         user = await session.get(AuthUser, args.user)
@@ -63,6 +66,12 @@ async def _issue(args: argparse.Namespace) -> None:
             args.company = user.current_company_id
         if not args.company:
             raise SystemExit("未指定 --company 且用户无 current_company_id")
+        # 与产品签发门禁同口径：脚本常被指向生产库联调，必须挡住跨账号错绑
+        if not await has_company_access(session=session, user_id=args.user, company_id=args.company):
+            raise SystemExit(
+                f"用户 {args.user} 不是公司 {args.company} 的 owner/有效成员，拒绝签发"
+                "（错绑令牌会让 MCP 跨账号读账本；请换用本人加入的公司）"
+            )
 
     raw, row = await issue_token(
         user_id=args.user,

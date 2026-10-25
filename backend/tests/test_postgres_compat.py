@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """PostgreSQL 兼容层翻译回归测试。
 
 测试套件跑在 SQLite 上，抓不住仅在生产 PG 暴露的方言缺口

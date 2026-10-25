@@ -1,9 +1,10 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, h, onMounted, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NCard, NButton, NTag, NSpace, useMessage, NSpin,
-  NModal, NDataTable, NSelect, NInput, NCheckbox, NEmpty, NDatePicker
+  NModal, NDataTable, NSelect, NInput, NCheckbox, NDatePicker
 } from 'naive-ui'
 import apiClient from '@/api/client'
 import { importInvoices } from '@/api/invoice'
@@ -12,8 +13,11 @@ import * as XLSX from 'xlsx'
 import { formatMoney } from '@/utils/format'
 import { EXPENSE_CATEGORIES, INCOME_CATEGORIES } from '@/utils/constants'
 import { useDeleteConfirm } from '@/composables/useDeleteConfirm'
+import { usePayeeEmployees } from '@/composables/usePayeeEmployees'
 import { getRdExpenseTypes, getRdProjects } from '@/api/rd'
 import type { RdExpenseTypeOption, RdProject } from '@/api/types'
+import { SoloDrawer,
+  SoloEmpty} from '@/components/ui'
 
 const router = useRouter()
 const message = useMessage()
@@ -436,6 +440,17 @@ const bookkeepingCategoryOptions = computed(() => {
   return categories.map(cat => ({ label: cat, value: cat }))
 })
 
+// 员工垫付要选到人：优先从员工档案挑，档案里没有的也能直接输入（tag）
+const payerEmployees = usePayeeEmployees()
+const payerEmployeesLoading = payerEmployees.loading
+const employeeNameOptions = computed(() => payerEmployees.options(bookkeepingForm.value.employeeName))
+watch(
+  () => bookkeepingForm.value.payerType,
+  (type) => {
+    if (type === 'employee_personal') void payerEmployees.ensure()
+  },
+)
+
 const fetchingAiSuggestion = ref(false)
 const aiSuggestedCategory = ref<string | null>(null)
 const aiReason = ref<string | null>(null)
@@ -463,6 +478,8 @@ function openBookkeepingModal(inv: any) {
     remark: inv.remark || ''
   }
   showBookkeepingModal.value = true
+  // 上次就是员工垫付：打开抽屉时名单要已经在，别等用户再点一次付款方式
+  if (payerType === 'employee_personal') void payerEmployees.ensure()
 
   // Reset AI suggestion state (do not auto-fetch)
   fetchingAiSuggestion.value = false
@@ -552,7 +569,7 @@ const importedInvoiceColumns = [
         color: row.direction === 'income' ? 'var(--solo-income)' : 'var(--solo-expense)',
         fontWeight: 650,
       },
-    }, `${row.direction === 'income' ? '+' : '-'}${formatMoney(Math.abs(row.amount))}`),
+    }, formatMoney(Number(row.amount) || 0)),
   },
   {
     title: '入账模式', key: 'is_archive_only', width: 130, align: 'center' as const,
@@ -586,7 +603,10 @@ const importedInvoiceColumns = [
         : row.billingStatus === 'reconciled'
           ? h(NButton, { size: 'tiny', type: 'success', secondary: true, onClick: () => openDetailModal(row) }, () => '已对账·查看')
           : isPostedInvoice(row)
-            ? h(NButton, { size: 'tiny', type: 'warning', secondary: true, onClick: () => goVoucherDetail(row) }, () => '已入账·去冲销')
+            // 「已入账·去冲销」是状态 + 跳转入口，不是危险操作：
+            // secondary 会垫一层 warning 淡底，深橙字压在上面只有 4.19:1；
+            // 去掉底色后同色字在白底上是 5.21:1，视觉也更轻。
+            ? h(NButton, { size: 'tiny', type: 'warning', quaternary: true, onClick: () => goVoucherDetail(row) }, () => '已入账·去冲销')
             : !isArchiveInvoice(row) ? h(NButton, {
               size: 'tiny',
               type: 'primary',
@@ -686,8 +706,16 @@ const previewColumns = [
 <template>
   <div class="invoice-import-page">
     <div class="page-header">
-      <NButton text @click="router.push('/ledger')">← 返回账本</NButton>
-      <h2>发票导入</h2>
+      <div class="page-header-left">
+        <NButton text class="back-btn" @click="router.push('/ledger')">
+          <template #icon><i class="ri-arrow-left-line" /></template>
+          返回账本
+        </NButton>
+        <div class="title-section">
+          <h2>发票导入</h2>
+          <p class="subtitle">批量导入税务局全量发票 Excel 明细，自动识别进销项并生成记账草稿</p>
+        </div>
+      </div>
     </div>
 
     <!-- Step: Upload -->
@@ -699,9 +727,13 @@ const previewColumns = [
     </NCard>
 
     <NCard v-if="step === 'upload'" title="已导入发票库" :bordered="false" style="margin-top: 16px;">
-      <div v-if="importedInvoices.length === 0" style="padding: 40px 0; text-align: center; color: var(--solo-text-muted);">
-        <NEmpty description="暂无已导入发票，请从上方上传发票进行批量解析导入" />
-      </div>
+      <SoloEmpty
+        v-if="importedInvoices.length === 0"
+        title="还没有已导入的发票"
+        description="从上方上传发票文件批量解析导入，这里就是你的发票库。"
+        icon="ri-receipt-line"
+        style="padding: 24px 0;"
+      />
       <div v-else>
         <div class="invoice-toolbar">
           <NInput v-model:value="invoiceSearch" clearable placeholder="搜索名称、号码、分类、金额">
@@ -828,8 +860,8 @@ const previewColumns = [
       </template>
     </NModal>
 
-    <!-- Bookkeeping Modal -->
-    <NModal v-model:show="showBookkeepingModal" title="发票记账管理" preset="card" style="width: 520px; border-radius: 16px;">
+    <!-- Bookkeeping Drawer -->
+    <SoloDrawer v-model:show="showBookkeepingModal" title="发票记账管理" :width="540">
       <div v-if="selectedInvoiceForBookkeeping">
         <NSpace vertical size="large">
           <div class="invoice-summary-details">
@@ -843,7 +875,7 @@ const previewColumns = [
             </div>
             <div class="summary-row">
               <span class="summary-label">发票金额:</span>
-              <span class="summary-value amount-text" :style="selectedInvoiceForBookkeeping.direction === 'income' ? 'color: var(--solo-income);' : 'color: var(--solo-expense);'">{{ selectedInvoiceForBookkeeping.direction === 'income' ? '+' : '-' }}{{ formatMoney(Math.abs(selectedInvoiceForBookkeeping.amount)) }}</span>
+              <span class="summary-value amount-text" :style="selectedInvoiceForBookkeeping.direction === 'income' ? 'color: var(--solo-income);' : 'color: var(--solo-expense);'">{{ formatMoney(Number(selectedInvoiceForBookkeeping.amount) || 0) }}</span>
             </div>
           </div>
           
@@ -883,7 +915,7 @@ const previewColumns = [
           </div>
 
           <div v-if="fetchingAiSuggestion || aiSuggestedCategory" class="form-item">
-            <div v-if="fetchingAiSuggestion" style="padding: 12px; font-size: 12px; color: var(--solo-text-secondary); display: flex; align-items: center; gap: 6px; background: var(--solo-bg-blue-soft, #eef6ff); border: 1px dashed var(--solo-primary, #3b82f6); border-radius: 8px;">
+            <div v-if="fetchingAiSuggestion" style="padding: 12px; font-size: 12px; color: var(--solo-text-secondary); display: flex; align-items: center; gap: 6px; background: var(--solo-bg-blue-soft, #eef6ff); border: 1px dashed var(--solo-primary, #1747b0); border-radius: 8px;">
               <NSpin size="small" />
               <span>正在获取 AI 智能分类建议...</span>
             </div>
@@ -928,10 +960,15 @@ const previewColumns = [
           </div>
 
           <div v-if="bookkeepingForm.payerType === 'employee_personal'" class="form-item">
-            <span class="form-label">员工姓名</span>
-            <NInput 
-              v-model:value="bookkeepingForm.employeeName" 
-              placeholder="请输入垫付员工的姓名"
+            <span class="form-label">垫付员工</span>
+            <NSelect
+              v-model:value="bookkeepingForm.employeeName"
+              :options="employeeNameOptions"
+              :loading="payerEmployeesLoading"
+              filterable
+              tag
+              clearable
+              placeholder="选择员工，或直接输入姓名"
             />
           </div>
 
@@ -952,10 +989,10 @@ const previewColumns = [
           <NButton type="primary" :loading="savingBookkeeping" @click="handleSaveBookkeeping">确认记账</NButton>
         </NSpace>
       </template>
-    </NModal>
+    </SoloDrawer>
 
-    <!-- Invoice Detail Modal -->
-    <NModal v-model:show="showDetailModal" title="发票明细" preset="card" style="width: 560px; border-radius: 16px;">
+    <!-- Invoice Detail Drawer -->
+    <SoloDrawer v-model:show="showDetailModal" title="发票明细" :width="580">
       <div v-if="selectedInvoice" class="invoice-detail-content">
         <div class="detail-section">
           <h4 class="detail-section-title">基本信息</h4>
@@ -1056,7 +1093,7 @@ const previewColumns = [
             </div>
             <div class="detail-item">
               <span class="detail-label">价税合计</span>
-              <span class="detail-value amount-text">{{ (selectedInvoice.direction === 'income' ? '+' : '-') + formatMoney(Math.abs((selectedInvoice.amount || 0) + (selectedInvoice.tax_amount || selectedInvoice.vatAmount || 0))) }}</span>
+              <span class="detail-value amount-text">{{ formatMoney((Number(selectedInvoice.amount) || 0) + (Number(selectedInvoice.tax_amount || selectedInvoice.vatAmount) || 0)) }}</span>
             </div>
           </div>
         </div>
@@ -1080,7 +1117,7 @@ const previewColumns = [
           <NButton @click="showDetailModal = false">关闭</NButton>
         </NSpace>
       </template>
-    </NModal>
+    </SoloDrawer>
   </div>
 </template>
 
@@ -1189,14 +1226,14 @@ const previewColumns = [
   font-size: 13px;
 }
 .summary-label {
-  color: var(--solo-text-secondary, #64748b);
+  color: var(--solo-text-secondary, #586474);
 }
 .summary-value {
   font-weight: 500;
-  color: var(--solo-text-primary, #1e293b);
+  color: var(--solo-text-primary, #182230);
 }
 .amount-text {
-  color: var(--n-primary-color, #10b981);
+  color: var(--n-primary-color, #0f7354);
   font-weight: bold;
   font-size: 15px;
 }
@@ -1208,13 +1245,13 @@ const previewColumns = [
 .form-label {
   font-size: 13px;
   font-weight: 500;
-  color: var(--solo-text-secondary, #64748b);
+  color: var(--solo-text-secondary, #586474);
 }
 
 /* AI suggestion box styles */
 .ai-suggestion-box {
   background: var(--solo-bg-blue-soft, #eef6ff);
-  border: 1px dashed var(--solo-primary, #3b82f6);
+  border: 1px dashed var(--solo-primary, #1747b0);
   padding: 8px 12px;
   border-radius: 8px;
   margin-bottom: 4px;
@@ -1243,7 +1280,7 @@ const previewColumns = [
 }
 .ai-trigger-tip {
   font-size: 12px;
-  color: var(--solo-text-secondary, #64748b);
+  color: var(--solo-text-secondary, #586474);
 }
 
 /* Invoice Detail Modal */
@@ -1260,10 +1297,10 @@ const previewColumns = [
 .detail-section-title {
   font-size: 14px;
   font-weight: 600;
-  color: var(--solo-text-primary, #1e293b);
+  color: var(--solo-text-primary, #182230);
   margin: 0 0 10px;
   padding-bottom: 6px;
-  border-bottom: 1px solid var(--solo-border-light, #e2e8f0);
+  border-bottom: 1px solid var(--solo-border-light, #dde3ea);
 }
 .detail-grid {
   display: grid;
@@ -1278,12 +1315,12 @@ const previewColumns = [
   padding: 4px 0;
 }
 .detail-label {
-  color: var(--solo-text-secondary, #64748b);
+  color: var(--solo-text-secondary, #586474);
   flex-shrink: 0;
   margin-right: 12px;
 }
 .detail-value {
-  color: var(--solo-text-primary, #1e293b);
+  color: var(--solo-text-primary, #182230);
   font-weight: 500;
   text-align: right;
   word-break: break-all;

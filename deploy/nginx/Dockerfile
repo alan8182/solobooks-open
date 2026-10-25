@@ -6,7 +6,8 @@ WORKDIR /app
 ARG VITE_API_BASE=
 ENV VITE_API_BASE=$VITE_API_BASE
 
-ARG NPM_REGISTRY=https://registry.npmjs.org
+# 默认 npmmirror：服务器在国内，npmjs.org 直连极慢。海外构建可 --build-arg 覆盖。
+ARG NPM_REGISTRY=https://registry.npmmirror.com
 RUN npm config set registry $NPM_REGISTRY
 COPY web/package.json web/package-lock.json ./
 RUN npm ci

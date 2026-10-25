@@ -9,6 +9,9 @@ services:
       POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?POSTGRES_APP_PASSWORD is required}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # 命名卷首挂时目录属主是 root，postgres(uid 70) 写不进 → 归档持续失败、pg_wal 无限积压。
+      # 入口脚本只 chown PGDATA，不会处理这个挂载点。若卷被重建，需一次性修复：
+      #   docker compose exec -u root postgres chown postgres:postgres /var/lib/postgresql/wal_archive
       - postgres_wal_archive:/var/lib/postgresql/wal_archive
       - ./postgres/init:/docker-entrypoint-initdb.d:ro
     command: >
@@ -30,12 +33,15 @@ services:
     build:
       context: ../
       dockerfile: deploy/backend.Dockerfile
+      # 默认清华源（与 Dockerfile ARG 默认一致），海外构建可设 PIP_INDEX_URL 覆盖
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     command: >
       sh -c "cd /app && DATABASE_URL=$$MIGRATION_DATABASE_URL alembic upgrade head && exec uvicorn main:app --host 0.0.0.0 --port 80"
     environment:
       - HOST=0.0.0.0
       - PORT=80
-      - CORS_ORIGINS=http://localhost:8080,http://your-domain:8080
+      - CORS_ORIGINS=https://solobooks.cn,https://www.solobooks.cn,http://localhost:8080
       - DATABASE_URL=postgresql+asyncpg://${POSTGRES_APP_USER:-solobooks_app}:${POSTGRES_APP_PASSWORD}@postgres:5432/${POSTGRES_DB:-solobooks}
       - MIGRATION_DATABASE_URL=postgresql+psycopg://${POSTGRES_USER:-solobooks_owner}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-solobooks}
       - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:?DASHSCOPE_API_KEY is required}
@@ -75,6 +81,8 @@ services:
       dockerfile: deploy/nginx/Dockerfile
       args:
         VITE_API_BASE: ""
+        # 默认 npmmirror（与 Dockerfile ARG 默认一致），可设 NPM_REGISTRY 覆盖
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
     ports:
       - "${EXTERNAL_PORT:-8080}:80"
     depends_on:

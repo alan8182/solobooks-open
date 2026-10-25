@@ -1,3 +1,4 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script lang="ts">
 export interface LegalSection {
   heading: string
@@ -41,7 +42,7 @@ defineProps<{
   width: 100%;
   max-width: 760px;
   background: var(--solo-bg-card, #fff);
-  border-radius: var(--solo-radius-lg, 14px);
+  border-radius: var(--solo-radius-lg, 12px);
   box-shadow: var(--solo-shadow, 0 8px 24px rgba(24, 34, 48, 0.06));
   padding: 40px 44px;
 }
@@ -53,7 +54,7 @@ defineProps<{
 }
 .legal-updated {
   font-size: 13px;
-  color: var(--solo-text-muted, #8a95a3);
+  color: var(--solo-text-muted, #636e7c);
   margin: 8px 0 4px;
 }
 .legal-heading {
@@ -76,7 +77,7 @@ defineProps<{
   font-size: 13px;
 }
 .legal-footer a {
-  color: var(--solo-primary, #165dff);
+  color: var(--solo-primary, #1747b0);
   text-decoration: none;
 }
 @media (max-width: 640px) {

@@ -1,7 +1,13 @@
+/**
+ * Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+ * Licensed under the SoloBooks License v2.0.
+ */
+
 import { describe, expect, it } from 'vitest'
 import { NAV_ITEMS } from '@/utils/constants'
 import { resolveAuthRedirect } from '@/router/guards'
 import { routes } from '@/router'
+import router from '@/router'
 
 describe('sidebar navigation structure', () => {
   it('keeps frequent work at the first level and removes the duplicate record action', () => {
@@ -10,42 +16,93 @@ describe('sidebar navigation structure', () => {
     expect(topLevelPaths).toEqual([
       '/',
       '/copilot',
-      '/ledger',
       '/todos',
+      '/ledger',
+      '/bank',
       '/closing-wizard',
       '/tax-filing',
       '/reports',
+      // 项目利润不再占导航位：入口收敛到「经营报表」页的项目利润卡片，
+      // 路由 /aggregation/report 保留（卡片跳转与旧链接不受影响）。
     ])
+    expect(topLevelPaths).not.toContain('/aggregation/report')
     expect(topLevelPaths).not.toContain('/record/text')
   })
 
-  it('organizes navigation into 3 clear temporal/functional groups', () => {
+  it('organizes navigation into four workflow groups', () => {
     const groups = Array.from(new Set(NAV_ITEMS.map((item) => item.group)))
-    expect(groups).toEqual(['日常', '周期', '管理'])
+    expect(groups).toEqual(['日常', '账务', '周期', '工具'])
   })
 
-  it('groups infrequent finance and settings destinations into secondary menus', () => {
-    const financeTools = NAV_ITEMS.find((item) => item.label === '财务工具')
-    const settings = NAV_ITEMS.find((item) => item.label === '系统设置')
+  it('groups invoices, vouchers and low-frequency tools into secondary menus', () => {
+    const invoice = NAV_ITEMS.find((item) => item.label === '发票')
+    const vouchers = NAV_ITEMS.find((item) => item.label === '凭证与账簿')
+    const special = NAV_ITEMS.find((item) => item.label === '专项核算')
+    const settings = NAV_ITEMS.find((item) => item.label === '设置')
 
-    expect(financeTools?.children?.map((item) => item.path)).toEqual([
+    expect(invoice?.children?.map((item) => item.path)).toEqual([
+      '/invoices',
       '/record/invoice-import',
-      '/bank',
+    ])
+    expect(vouchers?.children?.map((item) => item.path)).toEqual([
       '/vouchers',
+      '/ledger/books',
+      '/ledger/book',
+    ])
+    expect(special?.children?.map((item) => item.path)).toEqual([
       '/assets',
+      '/intangibles',
       '/rd-expenses',
       '/mine/salary',
       '/private-expenses',
+      '/recurring',
+      '/aggregation',
     ])
     expect(settings?.children?.map((item) => item.path)).toEqual([
-      '/mine',
       '/mine/companies',
-      '/mine/categories',
+      // 上手引导紧挨公司信息：主体配完了才谈得上「把账做起来」
+      '/guide',
+      // 税费种认定紧挨公司信息：同属「主体与税局口径」的配置
+      '/tax-registration',
       '/mine/accounts',
+      '/mine/contacts',
       '/mine/opening',
-      '/mine/mcp',
+      '/mine/legacy-import',
+      '/mine/backup',
       '/mine/audit-log',
+      '/mine/mcp',
+      '/mine',
     ])
+    expect(NAV_ITEMS.some((item) => item.label === '财务工具')).toBe(false)
+  })
+
+  it('never exposes a navigation path that does not resolve to a route', () => {
+    const paths = NAV_ITEMS.flatMap((item) => [
+      item.path,
+      ...(item.children?.map((child) => child.path) ?? []),
+    ]).filter((path): path is string => Boolean(path))
+
+    paths.forEach((path) => {
+      expect(router.resolve(path).matched.length, `导航死链：${path}`).toBeGreaterThan(0)
+    })
+  })
+
+  it('marks professional bookkeeping routes as accounting-only', () => {
+    expect(router.resolve('/vouchers').meta.workspace).toEqual(['accounting'])
+    expect(router.resolve('/ledger/book').meta.workspace).toEqual(['accounting'])
+    expect(router.resolve('/reports/general-ledger').meta.workspace).toEqual(['accounting'])
+    expect(router.resolve('/mine/accounts').meta.workspace).toEqual(['accounting'])
+    expect(router.resolve('/rd-expenses').meta.workspace).toEqual(['accounting'])
+  })
+
+  it('keeps shared boss and accounting routes available in both views', () => {
+    expect(router.resolve('/').meta.workspace).toBeUndefined()
+    expect(router.resolve('/ledger').meta.workspace).toBeUndefined()
+    expect(router.resolve('/todos').meta.workspace).toBeUndefined()
+    expect(router.resolve('/reports').meta.workspace).toBeUndefined()
+    expect(router.resolve('/closing-wizard').meta.workspace).toBeUndefined()
+    expect(router.resolve('/tax-filing').meta.workspace).toBeUndefined()
+    expect(router.resolve('/aggregation/report').meta.workspace).toBeUndefined()
   })
 })
 

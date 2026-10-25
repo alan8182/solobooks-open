@@ -58,6 +58,7 @@ from routers.report import router as report_router
 from routers.voucher import router as voucher_router
 from routers.auth import router as auth_router
 from routers.asset import router as asset_router
+from routers.intangible import router as intangible_router
 from routers.todo import router as todo_router
 from routers.category import router as category_router
 from routers.opening import router as opening_router
@@ -66,6 +67,10 @@ from routers.bank import router as bank_router
 from routers.recurring import router as recurring_router
 from routers.search import router as search_router
 from routers.invoice import router as invoice_router
+from routers.invoices import router as invoices_router
+from routers.auxiliary import router as auxiliary_router
+from routers.legacy_import import router as legacy_import_router
+from routers.backup import router as backup_router
 from routers.audit import router as audit_router
 from routers.private_expense import router as private_expense_router
 from routers.salary import router as salary_router
@@ -73,9 +78,15 @@ from routers.tax_report import router as tax_report_router
 from routers.wechat_bill import router as wechat_bill_router
 from routers.accounting import router as accounting_router
 from routers.rd import router as rd_router
+from routers.aggregation import router as aggregation_router
 from routers.agent import router as agent_router
 from routers.tax_filing import router as tax_filing_router
+from routers.tax_registration import router as tax_registration_router
+from routers.admin import router as admin_router
 from routers.mcp_tokens import router as mcp_tokens_router
+from routers.setup import router as setup_router
+from routers.audit_share import owner_router as audit_share_owner_router
+from routers.audit_share import public_router as audit_share_public_router
 
 app.include_router(record_router)
 app.include_router(copilot_router)
@@ -84,6 +95,7 @@ app.include_router(report_router)
 app.include_router(voucher_router)
 app.include_router(auth_router)
 app.include_router(asset_router)
+app.include_router(intangible_router)
 app.include_router(todo_router)
 app.include_router(category_router)
 app.include_router(opening_router)
@@ -92,6 +104,10 @@ app.include_router(bank_router)
 app.include_router(recurring_router)
 app.include_router(search_router)
 app.include_router(invoice_router)
+app.include_router(invoices_router)
+app.include_router(auxiliary_router)
+app.include_router(legacy_import_router)
+app.include_router(backup_router)
 app.include_router(audit_router)
 app.include_router(private_expense_router)
 app.include_router(salary_router)
@@ -99,9 +115,23 @@ app.include_router(tax_report_router)
 app.include_router(wechat_bill_router)
 app.include_router(accounting_router)
 app.include_router(rd_router)
+app.include_router(aggregation_router)
 app.include_router(agent_router)
 app.include_router(tax_filing_router)
+app.include_router(tax_registration_router)
+app.include_router(admin_router)
 app.include_router(mcp_tokens_router)
+# 上手引导：必须注册在 app.mount("/", mcp_asgi_app) 之前，否则会被 MCP 兜底吞掉
+app.include_router(setup_router)
+app.include_router(audit_share_owner_router)
+app.include_router(audit_share_public_router)
+
+
+@app.middleware("http")
+async def add_engine_fingerprint_header(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Powered-By-Engine"] = "SoloBooks-Core/jzxc-2026"
+    return response
 
 
 @app.get("/api/health")
@@ -114,6 +144,8 @@ async def health():
     return {
         "status": "ok",
         "service": "SoloBooks",
+        "engine": "SoloBooks-Core (芥子星辰)",
+        "fingerprint": "736f6c6f626f6f6b732d6a7a7863-2026-core",
         "database": "test" if os.getenv("ACCOUNTING_TEST_MODE") == "1" else "postgresql",
     }
 

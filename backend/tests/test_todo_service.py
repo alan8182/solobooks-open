@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """待办生成规则测试：冲销排除、被冲销原条目排除、小额豁免。"""
 from __future__ import annotations
 
@@ -134,6 +137,32 @@ def test_unreconciled_invoice_import_still_prompts():
     assert "invoice_unpaid" in _rule_ids(todos)
 
 
+def test_linked_intangible_asset_card_closes_amortization_todo():
+    """来源凭证已建立无形资产卡片后，摊销待办必须消失。"""
+    todos = _derive_entry_todos(
+        [_entry(id="e-intangible", direction="expense", amount="120000", category="无形资产", billingStatus="has_invoice")],
+        linked_intangible_entry_ids={"e-intangible"},
+    )
+    assert "intangible_asset_amortization" not in _rule_ids(todos)
+
+
+def test_intangible_todo_has_its_own_category():
+    todos = _derive_entry_todos([
+        _entry(id="e-intangible", direction="expense", amount="120000", category="无形资产", billingStatus="has_invoice"),
+    ])
+    by_rule = {t["meta"]["ruleId"]: t for t in todos}
+    assert by_rule["intangible_asset_amortization"]["category"] == "intangible"
+
+
+def test_linked_fixed_asset_card_closes_depreciation_todo():
+    """来源凭证已建立资产卡片后，固定资产待办必须消失。"""
+    todos = _derive_entry_todos(
+        [_entry(id="e-asset", direction="expense", amount="16800", category="固定资产", billingStatus="has_invoice")],
+        linked_asset_entry_ids={"e-asset"},
+    )
+    assert "fixed_asset_depreciation" not in _rule_ids(todos)
+
+
 def test_derived_todos_carry_category():
     """派生待办携带事项分类，前端按此分组展示。"""
     todos = _derive_entry_todos([
@@ -185,8 +214,60 @@ def test_todo_categories_cover_all_known_rules():
     """规则全集都必须有归属分类，未知规则由构造处兜底 other。"""
     known_rules = {
         "missing_document", "invoice_unpaid", "income_invoice", "fixed_asset_depreciation",
-        "entertainment_limit", "ad_limit", "owner_transfer_nature", "unmatched_statement",
-        "filing_deadline",
+        "intangible_asset_amortization", "entertainment_limit", "ad_limit",
+        "owner_transfer_nature", "unmatched_statement", "filing_deadline",
+        "intangible_review", "intangible_expiry",
     }
     assert set(TODO_CATEGORIES) == known_rules
-    assert set(TODO_CATEGORIES.values()) == {"filing", "match", "receipt", "reimburse", "billing", "risk"}
+    assert set(TODO_CATEGORIES.values()) == {
+        "filing", "match", "receipt", "reimburse", "billing", "risk", "intangible",
+    }
+
+
+def test_non_operating_inflows_silently_exempt_from_invoice_confirmation():
+    """微信提现、银行结息等非经营流入静默豁免待开票确认，并被收入自动留痕清单。"""
+    from services.todo_service import derive_silent_resolved_items
+
+    entries = [
+        _entry(id="w1", direction="income", amount="58.47", title="微信支付提现到账-2026-06-18",
+               category="微信支付结算", accountCode="1012001"),
+        _entry(id="i1", direction="income", amount="12.30", title="银行结息-2026-06-21",
+               category="利息收入", accountCode="5603005"),
+        _entry(id="sales", direction="income", amount="8800.00", title="软件开发技术服务费",
+               category="主营业务收入", accountCode="5001"),
+    ]
+    todos = _derive_entry_todos(entries)
+    rules = {t["meta"]["ruleId"] for t in todos}
+    # 微信提现和银行结息不产生待办
+    assert "income_invoice" in rules
+    assert len([t for t in todos if t["meta"]["ruleId"] == "income_invoice"]) == 1
+    assert todos[0]["meta"]["entryId"] == "sales"
+
+    # 留痕清单包含 2 项
+    silent_items = derive_silent_resolved_items(entries)
+    assert len(silent_items) == 2
+    assert {item["entryId"] for item in silent_items} == {"w1", "i1"}
+
+
+def test_same_amount_invoice_and_expense_merge_into_single_paired_todo():
+    """研发相关支出与同金额发票（500元）自动撮合为单张发票卡片，并带有一键核销建议。"""
+    entries = [
+        _entry(id="e-exp", direction="expense", amount="500.00", title="研发相关支出",
+               remark="支付的 deepseek api 调用费用，用于研发", occurDate="2026-05-31",
+               source="bank_import", billingStatus="no_document"),
+        _entry(id="e-inv", direction="expense", amount="500.00",
+               title="发票-杭州深度求索人工智能基础技术研究有限公司",
+               merchant="杭州深度求索人工智能基础技术研究有限公司",
+               occurDate="2026-06-02", source="invoice_import", billingStatus="has_invoice"),
+    ]
+    todos = _derive_entry_todos(entries)
+    # 不再产生两个割裂的待办，只保留一个待报销/付款卡片
+    rules = [t["meta"]["ruleId"] for t in todos]
+    assert rules == ["invoice_unpaid"]
+    inv_todo = todos[0]
+    meta = inv_todo["meta"]
+    assert meta["candidateExpenseId"] == "e-exp"
+    assert meta["candidateExpenseTitle"] == "研发相关支出"
+    assert meta["aiSuggestion"]["action"] == "link_invoice_expense"
+    assert "研发相关支出" in meta["aiSuggestion"]["label"]
+    assert "deepseek" in meta["aiSuggestion"]["reason"].lower() or "深度求索" in meta["aiSuggestion"]["reason"]

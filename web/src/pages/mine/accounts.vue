@@ -1,9 +1,9 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, computed, h, onMounted, watch } from 'vue'
-import { useRouter } from 'vue-router'
 import {
   NCard, NButton, NSpace, useMessage,
-  NInput, NModal, NForm, NFormItem, NSpin, NTree,
+  NInput, NModal, NForm, NFormItem, NSpin, NTree, NSwitch,
   NTabs, NTab, NGrid, NGridItem, NStatistic, NSelect
 } from 'naive-ui'
 import type { TreeOption } from 'naive-ui'
@@ -21,12 +21,13 @@ interface AccountNode {
   is_leaf: boolean
   is_system: boolean
   is_active: boolean
+  quantity_enabled?: boolean
+  unit?: string | null
   created_at: string
   updated_at: string
   children: AccountNode[]
 }
 
-const router = useRouter()
 const message = useMessage()
 
 // Reference components to satisfy strict TS unused imports checker
@@ -314,6 +315,25 @@ function renderSuffix(info: { option: TreeOption }) {
     }))
   }
 
+  // 数量核算（含内置存货科目）：仅末级科目可配
+  if (opt.is_leaf && opt.level > 0) {
+    actions.push(h(NButton, {
+      text: true,
+      size: 'tiny',
+      type: opt.quantity_enabled ? 'success' : 'default',
+      class: 'action-btn',
+      onClick: (e: Event) => {
+        e.stopPropagation()
+        openQuantityModal(node)
+      },
+    }, {
+      default: () => h(NSpace, { size: 4, align: 'center' }, () => [
+        h('i', { class: 'ri-hashtag' }),
+        h('span', opt.quantity_enabled ? `数量${opt.unit ? '·' + opt.unit : ''}` : '数量')
+      ])
+    }))
+  }
+
   if (actions.length > 0) {
     children.push(h(NSpace, { class: 'node-actions', size: 'medium' }, () => actions))
   }
@@ -445,6 +465,38 @@ async function addAccount() {
   }
 }
 
+// ── 数量金额式核算（P1 WP-D）：叶子科目可开关数量核算并填展示单位 ──
+const showQuantityModal = ref(false)
+const qtyForm = ref({ code: '', name: '', enabled: false, unit: '' })
+const qtySaving = ref(false)
+
+function openQuantityModal(node: AccountNode) {
+  qtyForm.value = {
+    code: node.code,
+    name: node.name,
+    enabled: !!node.quantity_enabled,
+    unit: String(node.unit || ''),
+  }
+  showQuantityModal.value = true
+}
+
+async function saveQuantitySetting() {
+  qtySaving.value = true
+  try {
+    await apiClient.put(`/api/ledger/accounts/${qtyForm.value.code}`, {
+      quantity_enabled: qtyForm.value.enabled,
+      unit: qtyForm.value.unit.trim() || null,
+    })
+    message.success('数量核算设置已保存')
+    showQuantityModal.value = false
+    await loadTree()
+  } catch {
+    message.error('保存失败，请重试')
+  } finally {
+    qtySaving.value = false
+  }
+}
+
 async function doDelete() {
   try {
     await apiClient.delete(`/api/ledger/accounts/${deleteTargetCode.value}`)
@@ -462,15 +514,13 @@ onMounted(loadTree)
 <template>
   <div class="accounts-page">
     <div class="page-header">
-      <NButton text class="back-btn" @click="router.push('/mine')">
-        <template #icon><i class="ri-arrow-left-line" /></template>
-        返回设置
-      </NButton>
-      <div class="header-row">
+      <div class="header-left">
         <div class="title-section">
           <h2>科目表</h2>
           <p class="subtitle">管理您的企业级科目体系，支持两级科目架构与自定义扩展</p>
         </div>
+      </div>
+      <div class="header-right">
         <NButton type="primary" class="add-main-btn" @click="openAddModal()">
           <template #icon><i class="ri-add-line" /></template>
           新增科目
@@ -641,6 +691,28 @@ onMounted(loadTree)
       </template>
     </NModal>
 
+    <!-- Quantity Accounting Modal (P1 WP-D) -->
+    <NModal v-model:show="showQuantityModal" title="数量金额式核算" preset="card" style="width: 420px; border-radius: var(--solo-radius-lg)">
+      <p style="margin: 0 0 14px; font-size: 13px; color: var(--solo-text-secondary); line-height: 1.6;">
+        为「<strong>{{ qtyForm.code }} {{ qtyForm.name }}</strong>」开启数量核算后，记账时可填数量与单价，
+        科目余额表将展示数量收发存。
+      </p>
+      <NForm label-placement="left" :label-width="90">
+        <NFormItem label="数量核算">
+          <NSwitch v-model:value="qtyForm.enabled" />
+        </NFormItem>
+        <NFormItem v-if="qtyForm.enabled" label="计量单位">
+          <NInput v-model:value="qtyForm.unit" placeholder="如 件 / 箱 / 吨（选填）" clearable maxlength="16" />
+        </NFormItem>
+      </NForm>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton @click="showQuantityModal = false">取消</NButton>
+          <NButton type="primary" :loading="qtySaving" @click="saveQuantitySetting">保存</NButton>
+        </NSpace>
+      </template>
+    </NModal>
+
     <!-- Delete Confirmation Modal -->
     <NModal v-model:show="showDeleteConfirm" title="确认删除" preset="card" style="width: 380px; border-radius: var(--solo-radius-lg)">
       <p style="margin: 0; font-size: 14px; color: var(--solo-text-secondary); line-height: 1.5;">
@@ -673,17 +745,10 @@ onMounted(loadTree)
   font-weight: 500;
   color: var(--solo-text-secondary);
   transition: color 0.2s ease;
-  margin-bottom: 8px;
 }
 
 .back-btn:hover {
   color: var(--solo-primary);
-}
-
-.header-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
 }
 
 .title-section h2 {
@@ -872,7 +937,7 @@ onMounted(loadTree)
 
 .type-flow-asset {
   background-color: rgba(16, 185, 129, 0.08);
-  color: #10b981;
+  color: #0f7354;
 }
 
 .type-nonflow-asset {
@@ -882,12 +947,12 @@ onMounted(loadTree)
 
 .type-flow-liability {
   background-color: rgba(245, 158, 11, 0.08);
-  color: #f59e0b;
+  color: #a05c10;
 }
 
 .type-equity {
   background-color: rgba(59, 130, 246, 0.08);
-  color: #3b82f6;
+  color: #1747b0;
 }
 
 .type-cost {
@@ -897,7 +962,7 @@ onMounted(loadTree)
 
 .type-income {
   background-color: rgba(16, 185, 129, 0.08);
-  color: #10b981;
+  color: #0f7354;
 }
 
 .type-expense {

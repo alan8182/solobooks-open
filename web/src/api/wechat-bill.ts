@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+ * Licensed under the SoloBooks License v2.0.
+ */
+
 import apiClient from './client'
 
 export function parseWechatBill(file: File): Promise<{
@@ -13,13 +18,29 @@ export function parseWechatBill(file: File): Promise<{
   })
 }
 
-export function importWechatBill(rows: Record<string, any>[]): Promise<{
+export function importWechatBill(
+  rows: Record<string, any>[],
+  opts: {
+    allowBackfill?: boolean
+    backfillReason?: string
+    importMode?: 'summary' | 'detail'
+    summary?: Record<string, any>
+    occurDate?: string
+  } = {},
+): Promise<{
   imported: number
   failed: number
   ignored_duplicates: number
   results: { status: string; title: string; amount?: number; error?: string }[]
 }> {
-  return apiClient.post('/api/wechat-bill/import', { rows })
+  return apiClient.post('/api/wechat-bill/import', {
+    rows,
+    importMode: opts.importMode || 'summary',
+    summary: opts.summary,
+    occurDate: opts.occurDate,
+    allowBackfill: opts.allowBackfill || undefined,
+    backfillReason: opts.backfillReason || undefined,
+  })
 }
 
 export function fetchWechatBillRecords(month: string): Promise<{

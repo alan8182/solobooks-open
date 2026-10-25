@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """MCP 接入 M2 测试：资源模板、提示词模板。"""
 import pytest
 from sqlalchemy.ext.asyncio import create_async_engine

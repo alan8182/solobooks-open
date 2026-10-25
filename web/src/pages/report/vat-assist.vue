@@ -1,13 +1,17 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { NAlert, NButton, NSelect, NSpin, NTag, useMessage } from 'naive-ui'
 import { getVatAssist } from '@/api/report'
 import { formatMoney } from '@/utils/format'
 import type { VatAssistResponse, VatFilingField } from '@/api/types'
 
+const route = useRoute()
 const router = useRouter()
 const message = useMessage()
+const requestedMonth = String(route.query.month || '')
+const hasRequestedMonth = /^\d{4}-(0[1-9]|1[0-2])$/.test(requestedMonth)
 const periodType = ref<'month' | 'quarter'>('quarter')
 const loading = ref(false)
 const result = ref<VatAssistResponse | null>(null)
@@ -33,12 +37,26 @@ function periodOptions(type: 'month' | 'quarter') {
   return options
 }
 
+function resolveInitialPeriod() {
+  if (hasRequestedMonth) {
+    const year = requestedMonth.slice(0, 4)
+    const m = parseInt(requestedMonth.slice(5, 7), 10)
+    const q = Math.ceil(m / 3)
+    return `${year}-Q${q}`
+  }
+  return periodOptions('quarter')[0].value
+}
+
 const options = computed(() => periodOptions(periodType.value))
-const period = ref(periodOptions('quarter')[0].value)
+const period = ref(resolveInitialPeriod())
 const typeOptions = [
   { label: '季度申报', value: 'quarter' },
   { label: '月度申报', value: 'month' },
 ]
+
+function handleBack() {
+  router.push({ path: '/reports', query: hasRequestedMonth ? { month: requestedMonth } : {} })
+}
 
 const filingSections = computed(() => {
   const order = ['货物及劳务', '服务、不动产和无形资产', '税费试算', '附加税费']
@@ -90,9 +108,9 @@ onMounted(load)
   <div class="report-container vat-workbench">
     <div class="report-header">
       <div class="report-header-left">
-        <NButton text class="report-back-btn" @click="router.push('/reports')">
+        <NButton text class="report-back-btn" @click="handleBack">
           <template #icon><i class="ri-arrow-left-line" /></template>
-          返回
+          返回报表中心
         </NButton>
         <div class="report-title-section">
           <h2>增值税简易申报辅助</h2>
@@ -200,7 +218,7 @@ onMounted(load)
           <div class="section-heading compact">
             <div>
               <h3>销售额来源核对</h3>
-              <p>只归集已过账的6001/6051营业收入，资金结算、银行利息和验证款不进入销售额。</p>
+              <p>只归集已过账的5001/5051营业收入，资金结算、银行利息和验证款不进入销售额。</p>
             </div>
             <span class="source-count">{{ result.sourceEntryCount }} 笔</span>
           </div>
@@ -254,7 +272,7 @@ onMounted(load)
   gap: 20px;
   padding: 18px 20px;
   border: 1px solid var(--solo-border);
-  border-radius: 14px;
+  border-radius: 12px;
   background: var(--solo-surface);
   margin-bottom: 12px;
 }
@@ -267,7 +285,7 @@ onMounted(load)
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   border: 1px solid var(--solo-border);
-  border-radius: 14px;
+  border-radius: 12px;
   background: var(--solo-surface);
   margin: 16px 0 24px;
   overflow: hidden;
@@ -279,7 +297,7 @@ onMounted(load)
 .summary-strip .payable { color: var(--solo-expense); }
 .filing-section, .basis-section {
   border: 1px solid var(--solo-border);
-  border-radius: 14px;
+  border-radius: 12px;
   background: var(--solo-surface);
   padding: 22px;
   margin-bottom: 20px;
@@ -291,7 +309,7 @@ onMounted(load)
 .filing-group { margin-top: 18px; }
 .filing-group:first-of-type { margin-top: 0; }
 .filing-group-title { margin-bottom: 8px; color: var(--solo-text-secondary); font-size: 13px; font-weight: 650; }
-.field-list { border: 1px solid var(--solo-border); border-radius: 10px; overflow: hidden; }
+.field-list { border: 1px solid var(--solo-border); border-radius: 8px; overflow: hidden; }
 .filing-field {
   width: 100%;
   min-height: 54px;
@@ -322,7 +340,7 @@ onMounted(load)
   gap: 12px;
   padding: 14px;
   border: 1px solid var(--solo-border);
-  border-radius: 10px;
+  border-radius: 8px;
   background: var(--solo-surface-soft);
   color: var(--solo-text-primary);
   cursor: pointer;
@@ -335,7 +353,7 @@ onMounted(load)
 .source-table td { padding: 11px 12px; border-bottom: 1px solid var(--solo-border-light); }
 .source-table tbody tr:last-child td { border-bottom: 0; }
 .source-table .amount { text-align: right; font-variant-numeric: tabular-nums; }
-.empty-state { padding: 28px; text-align: center; color: var(--solo-text-muted); background: var(--solo-surface-soft); border-radius: 10px; }
+.empty-state { padding: 28px; text-align: center; color: var(--solo-text-muted); background: var(--solo-surface-soft); border-radius: 8px; }
 .policy-note { color: var(--solo-text-muted); font-size: 12px; line-height: 1.6; }
 @media (max-width: 900px) {
   .report-header { align-items: flex-start; gap: 16px; }

@@ -1,13 +1,18 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { NButton, NCard, NCheckbox, NCollapse, NCollapseItem, NSelect, NSpin, useMessage } from 'naive-ui'
 import { getCitAssist } from '@/api/report'
 import { formatMoney } from '@/utils/format'
 import type { CitAssistResponse } from '@/api/types'
+import { SoloEmpty } from '@/components/ui'
 
+const route = useRoute()
 const router = useRouter()
 const message = useMessage()
+const requestedMonth = String(route.query.month || '')
+const hasRequestedMonth = /^\d{4}-(0[1-9]|1[0-2])$/.test(requestedMonth)
 const loading = ref(false)
 const result = ref<CitAssistResponse | null>(null)
 const costConfirmed = ref(false)
@@ -15,9 +20,19 @@ const profitConfirmed = ref(false)
 const assetLossChoice = ref<'yes' | 'no' | null>(null)
 
 function previousCompletedQuarter() {
+  if (hasRequestedMonth) {
+    const year = requestedMonth.slice(0, 4)
+    const m = parseInt(requestedMonth.slice(5, 7), 10)
+    const q = Math.ceil(m / 3)
+    return `${year}-Q${q}`
+  }
   const now = new Date()
   const q = Math.floor(now.getMonth() / 3) + 1
   return q === 1 ? `${now.getFullYear() - 1}-Q4` : `${now.getFullYear()}-Q${q - 1}`
+}
+
+function handleBack() {
+  router.push({ path: '/reports', query: hasRequestedMonth ? { month: requestedMonth } : {} })
 }
 
 const period = ref(previousCompletedQuarter())
@@ -62,8 +77,8 @@ onMounted(load)
   <div class="report-container">
     <div class="report-header">
       <div class="report-header-left">
-        <NButton text class="report-back-btn" @click="router.push('/reports')">
-          <template #icon><i class="ri-arrow-left-line" /></template>返回
+        <NButton text class="report-back-btn" @click="handleBack">
+          <template #icon><i class="ri-arrow-left-line" /></template>返回报表中心
         </NButton>
         <div class="report-title-section">
           <h2>企业所得税申报辅助</h2>
@@ -75,6 +90,7 @@ onMounted(load)
 
     <NSpin :show="loading">
       <template v-if="result">
+
         <NCard :bordered="false" class="result-card mb-4">
           <div class="result-icon" :class="Number(result.estimatedTax) === 0 ? 'safe' : 'payable'">
             <i :class="Number(result.estimatedTax) === 0 ? 'ri-checkbox-circle-line' : 'ri-money-cny-circle-line'" />
@@ -93,8 +109,13 @@ onMounted(load)
         </section>
 
         <NCard v-if="!result.companyTaxProfileComplete" :bordered="false" class="profile-card mb-4">
-          <div><strong>企业税务信息还没完善</strong><p>请在主体管理中确认限制行业和从业人数，之后每季度无需重复填写。</p></div>
+          <div><strong>企业税务信息还没完善</strong><p>请在主体管理中补充所属行业（系统按行业自动判定是否属于限制/禁止行业）；从业人数自动取自「薪酬社保」员工名册，无需填写。</p></div>
           <NButton type="primary" secondary @click="router.push('/mine/companies')">前往主体管理</NButton>
+        </NCard>
+
+        <NCard v-if="result.blockingIssues?.length" :bordered="false" class="report-card mb-4">
+          <h3 class="section-title">还差这些才能生成申报结果</h3>
+          <p v-for="issue in result.blockingIssues" :key="issue" class="blocking-line">• {{ issue }}</p>
         </NCard>
 
         <NCard :bordered="false" class="report-card mb-4">
@@ -135,11 +156,19 @@ onMounted(load)
             </NCollapseItem>
           </NCollapse>
         </NCard>
-      </template>
+            </template>
+      <SoloEmpty
+        v-else-if="!loading"
+        title="还没有可测算的数据"
+        description="选好期间后，这里会帮你测算企业所得税。"
+        icon="ri-calculator-line"
+      />
+
     </NSpin>
   </div>
 </template>
 
 <style scoped>
-.mb-4{margin-bottom:16px}.result-card{display:flex;gap:16px;align-items:center}.result-card h3{margin:0 0 5px;font-size:18px}.result-card p,.profile-card p,.help-text{margin:0;color:var(--solo-text-muted);font-size:13px}.result-icon{display:grid;place-items:center;width:48px;height:48px;border-radius:14px;font-size:25px}.result-icon.safe{color:var(--solo-income);background:rgba(16,185,129,.1)}.result-icon.payable{color:var(--solo-expense);background:rgba(239,68,68,.08)}.auto-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.auto-grid>div{display:flex;flex-direction:column;gap:6px;padding:16px;background:var(--solo-bg-card);border:1px solid var(--solo-border-glass);border-radius:var(--solo-radius-lg)}.auto-grid span,.auto-grid small{color:var(--solo-text-muted);font-size:12px}.auto-grid strong{font-size:17px}.profile-card{display:flex;align-items:center;justify-content:space-between;gap:16px;border:1px solid rgba(245,158,11,.3)!important}.section-title{margin:0 0 12px;font-size:16px}.confirm-row{display:flex;align-items:center;gap:10px;padding:12px 0;border-bottom:1px solid var(--solo-border-light);font-size:14px}.confirm-row:last-child{border-bottom:0}.help-text{margin-bottom:12px}.asset-warning{margin-top:12px;padding:10px 12px;border-radius:8px;color:var(--solo-expense);background:rgba(239,68,68,.06);font-size:13px}.action-row{display:flex;justify-content:flex-end;margin:18px 0}.detail-card{margin-top:8px}.meta-line{display:flex;justify-content:space-between;padding:8px 0}.detail-table{width:100%;border-collapse:collapse;margin-top:12px}.detail-table th,.detail-table td{padding:8px;border-bottom:1px solid var(--solo-border-light);text-align:left;font-size:12px}.detail-table th:last-child,.detail-table td:last-child{text-align:right}.expense{color:var(--solo-expense)}@media(max-width:800px){.auto-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.profile-card{align-items:flex-start;flex-direction:column}}@media(max-width:520px){.auto-grid{grid-template-columns:1fr}}
+.mb-4{margin-bottom:16px}.result-card{display:flex;gap:16px;align-items:center}.result-card h3{margin:0 0 5px;font-size:18px}.result-card p,.profile-card p,.help-text{margin:0;color:var(--solo-text-muted);font-size:13px}.result-icon{display:grid;place-items:center;width:48px;height:48px;border-radius:12px;font-size:25px}.result-icon.safe{color:var(--solo-income);background:rgba(16,185,129,.1)}.result-icon.payable{color:var(--solo-expense);background:rgba(239,68,68,.08)}.auto-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.auto-grid>div{display:flex;flex-direction:column;gap:6px;padding:16px;background:var(--solo-bg-card);border:1px solid var(--solo-border-glass);border-radius:var(--solo-radius-lg)}.auto-grid span,.auto-grid small{color:var(--solo-text-muted);font-size:12px}.auto-grid strong{font-size:17px}.profile-card{display:flex;align-items:center;justify-content:space-between;gap:16px;border:1px solid rgba(245,158,11,.3)!important}.section-title{margin:0 0 12px;font-size:16px}.confirm-row{display:flex;align-items:center;gap:10px;padding:12px 0;border-bottom:1px solid var(--solo-border-light);font-size:14px}.confirm-row:last-child{border-bottom:0}.help-text{margin-bottom:12px}.asset-warning{margin-top:12px;padding:10px 12px;border-radius:8px;color:var(--solo-expense);background:rgba(239,68,68,.06);font-size:13px}.action-row{display:flex;justify-content:flex-end;margin:18px 0}.detail-card{margin-top:8px}.meta-line{display:flex;justify-content:space-between;padding:8px 0}.detail-table{width:100%;border-collapse:collapse;margin-top:12px}.detail-table th,.detail-table td{padding:8px;border-bottom:1px solid var(--solo-border-light);text-align:left;font-size:12px}.detail-table th:last-child,.detail-table td:last-child{text-align:right}.expense{color:var(--solo-expense)}@media(max-width:800px){.auto-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.profile-card{align-items:flex-start;flex-direction:column}}@media(max-width:520px){.auto-grid{grid-template-columns:1fr}}
+.blocking-line{margin:4px 0 0;font-size:13px;color:var(--solo-text-secondary,#586474)}
 </style>

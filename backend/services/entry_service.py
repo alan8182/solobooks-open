@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Compatibility facade over the authoritative structured accounting core.
 
 Importers keep using this module, but every write now lands in
@@ -31,18 +34,31 @@ from services.accounting_core_service import (
 )
 
 
-def _deterministic_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
-    """Discard untrusted voucher lines while preserving known system vouchers."""
+def _deterministic_entry(entry: Dict[str, Any], *, trusted_voucher: bool = False) -> Dict[str, Any]:
+    """Discard untrusted voucher lines while preserving known system vouchers.
+
+    信任只能由服务端代码以函数参数传入，**不能读 payload 里的 ``voucherAuthority``**：
+    payload 会经过 HTTP / MCP / Agent 多层透传，任何客户端都能塞这个字段，
+    一旦把它当信任标志，就等于让外部决定借贷科目。
+
+    ``wechat_settlement`` 保持例外：它的凭证行由微信账单服务在本进程内构造，
+    且 source 值不是客户端可自由指定的通用入口。
+    """
     prepared = dict(entry)
-    trusted = prepared.get("voucherAuthority") in {"system", "legacy_import"}
-    trusted = trusted or prepared.get("source") == "wechat_settlement"
+    trusted = trusted_voucher or prepared.get("source") == "wechat_settlement"
+    prepared.pop("voucherAuthority", None)
     if not trusted:
         prepared["voucherLines"] = apply_rd_detail_to_voucher(prepared, get_voucher_hint(
             str(prepared.get("direction") or "expense"),
             str(prepared.get("category") or "其他支出"),
             prepared.get("amount") or 0,
-            payer=str(prepared.get("payer") or "company_account"),
+            str(prepared.get("payer") or "company_account"),
+            vat_rate=prepared.get("vatRate") if prepared.get("vatSeparated") else None,
         ))
+    else:
+        prepared = {**prepared, "voucherLines": apply_rd_detail_to_voucher(
+            prepared, prepared.get("voucherLines") or {}
+        )}
     return prepared
 
 
@@ -59,12 +75,20 @@ async def save_entry(
     user_id: str,
     company_id: str,
     confirm: bool = False,
+    trusted_voucher: bool = False,
+    allow_backfill: bool = False,
+    backfill_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     async with session_scope() as session:
         await ensure_tenant(session, company_id, user_id)
-        entry = _deterministic_entry(entry)
+        entry = _deterministic_entry(entry, trusted_voucher=trusted_voucher)
         entry_id = str(entry.get("id") or uuid4())
         entry = {**entry, "id": entry_id}
+        if allow_backfill:
+            entry["allowBackfill"] = True
+            entry["backfillReason"] = backfill_reason or (
+                f"关账后导入（业务日期 {str(entry.get('occurDate') or '')[:10]}）"
+            )
         try:
             existing = await get_journal(session, entry_id, company_id=company_id, lock=True)
         except AccountingError as exc:
@@ -99,14 +123,29 @@ async def save_entries_bulk(
     user_id: str,
     company_id: str,
     existing_entry_updates: Optional[List[Dict[str, Any]]] = None,
+    trusted_voucher: bool = False,
+    allow_backfill: bool = False,
+    backfill_reason: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
+    """批量落库（微信账单等历史数据导入）。
+
+    allow_backfill：单据日期所属期间已关账时是否补记到最早的未关账期间。
+    批量导入是用户对"一批历史流水"的显式动作，UI 无法逐行询问，因此由调用方
+    一次性决定；补记行都会进 period_backfills 台账，并在结账检查里提示。
+    """
     existing_entry_updates = existing_entry_updates or []
     results: list[dict[str, Any]] = []
     async with session_scope() as session:
         await ensure_tenant(session, company_id, user_id)
         for raw in entries:
-            raw = _deterministic_entry(raw)
+            raw = _deterministic_entry(raw, trusted_voucher=trusted_voucher)
             entry_id = str(raw.get("id") or uuid4())
+            payload = {**raw, "id": entry_id}
+            if allow_backfill:
+                payload["allowBackfill"] = True
+                payload["backfillReason"] = backfill_reason or (
+                    f"关账后批量导入（业务日期 {str(raw.get('occurDate') or '')[:10]}）"
+                )
             try:
                 existing = await get_journal(session, entry_id, company_id=company_id, lock=True)
             except AccountingError as exc:
@@ -116,7 +155,7 @@ async def save_entries_bulk(
             if existing is None:
                 existing = await create_entry(
                     session,
-                    {**raw, "id": entry_id},
+                    payload,
                     company_id=company_id,
                     user_id=user_id,
                     request_id=f"bulk-create-{uuid4()}",

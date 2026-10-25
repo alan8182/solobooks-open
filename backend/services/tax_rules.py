@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """
 税务规则引擎（硬编码规则）
 基于中国小微企业常见税务口径
@@ -190,7 +193,23 @@ def sanitize_risk_tags(tags: list) -> list:
     ]
 
 
-def is_tax_deductible(category: str, direction: str = "expense") -> bool:
-    """是否可税前扣除"""
+def is_tax_deductible(
+    category: str,
+    direction: str = "expense",
+    billing_status: str | None = None,
+    has_invoice_number: bool = False,
+) -> bool | None:
+    """是否可税前扣除（三态）。
+
+    True 可扣除 / False 明确不得扣除（如声明无票）/ None 待确认（状态不明）。
+    绝不默认 True——规则要求发票而单据状态不明时返回 None，
+    由报表层归入 pending_deductibility，汇算底稿按无票调增兜底。
+    """
+    from services.cit_adjustment_service import evaluate_deductibility
+
     rules = lookup_tax(category, direction)
-    return rules.get("citDeductible", True)
+    return evaluate_deductibility(
+        rules.get("requiredBilling"),
+        billing_status,
+        has_invoice_number,
+    )

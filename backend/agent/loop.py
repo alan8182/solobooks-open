@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Agent 循环：qwen function calling + 工具执行 + SSE 事件流。
 
 事件契约（routers/agent.py 以 SSE data: JSON 下发）：
@@ -31,6 +34,7 @@ class LoopContext:
     user_id: str
     company_id: str
     conversation_id: Optional[str] = None
+    workspace_view: Optional[str] = None
 
     def tool_ctx(self) -> ToolContext:
         return ToolContext(user_id=self.user_id, company_id=self.company_id)
@@ -67,11 +71,25 @@ async def _build_system_prompt(ctx: LoopContext) -> str:
             profile_lines.append(f"其他偏好：{profile['notes']}")
 
     profile_block = ("\n\n## 公司画像（长期记忆）\n" + "\n".join(profile_lines)) if profile_lines else ""
+    if ctx.workspace_view == "boss":
+        view_block = (
+            "\n\n## 当前视图\n"
+            "用户正在老板视图。优先用经营语言回答：赚了多少、钱在哪里、欠谁、要交多少税、下一步做什么。"
+            "除非用户主动询问会计处理，不要先展开借贷分录、科目编码或凭证状态。"
+        )
+    elif ctx.workspace_view == "accounting":
+        view_block = (
+            "\n\n## 当前视图\n"
+            "用户正在会计视图。可以给出科目编码、借贷方向、凭证状态、勾稽差异和五项检查细节；"
+            "但仍然必须遵守 AI 起草、规则校验、用户确认的边界。"
+        )
+    else:
+        view_block = ""
     return AGENT_SYSTEM_PROMPT.format(
         today=now.strftime("%Y-%m-%d"),
         weekday=WEEKDAYS[now.weekday()],
         month=now.strftime("%Y-%m"),
-    ) + profile_block
+    ) + view_block + profile_block
 
 
 def _summarize_result(result: object) -> str:
@@ -97,13 +115,16 @@ def _normalize_history(messages: List[dict]) -> List[dict]:
     return valid[-keep:]
 
 
-async def run_agent_stream(ctx: LoopContext, messages: List[dict]) -> AsyncIterator[dict]:
+async def run_agent_stream(
+    ctx: LoopContext, messages: List[dict], enable_thinking: bool = False
+) -> AsyncIterator[dict]:
     """运行 agent 循环，逐个产出 SSE 事件。"""
     yield {
         "type": "meta",
         "tools": [t["function"]["name"] for t in TOOL_SCHEMAS],
         "maxSteps": MAX_STEPS,
         "companyId": ctx.company_id,
+        "enableThinking": enable_thinking,
     }
 
     system_prompt = await _build_system_prompt(ctx)
@@ -123,12 +144,13 @@ async def run_agent_stream(ctx: LoopContext, messages: List[dict]) -> AsyncItera
                 scene="agent_chat",
                 user_id=ctx.user_id,
                 company_id=ctx.company_id,
+                enable_thinking=enable_thinking,
             ):
                 if chunk["type"] == "delta":
                     content_parts.append(chunk["content"])
                     yield {"type": "token", "content": chunk["content"]}
                 elif chunk["type"] == "reasoning":
-                    continue
+                    yield {"type": "reasoning", "content": chunk["content"]}
                 elif chunk["type"] == "final":
                     final_content = chunk["content"]
                     tool_calls = chunk["tool_calls"]

@@ -1,62 +1,72 @@
-# SoloBooks 系统设计规范与前端开发指南
+# SoloBooks 实现规范与前端开发指南
 
-本规范旨在定义 SoloBooks 全站页面的 UI 布局、容器宽度、排版字号、组件风格与视觉标准。为了给用户提供一致、高级、极具质感的 SaaS 财务管理体验，所有页面（包括新开发页面）必须遵循此开发规范。
-
----
-
-## 1. 核心设计原则
-
-*   **宽度绝对统一**：全站所有页面最大宽度硬性统一为 `920px`，使导航时页面标题、正文内容的左右边缘严密贴合在同一垂直线上。
-*   **字号层级规范**：严格限制标题大小，全站大标题字号必须高度统一，副标题清晰置灰。
-*   **极光玻璃态美学**：卡片与面板使用圆角毛玻璃微发光设计，搭配柔和过渡。
+> **设计语言看 [`DESIGN.md`](../../DESIGN.md)**（色彩意图、字体层级、Do's and Don'ts）。
+> 本文只管「落到代码上怎么摆」，面向新增页面和改动现有页面。
+> 两者冲突时以 `DESIGN.md` 的意图 + `variables.css` 的真值为准，本文的类名与宽度以代码实际引用为准。
+>
+> 最后核对：2026-10-20（对应设计评估整改批次，见 `design-audit/web-2026-10-20/`）
 
 ---
 
-## 2. 页面容器宽度规范 (Container Widths)
+## 1. 新增一个页面：照着这个顺序做
 
-系统通过全局样式表 [layout.css](file:///Users/ecarx/Documents/solobooks/web/src/assets/styles/layout.css) 与各模块专用样式定义了分层的响应式容器体系：
-*   **外层内容区基线**：主视图根容器 `.content > *` 统一设定上限 `max-width: 1440px`，居中排列并自适应屏幕空间。
-*   **多列宽表与财务核对页面（1200px ~ 1240px）**：
-    - 报表中心全景与 12 张子报表（资产负债表、利润表、现金流量表、明细账、总账、账龄等，`.report-container` / `.report-page`）
-    - 银行流水与智能对账（`.bank-page`）
-    - 发票导入向导与明细核验（`.invoice-import-page`）
-    - 经营账本与研发台账（`.ledger-page` / `.rd-page`）
-    - 薪酬个税、期初平衡表、会计科目（`.salary-page` / `.opening-page` / `.accounts-page`）
-    - 税务申报作业台与固定资产台账（`.tax-filing-page` / `.asset-page`）
-    > 以上宽表页面统一设定为 `max-width: 1200px ~ 1240px`，彻底解决过去 800px~920px 限制导致的横向拥挤、折行断流与水平滚动，并在大屏下提供开阔舒展的财务视图。
-*   **步骤向导与自适应过渡**：如月度结账向导（`.closing-wizard-container`），Step 1~3 保持 920px 步骤引导，Step 4~5 对账与核验自动平滑拓展为 1240px（`.closing-wizard--wide`）。
-*   **阅读型单据与表单页（640px ~ 720px）**：私账单据、凭证详情打印预览、新增主体与设置类表单，维持居中聚焦宽度，提升填写与阅读体验。
-*   **响应式防溢出保护**：各宽表卡片配置 `overflow-x: auto` 与 ≤768px 媒体查询间距，小屏幕下平滑包裹且不破坏主布局。
+1. **路由与导航**：在 `src/router/index.ts` 注册，在 `utils/constants.ts` 的 `NAV_ITEMS` 挂一项。
+   **必须同时给 `group`（会计视图）和 `bossGroup`（老板视图）**——老板视图是默认视图，
+   只挂 `group` 等于只有切到会计视图才能进。低频页挂到「专项核算」或「设置」的子项。
+2. **容器宽度**：按 §2 选档，写在页面根元素的 class 上。
+3. **页面头部**：`.page-header` + `h2` 标题 + `.subtitle`，见 §3。
+4. **状态与空态**：徽章用 `SoloStatusBadge`（正常态 `plain`），空态用 `SoloEmpty`（guide / hint），
+   加载首屏用 `SoloSkeleton`。规则见 `DESIGN.md` §7.2–7.4。
+5. **长列表**：超过一屏的流水按日分组 + 组头吸顶，用 `utils/entryGrouping.ts`。
+6. **自检**：`npx vitest run`、`npx vue-tsc --noEmit -p tsconfig.app.json`、
+   `npm run check:palette`，再加 §7 的验收口径。
 
 ---
 
-## 3. 页面头部与标题规范 (Headers & Typography)
+## 2. 容器宽度分层
 
-为保障每个界面的大标题大小与外边距达到全局绝对统一，系统在全局进行了规则覆盖：
+外层上限由 `layout.css` 的 `.content > *` 统一给到 `max-width: 1440px` 并居中；
+页面再按内容密度收窄。**不要再用「全站统一 920px」**——宽表在那套规则下会横向拥挤、
+折行断流。
 
-### 3.1 页面头部包裹器 (Header Wrapper)
-*   **CSS 类**：`.page-header` 或 `.report-header`。
-*   **布局逻辑**：使用 Flex 横向布局，两端对齐，垂直居中对齐，下方统一 `margin-bottom: 24px` 的呼吸感间距。
+| 档位 | 宽度 | 适用 |
+| --- | --- | --- |
+| 宽表 | 1200–1240 | 报表中心与 12 张子报表（`.report-container` / `.report-page`）、银行对账（`.bank-page`）、发票导入（`.invoice-import-page`）、经营账本与研发台账（`.ledger-page` / `.rd-page`）、薪酬 / 期初 / 会计科目（`.salary-page` / `.opening-page` / `.accounts-page`）、税务申报（`.tax-filing-page`）、固定资产与无形资产 |
+| 标准 | 1080–1200 | 大多数列表与看板 |
+| 聚焦 | 640–720 | 单据详情、凭证打印预览、新增主体、设置类表单 |
+| 步骤向导 | 920 → 1240 | 月度结账：Step 1–3 保持 920 引导，Step 4–5 对账核验自动展宽（`.closing-wizard--wide`） |
 
-### 3.2 页面大标题 (Page Title)
-*   **标签要求**：必须在头部中使用 `h2` 标签。
-*   **统一字体**：
-    *   **字号**：`22px`
-    *   **字重**：`700`
-    *   **颜色**：`var(--solo-text-primary)`（Slate 深灰）
-    *   **排版**：行高 `1.3`，字距缩紧 `letter-spacing: -0.5px`。
+宽表卡片需配 `overflow-x: auto`，并在 `≤768px` 收紧间距，避免小屏撑破主布局。
 
-### 3.3 页面副标题 (Page Subtitle)
-*   **CSS 类**：`.subtitle`、`.report-subtitle` 或 `.text-muted`。
-*   **统一字体**：字号 `13px`，字重 `normal`，颜色 `var(--solo-text-secondary)`（次要 Slate 灰）。
+---
 
-### 3.4 示例 HTML 结构：
+## 3. 页面头部与标题
+
+### 3.1 头部包裹器
+
+`.page-header` 或 `.report-header`：Flex 两端对齐、底边对齐，`margin-bottom: 24px`。
+
+### 3.2 页面大标题
+
+- 标签：`h2`（统一由 `layout.css` 接管，**不要在页面里覆盖字号**）
+- 字号 `24px`，字重 `650`，行高 `1.3`，`letter-spacing: -0.5px`
+- 颜色 `var(--solo-text-primary)`
+
+### 3.3 副标题
+
+`.subtitle` / `.report-subtitle`：`13px`、`normal`、`var(--solo-text-secondary)`。
+
+> 注意与 `--solo-text-muted` 的区别：`secondary` 用于「副标题、说明」，`muted` 用于
+> 「日期、元数据、时间戳」这类更弱的辅助信息。两者都在浅底上过 AA，别混用层级。
+
+### 3.4 结构示例
+
 ```html
-<div class="ledger-page"> <!-- 自动适配 920px 宽度 -->
+<div class="ledger-page">           <!-- 宽度档位见 §2 -->
   <div class="page-header">
     <div class="title-section">
-      <h2>账本</h2> <!-- 自动适配 22px 加粗大标题 -->
-      <p class="subtitle">记录企业日常经营的所有资金往来流向</p> <!-- 自动适配 13px 副标题 -->
+      <h2>账本</h2>
+      <p class="subtitle">记录企业日常经营的所有资金往来流向</p>
     </div>
     <NSpace>
       <NButton type="primary" size="small">新增记录</NButton>
@@ -68,31 +78,42 @@
 
 ---
 
-## 4. 玻璃态卡片组件规范 (Card Wrappers)
+## 4. 卡片与容器
 
-为了让数据容器产生通透、现代的视觉效果，全站卡片容器统一采用高斯模糊毛玻璃微光样式：
-*   **类名**：`.report-card` 配合 Naive UI `<NCard :bordered="false">` 使用。
-*   **卡片内小标题**：使用 `h3` 标签并赋予 `.report-section-title` 类，字号统一为 `14.5px`，字重 `750`。
+**平面优先。** 静止表面靠背景差、1px 边框和间距分层，不靠毛玻璃、发光或大面积阴影。
+（这一条取代了本文旧版「高斯模糊毛玻璃微光」的说法，与 `DESIGN.md` 的
+The Flat-at-Rest Rule / The No Glass Rule 一致。）
+
+- **类名**：`.report-card` 搭配 `<NCard :bordered="false">`。
+- **圆角**：全站四档——内嵌小块 4px、控件与卡片 8px、页面级大容器 12px、胶囊 999px。
+- **背景**：默认 `--solo-bg-card`；次级区块用 `--solo-bg-soft`；品牌弱的强调用 `--solo-bg-blue-soft`。
+- **边框**：`--solo-border-light` 或 `--solo-border`。**禁止彩色粗侧边条**（>1px 的
+  `border-left` 强调），需要强调用背景色或左侧 2px 以内的中性线。
+- **卡片内小标题**：`h3` + `.report-section-title`，`14.5px` / `750`。
+- **阴影**：静止不用；悬停 `--solo-shadow`，浮层 `--solo-shadow-lg`。
 
 ```html
 <NCard :bordered="false" class="report-card mb-4">
   <h3 class="report-section-title">
     <i class="ri-line-chart-line"></i> 月度趋势分析
   </h3>
-  <!-- 卡片图表或列表内容 -->
 </NCard>
 ```
 
+> naive-ui 的内容层类名是 `.n-card-content`（**无下划线**）。要在卡片内部做
+> flex/grid 布局，必须 `:deep(.n-card-content)`；写成 `.n-card__content` 是静默失配，
+> 不报错也不生效。
+
 ---
 
-## 5. 财务数据表格与对齐规范 (Data Tables)
+## 5. 财务数据表格
 
-表格排版必须遵循严谨的财务对齐原则：
-
-*   **数值/金额列**：文字必须右对齐（`text-align: right`），使用等宽字体（`Outfit` 或 `Inter` monospaced）并附加 `.amount-cell` 类。
-*   **科目代码列**：固定宽度并使用 `.code-cell` 类，展示为等宽字符。
-*   **合计/总计行**：在行上添加 `.total-row` 类，将自动添加 2px 上边框并赋予淡底色高亮。
-*   **利润与损失高亮**：收入/盈利数据附加 `.income`（绿色），支出/负债数据附加 `.expense`（红色）。
+- **金额列**：右对齐 + 等宽数字（`.amount-cell`），并加 `font-variant-numeric: tabular-nums`。
+- **科目代码列**：固定宽度、等宽字体（`.code-cell`）。
+- **合计行**：`.total-row`，2px 上边框 + 淡底。
+- **收支高亮**：`.income`（绿）/ `.expense`（红）取 token，不写裸 hex。
+- **长表**：可排序的表格用「日期列 `fixed: 'left'` + 表格 `max-height` 让表头吸顶」；
+  不可排序的流水用按日分组 + 组头吸顶。两者不要混用，理由见 `DESIGN.md` §7.6。
 
 ```html
 <div class="report-table-wrapper">
@@ -119,42 +140,65 @@
     </tfoot>
   </table>
 </div>
+```
 
 ---
 
-## 6. 月度结账向导交互设计规范 (Closing Wizard & Canvas)
+## 6. 特殊流程
 
-月度结账向导（Monthly Closing Wizard）代表了系统级核心引导流程的视觉标准，其交互规范如下：
+### 6.1 月度结账向导
 
-### 6.1 分步流程进度条 (Steps Layout)
-*   **进度展示**：使用 Naive UI 的 `<NSteps>` 组件进行顶层展示，统一放入 `.steps-card` 中以确保呼吸感间距。
-*   **卡片内边距**：容器内边距设定为 `16px 24px`，确保进度指示器的文字和点不拥挤。
+- 顶层进度用 `<NSteps>`，放进 `.steps-card`，内边距 `16px 24px`。
+- 步骤条的「未到达」态已在 `App.vue` 的 `Steps` 主题里抬到可读灰——不要再用
+  naive 默认（`#c2c2c2`，1.78:1）。
+- 银行流水在 `?step=4`。
 
-### 6.2 拖拽上传区域 (Drag & Drop Zone)
-*   **CSS 类**：`.uploader-zone`。
-*   **视觉规范**：
-    *   背景采用微透明的 `var(--solo-bg-input)`，配合虚线边框（Dashed border）。
-    *   鼠标悬停（`:hover`）时，边框颜色渐变为 `var(--solo-primary)`，背景微光发亮，并伴随 `0.2s` 的缩放缓动。
-    *   文字结构包含：大图标、引导标题、次要副标题说明。
+### 6.2 拖拽上传区
 
-### 6.3 智能对账画布工作区 (Match Canvas)
-对账工作台使用三栏式网格架构（发票 - 已配对 - 银行流水），使用 `.canvas-layout` 进行排列：
-*   **分栏容器** (`.canvas-column`)：
-    *   三栏等宽，使用 `flex: 1` 均分。
-    *   中间“已配对账单”列使用柔和绿底淡框高亮展示（`rgba(16, 185, 129, 0.02)` 背景，`rgba(16, 185, 129, 0.15)` 边框）。
-*   **对账选择卡片** (`.canvas-card`)：
-    *   两端对齐，标题文字居左，金额居右，并根据金额正负自动附带 `.income` 或 `.expense` 颜色。
-    *   被选中时（`.selected`），边框变为 `var(--solo-primary)`，并施加蓝色阴影（Box Shadow）以确保强交互提示。
-*   **匹配对账卡** (`.matched-pair-card`)：
-    *   上部包含 `confidence-badge`（置信度标签：99%、98% 或 手动匹配），下方纵向展示配对的发票名称与流水账单。
-    *   尾部提供「拆开」与「确认匹配」的双动作微型按钮。
+- `.uploader-zone`：`--solo-bg-soft` 底 + 虚线边框。
+- 悬停时边框转 `--solo-primary`，`0.2s` 过渡；不做缩放动效（避免布局抖动）。
+- 结构：大图标 + 引导标题 + 次要说明。
 
-### 6.4 CFO 诊断与仪式感关账 (Diagnosis & Dashboard)
-*   **关账状态容器** (`.closing-ceremony-modal`)：垂直居中对齐，大图标使用光晕背景包裹，文字限制最大宽度为 `480px` 以保证居中阅读体验。
-*   **核心指标行** (`.metrics-row`)：
-    *   包含收入、成本、净利润三项看板块 (`.metric-box`)。
-    *   采用毛玻璃卡片设计，内部金额以大字号（`20px`）和粗体展现，直观明了。
-*   **AI CFO 诊断气泡**：
-    *   带左侧粗边框的浅色毛玻璃卡片（`border-left: 4px solid var(--solo-primary)`）。
-    *   以极其丰富的排版（结合 Emoji 表情符号、小警告图标和小标题高亮）突出财务健康和税务合规风险。
+### 6.3 智能对账画布
+
+三栏网格（发票 / 已配对 / 银行流水），`.canvas-layout` + `.canvas-column`：
+
+- 三栏等宽 `flex: 1`；中间「已配对」列用 `--solo-income-bg` 淡底 + `--solo-income` 细边框区分。
+- `.canvas-card`：两端对齐，金额左标题右数值，正负分别用 `.income` / `.expense`。
+- 选中态 `.selected`：边框转 `--solo-primary`，加 `--solo-primary-glow` 焦点环。
+- `.matched-pair-card` 上部的 `confidence-badge` 用 `SoloStatusBadge`
+  （置信度正常 → `plain neutral`，需要人工确认 → `warning`）。
+
+### 6.4 关账确认
+
+- `.closing-ceremony-modal` 垂直居中，正文限宽 `480px`。
+- `.metrics-row` 三项看板（收入 / 成本 / 净利润）：平面卡片 + 1px 边框，
+  金额 `20px` 粗体、等宽数字。**不用毛玻璃**。
+- AI 诊断块：普通浅底卡片，左侧强调用 `--solo-info` 的 2px 内线或直接靠标题层级，
+  不用 4px 彩色粗边、不用 Emoji 表情符号。
+
+---
+
+## 7. 验收口径
+
+改完不要只看截图，跑这三条 + 两条实测：
+
+```bash
+cd web
+npx vitest run                                   # 单测
+npx vue-tsc --noEmit -p tsconfig.app.json        # 类型
+npm run check:design                             # 色板棘轮 + 文档与 token 一致性
 ```
+
+`check:design` = `check:palette`（非 token hex 只许降）+ `check:docs`
+（`DESIGN.md` / `DESIGN_SYSTEM.md` 的色值必须与 `variables.css` 一致）。
+
+实测两条：
+
+1. **对比度**：新增/改动的文字节点按 WCAG 2.1 AA 自查，且要按**最暗的实际背景**算，
+   不是白底。项目里已有一套页面级审计脚本的写法（遍历文本节点 + 逐级向上合成背景），
+   需要时重建即可。
+2. **吸顶**：有 sticky 元素时，滚动容器后读 `getBoundingClientRect().top` 是否恒定。
+   只确认「有 `overflow: auto`」是不够的——祖先不真的滚动时 sticky 完全不激活。
+
+更多踩过的坑见 `DESIGN.md` §7.8 反模式清单。

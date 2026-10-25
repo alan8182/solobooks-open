@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+ * Licensed under the SoloBooks License v2.0.
+ */
+
 import { describe, expect, it } from 'vitest'
 import { firstActionableReadinessItem, getClosingReadiness, deriveClosingTasks } from '@/utils/closingReadiness'
 
@@ -14,6 +19,23 @@ describe('closing readiness', () => {
       actionLabel: '去核对',
       step: 4,
     })])
+  })
+
+  it('surfaces a preceding unclosed month as a blocking task that switches month', () => {
+    const checks = {
+      checks: [{
+        code: 'PERIOD_ORDER', name: '关账顺序', status: 'blocking', uiStatus: 'blocked',
+        earlierOpenCount: 1, earliestOpenMonth: '2026-08',
+      }],
+    }
+    const [item] = getClosingReadiness(checks as any)
+    expect(item.detail).toBe('2026-08 还没结账，请先结完 2026-08 再结本月。')
+    expect(item.status).toBe('blocked')
+
+    const [task] = deriveClosingTasks(checks as any)
+    expect(task.id).toBe('period-order')
+    expect(task.severity).toBe('blocked')
+    expect(task.actions[0]).toEqual({ label: '去结 2026-08', kind: 'detail', month: '2026-08' })
   })
 
   it('does not treat an unknown backend status as complete', () => {
@@ -144,6 +166,36 @@ describe('deriveClosingTasks', () => {
     expect(tasks[0].matchDetails![0].statementId).toBe('bs-1')
   })
 
+  it('folds missing sources into the match task instead of showing a second card', () => {
+    const tasks = deriveClosingTasks({
+      checks: [
+        baseCheck('BOOK_TO_ACTUAL', {
+          issues: [
+            { type: 'book_only', entryId: 'e-1', reason: '银行存款分录未关联银行流水' },
+            { type: 'missing_source', statementId: 'bs-1', reason: '银行流水缺少有效权威来源记录' },
+          ],
+        }),
+      ],
+    })
+    expect(tasks).toHaveLength(1)
+    expect(tasks[0].id).toBe('match')
+    expect(tasks[0].title).toBe('有 1 张凭证的分录还没找到银行流水')
+    expect(tasks[0].detail).toContain('配对后会自动补建 1 条流水的来源记录')
+  })
+
+  it('keeps a standalone task when only source records are missing', () => {
+    const tasks = deriveClosingTasks({
+      checks: [
+        baseCheck('BOOK_TO_ACTUAL', {
+          issues: [{ type: 'missing_source', statementId: 'bs-1', reason: '银行流水缺少有效权威来源记录' }],
+        }),
+      ],
+    })
+    expect(tasks).toHaveLength(1)
+    expect(tasks[0].id).toBe('missing-source')
+    expect(tasks[0].title).toContain('1 笔流水缺少来源记录')
+  })
+
   it('creates dedicated tasks for duplicate income and balance mismatch', () => {
     const tasks = deriveClosingTasks({
       checks: [
@@ -168,5 +220,36 @@ describe('deriveClosingTasks', () => {
   it('returns empty for missing checks payload', () => {
     expect(deriveClosingTasks(null)).toEqual([])
     expect(deriveClosingTasks({})).toEqual([])
+  })
+})
+
+describe('closing notices（跨期与补记提示）', () => {
+  const passedChecks = [
+    { code: 'VOUCHER_TO_SOURCE', name: '账证核对', status: 'passed' },
+    { code: 'LEDGER_TO_LEDGER', name: '账账核对', status: 'passed' },
+    { code: 'BOOK_TO_ACTUAL', name: '账实核对', status: 'passed', unreconciledBankCount: 0 },
+    { code: 'LEDGER_TO_REPORT', name: '账表核对', status: 'passed' },
+    { code: 'REPORT_TO_TAX', name: '申报校验', status: 'passed' },
+  ]
+
+  it('提示项不进入五项核对，也不产生阻断任务', () => {
+    const checks = {
+      canClose: true,
+      checks: passedChecks,
+      notices: [
+        {
+          code: 'CROSS_PERIOD_PENDING',
+          name: '跨期未处理单据',
+          severity: 'warning' as const,
+          count: 2,
+          amount: '1200.00',
+          records: [{ businessDate: '2026-08-20', businessPeriod: '2026-08', description: '8 月流水', amount: '1200.00' }],
+        },
+      ],
+    }
+
+    expect(getClosingReadiness(checks)).toHaveLength(5)
+    expect(deriveClosingTasks(checks)).toHaveLength(0)
+    expect(checks.canClose).toBe(true)
   })
 })

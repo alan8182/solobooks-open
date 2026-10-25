@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """管理后台 M2：admin_audit_logs 操作留痕表。
 
 Revision ID: e1f5a7b9c2d4

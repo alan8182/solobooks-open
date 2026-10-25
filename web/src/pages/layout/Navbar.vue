@@ -1,21 +1,31 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { NDropdown, useMessage } from 'naive-ui'
 import type { DropdownOption } from 'naive-ui'
 import { useAuthStore } from '@/stores/auth'
+import { SoloStatusBadge } from '@/components/ui'
+import WorkspaceViewSwitch from '@/components/layout/WorkspaceViewSwitch.vue'
 
-const emit = defineEmits<{ toggleSidebar: [] }>()
+const emit = defineEmits<{ toggleSidebar: []; openSearch: [] }>()
 
 const router = useRouter()
 const message = useMessage()
 const authStore = useAuthStore()
+const shortcutLabel = /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘ K' : 'Ctrl K'
 
 const currentCompanyName = computed(() => {
   if (!authStore.user) return '加载中...'
   const co = authStore.companies.find((c) => c.company_id === authStore.currentCompanyId)
   return co?.name || '默认账本'
 })
+
+// 演示账套要一眼可辨：里面的数字是样本，不能当真账看
+const isDemoCompany = computed(
+  () =>
+    authStore.companies.find((c) => c.company_id === authStore.currentCompanyId)?.isDemo === true,
+)
 
 const companyOptions = computed<DropdownOption[]>(() => {
   const items: DropdownOption[] = authStore.companies.map((co) => ({
@@ -30,7 +40,7 @@ const companyOptions = computed<DropdownOption[]>(() => {
 })
 
 const userOptions: DropdownOption[] = [
-  { label: '个人中心', key: 'mine' },
+  { label: '个人设置', key: 'mine' },
   { label: '公司管理', key: 'companies' },
   { type: 'divider' as const },
   { label: '退出登录', key: 'logout' },
@@ -66,7 +76,11 @@ function handleUserAction(key: string) {
 <template>
   <header class="navbar">
     <div class="navbar-left">
-      <button class="menu-btn no-print" @click="emit('toggleSidebar')">
+      <button
+        class="menu-btn no-print"
+        aria-label="打开导航"
+        @click="emit('toggleSidebar')"
+      >
         <i class="ri-menu-2-line" />
       </button>
 
@@ -83,14 +97,25 @@ function handleUserAction(key: string) {
           <i class="ri-arrow-down-s-line arrow-icon" />
         </button>
       </NDropdown>
+
+      <SoloStatusBadge v-if="isDemoCompany" plain tone="info">演示账套</SoloStatusBadge>
+
+      <WorkspaceViewSwitch class="workspace-view-switch" />
     </div>
 
     <!-- Search shortcut bar in the middle -->
     <div class="navbar-center no-print">
-      <div class="search-trigger" @click="message.info('按 Ctrl + K 或 ⌘ + K 唤起全局搜索')">
+      <div
+        class="search-trigger"
+        role="button"
+        tabindex="0"
+        @click="emit('openSearch')"
+        @keydown.enter="emit('openSearch')"
+        @keydown.space.prevent="emit('openSearch')"
+      >
         <i class="ri-search-2-line" />
-        <span>搜索...</span>
-        <span class="kbd">⌘ K</span>
+        <span>搜索与命令...</span>
+        <span class="kbd">{{ shortcutLabel }}</span>
       </div>
     </div>
 
@@ -102,7 +127,6 @@ function handleUserAction(key: string) {
           </div>
           <div class="user-info">
             <span class="user-name">{{ authStore.user?.nickname || '用户' }}</span>
-            <span class="user-role">管理员</span>
           </div>
           <i class="ri-arrow-down-s-line user-arrow" />
         </div>
@@ -130,7 +154,10 @@ function handleUserAction(key: string) {
 .navbar-left {
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 12px;
+}
+.workspace-view-switch {
+  margin-left: 2px;
 }
 .menu-btn {
   background: none;
@@ -228,7 +255,7 @@ function handleUserAction(key: string) {
   align-items: center;
   gap: 10px;
   padding: 6px 12px;
-  border-radius: 10px;
+  border-radius: 8px;
   cursor: pointer;
   transition: all 0.2s;
   border: 1px solid transparent;
@@ -263,11 +290,6 @@ function handleUserAction(key: string) {
   font-size: 13px;
   font-weight: 600;
   color: var(--solo-text-primary);
-}
-.user-role {
-  font-size: 10px;
-  color: var(--solo-text-muted);
-  font-weight: 500;
 }
 .user-arrow {
   font-size: 14px;

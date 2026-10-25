@@ -1,3 +1,8 @@
+/**
+ * Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+ * Licensed under the SoloBooks License v2.0.
+ */
+
 export type CloseCheckStatus = 'complete' | 'blocked' | 'needs_review' | 'not_required' | 'incomplete'
 
 export interface PeriodCloseCheck {
@@ -14,6 +19,41 @@ export interface PeriodCloseChecks {
   canClose?: boolean
   blockingCount?: number
   checks?: PeriodCloseCheck[]
+  notices?: ClosingNotice[]
+  noticeCount?: number
+}
+
+/**
+ * 提示项：回答"有没有业务被漏在别的月份"，与五项核对（"账做平了没有"）分开。
+ * 不参与 canClose，只要求用户知情。
+ */
+export interface ClosingNoticeRecord {
+  businessDate?: string
+  businessPeriod?: string
+  originalPeriod?: string
+  postingPeriod?: string
+  description?: string
+  summary?: string
+  amount?: string
+  voucherRef?: string
+  reason?: string
+  sourceType?: string
+  entryId?: string
+  /** 增值税申报期差异（VAT_PERIOD_MISMATCH）专用字段 */
+  vatAmount?: string
+  businessFilingPeriod?: string
+  postingFilingPeriod?: string
+}
+
+export interface ClosingNotice {
+  code: string
+  name: string
+  severity: 'warning'
+  count: number
+  amount?: string
+  message?: string
+  suggestedAction?: string
+  records?: ClosingNoticeRecord[]
 }
 
 export interface ClosingReadinessItem {
@@ -27,6 +67,9 @@ export interface ClosingReadinessItem {
 }
 
 const COPY: Record<string, Omit<ClosingReadinessItem, 'status'>> = {
+  PERIOD_ORDER: {
+    code: 'PERIOD_ORDER', title: '关账顺序', detail: '更早的月份都已关账。', actionLabel: '去结更早的月份', step: 3,
+  },
   VOUCHER_TO_SOURCE: {
     code: 'VOUCHER_TO_SOURCE', title: '凭证与来源检查', detail: '凭证已过账，且关联有效的原始业务记录。', actionLabel: '查看本月凭证', step: 1, route: '/vouchers',
   },
@@ -42,6 +85,18 @@ const COPY: Record<string, Omit<ClosingReadinessItem, 'status'>> = {
   REPORT_TO_TAX: {
     code: 'REPORT_TO_TAX', title: '申报财务报表校验', detail: '检查记账规则及申报财务报表内部勾稽；不代表已完成税务申报。', actionLabel: '查看本月凭证', step: 1, route: '/vouchers',
   },
+  INTANGIBLE_AMORTIZATION: {
+    code: 'INTANGIBLE_AMORTIZATION', title: '无形资产摊销', detail: '本月无形资产摊销已计提入账。', actionLabel: '去摊销', step: 4, route: '/intangibles',
+  },
+  FIXED_ASSET_DEPRECIATION: {
+    code: 'FIXED_ASSET_DEPRECIATION', title: '固定资产折旧', detail: '固定资产折旧已按期间计提入账', actionLabel: '去计提折旧', step: 4, route: '/assets',
+  },
+  IMPAIRMENT_TEST_DUE: {
+    code: 'IMPAIRMENT_TEST_DUE', title: '无形资产减值迹象', detail: '存在未复核的减值迹象记录，请评估。', actionLabel: '去评估', step: 4, route: '/intangibles',
+  },
+  PAYROLL_ACCRUAL: {
+    code: 'PAYROLL_ACCRUAL', title: '工资计提', detail: '本月工资已按权责发生制计提，发放可延至次月。', actionLabel: '去计提工资', step: 2, route: '/mine/salary',
+  },
 }
 
 function normalizeStatus(check: PeriodCloseCheck): CloseCheckStatus {
@@ -54,6 +109,16 @@ function normalizeStatus(check: PeriodCloseCheck): CloseCheckStatus {
 }
 
 function detailFor(check: PeriodCloseCheck, fallback: string): string {
+  if (check.code === 'PERIOD_ORDER') {
+    const pending = Number(check.earlierOpenCount || 0)
+    if (pending) {
+      const earliest = String(check.earliestOpenMonth || '')
+      if (!earliest) return `有 ${pending} 个更早的月份还没结账，请从最早的月份开始。`
+      return pending > 1
+        ? `${earliest} 等 ${pending} 个更早的月份还没结账，请先补结。`
+        : `${earliest} 还没结账，请先结完 ${earliest} 再结本月。`
+    }
+  }
   if (check.code === 'VOUCHER_TO_SOURCE') {
     const draft = Number(check.draftCount ?? check.pendingCount ?? 0)
     const review = Number(check.pendingReviewCount || 0)
@@ -71,6 +136,22 @@ function detailFor(check: PeriodCloseCheck, fallback: string): string {
   if (check.code === 'REPORT_TO_TAX') {
     const pending = Number(check.missingRuleVersionCount || 0)
     if (pending) return `${pending} 笔记录缺少本期记账规则。`
+  }
+  if (check.code === 'INTANGIBLE_AMORTIZATION') {
+    const pending = Number(check.pendingCount || 0)
+    if (pending) return `有 ${pending} 项无形资产未计提摊销，合计 ${check.totalAmount ?? ''} 元。`
+  }
+  if (check.code === 'FIXED_ASSET_DEPRECIATION') {
+    const pending = Number(check.pendingCount || 0)
+    if (pending) return `有 ${pending} 期固定资产折旧未计提，合计 ${check.totalAmount ?? ''} 元。`
+  }
+  if (check.code === 'IMPAIRMENT_TEST_DUE') {
+    const count = Number(check.count || 0)
+    if (count) return `${count} 条减值迹象记录待复核。`
+  }
+  if (check.code === 'PAYROLL_ACCRUAL') {
+    const message = String(check.message || '')
+    if (message) return `${message}。`
   }
   const issues = check.issues as Array<{ message?: string }> | undefined
   if (issues?.length) return issues.map(issue => issue.message || '存在报表差异').join('；')
@@ -148,6 +229,8 @@ export interface ClosingTaskAction {
   kind: 'run-closing' | 'vouchers' | 'match' | 'detail'
   statementId?: string
   route?: string
+  /** detail 动作：切到该月份继续处理（关账顺序） */
+  month?: string
 }
 
 export interface ClosingTaskMatchDetail {
@@ -178,6 +261,20 @@ export function deriveClosingTasks(checks: PeriodCloseChecks | null | undefined)
   if (!allChecks || !Array.isArray(allChecks) || allChecks.length === 0) return []
   const find = (code: string) => allChecks.find(c => c.code === code)
   const tasks: ClosingTask[] = []
+
+  const order = find('PERIOD_ORDER')
+  if (order && normalizeStatus(order) !== 'complete') {
+    const count = Number(order.earlierOpenCount || 0)
+    const earliest = String(order.earliestOpenMonth || '')
+    tasks.push({
+      id: 'period-order',
+      title: count === 1 ? '有 1 个更早的月份还没关账' : `有 ${count} 个更早的月份还没关账`,
+      detail: earliest ? `请先完成 ${earliest} 的结账，再回来结本月。` : undefined,
+      affects: ['关账顺序'],
+      actions: earliest ? [{ label: `去结 ${earliest}`, kind: 'detail', month: earliest }] : [],
+      severity: 'blocked',
+    })
+  }
 
   const blockedNames = allChecks
     .filter(c => c.code !== 'VOUCHER_TO_SOURCE' && Number(c.blockedByPendingCount || 0) > 0 && normalizeStatus(c) !== 'complete')
@@ -228,12 +325,19 @@ export function deriveClosingTasks(checks: PeriodCloseChecks | null | undefined)
     const issues = ((bank.issues as any[]) || []).filter(i => i.type !== 'unposted_match')
     const unreconciled = issues.filter(i => i.type === 'unreconciled')
     const bookOnly = issues.filter(i => i.type === 'book_only')
+    // 缺来源是配对的副产物：确认配对时后端会补建来源行，所以并进同一张卡，
+    // 不让用户面对「10 笔流水没配对 + 10 处数据要修复」这种同一件事的两个计数。
+    const missingSource = issues.filter(i => i.type === 'missing_source')
     if (unreconciled.length > 0 || bookOnly.length > 0) {
+      const title = unreconciled.length > 0 && bookOnly.length > 0
+        ? `有 ${unreconciled.length} 笔银行流水和 ${bookOnly.length} 张账目凭证还没互相配对`
+        : unreconciled.length > 0
+          ? `有 ${unreconciled.length} 笔银行流水还没核对入账`
+          : `有 ${bookOnly.length} 张凭证的分录还没找到银行流水`
       tasks.push({
         id: 'match',
-        title: unreconciled.length > 0 && bookOnly.length > 0
-          ? `有 ${unreconciled.length} 笔银行流水和 ${bookOnly.length} 张账目凭证还没互相配对`
-          : `有 ${Math.max(unreconciled.length, bookOnly.length)} 笔银行流水还没和账目配对`,
+        title,
+        detail: missingSource.length ? `配对后会自动补建 ${missingSource.length} 条流水的来源记录。` : undefined,
         affects: ['银行流水核对'],
         actions: [{ label: '去对账', kind: 'match' }],
         severity: 'blocked',
@@ -243,6 +347,16 @@ export function deriveClosingTasks(checks: PeriodCloseChecks | null | undefined)
           description: String(issue.description || ''),
           reason: String(issue.reason || ''),
         })),
+      })
+    } else if (missingSource.length > 0) {
+      // 没有可配对的凭证/流水时，缺来源才需要用户单独处理
+      tasks.push({
+        id: 'missing-source',
+        title: `有 ${missingSource.length} 笔流水缺少来源记录`,
+        detail: '重新导入或认领入账后会自动补建。',
+        affects: ['银行流水核对'],
+        actions: [{ label: '去处理', kind: 'detail' }],
+        severity: 'blocked',
       })
     }
     const duplicates = issues.filter(i => i.type === 'possible_duplicate_income')
@@ -267,13 +381,29 @@ export function deriveClosingTasks(checks: PeriodCloseChecks | null | undefined)
         severity: 'blocked',
       })
     }
-    const repair = issues.filter(i => !BOOK_MATCH_IGNORED_TYPES.has(String(i.type)))
+    // missing_source 已并入配对卡或单独的「缺来源」卡，不再重复计一次
+    const repair = issues.filter(i => !BOOK_MATCH_IGNORED_TYPES.has(String(i.type)) && i.type !== 'missing_source')
     if (repair.length > 0) {
       tasks.push({
         id: 'repair',
         title: `有 ${repair.length} 处对账数据需要修复`,
         affects: ['银行流水核对'],
         actions: [{ label: '查看核对明细', kind: 'detail' }],
+        severity: 'blocked',
+      })
+    }
+  }
+
+  const intangible = find('INTANGIBLE_AMORTIZATION')
+  if (intangible) {
+    const pending = Number(intangible.pendingCount || 0)
+    if (pending > 0 && normalizeStatus(intangible) !== 'complete') {
+      tasks.push({
+        id: 'intangible-amortization',
+        title: pending === 1 ? '有 1 项无形资产还没摊销' : `有 ${pending} 项无形资产还没摊销`,
+        count: pending,
+        affects: ['无形资产摊销'],
+        actions: [{ label: '去摊销', kind: 'detail', route: '/intangibles' }],
         severity: 'blocked',
       })
     }

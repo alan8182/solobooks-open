@@ -1,8 +1,11 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """MCP stdio 本地入口：单进程调试用（ZCode / Claude Code 本地配置）。
 
 用法（本地 SQLite 测试模式；生产配 DATABASE_URL 指向 PG）：
     cd backend && DATABASE_URL="sqlite+aiosqlite:///data/app.db" \
-        MCP_STDIO_TOKEN=<sbk_...> ./.venv313/bin/python scripts/mcp_stdio.py
+        MCP_STDIO_TOKEN=<sbk_...> ./venv/Scripts/python.exe scripts/mcp_stdio.py
 
 stdio 传输没有 HTTP 中间件，启动时校验一次 MCP_STDIO_TOKEN 并把 PAT 身份
 注入 contextvar，进程生命周期内所有工具调用共用该身份。

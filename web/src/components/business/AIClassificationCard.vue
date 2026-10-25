@@ -1,8 +1,11 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue'
-import { NCard, NTag, NInput, NSelect, NInputNumber, NButton, NDivider, NAlert } from 'naive-ui'
+import { NCard, NTag, NInput, NSelect, NInputNumber, NButton, NDivider, NAlert, useMessage } from 'naive-ui'
 import { moneyPresentation } from '@/utils/accounting'
 import { getEntryNaturePresentation } from '@/utils/entryNature'
+import { joinPayer, splitPayer, type PayerKind } from '@/utils/fundsChannel'
+import { usePayeeEmployees } from '@/composables/usePayeeEmployees'
 import type { RecordTextResponse } from '@/api/types'
 import type { RdExpenseType, RdExpenseTypeOption, RdProject } from '@/api/types'
 import { getRdExpenseTypes, getRdProjects } from '@/api/rd'
@@ -20,6 +23,7 @@ const emit = defineEmits<{
   retry: []
 }>()
 
+const message = useMessage()
 const editing = ref(false)
 
 // Editable fields
@@ -27,7 +31,8 @@ const editAmount = ref(props.result.amount)
 const editTitle = ref(props.result.title)
 const editCategory = ref(props.result.category)
 const editDirection = ref(props.result.direction)
-const editPayer = ref(props.result.payer || 'company_account')
+// payer 会写入 employee_personal:<姓名>，比接口响应里的两值枚举更宽，显式放宽为 string
+const editPayer = ref<string>(props.result.payer || 'company_account')
 const rdProjectId = ref<string | null>(null)
 const rdExpenseType = ref<RdExpenseType | null>(null)
 const rdProjects = ref<RdProject[]>([])
@@ -51,7 +56,34 @@ const directionOptions = [
 const payerOptions = [
   { label: '公司账户', value: 'company_account' },
   { label: '股东个人', value: 'boss_personal' },
+  { label: '员工垫付', value: 'employee_personal' },
 ]
+
+// 员工垫付必须选到人：editPayer 仍是标准串 employee_personal:<姓名>，
+// 下拉拆成「类型 + 姓名」两段，确认时原样提交。
+const payerEmployees = usePayeeEmployees()
+const payerEmployeesLoading = payerEmployees.loading
+const editPayerKind = computed<PayerKind>({
+  get: () => splitPayer(editPayer.value).kind,
+  set: (kind) => {
+    const pendingName = kind === 'employee_personal' ? splitPayer(editPayer.value).employeeName : ''
+    editPayer.value = joinPayer(kind, pendingName)
+    if (kind === 'employee_personal') void payerEmployees.ensure()
+  },
+})
+const editPayerEmployee = computed<string>({
+  get: () => splitPayer(editPayer.value).employeeName,
+  set: (name) => {
+    editPayer.value = joinPayer('employee_personal', name || '')
+  },
+})
+const editPayerEmployeeOptions = computed(() => payerEmployees.options(editPayerEmployee.value))
+
+function payerText() {
+  const { kind, employeeName } = splitPayer(editPayer.value)
+  if (kind === 'employee_personal') return employeeName ? `员工垫付 · ${employeeName}` : '员工垫付'
+  return kind === 'boss_personal' ? '股东个人' : '公司账户'
+}
 
 const directionLabel = computed(() => {
   const presentation = getEntryNaturePresentation(editDirection.value, editCategory.value)
@@ -85,6 +117,11 @@ onMounted(async () => {
 })
 
 function handleConfirm() {
+  // 员工垫付没选人，凭证只会挂一个不具名的「其他应付款-员工往来」
+  if (editPayerKind.value === 'employee_personal' && !editPayerEmployee.value.trim()) {
+    message.warning('请选择垫付的员工，或改为股东个人/公司账户')
+    return
+  }
   emit('confirm', {
     id: props.result.id,
     direction: editDirection.value,
@@ -140,7 +177,7 @@ function handleConfirm() {
         </div>
         <div class="result-row">
           <span class="label">付款方式</span>
-          <span class="value">{{ editPayer === 'company_account' ? '公司账户' : '股东个人' }}</span>
+          <span class="value">{{ payerText() }}</span>
         </div>
         <NDivider v-if="result.explanation" style="margin: 8px 0;" />
         <div v-if="result.explanation" class="result-row explanation">
@@ -182,7 +219,18 @@ function handleConfirm() {
             </div>
             <div class="form-field">
               <label>付款方</label>
-              <NSelect v-model:value="editPayer" :options="payerOptions" />
+              <NSelect v-model:value="editPayerKind" :options="payerOptions" />
+            </div>
+            <div v-if="editPayerKind === 'employee_personal'" class="form-field">
+              <label>垫付员工</label>
+              <NSelect
+                v-model:value="editPayerEmployee"
+                :options="editPayerEmployeeOptions"
+                :loading="payerEmployeesLoading"
+                filterable
+                clearable
+                placeholder="选择垫付的员工"
+              />
             </div>
           </div>
           <div class="form-field">

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Category persistence service (async SQLite)."""
 from __future__ import annotations
 
@@ -19,12 +22,13 @@ _DIRECTION_MAP = {
     "股东垫付报销": "owner_transfer", "员工垫付报销": "owner_transfer",
     "其他应收款": "owner_transfer", "其他应付款": "owner_transfer", "往来款": "owner_transfer",
     "老板投入": "owner_transfer", "老板垫付": "owner_transfer", "老板取现": "owner_transfer",
+    "微信支付结算": "owner_transfer", "支付宝结算": "owner_transfer", "平台提现结算": "owner_transfer",
 
     # ── 支出类（不在以上两组的全部默认为支出）──
 }
 
 # 可在多个方向下使用的科目（校验时不强制方向）
-_ANY_DIRECTION_CATEGORIES = {"股东垫付", "员工垫付"}
+_ANY_DIRECTION_CATEGORIES = {"股东垫付", "员工垫付", "微信支付结算", "支付宝结算", "平台提现结算"}
 
 _DEFAULT_SORT = {
     "income": 0, "owner_transfer": 100, "expense": 200,
@@ -51,9 +55,9 @@ def _cat_sort(name: str, base: int) -> int:
         "原材料采购", "商品采购", "生产成本", "研发支出-费用化支出", "人力成本", "员工福利费",
         "差旅费", "办公费", "业务招待费", "推广费",
         "租金物业", "运费及物流", "水电通讯费", "信息技术服务费",
-        "银行及金融手续费", "税费缴纳",
-        "固定资产", "设备采购", "预付账款",
-        "其他支出",
+        "银行及金融手续费", "税费缴纳", "所得税费用",
+        "固定资产", "设备采购", "无形资产", "预付账款",
+        "营业外支出", "其他支出",
     ]
     try:
         return base + order.index(name)
@@ -223,3 +227,17 @@ async def delete_category(company_id: str, category_id: str) -> bool:
         return cursor.rowcount > 0
     finally:
         await conn.close()
+
+
+def list_account_mapping() -> List[Dict[str, Any]]:
+    """下发「分类 → 科目」权威映射（单一来源：account_mapper.CATEGORY_TO_ACCOUNT）。"""
+    return [
+        {
+            "category": name,
+            "direction": _cat_direction(name),
+            "accountCode": info.get("accountCode"),
+            "accountName": info.get("accountName"),
+            "accountType": info.get("accountType", ""),
+        }
+        for name, info in CATEGORY_TO_ACCOUNT.items()
+    ]

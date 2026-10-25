@@ -1,13 +1,38 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """API integration tests using FastAPI TestClient.
 
 Uses the test-token bypass mechanism (no JWT required).
 Pure computational endpoints only — no LLM-dependent endpoints tested.
 """
 import json
+import sqlite3
 import uuid
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
+
+
+def _update_company_payload(company_id: str, updates: dict, *, remove: tuple[str, ...] = ()) -> None:
+    """同步测试内直接改公司 payload（CIT 完整度只看 restrictedIndustry）。"""
+    import asyncio
+
+    async def _run() -> None:
+        from db.models import Company
+        from db.session import session_scope
+
+        async with session_scope() as session:
+            row = await session.get(Company, company_id)
+            assert row is not None, f"company {company_id} not found"
+            payload = dict(row.payload or {})
+            for key in remove:
+                payload.pop(key, None)
+            payload.update(updates)
+            row.payload = payload
+
+    asyncio.run(_run())
 
 
 class TestHealth:
@@ -27,6 +52,7 @@ class TestHealth:
 
 class TestAuthoritativeAccountingApi:
     month = "2031-06"
+    next_month = "2031-07"
 
     @staticmethod
     def _row_value(data, key, column):
@@ -109,16 +135,18 @@ class TestAuthoritativeAccountingApi:
             json={"month": self.month, "viewMode": "summary"},
             headers=auth_headers,
         ).json()
-        assert self._row_value(income, "operating_revenue", "current") == "10000.00"
+        # 10000 含税收入按 1% 价税分离：收入 9900.99、应交增值税 99.01（未关账前仍为负债）
+        assert self._row_value(income, "operating_revenue", "current") == "9900.99"
         assert self._row_value(income, "admin_expenses", "current") == "3500.00"
-        assert self._row_value(income, "net_profit", "current") == "6500.00"
+        assert self._row_value(income, "net_profit", "current") == "6400.99"
 
         balance = client.post(
             "/api/report/balance-sheet", json={"month": self.month}, headers=auth_headers
         ).json()
         assert balance["isBalanced"] is True
         assert balance["totalAssets"] == "6500.00"
-        assert balance["totalEquity"] == "6500.00"
+        assert balance["totalLiabilities"] == "99.01"
+        assert balance["totalEquity"] == "6400.99"
 
         cash = client.post(
             "/api/report/cash-flow", json={"month": self.month}, headers=auth_headers
@@ -130,20 +158,8 @@ class TestAuthoritativeAccountingApi:
         assert cash["cashRollForwardBalanced"] is True
         assert cash["balanceSheetCashBalanced"] is True
 
-        tax_summary = client.post(
-            "/api/report/tax-summary",
-            json={"period": "2031-Q2", "periodType": "quarter"},
-            headers=auth_headers,
-        )
-        assert tax_summary.status_code == 200
-        tax_data = tax_summary.json()
-        assert tax_data["period"] == "2031-Q2"
-        assert tax_data["totalSales"] == "10000.00"
-        assert tax_data["accountingProfit"] == "6500.00"
-        assert tax_data["estimatedCit"] == "1625.00"
-        assert tax_data["estimatedVat"] == "0.00"
-        assert tax_data["vatExemption"] == "300.00"
-
+        # 从业人数改为名册派生：清空历史字段，仅保留"限制行业未确认"的初始态
+        _update_company_payload("c1", {}, remove=("restrictedIndustry", "employeeCount"))
         cit = client.post(
             "/api/report/cit-assist",
             json={"period": "2031-Q2", "periodType": "quarter"},
@@ -152,11 +168,17 @@ class TestAuthoritativeAccountingApi:
         assert cit.status_code == 200
         cit_data = cit.json()
         assert cit_data["period"] == "2031-Q2"
-        assert cit_data["cumulativeRevenue"] == "10000.00"
-        assert cit_data["cumulativeProfit"] == "6500.00"
+        # 办公费 3000 + 招待费 500 均无票据信息，按无合规扣除凭证全额调增：
+        # 实际利润额 = 6400.99 + 3500 = 9900.99
+        assert cit_data["autoAdjustmentTotal"] == "3500.00"
+        assert cit_data["cumulativeRevenue"] == "9900.99"
+        assert cit_data["cumulativeProfit"] == "6400.99"
         assert cit_data["smallMicroEligibility"] == "undetermined"
-        assert cit_data["standardTax"] == "1625.00"
-        assert cit_data["estimatedTax"] == "1625.00"
+        # 公司制名册为空按 1 人兜底（法定代表人口径）
+        assert cit_data["employeeAverage"] == "1.00"
+        assert cit_data["companyTaxProfileComplete"] is False
+        assert cit_data["standardTax"] == "2475.25"
+        assert cit_data["estimatedTax"] == "2475.25"
         assert cit_data["readyToFile"] is False
         assert cit_data["assetTotalStart"] == "0.00"
         assert cit_data["assetTotalEnd"] == "0.65"
@@ -165,19 +187,22 @@ class TestAuthoritativeAccountingApi:
         assert cit_data["assetLoss"] is None
         assert cit_data["beginnerReady"] is False
 
+        # 确认非限制行业后即可判定；请求体里的人数不再覆盖名册派生值
+        _update_company_payload("c1", {"restrictedIndustry": False})
         eligible_cit = client.post(
             "/api/report/cit-assist",
             json={
                 "period": "2031-Q2", "periodType": "quarter",
-                "employeeCountStart": 1, "employeeCountEnd": 1,
+                "employeeCountStart": 999, "employeeCountEnd": 999,
                 "assetTotalStart": "1.00", "assetTotalEnd": "1.00",
-                "restrictedIndustry": False, "manualAdjustmentsConfirmed": True,
+                "restrictedIndustry": True, "manualAdjustmentsConfirmed": True,
             },
             headers=auth_headers,
         ).json()
+        assert eligible_cit["employeeAverage"] == "1.00"
         assert eligible_cit["smallMicroEligibility"] == "eligible"
-        assert eligible_cit["taxReduction"] == "1300.00"
-        assert eligible_cit["estimatedTax"] == "325.00"
+        assert eligible_cit["taxReduction"] == "1980.20"
+        assert eligible_cit["estimatedTax"] == "495.05"
         assert eligible_cit["readyToFile"] is True
 
         trial = client.post(
@@ -199,6 +224,19 @@ class TestAuthoritativeAccountingApi:
         ).json()
         assert summary["isBalanced"] is True
         assert summary["totalDebit"] == summary["totalCredit"]
+        bank_row = next(item for item in summary["items"] if item["accountCode"] == "1002")
+        # 首月无期初，期末 = 期初 + 本期净额；1002 本期净额 6500.00
+        assert bank_row["openingBalance"] == "0.00"
+        assert bank_row["closingBalance"] == "6500.00"
+        # 次月查询：期初结转上月期末
+        next_month = client.get(
+            "/api/ledger/balance-summary",
+            params={"month": self.next_month},
+            headers=auth_headers,
+        ).json()
+        next_bank = next(item for item in next_month["items"] if item["accountCode"] == "1002")
+        assert next_bank["openingBalance"] == "6500.00"
+        assert next_bank["closingBalance"] == next_bank["openingBalance"]
 
         vouchers = client.post(
             "/api/ledger/voucher", json={"entryIds": created_ids}, headers=auth_headers
@@ -223,7 +261,9 @@ class TestAuthoritativeAccountingApi:
         trial = client.post(
             "/api/ledger/trial-balance", json={"month": "2099-12"}, headers=auth_headers
         ).json()
-        assert trial["items"] == []
+        # 试算平衡与科目余额表统一实现后，空月列出全部启用科目但全为 0 行
+        assert trial["items"], "统一口径后应返回完整科目表 0 行"
+        assert all(row["debitTotal"] == "0.00" and row["creditTotal"] == "0.00" for row in trial["items"])
         assert trial["isBalanced"] is True
 
     def test_bank_import_is_idempotent_and_blocks_close_until_reconciled(self, client, auth_headers):
@@ -349,6 +389,49 @@ class TestInvoice:
         assert valid[2]["seller_name"] == "杭州市拱墅区同泡大餐饮店"
 
     @pytest.mark.asyncio
+    async def test_invoice_import_sales_row_without_category_normalizes_to_income(self, monkeypatch):
+        """销项票缺类别（结账向导兜底前的原始形态）不应导致导入 500。
+
+        历史缺陷：向导以 classify=False 导入时，无类别行被兜底成支出类别"其他支出"，
+        收入方向配出贷方支出科目 5602999，被收支校验拒绝后整批 500。
+        """
+        from services import invoice_service
+
+        saved_entries = []
+
+        async def fake_get_company_name(company_id, rows):
+            return ""
+
+        async def fake_save_entry(entry, *, user_id, company_id, **kwargs):
+            saved_entries.append(entry)
+            return {**entry, "id": "entry-1"}
+
+        monkeypatch.setattr(invoice_service, "get_real_company_name", fake_get_company_name)
+        monkeypatch.setattr(invoice_service, "save_entry", fake_save_entry)
+
+        result = await invoice_service.import_invoices(
+            "c1",
+            "u1",
+            [{
+                "invoice_number": "sales-no-category-1",
+                "invoice_date": "2026-09-15",
+                "seller_name": "杭州南山科技有限公司",
+                "buyer_name": "测试客户有限公司",
+                "amount": 11300,
+                "direction": "income",
+                "category": "其他支出",
+            }],
+            classify=False,
+        )
+
+        assert result["imported"] == 1
+        entry = saved_entries[0]
+        assert entry["direction"] == "income"
+        assert entry["category"] == "主营业务收入"
+        credit_codes = [line["accountCode"] for line in entry["voucherLines"]["credit"]]
+        assert "5001" in credit_codes  # 贷方必须落在收入科目
+
+    @pytest.mark.asyncio
     async def test_invoice_import_without_classify_preserves_preview_values(self, monkeypatch):
         from services import invoice_service
 
@@ -357,7 +440,7 @@ class TestInvoice:
         async def fake_get_company_name(company_id, rows):
             return ""
 
-        async def fake_save_entry(entry, *, user_id, company_id):
+        async def fake_save_entry(entry, *, user_id, company_id, **kwargs):
             saved_entries.append(entry)
             return {**entry, "id": "entry-1"}
 
@@ -386,6 +469,87 @@ class TestInvoice:
         assert result["imported"] == 1
         assert saved_entries[0]["direction"] == "income"
         assert saved_entries[0]["category"] == "主营业务收入"
+
+    @pytest.mark.asyncio
+    async def test_invoice_import_income_creates_receivable_not_cash(self, monkeypatch):
+        """收入发票是凭证不是收款：借方必须是 1122 应收，而不是 1002 银行存款。
+
+        历史缺陷：发票服务构造的 1122/2241 被 entry_service 的确定性重算静默覆盖，
+        导致发票导入时直接减少银行存款，与后续流水配对后重复支出。
+        """
+        from services import invoice_service
+
+        saved_entries = []
+
+        async def fake_get_company_name(company_id, rows):
+            return ""
+
+        async def fake_save_entry(entry, *, user_id, company_id, **kwargs):
+            saved_entries.append((entry, kwargs))
+            return {**entry, "id": "entry-1"}
+
+        monkeypatch.setattr(invoice_service, "get_real_company_name", fake_get_company_name)
+        monkeypatch.setattr(invoice_service, "save_entry", fake_save_entry)
+
+        result = await invoice_service.import_invoices(
+            "c1",
+            "u1",
+            [{
+                "invoice_number": "income-invoice-1",
+                "invoice_date": "2026-05-15",
+                "seller_name": "本公司",
+                "buyer_name": "测试客户有限公司",
+                "amount": 1010,
+                "direction": "income",
+                "category": "主营业务收入",
+            }],
+            classify=False,
+        )
+
+        assert result["imported"] == 1
+        entry, kwargs = saved_entries[0]
+        voucher = entry["voucherLines"]
+        assert voucher["debit"][0]["accountCode"] == "1122"
+        credits = {line["accountCode"]: line["amount"] for line in voucher["credit"]}
+        assert credits["5001"] == 1000
+        assert credits["2221026"] == 10
+        assert kwargs.get("trusted_voucher") is True
+
+    @pytest.mark.asyncio
+    async def test_invoice_import_expense_creates_payable_not_cash(self, monkeypatch):
+        from services import invoice_service
+
+        saved_entries = []
+
+        async def fake_get_company_name(company_id, rows):
+            return ""
+
+        async def fake_save_entry(entry, *, user_id, company_id, **kwargs):
+            saved_entries.append(entry)
+            return {**entry, "id": "entry-1"}
+
+        monkeypatch.setattr(invoice_service, "get_real_company_name", fake_get_company_name)
+        monkeypatch.setattr(invoice_service, "save_entry", fake_save_entry)
+
+        result = await invoice_service.import_invoices(
+            "c1",
+            "u1",
+            [{
+                "invoice_number": "expense-invoice-1",
+                "invoice_date": "2026-05-15",
+                "seller_name": "成都彩虹电器（集团）股份有限公司",
+                "buyer_name": "本公司",
+                "amount": 3000,
+                "direction": "expense",
+                "category": "办公费",
+            }],
+            classify=False,
+        )
+
+        assert result["imported"] == 1
+        voucher = saved_entries[0]["voucherLines"]
+        assert voucher["debit"][0]["accountCode"] == "5602004"
+        assert voucher["credit"][0]["accountCode"] == "2241"
 
     @pytest.mark.asyncio
     async def test_classify_entry_invoice_endpoint(self, client, auth_headers, monkeypatch):
@@ -699,7 +863,7 @@ class TestBankReconciliation:
         result = await classify_single_statement(company_id, stmt["id"], "这笔技术服务费用于研发项目")
 
         assert result["category"] == "研发支出-费用化支出"
-        assert result["accountCode"] == "5301"
+        assert result["accountCode"] == "4301"
         assert "研发" in result["reason"]
 
     @pytest.mark.asyncio
@@ -719,7 +883,9 @@ class TestBankReconciliation:
         })
         await import_statements_json(company_id, [{
             "transaction_date": "2026-06-04",
-            "description": "微信公众号注册退款",
+            # 描述不能含「微信/财付通」等关键词，否则会被 wechat_withdrawal
+            # 快速规则拦截，走不到下面要测的 AI 方向校正路径
+            "description": "客户注册服务退款",
             "amount": 0.74,
             "balance": 100.74,
         }], "bank-batch-positive-fallback")
@@ -728,7 +894,7 @@ class TestBankReconciliation:
             return {
                 "direction": "expense",
                 "category": "其他支出",
-                "accountCode": "5699",
+                "accountCode": "5602999",
                 "accountName": "管理费用-其他",
                 "title": "wrong expense suggestion",
                 "confidence": 0.95,
@@ -741,7 +907,73 @@ class TestBankReconciliation:
 
         assert suggestions[0]["type"] == "new"
         assert suggestions[0]["suggestedEntry"]["direction"] == "income"
-        assert suggestions[0]["suggestedEntry"]["accountCode"] == "6051"
+        assert suggestions[0]["suggestedEntry"]["accountCode"] == "5051"
+
+    @pytest.mark.asyncio
+    async def test_classify_single_statement_infers_missing_direction_and_keeps_category(
+        self, temp_bank_db, monkeypatch
+    ):
+        from services import llm
+        from services.bank_service import classify_single_statement, import_statements_json
+
+        company_id = "c-bank-classify-direction"
+        await import_statements_json(company_id, [{
+            "transaction_date": "2026-06-12",
+            "description": "转入-技术服务预付款",
+            "amount": 2400,
+            "balance": 2400,
+        }], "bank-batch-classify-direction")
+        stmt = await self._statement_row("bank-batch-classify-direction")
+
+        # 模型只给了分类、没有 direction，不应该整条退化成兜底草稿
+        monkeypatch.setattr(llm, "safe_chat_text_json", lambda *args, **kwargs: {
+            "category": "其他业务收入",
+            "accountCode": "5051",
+            "accountName": "其他业务收入",
+            "title": "技术服务预付款",
+            "confidence": "0.9",
+            "reason": "预收服务款",
+        })
+
+        result = await classify_single_statement(company_id, stmt["id"], "")
+
+        assert result["direction"] == "income"
+        assert result["category"] == "其他业务收入"
+        assert result["confidence"] == 0.8
+        assert "推断" in result["reason"]
+
+    @pytest.mark.asyncio
+    async def test_ai_suggest_runs_llm_match_for_decimal_amounts(self, temp_bank_db, monkeypatch):
+        """金额阈值用 Decimal 计算：混入 float 会 TypeError，整条建议静默退化成兜底。"""
+        from services import llm
+        from services.bank_service import ai_suggest_matches, import_statements_json
+
+        company_id = "c-bank-decimal-gap"
+        await self._insert_entry(company_id, {
+            "id": "entry-decimal",
+            "direction": "expense",
+            "amount": 2380,
+            "category": "信息技术服务费",
+            "occurDate": "2026-05-01",
+            "title": "云服务费",
+            "billingStatus": "has_invoice",
+        })
+        await import_statements_json(company_id, [{
+            "transaction_date": "2026-06-12",
+            "description": "技术服务预付款",
+            "amount": -2400,
+            "balance": 100,
+        }], "bank-batch-decimal")
+
+        monkeypatch.setattr(llm, "safe_chat_text_json", lambda *args, **kwargs: {
+            "matchedEntryId": "entry-decimal", "confidence": 0.9, "reason": "金额接近",
+        })
+
+        suggestions = await ai_suggest_matches(company_id)
+
+        assert suggestions[0]["type"] == "difference"
+        assert suggestions[0]["matchedEntryId"] == "entry-decimal"
+        assert suggestions[0]["reason"] == "金额接近"
 
     @pytest.mark.asyncio
     async def test_confirm_new_owner_transfer_income_is_idempotent(self, temp_bank_db):
@@ -767,7 +999,7 @@ class TestBankReconciliation:
                 "amount": 20000,
                 "direction": "owner_transfer",
                 "category": "股东投入",
-                "accountCode": "4001",
+                "accountCode": "3001",
                 "accountName": "实收资本",
                 "occurDate": "2026-05-22",
                 "remark": "何静谷 实缴注册资本",
@@ -817,12 +1049,12 @@ class TestBankReconciliation:
                     "amount": 4.15,
                     "direction": "income",
                     "category": "利息收入",
-                    "accountCode": "6603",
+                    "accountCode": "5603005",
                     "accountName": "财务费用-利息收入",
                     "occurDate": "2026-06-21",
                     "voucherLines": {
                         "debit": [{"accountCode": "1002", "accountName": "银行存款", "amount": 4.15}],
-                        "credit": [{"accountCode": "6001", "accountName": "主营业务收入", "amount": 4.15}],
+                        "credit": [{"accountCode": "5001", "accountName": "主营业务收入", "amount": 4.15}],
                     },
                 },
             ),
@@ -833,7 +1065,7 @@ class TestBankReconciliation:
         payload = await self._entry_payload(result["entryId"])
         assert payload["category"] == "利息收入"
         assert payload["voucherLines"]["debit"][0]["accountCode"] == "1002"
-        assert payload["voucherLines"]["credit"][0]["accountCode"] == "6603"
+        assert payload["voucherLines"]["credit"][0]["accountCode"] == "5603005"
         assert payload["voucherLines"]["credit"][0]["accountName"] == "财务费用-利息收入"
 
     @pytest.mark.asyncio
@@ -899,7 +1131,7 @@ class TestBankReconciliation:
             "payer": "company_account",
             "billingStatus": "has_invoice",
             "voucherLines": {
-                "debit": [{"accountCode": "5602", "accountName": "管理费用-信息技术服务费", "amount": 500}],
+                "debit": [{"accountCode": "5602004", "accountName": "管理费用-信息技术服务费", "amount": 500}],
                 "credit": [{"accountCode": "1002", "accountName": "银行存款", "amount": 500}],
             },
         })
@@ -990,8 +1222,8 @@ class TestBankReconciliation:
             "occurDate": "2026-06-17",
             "billingStatus": "has_invoice",
             "voucherLines": {
-                "debit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": 59}],
-                "credit": [{"accountCode": "6001", "accountName": "主营业务收入", "amount": 59}],
+                "debit": [{"accountCode": "1012001", "accountName": "微信支付待结算", "amount": 59}],
+                "credit": [{"accountCode": "5001", "accountName": "主营业务收入", "amount": 59}],
             },
         })
         await self._insert_entry(company_id, {
@@ -1003,8 +1235,8 @@ class TestBankReconciliation:
             "occurDate": "2026-06-17",
             "billingStatus": "no_document",
             "voucherLines": {
-                "debit": [{"accountCode": "6602", "accountName": "财务费用-手续费", "amount": 0.53}],
-                "credit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": 0.53}],
+                "debit": [{"accountCode": "5603002", "accountName": "财务费用-手续费", "amount": 0.53}],
+                "credit": [{"accountCode": "1012001", "accountName": "微信支付待结算", "amount": 0.53}],
             },
         })
         await import_statements_json(company_id, [{
@@ -1076,8 +1308,8 @@ class TestBankReconciliation:
             "title": "销售收入",
             "occurDate": "2026-06-17",
             "voucherLines": {
-                "debit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": 59}],
-                "credit": [{"accountCode": "6001", "accountName": "主营业务收入", "amount": 59}],
+                "debit": [{"accountCode": "1012001", "accountName": "微信支付待结算", "amount": 59}],
+                "credit": [{"accountCode": "5001", "accountName": "主营业务收入", "amount": 59}],
             },
         })
         await self._insert_entry(company_id, {
@@ -1087,8 +1319,8 @@ class TestBankReconciliation:
             "title": "微信手续费",
             "occurDate": "2026-06-17",
             "voucherLines": {
-                "debit": [{"accountCode": "6602", "accountName": "手续费", "amount": 0.53}],
-                "credit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": 0.53}],
+                "debit": [{"accountCode": "5603002", "accountName": "手续费", "amount": 0.53}],
+                "credit": [{"accountCode": "1012001", "accountName": "微信支付待结算", "amount": 0.53}],
             },
         })
         await import_statements_json(company_id, [{
@@ -1117,7 +1349,7 @@ class TestBankReconciliation:
         repair_payload = await self._entry_payload(repaired["entryId"])
         assert repair_payload["voucherLines"] == {
             "debit": [{"accountCode": "1002", "accountName": "银行存款", "amount": "58.47"}],
-            "credit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": "58.47"}],
+            "credit": [{"accountCode": "1012001", "accountName": "微信支付待结算", "amount": "58.47"}],
         }
 
         after = await get_difference_report(company_id, "2026-06")
@@ -1501,8 +1733,8 @@ class TestBankReconciliation:
 
     async def _insert_wechat_order(self, company_id, order_no, amount=5, fee=0.05, occur_date="2026-07-14"):
         for suffix, direction, value, debit, credit in [
-            ("income", "income", amount, "1012", "6001"),
-            ("fee", "expense", fee, "6602", "1012"),
+            ("income", "income", amount, "1012001", "5001"),
+            ("fee", "expense", fee, "5603002", "1012001"),
         ]:
             await self._insert_entry(company_id, {
                 "id": f"{order_no}-{suffix}", "source": "wechat_bill", "wechat_order_no": order_no,
@@ -1588,8 +1820,12 @@ class TestBankReconciliation:
         await self._insert_wechat_order(company_id, "wx-same-2")
         await import_statements_json(company_id, [{**statement, "amount": 4.95}], "wx-ambiguous")
         suggestion = (await ai_suggest_matches(company_id))[0]
-        assert suggestion["type"] == "existing"
-        assert "suggestedEntry" not in suggestion
+        # 智能认领制下模糊金额订单不做自动归组（避免错配），流水退回
+        # 汇总记账：直接建议微信结算资金划转草稿
+        assert suggestion["type"] == "new"
+        assert suggestion["rule"] == "wechat_withdrawal"
+        assert suggestion["suggestedEntry"]["category"] == "微信支付结算"
+        assert float(suggestion["suggestedEntry"]["amount"]) == pytest.approx(4.95)
 
     @pytest.mark.asyncio
     async def test_wechat_settlement_excludes_confirmed_partial_and_refunded_orders(self, temp_bank_db):
@@ -1607,7 +1843,7 @@ class TestBankReconciliation:
         stmt = {"transaction_date": "2026-07-15", "description": "微信结算", "amount": 4.95}
         assert await get_wechat_settlement_candidates(company_id, stmt) == []
         await self._insert_wechat_order(company_id, "wx-refunded")
-        for suffix, amount, debit, credit in [("refund", 5, "6001", "1012"), ("fee-refund", 0.05, "1012", "6602")]:
+        for suffix, amount, debit, credit in [("refund", 5, "5001", "1012001"), ("fee-refund", 0.05, "1012001", "5603002")]:
             await self._insert_entry(company_id, {"id": suffix, "source": "wechat_bill", "wechat_order_no": "wx-refunded",
                 "occurDate": "2026-07-14", "voucherLines": {
                     "debit": [{"accountCode": debit, "amount": amount}],
@@ -1671,7 +1907,7 @@ class TestWechatBill:
 
         saved = {}
 
-        async def fake_save(entries, *, user_id, company_id, existing_entry_updates=None):
+        async def fake_save(entries, *, user_id, company_id, existing_entry_updates=None, **kwargs):
             saved["entries"] = entries
             saved["updates"] = existing_entry_updates or []
             return entries
@@ -1771,7 +2007,7 @@ class TestWechatBill:
 
         saved = {}
 
-        async def fake_save(entries, *, user_id, company_id, existing_entry_updates=None):
+        async def fake_save(entries, *, user_id, company_id, existing_entry_updates=None, **kwargs):
             saved["entries"] = entries
             saved["updates"] = existing_entry_updates or []
             return entries
@@ -1811,7 +2047,7 @@ class TestWechatBill:
 
         saved = {}
 
-        async def fake_save(entries, *, user_id, company_id, existing_entry_updates=None):
+        async def fake_save(entries, *, user_id, company_id, existing_entry_updates=None, **kwargs):
             saved["entries"] = entries
             saved["updates"] = existing_entry_updates or []
             return entries
@@ -1850,7 +2086,7 @@ class TestWechatBill:
 
         saved_batches = []
 
-        async def fake_save_entries_bulk(entries, *, user_id, company_id):
+        async def fake_save_entries_bulk(entries, *, user_id, company_id, **kwargs):
             saved_batches.append(entries)
             return [{**entry, "id": f"entry-{idx}"} for idx, entry in enumerate(entries)]
 
@@ -1906,18 +2142,18 @@ class TestWechatBill:
         assert refund_entry["direction"] == "income"
 
         revenue_entry = saved_batches[0][0]
-        assert revenue_entry["voucherLines"]["debit"][0]["accountCode"] == "1012"
-        assert revenue_entry["voucherLines"]["credit"][0]["accountCode"] == "6001"
+        assert revenue_entry["voucherLines"]["debit"][0]["accountCode"] == "1012001"
+        assert revenue_entry["voucherLines"]["credit"][0]["accountCode"] == "5001"
 
         fee_entry = saved_batches[0][1]
-        assert fee_entry["voucherLines"]["debit"][0]["accountCode"] == "6602"
-        assert fee_entry["voucherLines"]["credit"][0]["accountCode"] == "1012"
+        assert fee_entry["voucherLines"]["debit"][0]["accountCode"] == "5603002"
+        assert fee_entry["voucherLines"]["credit"][0]["accountCode"] == "1012001"
 
         fee_refund = next(e for e in saved_batches[0] if e.get("remark") == "退款手续费退还")
         assert fee_refund["amount"] == Decimal("-0.20")
         assert fee_refund["direction"] == "expense"
-        assert fee_refund["voucherLines"]["debit"][0]["accountCode"] == "1012"
-        assert fee_refund["voucherLines"]["credit"][0]["accountCode"] == "6602"
+        assert fee_refund["voucherLines"]["debit"][0]["accountCode"] == "1012001"
+        assert fee_refund["voucherLines"]["credit"][0]["accountCode"] == "5603002"
 
     @pytest.mark.asyncio
     async def test_wechat_bill_import_keeps_refund_with_same_order_no(self, monkeypatch):
@@ -1939,7 +2175,7 @@ class TestWechatBill:
 
         saved_batches = []
 
-        async def fake_save_entries_bulk(entries, *, user_id, company_id):
+        async def fake_save_entries_bulk(entries, *, user_id, company_id, **kwargs):
             saved_batches.append(entries)
             return [{**entry, "id": f"entry-{idx}"} for idx, entry in enumerate(entries)]
 
@@ -2000,8 +2236,8 @@ class TestWechatBill:
         fee_refund = next(entry for entry in saved_batches[0] if entry.get("remark") == "退款手续费退还")
         assert fee_refund["amount"] == Decimal("-0.05")
         assert fee_refund["direction"] == "expense"
-        assert fee_refund["voucherLines"]["debit"][0]["accountCode"] == "1012"
-        assert fee_refund["voucherLines"]["credit"][0]["accountCode"] == "6602"
+        assert fee_refund["voucherLines"]["debit"][0]["accountCode"] == "1012001"
+        assert fee_refund["voucherLines"]["credit"][0]["accountCode"] == "5603002"
 
         transaction_keys = {entry["wechat_transaction_key"] for entry in saved_batches[0]}
         # 手续费/手续费退还条目使用 ":fee" 后缀 key，与同笔交易的收入/退款条目区分，
@@ -2017,24 +2253,24 @@ class TestWechatBill:
         from services.bank_service import _bank_effect_from_voucher, build_group_reconciliation_check
 
         revenue_voucher = {
-            "debit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": 100}],
-            "credit": [{"accountCode": "6001", "accountName": "主营业务收入", "amount": 100}],
+            "debit": [{"accountCode": "1012001", "accountName": "微信支付待结算", "amount": 100}],
+            "credit": [{"accountCode": "5001", "accountName": "主营业务收入", "amount": 100}],
         }
         fee_voucher = {
-            "debit": [{"accountCode": "6602", "accountName": "财务费用-手续费", "amount": 0.6}],
-            "credit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": 0.6}],
+            "debit": [{"accountCode": "5603002", "accountName": "财务费用-手续费", "amount": 0.6}],
+            "credit": [{"accountCode": "1012001", "accountName": "微信支付待结算", "amount": 0.6}],
         }
         settlement_voucher = {
             "debit": [{"accountCode": "1002", "accountName": "银行存款", "amount": 99.4}],
-            "credit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": 99.4}],
+            "credit": [{"accountCode": "1012001", "accountName": "微信支付待结算", "amount": 99.4}],
         }
         refund_voucher = {
-            "debit": [{"accountCode": "6001", "accountName": "主营业务收入", "amount": 5}],
-            "credit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": 5}],
+            "debit": [{"accountCode": "5001", "accountName": "主营业务收入", "amount": 5}],
+            "credit": [{"accountCode": "1012001", "accountName": "微信支付待结算", "amount": 5}],
         }
         refunded_fee_voucher = {
-            "debit": [{"accountCode": "1012", "accountName": "微信支付待结算", "amount": 0.05}],
-            "credit": [{"accountCode": "6602", "accountName": "财务费用-手续费", "amount": 0.05}],
+            "debit": [{"accountCode": "1012001", "accountName": "微信支付待结算", "amount": 0.05}],
+            "credit": [{"accountCode": "5603002", "accountName": "财务费用-手续费", "amount": 0.05}],
         }
 
         assert _bank_effect_from_voucher(revenue_voucher) == 0
@@ -2047,3 +2283,83 @@ class TestWechatBill:
         assert refund_group["entryBankEffect"] == Decimal("-4.95")
         assert refund_group["amountMatches"] is True
         assert refund_group["directionMatches"] is True
+
+
+class TestBankBatchDeleteApi:
+    @staticmethod
+    def _test_db():
+        return Path(__file__).resolve().parent.parent / "data" / ".pytest_accounting.db"
+
+    def test_batch_delete_removes_statements_matches_and_sources(self, client, auth_headers):
+        rows = [
+            {"transaction_date": "2035-03-01", "description": "批量删除流水一", "amount": 100, "balance": "900"},
+            {"transaction_date": "2035-03-02", "description": "批量删除流水二", "amount": -40, "balance": "860"},
+            {"transaction_date": "2035-03-03", "description": "批量删除流水三", "amount": -15, "balance": "845"},
+        ]
+        imported = client.post("/api/bank/import-json", json={
+            "statement_id": "batch-del-source", "rows": rows,
+        }, headers=auth_headers)
+        assert imported.status_code == 200, imported.text
+        assert imported.json()["imported"] == 3
+
+        items = client.get(
+            "/api/bank/statements?statement_id=batch-del-source", headers=auth_headers
+        ).json()["items"]
+        assert len(items) == 3
+        id_one, id_two, id_three = [item["id"] for item in items]
+
+        db_path = self._test_db()
+        conn = sqlite3.connect(db_path)
+        try:
+            company_id = conn.execute(
+                "SELECT company_id FROM bank_statements WHERE id = ?", (id_one,)
+            ).fetchone()[0]
+            for statement_id, entry_id in ((id_one, "entry-del-A"), (id_three, "entry-del-B")):
+                conn.execute(
+                    "INSERT INTO bank_statement_matches (statement_id, company_id, entry_id, "
+                    "previous_billing_status, previous_payment_date, created_at) VALUES (?, ?, ?, NULL, NULL, ?)",
+                    (statement_id, company_id, entry_id, "2035-03-01T00:00:00"),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        deleted = client.post(
+            "/api/bank/statements/batch-delete",
+            json={"ids": [id_one, id_two, "bs-not-exists"]},
+            headers=auth_headers,
+        )
+        assert deleted.status_code == 200, deleted.text
+        assert deleted.json()["deleted"] == 2
+
+        remaining = client.get(
+            "/api/bank/statements?statement_id=batch-del-source", headers=auth_headers
+        ).json()["items"]
+        assert [item["id"] for item in remaining] == [id_three]
+
+        conn = sqlite3.connect(db_path)
+        try:
+            placeholders = ",".join("?" for _ in (id_one, id_two, id_three))
+            match_ids = {row[0] for row in conn.execute(
+                f"SELECT statement_id FROM bank_statement_matches WHERE statement_id IN ({placeholders})",
+                (id_one, id_two, id_three)).fetchall()}
+            source_keys = {row[0] for row in conn.execute(
+                f"SELECT external_key FROM source_transactions WHERE source_type = 'bank' "
+                f"AND external_key IN ({placeholders})",
+                (id_one, id_two, id_three)).fetchall()}
+        finally:
+            conn.close()
+        assert match_ids == {id_three}
+        assert id_three in source_keys
+        assert not {id_one, id_two} & (match_ids | source_keys)
+
+        reimported = client.post("/api/bank/import-json", json={
+            "statement_id": "batch-del-source", "rows": rows,
+        }, headers=auth_headers)
+        assert reimported.status_code == 200, reimported.text
+        assert reimported.json()["imported"] == 2
+        assert reimported.json()["skipped"] == 1
+
+    def test_batch_delete_validates_ids(self, client, auth_headers):
+        response = client.post("/api/bank/statements/batch-delete", json={"ids": []}, headers=auth_headers)
+        assert response.status_code == 422

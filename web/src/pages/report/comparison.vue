@@ -1,19 +1,33 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { h, ref, computed, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { NCard, NButton, NSpace, NSpin, NDataTable, NSelect, useMessage } from 'naive-ui'
 import { useEntryStore } from '@/stores/entry'
 import { getComparison } from '@/api/report'
 import { formatMoney, getCurrentMonth } from '@/utils/format'
+import { SoloEmpty } from '@/components/ui'
 
+const route = useRoute()
 const router = useRouter()
 const message = useMessage()
 const entryStore = useEntryStore()
 
 const loading = ref(false)
 const result = ref<any>(null)
-const baseMonth = ref(getCurrentMonth())
+const requestedMonth = String(route.query.month || '')
+const hasRequestedMonth = /^\d{4}-(0[1-9]|1[0-2])$/.test(requestedMonth)
+const baseMonth = ref(hasRequestedMonth ? requestedMonth : getCurrentMonth())
 const compareMode = ref<'mom' | 'yoy'>('mom')
+
+function handleBack() {
+  router.push({ path: '/reports', query: { month: baseMonth.value } })
+}
+
+function handleMonthChange() {
+  router.replace({ query: { ...route.query, month: baseMonth.value } })
+  doQuery()
+}
 
 const monthOptions = computed(() => {
   const options: { label: string; value: string }[] = []
@@ -95,9 +109,9 @@ onMounted(doQuery)
   <div class="report-container">
     <div class="report-header">
       <div class="report-header-left">
-        <NButton text class="report-back-btn" @click="router.push('/reports')">
+        <NButton text class="report-back-btn" @click="handleBack">
           <template #icon><i class="ri-arrow-left-line" /></template>
-          返回
+          返回报表中心
         </NButton>
         <div class="report-title-section">
           <h2>同比/环比分析</h2>
@@ -111,7 +125,7 @@ onMounted(doQuery)
             placeholder="选择月份"
             style="width: 140px;"
             :options="monthOptions"
-            @update:value="doQuery"
+            @update:value="handleMonthChange"
           />
           <NButton
             :type="compareMode === 'mom' ? 'primary' : 'default'"
@@ -131,6 +145,7 @@ onMounted(doQuery)
 
     <NSpin :show="loading">
       <template v-if="result">
+
         <NCard :bordered="false" class="report-card mb-4">
           <h3 class="report-section-title">核心财务数据对比</h3>
           <p class="text-muted">基期月份：<strong>{{ result.base_month }}</strong> 与 对比月份：<strong>{{ result.compare_month }}</strong>（{{ compareMode === 'mom' ? '环比上月' : '同比去年同期' }}）</p>
@@ -155,7 +170,14 @@ onMounted(doQuery)
             class="report-data-table"
           />
         </NCard>
-      </template>
+            </template>
+      <SoloEmpty
+        v-else-if="!loading"
+        title="所选期间没有可比数据"
+        description="换一个期间试试，或先确认两个月都有已过账凭证。"
+        icon="ri-line-chart-line"
+      />
+
     </NSpin>
   </div>
 </template>

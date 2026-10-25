@@ -1,0 +1,61 @@
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: deploy/backend.Dockerfile
+      args:
+        PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+    container_name: solobooks-backend
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: 80
+      CORS_ORIGINS: "http://106.12.136.155:8080,http://localhost:8080"
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_APP_USER}:${POSTGRES_APP_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      MIGRATION_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      JWT_SECRET: ${JWT_SECRET}
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY}
+      ZHIPU_API_KEY: ${ZHIPU_API_KEY}
+      LLM_BASE_URL: ${LLM_BASE_URL}
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_SEND_ENABLE_THINKING: ${LLM_SEND_ENABLE_THINKING:-0}
+      QWEN_TEXT_MODEL: ${QWEN_TEXT_MODEL}
+      QWEN_VL_MODEL: ${QWEN_VL_MODEL}
+      # 管理后台安全前提：生产环境强制关闭开发兜底 token
+      AUTH_DEV_FALLBACK: "0"
+      WECHAT_APPID: ${WECHAT_APPID}
+      WECHAT_SECRET: ${WECHAT_SECRET}
+      ALIYUN_ACCESS_KEY_ID: ${ALIYUN_ACCESS_KEY_ID}
+      ALIYUN_ACCESS_KEY_SECRET: ${ALIYUN_ACCESS_KEY_SECRET}
+      ALIYUN_SMS_SIGN_NAME: ${ALIYUN_SMS_SIGN_NAME}
+      ALIYUN_SMS_TEMPLATE_CODE: ${ALIYUN_SMS_TEMPLATE_CODE}
+      ACCOUNTING_TIMEZONE: Asia/Shanghai
+    command: sh -c "cd /app && DATABASE_URL=$$MIGRATION_DATABASE_URL alembic upgrade head && exec uvicorn main:app --host 0.0.0.0 --port 80"
+    networks:
+      - default
+      - db
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: deploy/nginx/Dockerfile
+      args:
+        VITE_API_BASE: ""
+        NPM_REGISTRY: https://registry.npmmirror.com
+    container_name: solobooks-frontend
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+
+networks:
+  db:
+    external: true
+    name: deploy_default

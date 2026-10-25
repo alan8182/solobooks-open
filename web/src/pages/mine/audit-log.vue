@@ -1,8 +1,10 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { h, ref, onMounted } from 'vue'
 import { NDataTable, NTag, NPagination, useMessage } from 'naive-ui'
 import { getAuditLogs } from '@/api/audit'
 import type { AuditLogItem } from '@/api/audit'
+import { SoloEmpty } from '@/components/ui'
 
 const message = useMessage()
 const logs = ref<AuditLogItem[]>([])
@@ -103,7 +105,15 @@ const columns = [
       :bordered="false"
       striped
       size="small"
-    />
+    >
+      <template #empty>
+        <SoloEmpty
+          variant="hint"
+          title="还没有操作记录"
+          description="创建、过账、结账这类关键动作都会留痕在这里。"
+        />
+      </template>
+    </NDataTable>
 
     <div class="pagination-wrap" v-if="total > limit">
       <NPagination

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Tests for tax_rules.py — pure function tests, no DB, no mock."""
 import pytest
 from decimal import Decimal
@@ -89,12 +92,23 @@ class TestSanitizeRiskTags:
 
 
 class TestIsTaxDeductible:
-    def test_expense_deductible_by_default(self):
-        assert is_tax_deductible("办公费", "expense") is True
+    def test_invoice_present_is_deductible(self):
+        assert is_tax_deductible("办公费", "expense", billing_status="has_invoice") is True
+        assert is_tax_deductible("办公费", "expense", has_invoice_number=True) is True
 
-    def test_income_not_deductible(self):
-        # income 的 taxRules 没有 citDeductible 字段
-        assert is_tax_deductible("主营业务收入", "income") is True  # fallback
+    def test_no_document_is_not_deductible(self):
+        assert is_tax_deductible("办公费", "expense", billing_status="no_document") is False
+        assert is_tax_deductible("办公费", "expense", billing_status="no_invoice") is False
 
-    def test_unknown_category(self):
-        assert is_tax_deductible("不存在的分类", "expense") is True
+    def test_unknown_billing_status_is_pending(self):
+        # 规则要求发票而状态不明 → 待确认，绝不默认 True（计划 P1-4）
+        assert is_tax_deductible("办公费", "expense") is None
+        assert is_tax_deductible("办公费", "expense", billing_status="") is None
+        assert is_tax_deductible("办公费", "expense", billing_status="has_receipt") is None
+
+    def test_income_deductibility_not_applicable(self):
+        # income 没有"税前扣除"概念 → 待确认而非 True
+        assert is_tax_deductible("主营业务收入", "income") is None
+
+    def test_unknown_category_is_pending(self):
+        assert is_tax_deductible("不存在的分类", "expense") is None

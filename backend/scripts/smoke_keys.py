@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """临时连通性自检：不写日志、不打印密钥明文。用法：在 backend 目录下 python scripts/smoke_keys.py"""
 import asyncio
 import json

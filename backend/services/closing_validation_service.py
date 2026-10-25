@@ -1,3 +1,6 @@
+# Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
+# Licensed under the SoloBooks License v2.0.
+
 """Close checks against authoritative journals, in the caller's transaction."""
 from __future__ import annotations
 
@@ -28,7 +31,7 @@ async def possible_duplicate_wechat_income(session: AsyncSession, entry: Journal
     ))).scalars().all()
     bank_effect = sum((money(line.amount) * (1 if line.direction == "debit" else -1)
                        for line in own_lines if line.account_code == "1002"), ZERO)
-    if bank_effect <= ZERO or not any(line.account_code in {"6001", "6051"} for line in own_lines):
+    if bank_effect <= ZERO or not any(line.account_code in {"5001", "5051"} for line in own_lines):
         return []
     candidates = (await session.execute(select(JournalEntry, JournalLine).join(
         JournalLine, JournalLine.journal_entry_id == JournalEntry.id,
@@ -38,7 +41,7 @@ async def possible_duplicate_wechat_income(session: AsyncSession, entry: Journal
         JournalEntry.occurred_on >= entry.occurred_on - timedelta(days=5),
         JournalEntry.occurred_on <= entry.occurred_on,
         JournalEntry.status.in_(("draft", "pending_review", "posted")),
-        JournalLine.account_code == "1012",
+        JournalLine.account_code.in_(("1012001", "1012")),
     ))).all()
     groups: dict[tuple, dict[str, Any]] = {}
     days: dict[date, dict[str, Any]] = {}
@@ -87,6 +90,14 @@ async def bank_close_validation(session: AsyncSession, company_id: str, month_st
     for link, source in all_links:
         by_source.setdefault(source.id, []).append(link)
         by_entry.setdefault(link.journal_entry_id, set()).add(source.id)
+    # Read actual statement balances in this transaction; never trust projection
+    # billing flags or a separate connection's possibly stale view at close time.
+    statements = [dict(row) for row in (await session.execute(text(
+        "SELECT id, transaction_date, amount, balance FROM bank_statements "
+        "WHERE company_id = :company AND transaction_date >= :start AND transaction_date < :end"
+    ), {"company": company_id, "start": month_start.isoformat(), "end": next_month.isoformat()})).mappings()]
+    stmt_amount_by_id = {stmt["id"]: stmt.get("amount") for stmt in statements}
+
     issues = []
     for source in sources:
         links = by_source.get(source.id, [])
@@ -109,7 +120,13 @@ async def bank_close_validation(session: AsyncSession, company_id: str, month_st
             duplicates = await possible_duplicate_wechat_income(session, entry)
             if duplicates:
                 issues.append({**base, "type": "possible_duplicate_income", "reason": "银行到账可能重复记为微信收入，请核对原收入与结算凭证", "entryId": entry.id, "candidateEntryIds": duplicates})
-        signed = (source.raw_payload or {}).get("signedAmount")
+        raw_payload = source.raw_payload or {}
+        # ponytail: 兼容 SQLite→PG 迁移生成的 bank_statement 记录（带符号金额存于 amount 字段或 bank_statements 表）
+        signed = raw_payload.get("signedAmount")
+        if signed is None:
+            signed = raw_payload.get("amount")
+        if signed is None and source.external_key in stmt_amount_by_id:
+            signed = stmt_amount_by_id[source.external_key]
         if signed is None:
             issues.append({**base, "type": "missing_direction", "reason": "缺少流水收支方向，不能验证银行科目影响"})
         elif payloads:
@@ -120,12 +137,6 @@ async def bank_close_validation(session: AsyncSession, company_id: str, month_st
             if effect_issue:
                 issues.append(effect_issue)
 
-    # Read actual statement balances in this transaction; never trust projection
-    # billing flags or a separate connection's possibly stale view at close time.
-    statements = [dict(row) for row in (await session.execute(text(
-        "SELECT id, transaction_date, amount, balance FROM bank_statements "
-        "WHERE company_id = :company AND transaction_date >= :start AND transaction_date < :end"
-    ), {"company": company_id, "start": month_start.isoformat(), "end": next_month.isoformat()})).mappings()]
     source_keys = {source.external_key for source in sources}
     for statement in statements:
         if statement["id"] not in source_keys:
@@ -137,7 +148,8 @@ async def bank_close_validation(session: AsyncSession, company_id: str, month_st
         JournalEntry.period_start <= month_start, JournalEntry.status.in_(("posted", "reversed")),
         JournalLine.account_code == "1002",
     ))).all()
-    # ponytail: 仅归档不记账条目不参与银行对公存款余额核对；
+    # ponytail: 仅归档不记账条目不参与银行对公存款余额核对；挂账/垫付类单据的凭证本身不含 1002 行，
+    # 无需在此过滤（过滤会掩盖"凭证仍贷记银行存款"的真实差错）。
     # 冲销对（红字凭证 + 被冲销原凭证）的 1002 行相互抵消，不作为"未关联流水"问题上报
     reversal_ids = {
         str(entry.reversal_of_id) for _, entry in raw_bank_lines

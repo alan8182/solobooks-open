@@ -1,8 +1,10 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, watch } from 'vue'
 import { NImage, NTabs, NTabPane } from 'naive-ui'
 import type { AgentActionItem } from '@/api/agent'
 import AgentActionCard from '@/components/business/AgentActionCard.vue'
+import { SoloEmpty } from '@/components/ui'
 
 interface ReceiptPreview {
   url: string
@@ -104,7 +106,7 @@ const SNAPSHOT_PROMPTS = [
         </div>
 
         <!-- 待确认动作清单 -->
-        <div class="actions-container">
+        <div class="actions-container" :class="{ 'is-empty': actions.length === 0 }">
           <div v-if="actions.length > 0" class="actions-list">
             <AgentActionCard
               v-for="action in actions"
@@ -113,13 +115,12 @@ const SNAPSHOT_PROMPTS = [
               @resolved="emit('resolved')"
             />
           </div>
-          <div v-else class="empty-actions">
-            <div class="empty-icon"><i class="ri-checkbox-circle-line" /></div>
-            <p class="empty-title">当前没有待确认的草稿</p>
-            <p class="empty-desc">
-              你可以对 AI 说“记一笔昨天打车 58 元”，或拍一张发票，AI 生成草稿后将在此处供你核对确认。
-            </p>
-          </div>
+          <SoloEmpty
+            v-else
+            icon="ri-checkbox-circle-line"
+            title="当前没有待确认的草稿"
+            description="你可以对 AI 说「记一笔昨天打车 58 元」，或拍一张发票，AI 生成草稿后将在此处供你核对确认。"
+          />
         </div>
       </div>
 
@@ -222,8 +223,8 @@ const SNAPSHOT_PROMPTS = [
   font-size: 11px;
   font-weight: 600;
   line-height: 1;
-  border-radius: 9px;
-  background: var(--solo-primary, #165dff);
+  border-radius: 8px;
+  background: var(--solo-primary, #1747b0);
   color: #ffffff;
 }
 
@@ -232,7 +233,7 @@ const SNAPSHOT_PROMPTS = [
   border: none;
   cursor: pointer;
   padding: 4px;
-  color: var(--solo-text-muted, #8a95a3);
+  color: var(--solo-text-muted, #636e7c);
   font-size: 18px;
   line-height: 1;
   border-radius: 4px;
@@ -254,6 +255,7 @@ const SNAPSHOT_PROMPTS = [
 
 .tab-content {
   display: flex;
+  flex: 1;
   flex-direction: column;
   gap: 12px;
 }
@@ -285,7 +287,7 @@ const SNAPSHOT_PROMPTS = [
 }
 
 .preview-name {
-  color: var(--solo-text-muted, #8a95a3);
+  color: var(--solo-text-muted, #636e7c);
   max-width: 160px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -295,7 +297,7 @@ const SNAPSHOT_PROMPTS = [
 .preview-image-container {
   max-height: 180px;
   background: var(--solo-bg-page, #f6f7f9);
-  border-radius: 6px;
+  border-radius: 4px;
   overflow: hidden;
   display: flex;
   align-items: center;
@@ -320,7 +322,7 @@ const SNAPSHOT_PROMPTS = [
 
 .ocr-tag {
   background: var(--solo-bg-blue-soft, #edf3ff);
-  color: var(--solo-primary, #165dff);
+  color: var(--solo-primary, #1747b0);
   padding: 2px 6px;
   border-radius: 4px;
 }
@@ -336,39 +338,17 @@ const SNAPSHOT_PROMPTS = [
   flex-direction: column;
 }
 
+/* 空态时撑满面板并居中，否则内容贴着 tab 下方，留一整块死白 */
+.actions-container.is-empty {
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+}
+
 .actions-list {
   display: flex;
   flex-direction: column;
   gap: 10px;
-}
-
-.empty-actions {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  text-align: center;
-  padding: 36px 16px;
-  color: var(--solo-text-muted, #8a95a3);
-}
-
-.empty-icon {
-  font-size: 36px;
-  color: var(--solo-income, #12805c);
-  margin-bottom: 8px;
-}
-
-.empty-title {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--solo-text-primary, #182230);
-  margin: 0 0 6px 0;
-}
-
-.empty-desc {
-  font-size: 12px;
-  line-height: 1.6;
-  max-width: 280px;
-  margin: 0;
 }
 
 /* 快照视图 */
@@ -397,7 +377,7 @@ const SNAPSHOT_PROMPTS = [
 
 .pulse-subtitle {
   font-size: 11px;
-  color: var(--solo-text-muted, #8a95a3);
+  color: var(--solo-text-muted, #636e7c);
 }
 
 .metrics-grid {
@@ -412,7 +392,7 @@ const SNAPSHOT_PROMPTS = [
   align-items: center;
   padding: 8px 10px;
   background: var(--solo-bg-page, #f6f7f9);
-  border-radius: 6px;
+  border-radius: 4px;
 }
 
 .metric-label {
@@ -428,19 +408,19 @@ const SNAPSHOT_PROMPTS = [
 }
 
 .metric-item.income .metric-val {
-  color: var(--solo-income, #12805c);
+  color: var(--solo-income, #0f7354);
 }
 
 .metric-item.expense .metric-val {
-  color: var(--solo-expense, #c74444);
+  color: var(--solo-expense, #bd3d3d);
 }
 
 .metric-item.profit .metric-val {
-  color: var(--solo-income, #12805c);
+  color: var(--solo-income, #0f7354);
 }
 
 .metric-item.profit.negative .metric-val {
-  color: var(--solo-expense, #c74444);
+  color: var(--solo-expense, #bd3d3d);
 }
 
 .quick-prompts-card {
@@ -453,7 +433,7 @@ const SNAPSHOT_PROMPTS = [
 .quick-prompts-card .card-title {
   font-size: 13px;
   font-weight: 600;
-  color: var(--solo-primary, #165dff);
+  color: var(--solo-primary, #1747b0);
   display: flex;
   align-items: center;
   gap: 5px;
@@ -461,7 +441,7 @@ const SNAPSHOT_PROMPTS = [
 
 .quick-prompts-card .card-desc {
   font-size: 11.5px;
-  color: var(--solo-text-muted, #8a95a3);
+  color: var(--solo-text-muted, #636e7c);
   margin: 4px 0 8px 0;
 }
 
@@ -476,7 +456,7 @@ const SNAPSHOT_PROMPTS = [
   align-items: center;
   justify-content: space-between;
   padding: 8px 10px;
-  border-radius: 6px;
+  border-radius: 4px;
   border: 1px solid var(--solo-border, #dde3ea);
   background: var(--solo-bg-page, #f6f7f9);
   color: var(--solo-text-primary, #182230);
@@ -487,8 +467,8 @@ const SNAPSHOT_PROMPTS = [
 }
 
 .board-prompt-chip:hover {
-  border-color: var(--solo-primary, #165dff);
-  color: var(--solo-primary, #165dff);
+  border-color: var(--solo-primary, #1747b0);
+  color: var(--solo-primary, #1747b0);
   background: #ffffff;
 }
 
@@ -510,7 +490,7 @@ const SNAPSHOT_PROMPTS = [
 
 .tip-text {
   margin: 0;
-  color: var(--solo-text-muted, #8a95a3);
+  color: var(--solo-text-muted, #636e7c);
   line-height: 1.5;
 }
 </style>

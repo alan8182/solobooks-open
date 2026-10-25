@@ -1,22 +1,38 @@
+<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NCard, NButton, NTag, NSpace, NInput, NInputNumber, NSelect, NDatePicker, useMessage, NModal, NForm, NFormItem, NDivider } from 'naive-ui'
+import { NCard, NButton, NTag, NSpace, NInput, NInputNumber, NSelect, NDatePicker, useMessage, NModal, NForm, NFormItem, NDivider, NTooltip } from 'naive-ui'
 import { useEntryStore } from '@/stores/entry'
+import { useWorkspaceViewStore } from '@/stores/workspaceView'
 import { moneyPresentation, generateVoucherLines, normalizeVoucherLines } from '@/utils/accounting'
+import { toCents } from '@/utils/aggregation'
 import { formatMoney, formatDate } from '@/utils/format'
 import { getCategoriesByDirection } from '@/utils/constants'
 import { getEntryNaturePresentation } from '@/utils/entryNature'
-import { payerDisplayLabel } from '@/utils/fundsChannel'
+import { payerDisplayLabel, joinPayer, splitPayer, type PayerKind } from '@/utils/fundsChannel'
+import { usePayeeEmployees } from '@/composables/usePayeeEmployees'
+import { reportErrorToast } from '@/utils/errorPresenter'
 import type { Entry } from '@/api/types'
 import { getRdExpenseTypes, getRdProjects } from '@/api/rd'
 import type { RdExpenseTypeOption, RdProject } from '@/api/types'
-import { approveEntry, getPostingOptions, postEntry, reverseEntry, submitEntryForReview, type PostingOptions } from '@/api/accounting'
+import { getLedgerAccounts, type LedgerAccountOption } from '@/api/ledger'
+import {
+  adjustEntryVoucherLines,
+  approveEntry,
+  getPostingOptions,
+  postEntry,
+  reverseEntry,
+  submitEntryForReview,
+  type PostingOptions,
+  type VoucherLineAdjustment,
+} from '@/api/accounting'
 
 const route = useRoute()
 const router = useRouter()
 const message = useMessage()
 const entryStore = useEntryStore()
+const viewStore = useWorkspaceViewStore()
 
 const entry = ref<Entry | null>(null)
 const loading = ref(true)
@@ -42,7 +58,7 @@ const returnTarget = computed(() => {
 
 const backLabel = computed(() => {
   if (returnTarget.value.includes('closing-wizard')) return '返回结账向导'
-  if (returnTarget.value.includes('vouchers')) return '返回凭证管理'
+  if (returnTarget.value.includes('vouchers')) return '返回记账凭证'
   return '返回'
 })
 
@@ -74,7 +90,7 @@ async function confirmPost() {
       message.warning('处理已完成，刷新列表失败，请刷新页面查看最新状态')
     }
   } catch (err) {
-    message.error(errDetail(err, '过账失败，请核对权限、凭证及期间状态'))
+    reportErrorToast(message, err, '过账失败，请核对权限、凭证及期间状态')
   } finally {
     posting.value = false
   }
@@ -88,15 +104,6 @@ const settlementBankId = computed<string>(() => (entry.value as any)?.linkedStat
 const isPosted = computed(() => voucherStatus.value === 'posted')
 const isReversed = computed(() => voucherStatus.value === 'reversed')
 
-function errDetail(err: unknown, fallback: string): string {
-  const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail
-  if (typeof detail === 'string' && detail) return detail
-  if (detail && typeof detail === 'object') {
-    const msg = (detail as { message?: unknown }).message
-    if (typeof msg === 'string' && msg) return msg
-  }
-  return fallback
-}
 const saving = ref(false)
 const rdProjects = ref<RdProject[]>([])
 const rdExpenseTypes = ref<RdExpenseTypeOption[]>([])
@@ -119,10 +126,38 @@ const directionOptions = [
 ]
 
 const payerOptions = [
-  { label: '公司账户', value: 'company_account' },
-  { label: '股东个人', value: 'boss_personal' },
-  { label: '员工垫付', value: 'employee_personal' },
+  { label: '老板个人垫付', value: 'boss_personal' },
+  { label: '员工个人垫付', value: 'employee_personal' },
+  { label: '公司对公账户', value: 'company_account' },
 ]
+
+// 员工垫付必须落到具体的人：payer 仍是标准串 employee_personal:<姓名>（后端 payer
+// 是自由字符串），下拉拆成「类型 + 姓名」两段，保存时再拼回去。
+const payerEmployees = usePayeeEmployees()
+const payerKind = computed<PayerKind>({
+  get: () => splitPayer(editForm.value.payer).kind,
+  set: (kind) => {
+    const pendingName = kind === 'employee_personal' ? splitPayer(editForm.value.payer).employeeName : ''
+    editForm.value.payer = joinPayer(kind, pendingName)
+    if (kind === 'employee_personal') void payerEmployees.ensure()
+  },
+})
+const payerEmployeeName = computed<string>({
+  get: () => splitPayer(editForm.value.payer).employeeName,
+  set: (name) => {
+    editForm.value.payer = joinPayer('employee_personal', name || '')
+  },
+})
+const payerEmployeeOptions = computed(() => payerEmployees.options(payerEmployeeName.value))
+const payerEmployeesLoading = payerEmployees.loading
+
+/** 只读展示：个人垫付要显示到人，公司账户仍按资金渠道口径（含微信待结算） */
+function payerLabel(record: Entry) {
+  const { kind, employeeName } = splitPayer(record.payer)
+  if (kind === 'employee_personal') return employeeName ? `员工垫付 · ${employeeName}` : '员工垫付'
+  if (kind === 'boss_personal') return '股东个人'
+  return payerDisplayLabel(record.payer, (record as any).voucherLines)
+}
 
 const billingOptions = [
   { label: '有发票', value: 'has_invoice' },
@@ -160,6 +195,188 @@ const voucherBalanced = computed(() =>
   && Math.abs(totalVoucherDebit.value - totalVoucherCredit.value) < 0.005,
 )
 const rdVoucherLines = computed(() => voucherLines.value.filter(line => line.rdDetail))
+
+// ── 人工调整分录（会计纠错）────────────────────────────────────────────────
+// 系统按「方向 + 分类 + 付款方式」生成分录，规则偶有记错科目。这里让会计在
+// 过账前直接改科目/方向/金额，后端再复核平衡、金额与末级科目。
+interface VoucherDraftLine {
+  direction: 'debit' | 'credit'
+  accountCode: string
+  amount: number
+}
+
+const editingVoucher = ref(false)
+const adjusting = ref(false)
+const adjustReason = ref('')
+const voucherDraft = ref<VoucherDraftLine[]>([])
+const showResetVoucherConfirm = ref(false)
+const ledgerAccounts = ref<LedgerAccountOption[]>([])
+const loadingAccounts = ref(false)
+
+const isManuallyAdjusted = computed(() => !!(entry.value as any)?.voucherManuallyAdjusted)
+const showOverwriteVoucherConfirm = ref(false)
+// 「改交易」的哪些字段会触发按规则重算分录（与后端 financial_fields 对齐）
+const editTouchesVoucher = computed(() => {
+  const base = entry.value
+  if (!base) return false
+  return toCents(Number(editForm.value.amount || 0)) !== toCents(Number(base.amount || 0))
+    || editForm.value.direction !== base.direction
+    || editForm.value.category !== (base.category || '')
+    || (editForm.value.payer || 'company_account') !== (base.payer || 'company_account')
+})
+const editOverwritesVoucher = computed(() => isManuallyAdjusted.value && editTouchesVoucher.value)
+const isSystemVoucher = computed(() =>
+  ['opening', 'closing', 'reversal'].includes(String(entry.value?.entryType || ''))
+)
+// 老板视图不出现会计术语；已过账/已冲销/系统凭证/银行结算凭证都不允许直接改分录
+const canAdjustVoucher = computed(() =>
+  !viewStore.isBoss
+  && voucherLines.value.length > 0
+  && !isPosted.value
+  && !isReversed.value
+  && !settlementBankId.value
+  && !isSystemVoucher.value
+)
+const adjustBlockedReason = computed(() => {
+  if (viewStore.isBoss) return '会计视图下可调整分录'
+  if (isPosted.value) return '已过账凭证不能直接改分录，请先冲销'
+  if (isSystemVoucher.value) return '期初/结转/冲销凭证的分录由系统生成'
+  if (settlementBankId.value) return '银行结算凭证按净额生成，请取消对账后重做'
+  return ''
+})
+
+const accountOptions = computed(() =>
+  ledgerAccounts.value
+    // 只给末级科目：容器科目（1221/2211/2221）本身不允许记账
+    .filter(item => item.isLeaf)
+    .map(item => ({ label: `${item.code} ${item.name}`, value: item.code, name: item.name }))
+)
+
+/** 分为单位的整数还原成金额文本（避免裸浮点参与展示比较）。 */
+function centsText(cents: number): string {
+  return formatMoney(Number((cents / 100).toFixed(2)))
+}
+
+const draftDebitCents = computed(() =>
+  voucherDraft.value.filter(l => l.direction === 'debit').reduce((sum, l) => sum + toCents(l.amount || 0), 0)
+)
+const draftCreditCents = computed(() =>
+  voucherDraft.value.filter(l => l.direction === 'credit').reduce((sum, l) => sum + toCents(l.amount || 0), 0)
+)
+const draftDiffCents = computed(() => draftDebitCents.value - draftCreditCents.value)
+const draftTradeAmountCents = computed(() => toCents(Number(entry.value?.amount || 0)))
+const draftBalanced = computed(() => voucherDraft.value.length >= 2 && draftDiffCents.value === 0)
+// 借方合计必须仍是这笔交易的金额：改科目不能顺带改交易
+const draftAmountMatches = computed(() => draftDebitCents.value === draftTradeAmountCents.value)
+const draftLinesComplete = computed(() =>
+  voucherDraft.value.every(line => line.accountCode && toCents(line.amount || 0) > 0)
+)
+const canSaveVoucherDraft = computed(() =>
+  draftBalanced.value && draftAmountMatches.value && draftLinesComplete.value
+)
+
+async function ensureLedgerAccounts() {
+  if (ledgerAccounts.value.length > 0 || loadingAccounts.value) return
+  loadingAccounts.value = true
+  try {
+    const data = await getLedgerAccounts()
+    ledgerAccounts.value = data.accounts || []
+  } catch (err) {
+    reportErrorToast(message, err, '读取科目表失败，请稍后重试')
+  } finally {
+    loadingAccounts.value = false
+  }
+}
+
+async function startAdjustVoucher() {
+  if (!canAdjustVoucher.value) return
+  await ensureLedgerAccounts()
+  voucherDraft.value = voucherLines.value.map(line => ({
+    direction: line.side,
+    accountCode: line.code,
+    amount: line.amount,
+  }))
+  adjustReason.value = ''
+  editingVoucher.value = true
+  showVoucherDetails.value = true
+}
+
+function cancelAdjustVoucher() {
+  editingVoucher.value = false
+  voucherDraft.value = []
+  adjustReason.value = ''
+}
+
+function addDraftLine(direction: 'debit' | 'credit') {
+  voucherDraft.value.push({ direction, accountCode: '', amount: 0 })
+}
+
+function removeDraftLine(index: number) {
+  if (voucherDraft.value.length <= 2) {
+    message.warning('分录至少保留一借一贷两行')
+    return
+  }
+  voucherDraft.value.splice(index, 1)
+}
+
+async function saveVoucherAdjustment() {
+  if (!entry.value || adjusting.value) return
+  if (!canSaveVoucherDraft.value) {
+    message.warning(
+      draftBalanced.value && !draftAmountMatches.value
+        ? `借方合计需等于交易金额 ${formatMoney(entry.value.amount)}`
+        : '请先让借贷平衡并补齐科目',
+    )
+    return
+  }
+  adjusting.value = true
+  try {
+    const lines: VoucherLineAdjustment[] = voucherDraft.value.map(line => ({
+      direction: line.direction,
+      accountCode: line.accountCode,
+      amount: line.amount,
+    }))
+    const result = await adjustEntryVoucherLines(entry.value.id, {
+      lines,
+      reason: adjustReason.value.trim(),
+    })
+    entry.value = result.entry
+    editingVoucher.value = false
+    voucherDraft.value = []
+    message.success('分录已调整，账簿与报表将按新科目归集')
+    try {
+      await entryStore.fetchEntries()
+    } catch {
+      // 列表缓存刷新失败不影响单据本身，用户回列表时会重新拉取
+    }
+  } catch (err) {
+    reportErrorToast(message, err, '调整分录失败')
+  } finally {
+    adjusting.value = false
+  }
+}
+
+async function resetVoucherToSystem() {
+  if (!entry.value || adjusting.value) return
+  adjusting.value = true
+  try {
+    const result = await adjustEntryVoucherLines(entry.value.id, { resetToSystem: true })
+    entry.value = result.entry
+    editingVoucher.value = false
+    voucherDraft.value = []
+    showResetVoucherConfirm.value = false
+    message.success('已恢复系统建议分录')
+    try {
+      await entryStore.fetchEntries()
+    } catch {
+      // 同上：列表刷新失败不影响单据本身
+    }
+  } catch (err) {
+    reportErrorToast(message, err, '恢复系统分录失败')
+  } finally {
+    adjusting.value = false
+  }
+}
 
 function rdProjectLabel(projectId: string) {
   const project = rdProjects.value.find(item => item.id === projectId)
@@ -245,10 +462,23 @@ function startEdit() {
     paymentDate: entry.value.paymentDate || null,
   }
   editing.value = true
+  // 已经是员工垫付的旧数据：进编辑就先把名单拉好，别等用户再点一次
+  if (payerKind.value === 'employee_personal') void payerEmployees.ensure()
 }
 
-async function saveEdit() {
+async function saveEdit(confirmOverwriteVoucher = false) {
   if (!entry.value) return
+  // 员工垫付必须落到具体的人，否则凭证只挂个「其他应付款-员工往来」谁也不认
+  if (payerKind.value === 'employee_personal' && !payerEmployeeName.value.trim()) {
+    message.warning('请选择垫付的员工，或改为股东个人/公司账户')
+    return
+  }
+  // 分录已被会计手改过：改方向/分类/付款方式/金额会按规则重算并覆盖手改结果，
+  // 必须先确认。后端也有同名拦截（VOUCHER_ADJUSTMENT_WILL_BE_LOST）兜底。
+  if (editOverwritesVoucher.value && !confirmOverwriteVoucher) {
+    showOverwriteVoucherConfirm.value = true
+    return
+  }
   saving.value = true
   try {
     const updated = await entryStore.updateEntryField(entry.value.id, {
@@ -259,6 +489,7 @@ async function saveEdit() {
       billingStatus: editForm.value.billingStatus,
       payer: editForm.value.payer,
       paymentDate: editForm.value.paymentDate || null,
+      ...(confirmOverwriteVoucher ? { confirmRegenerateVoucher: true } : {}),
     })
     entry.value = updated || entryStore.activeEntries.find((e) => e.id === entry.value?.id) || {
       ...entry.value,
@@ -270,10 +501,11 @@ async function saveEdit() {
       billingStatus: editForm.value.billingStatus,
       paymentDate: editForm.value.paymentDate || undefined,
     }
+    showOverwriteVoucherConfirm.value = false
     editing.value = false
     message.success('已保存')
   } catch (err) {
-    message.error(errDetail(err, '保存失败'))
+    reportErrorToast(message, err, '保存失败')
   } finally {
     saving.value = false
   }
@@ -296,7 +528,7 @@ async function confirmReverse() {
     await entryStore.fetchEntries()
     entry.value = entryStore.activeEntries.find((e) => e.id === entry.value?.id) || entry.value
   } catch (err) {
-    message.error(errDetail(err, '冲销失败'))
+    reportErrorToast(message, err, '冲销失败')
   } finally {
     reversing.value = false
   }
@@ -310,7 +542,7 @@ async function deleteEntry() {
     message.success('已删除')
     handleBack()
   } catch (err) {
-    message.error(errDetail(err, '删除失败'))
+    reportErrorToast(message, err, '删除失败')
   } finally {
     deleting.value = false
   }
@@ -381,7 +613,7 @@ async function deleteEntry() {
           </div>
           <div class="info-item">
             <span class="label">付款方式</span>
-            <span class="value">{{ payerDisplayLabel(entry.payer, (entry as any).voucherLines) }}</span>
+            <span class="value">{{ payerLabel(entry) }}</span>
           </div>
           <div class="info-item">
             <span class="label">业务/票据日期</span>
@@ -449,12 +681,31 @@ async function deleteEntry() {
             <NFormItem label="分类">
               <NSelect v-model:value="editForm.category" :options="categoryOptions" filterable />
             </NFormItem>
-            <NFormItem label="付款方式">
+            <NFormItem label="付款方式" class="span-2">
+              <NSpace size="small" style="flex-wrap: wrap;">
+                <NButton
+                  v-for="opt in payerOptions"
+                  :key="opt.value"
+                  size="small"
+                  round
+                  :type="payerKind === opt.value ? 'primary' : 'default'"
+                  :secondary="payerKind === opt.value"
+                  @click="payerKind = opt.value as PayerKind"
+                >
+                  {{ opt.label }}
+                </NButton>
+              </NSpace>
+            </NFormItem>
+            <NFormItem v-if="payerKind === 'employee_personal'" label="垫付员工">
               <NSelect
-                v-model:value="editForm.payer"
-                :options="payerOptions"
+                v-model:value="payerEmployeeName"
+                :options="payerEmployeeOptions"
+                :loading="payerEmployeesLoading"
+                filterable
+                clearable
+                placeholder="选择垫付的员工"
                 :autofocus="String(route.query.focus || '') === 'payer'"
-                :default-open="String(route.query.focus || '') === 'payer'"
+                :default-open="String(route.query.focus || '') === 'payer' && payerEmployeeName === ''"
               />
             </NFormItem>
             <NFormItem label="付款日">
@@ -472,7 +723,7 @@ async function deleteEntry() {
           </NForm>
           <NSpace justify="end">
             <NButton @click="editing = false">取消</NButton>
-            <NButton type="primary" :loading="saving" @click="saveEdit">保存</NButton>
+            <NButton type="primary" :loading="saving" @click="() => saveEdit()">保存</NButton>
           </NSpace>
         </div>
       </template>
@@ -495,46 +746,190 @@ async function deleteEntry() {
       <div class="voucher-toggle-header" @click="showVoucherDetails = !showVoucherDetails">
         <div class="toggle-title-group">
           <i class="ri-file-list-3-line" />
-          <span class="toggle-heading">会计凭证分录（合规底账）</span>
-          <span class="toggle-badge">{{ showVoucherDetails ? '点击收起' : '点击展开查看' }}</span>
+          <span class="toggle-heading">
+            {{ viewStore.isBoss ? '查看会计处理（借贷分录）' : '会计凭证分录（合规底账）' }}
+          </span>
+          <span class="toggle-badge">
+            {{ showVoucherDetails ? '点击收起' : (viewStore.isBoss ? '需要时展开' : '点击展开查看') }}
+          </span>
+          <NTooltip v-if="isManuallyAdjusted">
+            <template #trigger>
+              <span class="adjusted-badge" @click.stop>
+                <NTag size="tiny" type="warning" :bordered="false">已人工调整</NTag>
+              </span>
+            </template>
+            <div style="max-width: 260px;">
+              <div>{{ entry?.voucherAdjustment?.reason || '会计已手工调整过科目' }}</div>
+              <div v-if="entry?.voucherAdjustment?.adjustedAt" style="opacity: 0.75;">
+                {{ formatDate(entry.voucherAdjustment.adjustedAt) }}
+              </div>
+            </div>
+          </NTooltip>
         </div>
         <i :class="showVoucherDetails ? 'ri-arrow-up-s-line' : 'ri-arrow-down-s-line'" class="toggle-chevron" />
       </div>
 
       <div v-show="showVoucherDetails" class="voucher-table-wrapper">
-        <table class="voucher-table">
-          <thead>
-            <tr>
-              <th class="col-code">科目编码</th>
-              <th class="col-name">科目名称</th>
-              <th class="col-side">方向</th>
-              <th class="col-amount">金额</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="line in voucherLines" :key="line.code + line.side">
-              <td>{{ line.code }}</td>
-              <td>{{ line.name }}</td>
-              <td>
-                <NTag size="tiny" :type="line.side === 'debit' ? 'error' : 'success'" :bordered="false">
-                  {{ line.side === 'debit' ? '借方' : '贷方' }}
-                </NTag>
-              </td>
-              <td class="amount-cell">{{ formatMoney(line.amount) }}</td>
-            </tr>
-          </tbody>
-          <tfoot>
-            <tr>
-              <td colspan="3" class="total-label">合计</td>
-              <td class="amount-cell">{{ formatMoney(Math.max(totalVoucherDebit, totalVoucherCredit)) }}</td>
-            </tr>
-          </tfoot>
-        </table>
-        <div class="voucher-footer" v-if="entry.voucherRef">
-          凭证号：{{ entry.voucherRef }}
+        <template v-if="!editingVoucher">
+          <table class="voucher-table">
+            <thead>
+              <tr>
+                <th class="col-code">科目编码</th>
+                <th class="col-name">科目名称</th>
+                <th class="col-side">方向</th>
+                <th class="col-amount">金额</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="line in voucherLines" :key="line.code + line.side">
+                <td>{{ line.code }}</td>
+                <td>{{ line.name }}</td>
+                <td>
+                  <NTag size="tiny" :type="line.side === 'debit' ? 'error' : 'success'" :bordered="false">
+                    {{ line.side === 'debit' ? '借方' : '贷方' }}
+                  </NTag>
+                </td>
+                <td class="amount-cell">{{ formatMoney(line.amount) }}</td>
+              </tr>
+            </tbody>
+            <tfoot>
+              <tr>
+                <td colspan="3" class="total-label">合计</td>
+                <td class="amount-cell">{{ formatMoney(Math.max(totalVoucherDebit, totalVoucherCredit)) }}</td>
+              </tr>
+            </tfoot>
+          </table>
+          <div class="voucher-footer-row">
+            <span class="voucher-footer" v-if="entry.voucherRef">凭证号：{{ entry.voucherRef }}</span>
+            <span v-else class="voucher-footer" />
+            <NTooltip v-if="!viewStore.isBoss" placement="top">
+              <template #trigger>
+                <NButton size="tiny" secondary :disabled="!canAdjustVoucher" @click="startAdjustVoucher">
+                  调整科目
+                </NButton>
+              </template>
+              {{ canAdjustVoucher ? '可修改科目、方向和金额，也可增删分录行' : adjustBlockedReason }}
+            </NTooltip>
+          </div>
+        </template>
+
+        <!-- 调整态：会计手工纠错 -->
+        <div v-else class="voucher-editor">
+          <table class="voucher-table voucher-table-edit">
+            <thead>
+              <tr>
+                <th class="col-name">科目</th>
+                <th class="col-side">方向</th>
+                <th class="col-amount">金额</th>
+                <th class="col-op" />
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="(line, index) in voucherDraft" :key="index">
+                <td>
+                  <NSelect
+                    v-model:value="line.accountCode"
+                    :options="accountOptions"
+                    size="small"
+                    filterable
+                    placeholder="搜索科目编码或名称"
+                    :loading="loadingAccounts"
+                  />
+                </td>
+                <td>
+                  <NSelect
+                    v-model:value="line.direction"
+                    size="small"
+                    :options="[{ label: '借方', value: 'debit' }, { label: '贷方', value: 'credit' }]"
+                  />
+                </td>
+                <td>
+                  <NInputNumber
+                    v-model:value="line.amount"
+                    size="small"
+                    :show-button="false"
+                    :precision="2"
+                    :min="0"
+                    style="width: 100%;"
+                  />
+                </td>
+                <td class="col-op">
+                  <NButton text size="tiny" type="error" @click="removeDraftLine(index)">
+                    <template #icon><i class="ri-delete-bin-line" /></template>
+                  </NButton>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="voucher-add-row">
+            <NButton size="tiny" dashed @click="addDraftLine('debit')">+ 借方行</NButton>
+            <NButton size="tiny" dashed @click="addDraftLine('credit')">+ 贷方行</NButton>
+          </div>
+
+          <div class="voucher-draft-summary">
+            <span>借 {{ centsText(draftDebitCents) }} · 贷 {{ centsText(draftCreditCents) }}</span>
+            <span :class="draftBalanced ? 'ok' : 'bad'">
+              {{ draftBalanced ? '借贷平衡' : `差额 ${centsText(Math.abs(draftDiffCents))}` }}
+            </span>
+            <span :class="draftAmountMatches ? 'ok' : 'bad'">
+              交易金额 {{ formatMoney(entry.amount) }}{{ draftAmountMatches ? '' : '（借方合计需等于交易金额）' }}
+            </span>
+          </div>
+
+          <NInput
+            v-model:value="adjustReason"
+            size="small"
+            placeholder="调整原因（选填，例如：客户赊账，应记应收账款）"
+            style="margin-top: 10px;"
+          />
+
+          <NSpace justify="end" style="margin-top: 12px;">
+            <NButton size="small" @click="cancelAdjustVoucher">取消</NButton>
+            <NButton v-if="isManuallyAdjusted" size="small" @click="showResetVoucherConfirm = true">
+              恢复系统建议
+            </NButton>
+            <NButton
+              size="small"
+              type="primary"
+              :loading="adjusting"
+              :disabled="!canSaveVoucherDraft"
+              @click="saveVoucherAdjustment"
+            >
+              保存调整
+            </NButton>
+          </NSpace>
         </div>
       </div>
     </NCard>
+
+    <!-- 恢复系统建议确认 -->
+    <NModal v-model:show="showResetVoucherConfirm" title="恢复系统建议分录" preset="card" style="width: 420px;">
+      <p style="margin: 0;">
+        将丢弃会计手工调整的科目，按「方向 + 分类 + 付款方式」重新生成分录。此操作会留痕，但手改内容不会保留。
+      </p>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton @click="showResetVoucherConfirm = false">取消</NButton>
+          <NButton type="warning" :loading="adjusting" @click="resetVoucherToSystem">确认恢复</NButton>
+        </NSpace>
+      </template>
+    </NModal>
+
+    <!-- 改交易字段会重算分录：手改过的必须先确认 -->
+    <NModal v-model:show="showOverwriteVoucherConfirm" title="分录将被重新生成" preset="card" style="width: 460px;">
+      <p style="margin: 0 0 8px;">这笔凭证的分录已被会计人工调整过。</p>
+      <p style="margin: 0;">
+        继续保存会按「方向 + 分类 + 付款方式」重新生成分录，覆盖手工调整的科目。
+        如需保留手改结果，请取消，只修改摘要等不影响分录的字段。
+      </p>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton @click="showOverwriteVoucherConfirm = false">取消</NButton>
+          <NButton type="warning" :loading="saving" @click="saveEdit(true)">仍然保存并覆盖</NButton>
+        </NSpace>
+      </template>
+    </NModal>
 
     <!-- Delete Confirm -->
     <NModal v-model:show="showDeleteConfirm" title="确认删除" preset="card" style="width: 400px;">
@@ -757,7 +1152,7 @@ async function deleteEntry() {
   color: var(--solo-primary);
   background: var(--solo-bg-blue-soft);
   padding: 2px 8px;
-  border-radius: 10px;
+  border-radius: 8px;
   font-weight: 500;
 }
 .toggle-chevron {
@@ -813,7 +1208,7 @@ async function deleteEntry() {
   gap: 12px;
   padding: 12px 14px;
   border: 1px solid var(--solo-border-light);
-  border-radius: var(--solo-radius, 10px);
+  border-radius: var(--solo-radius, 8px);
   background: var(--solo-bg-soft, #f1f4f8);
 }
 
@@ -853,17 +1248,17 @@ async function deleteEntry() {
 
 .post-line-card {
   border: 1px solid var(--solo-border-light);
-  border-radius: var(--solo-radius, 10px);
+  border-radius: var(--solo-radius, 8px);
   padding: 10px 12px;
   min-width: 0;
 }
 
 .post-line-card.debit {
-  border-top: 3px solid var(--solo-expense, #c74444);
+  border-top: 3px solid var(--solo-expense, #bd3d3d);
 }
 
 .post-line-card.credit {
-  border-top: 3px solid var(--solo-income, #12805c);
+  border-top: 3px solid var(--solo-income, #0f7354);
 }
 
 .post-line-side {
@@ -904,11 +1299,11 @@ async function deleteEntry() {
 }
 
 .post-balance.ok {
-  color: var(--solo-income, #12805c);
+  color: var(--solo-income, #0f7354);
 }
 
 .post-balance.bad {
-  color: var(--solo-expense, #c74444);
+  color: var(--solo-expense, #bd3d3d);
   font-weight: 600;
 }
 
@@ -926,7 +1321,7 @@ async function deleteEntry() {
 }
 
 .post-note i {
-  color: var(--solo-info, #165dff);
+  color: var(--solo-info, #1747b0);
 }
 
 @media (max-width: 640px) {
@@ -934,4 +1329,48 @@ async function deleteEntry() {
     grid-template-columns: 1fr;
   }
 }
+
+/* 人工调整分录 */
+.voucher-footer-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
+}
+.voucher-editor {
+  display: flex;
+  flex-direction: column;
+}
+.voucher-table-edit th,
+.voucher-table-edit td {
+  padding: 6px 8px;
+}
+.voucher-table-edit .col-op {
+  width: 40px;
+  text-align: center;
+}
+.voucher-add-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+.voucher-draft-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 14px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--solo-text-secondary);
+}
+.voucher-draft-summary .ok {
+  color: var(--solo-income, #0f7354);
+  font-weight: 600;
+}
+.voucher-draft-summary .bad {
+  color: var(--solo-expense, #bd3d3d);
+  font-weight: 600;
+}
+
 </style>
