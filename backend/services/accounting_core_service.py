@@ -6,6 +6,7 @@ from __future__ import annotations
 import calendar
 import hashlib
 import json
+import logging
 import secrets
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -61,6 +62,8 @@ from services.period_resolution_service import (
     PeriodResolution,
     resolve_posting_period,
 )
+
+logger = logging.getLogger(__name__)
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -754,6 +757,8 @@ def _normalize_voucher_lines(payload: dict[str, Any]) -> list[dict[str, Any]]:
             money(payload.get("amount") or ZERO),
             payer=str(payload.get("payer") or "company_account"),
             payment_status=payload.get("paymentStatus"),
+            vat_rate=payload.get("vatRate"),
+            vat_amount=payload.get("vatAmount"),
         ))
     normalized: list[dict[str, Any]] = []
     for direction in ("debit", "credit"):
@@ -830,6 +835,19 @@ async def _add_lines(
     accounts = await _load_accounts(
         session, entry.company_id, [line["accountCode"] for line in raw_lines], enforce_leaf=enforce_leaf
     )
+    # 科目完整路径名：二级科目拼父级（如「管理费用-办公费」），底账与报表口径统一
+    parent_codes = {a.parent_code for a in accounts.values() if a.parent_code}
+    parent_names: dict[str, str] = {}
+    if parent_codes:
+        parent_rows = (
+            await session.execute(
+                select(ChartAccount).where(
+                    ChartAccount.company_id == entry.company_id,
+                    ChartAccount.code.in_(parent_codes),
+                )
+            )
+        ).scalars().all()
+        parent_names = {p.code: p.name for p in parent_rows}
     # 期末结转/期初凭证是"搬运"不是"发生"：对冲研发科目时不可能带项目明细，
     # 因此系统凭证允许缺省 rdDetail，不参与研发辅助核算校验。
     require_rd_detail = entry.entry_type not in {"closing", "opening"}
@@ -851,7 +869,11 @@ async def _add_lines(
                 line_no=line_no,
                 account_id=account.id,
                 account_code=account.code,
-                account_name=account.name,
+                account_name=(
+                    f"{parent_names[account.parent_code]}-{account.name}"
+                    if account.parent_code and account.parent_code in parent_names
+                    else account.name
+                ),
                 direction=line["direction"],
                 amount=line["amount"],
                 # 数量金额式（P1 WP-D）：只在科目勾选数量核算时落数量三列；
@@ -1335,23 +1357,136 @@ PROJECTION_BACKFILL_KEYS = (
 )
 
 
-async def serialize_journal(
-    session: AsyncSession,
-    entry: JournalEntry,
-    *,
-    api_money: bool = True,
-) -> dict[str, Any]:
-    lines = await _entry_lines(session, entry.id)
+class _JournalPrefetch:
+    """serialize_journal 的批量预取上下文。
+
+    列表场景（list_journals → 报表/待办/申报包）原实现每条凭证发 5-7 条子查询，
+    N 条凭证线性放大。这里把行/来源/投影/研发明细/科目全名/用户显示名各收敛成
+    一次 IN 查询，渲染阶段零 await。单条路径与批量路径共用 _render_journal，
+    保证两条路径输出逐字节一致。
+    """
+
+    __slots__ = ("lines_by_entry", "sources", "projections", "rd_by_line", "full_names", "user_names")
+
+    def __init__(
+        self,
+        lines_by_entry: dict[str, list[JournalLine]],
+        sources: dict[str, SourceTransaction],
+        projections: dict[str, "LegacyEntryProjection"],
+        rd_by_line: dict[str, "RdJournalLineDetail"],
+        full_names: dict[str, str],
+        user_names: dict[str, str],
+    ) -> None:
+        self.lines_by_entry = lines_by_entry
+        self.sources = sources
+        self.projections = projections
+        self.rd_by_line = rd_by_line
+        self.full_names = full_names
+        self.user_names = user_names
+
+
+async def _prefetch_journals(
+    session: AsyncSession, entries: list[JournalEntry], *, lite: bool = False
+) -> _JournalPrefetch:
+    """lite=True 时跳过分录行/研发明细/科目名/用户名查询（约省 4 次）。
+
+    仅供不读 voucherLines 的轻量消费方（如待办派生）使用：metadata + 投影
+    回填语义保持完整，分录行序列化跳过（debit/credit 为空列表）。
+    """
+    entry_ids = [e.id for e in entries]
+    if not entry_ids:
+        return _JournalPrefetch({}, {}, {}, {}, {}, {})
+
+    lines_by_entry: dict[str, list[JournalLine]] = {eid: [] for eid in entry_ids}
+    all_line_ids: list[str] = []
+    rd_by_line: dict[str, RdJournalLineDetail] = {}
+    if not lite:
+        for line in (
+            await session.execute(
+                select(JournalLine)
+                .where(JournalLine.journal_entry_id.in_(entry_ids))
+                .order_by(JournalLine.journal_entry_id, JournalLine.line_no)
+            )
+        ).scalars().all():
+            lines_by_entry.setdefault(line.journal_entry_id, []).append(line)
+
+        all_line_ids = [line.id for lines in lines_by_entry.values() for line in lines]
+    if all_line_ids:
+        for detail in (
+            await session.execute(
+                select(RdJournalLineDetail).where(RdJournalLineDetail.journal_line_id.in_(all_line_ids))
+            )
+        ).scalars().all():
+            rd_by_line[detail.journal_line_id] = detail
+
+    source_ids = {e.source_transaction_id for e in entries if e.source_transaction_id}
+    sources: dict[str, SourceTransaction] = {}
+    if source_ids:
+        for source in (
+            await session.execute(select(SourceTransaction).where(SourceTransaction.id.in_(source_ids)))
+        ).scalars().all():
+            sources[source.id] = source
+
+    projections = {
+        p.id: p
+        for p in (
+            await session.execute(select(LegacyEntryProjection).where(LegacyEntryProjection.id.in_(entry_ids)))
+        ).scalars().all()
+    }
+
+    company_id = entries[0].company_id
+    all_codes = {line.account_code for lines in lines_by_entry.values() for line in lines}
+    full_names: dict[str, str] = {}
+    if not lite and all_codes and company_id:
+        acct_rows = (
+            await session.execute(
+                select(ChartAccount).where(
+                    ChartAccount.company_id == company_id,
+                    ChartAccount.code.in_(all_codes),
+                )
+            )
+        ).scalars().all()
+        acct_by_code = {a.code: a for a in acct_rows}
+        parent_codes = {a.parent_code for a in acct_rows if a.parent_code}
+        parent_names: dict[str, str] = {}
+        if parent_codes:
+            parent_rows = (
+                await session.execute(
+                    select(ChartAccount).where(
+                        ChartAccount.company_id == company_id,
+                        ChartAccount.code.in_(parent_codes),
+                    )
+                )
+            ).scalars().all()
+            parent_names = {p.code: p.name for p in parent_rows}
+        for a in acct_rows:
+            pn = parent_names.get(a.parent_code) if a.parent_code else None
+            if not pn:
+                continue
+            full_names[a.code] = a.name if a.name.startswith(pn + "-") else f"{pn}-{a.name}"
+
+    user_names: dict[str, str] = {}
+    if not lite:
+        user_ids: set[str] = set()
+        for e in entries:
+            user_ids.update({e.created_by, e.reviewed_by or "", e.posted_by or ""} - {""})
+        user_names = await _user_display_names(session, user_ids)
+
+    return _JournalPrefetch(lines_by_entry, sources, projections, rd_by_line, full_names, user_names)
+
+
+def _render_journal(entry: JournalEntry, *, api_money: bool, pf: _JournalPrefetch) -> dict[str, Any]:
+    lines = pf.lines_by_entry.get(entry.id) or []
     payload = dict(entry.metadata_json or {})
     if entry.source_transaction_id:
-        source = await session.get(SourceTransaction, entry.source_transaction_id)
+        source = pf.sources.get(entry.source_transaction_id)
         if source:
             for key in ("billingStatus", "reconciliationType", "paymentDate", "bankStatementId"):
                 if key in (source.raw_payload or {}):
                     payload[key] = source.raw_payload[key]
     # 对账状态由银行确认/解绑路径直接维护在 legacy 投影 payload 上
     # （json_set/json_remove），权威层 metadata 感知不到，这里以投影为准回填。
-    projection = await session.get(LegacyEntryProjection, entry.id)
+    projection = pf.projections.get(entry.id)
     if projection is not None:
         try:
             legacy_payload = json.loads(projection.payload) if isinstance(projection.payload, str) else (projection.payload or {})
@@ -1366,21 +1501,15 @@ async def serialize_journal(
                 payload["is_archive_only"] = legacy_payload.get("is_archive_only")
             if legacy_payload.get("isArchiveOnly") is not None:
                 payload["isArchiveOnly"] = legacy_payload.get("isArchiveOnly")
-    rd_details = {
-        detail.journal_line_id: detail
-        for detail in (
-            await session.execute(
-                select(RdJournalLineDetail).where(
-                    RdJournalLineDetail.journal_line_id.in_([line.id for line in lines])
-                )
-            )
-        ).scalars().all()
-    } if lines else {}
+    rd_details = pf.rd_by_line
+
+    # 科目完整路径名：预取阶段已按公司全量代码装配（含父级名）
+    full_names: dict[str, str] = pf.full_names
 
     def serialize_line(line: JournalLine) -> dict[str, Any]:
         result = {
             "accountCode": line.account_code,
-            "accountName": line.account_name,
+            "accountName": full_names.get(line.account_code) or line.account_name,
             "amount": money_text(line.amount) if api_money else line.amount,
         }
         if line.quantity is not None:
@@ -1406,9 +1535,7 @@ async def serialize_journal(
             }
         return result
 
-    name_map = await _user_display_names(
-        session, {entry.created_by, entry.reviewed_by, entry.posted_by}
-    )
+    name_map = pf.user_names
     debit = [serialize_line(line) for line in lines if line.direction == "debit"]
     credit = [serialize_line(line) for line in lines if line.direction == "credit"]
     payload.update(
@@ -1440,12 +1567,39 @@ async def serialize_journal(
     return payload
 
 
+async def serialize_journal(
+    session: AsyncSession,
+    entry: JournalEntry,
+    *,
+    api_money: bool = True,
+    lite: bool = False,
+) -> dict[str, Any]:
+    pf = await _prefetch_journals(session, [entry], lite=lite)
+    return _render_journal(entry, api_money=api_money, pf=pf)
+
+
+async def serialize_journals(
+    session: AsyncSession,
+    entries: list[JournalEntry],
+    *,
+    api_money: bool = True,
+    lite: bool = False,
+) -> list[dict[str, Any]]:
+    """批量序列化：行/投影/研发明细/科目/用户名各一次 IN 查询（消除列表场景 N+1）。
+
+    lite=True 供不读 voucherLines 的消费方（待办派生）跳过分录行与科目装配。
+    """
+    pf = await _prefetch_journals(session, entries, lite=lite)
+    return [_render_journal(entry, api_money=api_money, pf=pf) for entry in entries]
+
+
 async def list_journals(
     session: AsyncSession,
     company_id: str,
     *,
     statuses: Iterable[str] = ACTIVE_ENTRY_STATUSES,
     api_money: bool = True,
+    lite: bool = False,
 ) -> list[dict[str, Any]]:
     entries = (
         await session.execute(
@@ -1454,7 +1608,7 @@ async def list_journals(
             .order_by(JournalEntry.occurred_on.desc(), JournalEntry.created_at.desc())
         )
     ).scalars().all()
-    return [await serialize_journal(session, entry, api_money=api_money) for entry in entries]
+    return await serialize_journals(session, list(entries), api_money=api_money, lite=lite)
 
 
 async def journal_entries_for_reports(
@@ -2298,6 +2452,81 @@ async def reverse_journal(
     return reversal
 
 
+async def correct_entry_category(
+    session: AsyncSession,
+    entry_id: str,
+    new_category: str,
+    *,
+    company_id: str,
+    user_id: str,
+    request_id: str,
+    reason: str,
+) -> dict[str, str]:
+    """更正已过账凭证的分类/科目：红字冲销原凭证 + 按新分类重建并双双过账。
+
+    合规留痕：原凭证生成红字冲销（reversal 凭证），新凭证独立成单；两者过账后
+    账面净额即新分类口径，报表/对账/税务口径一致。只适用于普通业务凭证，发票
+    挂账（贷 2241/借 1122）等特殊凭证应走冲销后手动重做。
+    """
+    from services.account_mapper import get_voucher_hint
+
+    original = await get_journal(session, entry_id, company_id=company_id, lock=True)
+    if original.status != "posted":
+        raise AccountingError(ENTRY_POSTED_IMMUTABLE, "只有已过账凭证可以更正科目", 409, _locked_entry_context(original))
+    meta = dict(original.metadata_json or {})
+    direction = str(meta.get("direction") or "expense")
+    amount = money(meta.get("amount") or ZERO)
+    payer = str(meta.get("payer") or "company_account")
+    if not new_category or not new_category.strip():
+        raise AccountingError("INVALID_CATEGORY", "请选择更正后的分类", 422, {"entryId": entry_id})
+
+    reversal = await reverse_journal(
+        session,
+        entry_id,
+        company_id=company_id,
+        user_id=user_id,
+        request_id=f"{request_id}:rev",
+        reason=reason.strip() or f"更正科目为 {new_category}",
+    )
+
+    hint = get_voucher_hint(
+        direction,
+        new_category,
+        amount,
+        payer,
+        vat_rate=meta.get("vatRate"),
+        vat_amount=meta.get("vatAmount"),
+        payment_status=meta.get("paymentStatus"),
+    )
+    corrected = await create_entry(
+        session,
+        {
+            "id": f"correct-{original.id[:12]}-{uuid4().hex[:6]}",
+            "title": meta.get("title") or original.summary,
+            "amount": money_text(amount),
+            "direction": direction,
+            "category": new_category,
+            "occurDate": original.occurred_on.isoformat(),
+            "payer": payer,
+            "source": str(meta.get("source") or "manual"),
+            "paymentStatus": meta.get("paymentStatus"),
+            "invoiceNumber": meta.get("invoiceNumber"),
+            "invoiceType": meta.get("invoiceType"),
+            "voucherLines": hint,
+            "voucherAuthority": "system",
+            "reason": f"更正自 {original.id}",
+        },
+        company_id=company_id,
+        user_id=user_id,
+        request_id=f"{request_id}:new",
+        confirm=False,
+    )
+    await post_journal(session, reversal.id, company_id=company_id, user_id=user_id, request_id=f"{request_id}:post-rev")
+    await post_journal(session, corrected.id, company_id=company_id, user_id=user_id, request_id=f"{request_id}:post-new")
+    await _sync_projection(session, corrected)
+    return {"reversalId": reversal.id, "correctedId": corrected.id}
+
+
 async def available_periods(
     session: AsyncSession, company_id: str, *, start_from: date | None = None
 ) -> dict[str, Any]:
@@ -2357,8 +2586,9 @@ async def available_periods(
                 month = str(row["month"] or "")[:7]
                 if len(month) == 7 and not below_floor(month):
                     months.setdefault(month, None)
-        except Exception:
-            pass
+        except Exception as exc:
+            # 表可能尚未建（迁移未跑齐）：降级为跳过该来源，但留痕便于排查
+            logger.warning("关账顺序检查：辅助表月份查询失败，跳过该来源 company=%s: %s", company_id, exc)
         try:
             salary_cursor = await conn.execute(
                 "SELECT DISTINCT month FROM salary_sheets WHERE company_id = ?",
@@ -2368,8 +2598,8 @@ async def available_periods(
                 month = str(row["month"] or "")[:7]
                 if len(month) == 7 and not below_floor(month):
                     months.setdefault(month, None)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("关账顺序检查：辅助表月份查询失败，跳过该来源 company=%s: %s", company_id, exc)
     finally:
         await conn.close()
 
@@ -2412,8 +2642,9 @@ async def pre_book_start_activity(
                 if len(month) == 7 and month < floor_key:
                     bank_count += 1
                     months.add(month)
-        except Exception:
-            pass
+        except Exception as exc:
+            # 表可能尚未建（迁移未跑齐）：降级为跳过该来源，但留痕便于排查
+            logger.warning("关账顺序检查：辅助表月份查询失败，跳过该来源 company=%s: %s", company_id, exc)
         try:
             cursor = await conn.execute(
                 "SELECT month FROM salary_sheets WHERE company_id = ?",
@@ -2424,8 +2655,8 @@ async def pre_book_start_activity(
                 if len(month) == 7 and month < floor_key:
                     salary_count += 1
                     months.add(month)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("结账前活动检查：辅助表月份查询失败，跳过该来源 company=%s: %s", company_id, exc)
     finally:
         await conn.close()
 
@@ -2758,24 +2989,13 @@ async def _salary_accrual_close_check(
 async def period_close_checks(session: AsyncSession, company_id: str, month: Any) -> dict[str, Any]:
     month_start = period_start_for(month)
     period = (
-        await session.execute(
-            select(AccountingPeriod).where(
-                AccountingPeriod.company_id == company_id,
-                AccountingPeriod.period_start == month_start,
-            )
-        )
-    ).scalar_one_or_none()
-    pending_count = int(
-        (
             await session.execute(
-                select(func.count(JournalEntry.id)).where(
-                    JournalEntry.company_id == company_id,
-                    JournalEntry.period_start == month_start,
-                    JournalEntry.status.in_(("draft", "pending_review")),
+                select(AccountingPeriod).where(
+                    AccountingPeriod.company_id == company_id,
+                    AccountingPeriod.period_start == month_start,
                 )
             )
-        ).scalar_one()
-    )
+        ).scalar_one_or_none()
     totals = (
         await session.execute(
             select(
@@ -3132,6 +3352,23 @@ async def period_close_checks(session: AsyncSession, company_id: str, month: Any
                 ),
             }
         )
+    vat_base = await _calculate_vat_exemption_base(session, company_id, month_start)
+    if vat_base and vat_base["exemptable_vat"] > ZERO:
+        cycle_name = "本季度" if vat_base["config"].filing_cycle == "quarter" else "本月"
+        if vat_base["is_eligible"]:
+            notices.append(
+                {
+                    "code": "VAT_EXEMPTION_PREVIEW",
+                    "name": "增值税小微免税结转预告",
+                    "severity": "info",
+                    "count": 1,
+                    "amount": str(vat_base["exemptable_vat"]),
+                    "message": (
+                        f"{cycle_name}累计销售额 ¥{vat_base['revenue_net']}（未超 ¥{vat_base['threshold']} 免税限额），"
+                        f"确认结账时系统将自动生成免税凭证，减免增值税 ¥{vat_base['exemptable_vat']} 并转入营业外收入。"
+                    ),
+                }
+            )
     return {
         "period": month_start.isoformat()[:7],
         "periodStatus": period.status if period else "open",
@@ -3166,86 +3403,16 @@ async def _generate_vat_exemption_transfer(
         VAT_EXEMPT_INCOME_ACCOUNT,
         VAT_EXEMPT_INCOME_ACCOUNT_NAME,
         VAT_PAYABLE_ACCOUNT,
-        get_vat_config,
     )
 
-    company = (
-        await session.execute(select(Company).where(Company.company_id == company_id))
-    ).scalar_one_or_none()
-    if company is None:
-        return []
-    try:
-        config = get_vat_config(company.payload or {})
-    except ValueError:
+    base = await _calculate_vat_exemption_base(session, company_id, period_start)
+    if not base or not base["is_eligible"]:
         return []
 
-    if config.filing_cycle == "quarter":
-        if period_start.month % 3 != 0:
-            return []
-        range_start = date(period_start.year, period_start.month - 2, 1)
-    else:
-        range_start = period_start
-    month_end = date(
-        period_start.year,
-        period_start.month,
-        calendar.monthrange(period_start.year, period_start.month)[1],
-    )
-
-    entries = await posted_entries_for_reports(session, company_id)
-    revenue_net = ZERO
-    exemptable_vat = ZERO
-    for entry in entries:
-        if entry.get("entryType") == "opening" or entry.get("isClosingTransfer"):
-            continue
-        # 成对跳过红字冲销：已冲销原凭证（voucherStatus=reversed）与其冲销凭证
-        # （isReversal）净额为零。否则"反结账→重关"场景下，冲销凭证因继承
-        # isClosingTransfer 被跳过（+税额丢失），而已冲销的原转出凭证仍被计入
-        # （-税额），免税转出基数被错误归零，税额永久重复挂账。
-        if entry.get("voucherStatus") == "reversed" or entry.get("isReversal"):
-            continue
-        try:
-            occurred = _parse_date(entry.get("occurDate"))
-        except AccountingError:
-            continue
-        if occurred < range_start or occurred > month_end:
-            continue
-        voucher = entry.get("voucherLines") or {}
-        revenue_credit = sum(
-            (money(line.get("amount") or ZERO) for line in voucher.get("credit") or []
-             if str(line.get("accountCode") or "") in VAT_REVENUE_ACCOUNT_CODES),
-            ZERO,
-        )
-        revenue_debit = sum(
-            (money(line.get("amount") or ZERO) for line in voucher.get("debit") or []
-             if str(line.get("accountCode") or "") in VAT_REVENUE_ACCOUNT_CODES),
-            ZERO,
-        )
-        revenue_net += revenue_credit - revenue_debit
-        vat_credit = sum(
-            (money(line.get("amount") or ZERO) for line in voucher.get("credit") or []
-             if str(line.get("accountCode") or "") == VAT_PAYABLE_ACCOUNT),
-            ZERO,
-        )
-        vat_debit = sum(
-            (money(line.get("amount") or ZERO) for line in voucher.get("debit") or []
-             if str(line.get("accountCode") or "") == VAT_PAYABLE_ACCOUNT),
-            ZERO,
-        )
-        entry_vat = money(vat_credit - vat_debit)
-        if entry_vat == ZERO:
-            continue
-        invoice_type = str(entry.get("invoiceType") or "")
-        if "专用发票" in invoice_type or "专票" in invoice_type:
-            # 专票不得免税，其税额留在应交税费等待申报缴纳
-            continue
-        exemptable_vat += entry_vat
-
-    revenue_net = money(revenue_net)
-    exemptable_vat = money(exemptable_vat)
-    if revenue_net <= ZERO or revenue_net >= config.threshold_for(config.filing_cycle):
-        return []
-    if exemptable_vat <= ZERO:
-        return []
+    config = base["config"]
+    range_start = base["range_start"]
+    month_end = base["month_end"]
+    exemptable_vat = base["exemptable_vat"]
 
     if config.filing_cycle == "quarter":
         label = f"{range_start.year}Q{(range_start.month - 1) // 3 + 1}"
@@ -3289,6 +3456,102 @@ async def _generate_vat_exemption_transfer(
         confirm=True,
     )
     return [entry]
+
+
+async def _calculate_vat_exemption_base(
+    session: AsyncSession,
+    company_id: str,
+    period_start: date,
+) -> dict[str, Any] | None:
+    """计算当期（季度末或月末）小规模免征增值税测算基数。"""
+    from services.vat_service import (
+        VAT_PAYABLE_ACCOUNT,
+        get_vat_config,
+    )
+
+    company = (
+        await session.execute(select(Company).where(Company.company_id == company_id))
+    ).scalar_one_or_none()
+    if company is None:
+        return None
+    try:
+        config = get_vat_config(company.payload or {})
+    except ValueError:
+        return None
+
+    if config.filing_cycle == "quarter":
+        if period_start.month % 3 != 0:
+            return None
+        range_start = date(period_start.year, period_start.month - 2, 1)
+    else:
+        range_start = period_start
+    month_end = date(
+        period_start.year,
+        period_start.month,
+        calendar.monthrange(period_start.year, period_start.month)[1],
+    )
+
+    entries = await posted_entries_for_reports(session, company_id)
+    revenue_net = ZERO
+    exemptable_vat = ZERO
+    for entry in entries:
+        if entry.get("entryType") == "opening" or entry.get("isClosingTransfer"):
+            continue
+        # 成对跳过红字冲销：已冲销原凭证（voucherStatus=reversed）与其冲销凭证
+        # （isReversal）净额为零。
+        if entry.get("voucherStatus") == "reversed" or entry.get("isReversal"):
+            continue
+        try:
+            occurred = _parse_date(entry.get("occurDate"))
+        except AccountingError:
+            continue
+        if occurred < range_start or occurred > month_end:
+            continue
+        voucher = entry.get("voucherLines") or {}
+        revenue_credit = sum(
+            (money(line.get("amount") or ZERO) for line in voucher.get("credit") or []
+             if str(line.get("accountCode") or "") in VAT_REVENUE_ACCOUNT_CODES),
+            ZERO,
+        )
+        revenue_debit = sum(
+            (money(line.get("amount") or ZERO) for line in voucher.get("debit") or []
+             if str(line.get("accountCode") or "") in VAT_REVENUE_ACCOUNT_CODES),
+            ZERO,
+        )
+        revenue_net += revenue_credit - revenue_debit
+        vat_credit = sum(
+            (money(line.get("amount") or ZERO) for line in voucher.get("credit") or []
+             if str(line.get("accountCode") or "") == VAT_PAYABLE_ACCOUNT),
+            ZERO,
+        )
+        vat_debit = sum(
+            (money(line.get("amount") or ZERO) for line in voucher.get("debit") or []
+             if str(line.get("accountCode") or "") == VAT_PAYABLE_ACCOUNT),
+            ZERO,
+        )
+        entry_vat = money(vat_credit - vat_debit)
+        if entry_vat == ZERO:
+            continue
+        invoice_type = str(entry.get("invoiceType") or "")
+        if "专用发票" in invoice_type or "专票" in invoice_type:
+            # 专票不得免税，其税额留在应交税费等待申报缴纳
+            continue
+        exemptable_vat += entry_vat
+
+    revenue_net = money(revenue_net)
+    exemptable_vat = money(exemptable_vat)
+    threshold = config.threshold_for(config.filing_cycle)
+    is_eligible = (revenue_net > ZERO and revenue_net < threshold and exemptable_vat > ZERO)
+
+    return {
+        "config": config,
+        "range_start": range_start,
+        "month_end": month_end,
+        "revenue_net": revenue_net,
+        "exemptable_vat": exemptable_vat,
+        "threshold": threshold,
+        "is_eligible": is_eligible,
+    }
 
 
 async def _generate_closing_entries(
@@ -3605,6 +3868,9 @@ async def _close_period_in_transaction(
     result["closingCount"] = len(closing_entries)
     result["closingEntryIds"] = [entry.id for entry in closing_entries]
     result["closingVoucherRefs"] = [entry.voucher_no for entry in closing_entries]
+    result["vatExemptCount"] = len(vat_exempt_entries)
+    result["vatExemptAmount"] = str(sum((money(entry.metadata_json.get("amount") or ZERO) for entry in vat_exempt_entries), ZERO))
+    result["vatExemptVoucherRefs"] = [entry.voucher_no for entry in vat_exempt_entries]
     return result
 
 

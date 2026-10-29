@@ -1,9 +1,10 @@
 <!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { usePageRefresh } from '@/composables/usePageRefresh'
+import { accountingErrorText } from '@/utils/errors'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NButton, NDatePicker, NInput, NModal, NSelect, NSpin, useMessage } from 'naive-ui'
+import { NButton, NInput, NModal, NSelect, NSpin, useMessage } from 'naive-ui'
 import {
   diffLedgerBookSnapshots,
   getLedgerBook,
@@ -21,7 +22,7 @@ import {
 import { useAuthStore } from '@/stores/auth'
 import { exportLedgerBookToExcel } from '@/utils/export'
 import { reportErrorToast } from '@/utils/errorPresenter'
-import { SoloErrorState } from '@/components/ui'
+import { SoloErrorState, SoloMonthPicker } from '@/components/ui'
 import { formatDate, getCurrentMonth } from '@/utils/format'
 import {
   directionLabel,
@@ -347,7 +348,7 @@ async function issue() {
     await loadIssued()
     message.success(`已签发正式账簿 ${detail.bookNo}，校验码 ${detail.contentHash.slice(0, 8)}`)
   } catch (err) {
-    message.error(errorText(err, '签发失败'))
+    message.error(accountingErrorText(err))
   } finally {
     issuing.value = false
   }
@@ -360,7 +361,7 @@ async function openSnapshot(item: LedgerBookSnapshotSummary) {
     snapshotMode.value = { id: detail.id, bookNo: detail.bookNo, status: detail.status }
     message.success(`正在查看 ${detail.bookNo}（${detail.status === 'void' ? '已作废' : '已签发'}）`)
   } catch (err) {
-    message.error(errorText(err, '读取账簿快照失败'))
+    message.error(accountingErrorText(err))
   }
 }
 
@@ -385,7 +386,7 @@ async function openDiff(item: LedgerBookSnapshotSummary) {
   try {
     diffData.value = await diffLedgerBookSnapshots(item.id, previous.id)
   } catch (err) {
-    message.error(errorText(err, '账簿比对失败'))
+    message.error(accountingErrorText(err))
   } finally {
     diffLoading.value = false
   }
@@ -412,7 +413,7 @@ async function confirmVoid() {
     if (snapshotMode.value?.id === target.id) snapshotMode.value = { ...snapshotMode.value, status: 'void' }
     message.success('已作废，原册仍保留可查')
   } catch (err) {
-    message.error(errorText(err, '作废失败'))
+    message.error(accountingErrorText(err))
   } finally {
     voiding.value = false
   }
@@ -457,12 +458,9 @@ usePageRefresh(load)
           <button :class="{ active: scope === 'month' }" @click="scope = 'month'">本月</button>
           <button :class="{ active: scope === 'year' }" @click="scope = 'year'">全年</button>
         </div>
-        <NDatePicker
+        <SoloMonthPicker
           v-if="scope === 'month'"
-          v-model:formatted-value="month"
-          type="month"
-          value-format="yyyy-MM"
-          format="yyyy-MM"
+          v-model:value="month"
           style="width: 140px;"
         />
         <NSelect v-else v-model:value="year" :options="yearOptions" style="width: 120px;" />

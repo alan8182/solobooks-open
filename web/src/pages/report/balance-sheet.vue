@@ -5,15 +5,20 @@ import { useRoute, useRouter } from 'vue-router'
 import { NCard, NSpin, useMessage, NSelect, NButton, NRadioGroup, NRadioButton } from 'naive-ui'
 import { useEntryStore } from '@/stores/entry'
 import { getBalanceSheet } from '@/api/report'
-import { formatMoney, getCurrentMonth } from '@/utils/format'
-import type { BalanceSheetResponse } from '@/api/types'
+import { formatMoney, formatAmountPlain, getCurrentMonth } from '@/utils/format'
+import type { BalanceSheetResponse, StandardStatementRow } from '@/api/types'
 import ReportScopeNote from '@/components/business/ReportScopeNote.vue'
+import StatementViewToggle from '@/components/business/StatementViewToggle.vue'
+import ProStatementHeader from '@/components/business/ProStatementHeader.vue'
+import { useStatementViewMode } from '@/composables/useStatementViewMode'
 
 // ponytail: Boss-centric balance sheet: plain-language asset/liability/equity formula, neutral liability coloring
+// 会计视图：会小企01表全量行次（年初/期末双列，左右对照），数据同源 standard 块
 const route = useRoute()
 const router = useRouter()
 const message = useMessage()
 const entryStore = useEntryStore()
+const { mode } = useStatementViewMode()
 
 const requestedMonth = String(route.query.month || '')
 const hasRequestedMonth = /^\d{4}-(0[1-9]|1[0-2])$/.test(requestedMonth)
@@ -83,6 +88,42 @@ function drillDown(accountCode: string, accountName?: string) {
   })
 }
 
+// ── 会计视图（会小企01表）──
+
+const statementDateText = computed(() => {
+  const [year, monthValue] = month.value.split('-').map(Number)
+  if (periodType.value === 'quarter') {
+    const quarterEndMonth = Math.ceil(monthValue / 3) * 3
+    const day = new Date(year, quarterEndMonth, 0).getDate()
+    return `${year}年${quarterEndMonth}月${day}日`
+  }
+  const day = new Date(year, monthValue, 0).getDate()
+  return `${year}年${monthValue}月${day}日`
+})
+
+/** 左右对照：资产侧与负债权益侧按行号对齐，短侧补空行 */
+const stdPairs = computed(() => {
+  const assets = result.value?.standard?.assets || []
+  const rights = result.value?.standard?.rights || []
+  const length = Math.max(assets.length, rights.length)
+  return Array.from({ length }, (_, i) => ({ left: assets[i] || null, right: rights[i] || null }))
+})
+
+function stdCellClass(row: StandardStatementRow) {
+  return {
+    'std-section': row.kind === 'section',
+    'std-subtotal': row.kind === 'subtotal',
+    'std-total': row.kind === 'total',
+    'std-leaf': row.kind === 'item',
+  }
+}
+
+function stdClick(row: StandardStatementRow) {
+  if (row.kind === 'item' && row.accountCode) {
+    drillDown(row.accountCode, row.name)
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -101,6 +142,7 @@ onMounted(load)
         </div>
       </div>
       <div class="report-header-right">
+        <StatementViewToggle style="margin-right: 8px;" />
         <NRadioGroup
           v-model:value="periodType"
           size="small"
@@ -122,6 +164,7 @@ onMounted(load)
 
     <NSpin :show="loading">
       <template v-if="result">
+        <template v-if="mode === 'boss'">
         <!-- 老板家底透视卡 -->
         <NCard :bordered="false" class="report-card boss-balance-card mb-4">
           <div class="formula-head">
@@ -142,25 +185,56 @@ onMounted(load)
 
           <div class="formula-steps">
             <div class="step-card asset-step">
-              <div class="step-label">1. 公司总家底 (总资产)</div>
-              <div class="step-num text-primary">{{ formatMoney(result.totalAssets) }}</div>
-              <div class="step-note">银行存款 + 客户欠款 + 存货与设备</div>
+              <div class="step-header">
+                <span class="step-badge asset">
+                  <i class="ri-bank-card-line" />
+                  <span>公司总家底</span>
+                </span>
+                <span class="step-alias">总资产</span>
+              </div>
+              <div class="step-num">{{ formatMoney(result.totalAssets) }}</div>
+              <div class="step-note">存款 + 客户欠款 + 存货与设备</div>
             </div>
 
-            <div class="step-operator">－</div>
+            <div class="step-operator">
+              <span class="operator-badge">
+                <i class="ri-subtract-line" />
+              </span>
+            </div>
 
             <div class="step-card liability-step">
-              <div class="step-label">2. 欠外部的钱 (总负债)</div>
-              <div class="step-num text-secondary">{{ formatMoney(result.totalLiabilities) }}</div>
-              <div class="step-note">欠供应商货款 + 员工工资 + 应交税费</div>
+              <div class="step-header">
+                <span class="step-badge liability">
+                  <i class="ri-bill-line" />
+                  <span>欠外部的钱</span>
+                </span>
+                <span class="step-alias">总负债</span>
+              </div>
+              <div class="step-num">{{ formatMoney(result.totalLiabilities) }}</div>
+              <div class="step-note">供应商货款 + 员工工资 + 税金</div>
             </div>
 
-            <div class="step-operator">＝</div>
+            <div class="step-operator">
+              <span class="operator-badge">
+                <i class="ri-equal-line" />
+              </span>
+            </div>
 
             <div class="step-card equity-step">
-              <div class="step-label">3. 属于老板的净资产 (权益)</div>
-              <div class="step-num income">{{ formatMoney(result.totalEquity) }}</div>
-              <div class="step-note">投入资本 + 历年经营累计未分配净利润</div>
+              <div class="step-header">
+                <span class="step-badge equity">
+                  <i class="ri-scales-3-line" />
+                  <span>真正归属净家底</span>
+                </span>
+                <span class="step-alias">股东权益</span>
+              </div>
+              <div
+                class="step-num"
+                :class="Number(result.totalEquity) > 0 ? 'income' : (Number(result.totalEquity) < 0 ? 'expense' : '')"
+              >
+                {{ formatMoney(result.totalEquity) }}
+              </div>
+              <div class="step-note">投入资本 + 历年累计未分配利润</div>
             </div>
           </div>
         </NCard>
@@ -289,6 +363,54 @@ onMounted(load)
             </table>
           </div>
         </NCard>
+        </template>
+
+        <!-- 会计视图：会小企01表全量行次，左右对照 -->
+        <template v-else>
+          <NCard :bordered="false" class="report-card mb-4">
+            <ProStatementHeader title="资产负债表" :period-text="statementDateText" />
+            <div v-if="result.standard && !result.standard.balanced" class="std-balance-note">
+              <i class="ri-error-warning-line" />
+              <span>
+                账套存在未结账月份，未分配利润按「资产 − 负债 − 显式权益」轧差列示；
+                完成月结/年结后与科目余额口径一致。
+              </span>
+            </div>
+            <div class="report-table-wrapper std-table-wrapper">
+              <table class="report-table std-table">
+                <thead>
+                  <tr>
+                    <th class="std-item-col">资产</th>
+                    <th class="std-rowno-col">行次</th>
+                    <th class="std-amt-col">年初余额</th>
+                    <th class="std-amt-col">期末余额</th>
+                    <th class="std-item-col std-item-col-right">负债和所有者权益</th>
+                    <th class="std-rowno-col">行次</th>
+                    <th class="std-amt-col">年初余额</th>
+                    <th class="std-amt-col">期末余额</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(pair, idx) in stdPairs" :key="idx">
+                    <td class="std-item" :class="pair.left ? stdCellClass(pair.left) : ''" :style="pair.left?.level ? { paddingLeft: '18px' } : undefined" @click="pair.left && stdClick(pair.left)">
+                      <span :class="{ 'account-link': Boolean(pair.left?.accountCode) }">{{ pair.left ? pair.left.name : '' }}</span>
+                    </td>
+                    <td class="std-rowno">{{ pair.left?.rowNo || '' }}</td>
+                    <td class="amount-cell">{{ pair.left ? formatAmountPlain(pair.left.openingAmount) : '' }}</td>
+                    <td class="amount-cell">{{ pair.left ? formatAmountPlain(pair.left.currentAmount) : '' }}</td>
+                    <td class="std-item" :class="pair.right ? stdCellClass(pair.right) : ''" :style="pair.right?.level ? { paddingLeft: '18px' } : undefined" @click="pair.right && stdClick(pair.right)">
+                      <span :class="{ 'account-link': Boolean(pair.right?.accountCode) }">{{ pair.right ? pair.right.name : '' }}</span>
+                    </td>
+                    <td class="std-rowno">{{ pair.right?.rowNo || '' }}</td>
+                    <td class="amount-cell">{{ pair.right ? formatAmountPlain(pair.right.openingAmount) : '' }}</td>
+                    <td class="amount-cell">{{ pair.right ? formatAmountPlain(pair.right.currentAmount) : '' }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="std-compiler-note">编制基础：小企业会计准则；本表由系统按已过账复式分录自动编制，正式申报请由财税人员复核。</p>
+          </NCard>
+        </template>
       </template>
     </NSpin>
   </div>
@@ -352,46 +474,97 @@ onMounted(load)
 
 .formula-steps {
   display: flex;
-  align-items: center;
+  align-items: stretch;
   justify-content: space-between;
-  gap: 12px;
+  gap: 14px;
 }
 
 .step-card {
   flex: 1;
   padding: 14px 16px;
-  background: var(--solo-surface-soft, #F1F4F8);
-  border-radius: var(--solo-radius-md, 8px);
+  background: #ffffff;
+  border: 1px solid var(--solo-border, #dde3ea);
+  border-radius: var(--solo-radius-md, 10px);
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  justify-content: space-between;
+  gap: 6px;
   min-width: 0;
+  box-shadow: 0 1px 2px rgba(24, 34, 48, 0.02);
+  transition: all 0.2s ease;
 }
 
-.step-card.asset-step {
-  border-left: 3px solid var(--solo-primary, #1747b0);
+.step-card:hover {
+  border-color: #c7d2fe;
+  box-shadow: 0 4px 12px rgba(23, 71, 176, 0.05);
 }
 
-.step-card.liability-step {
-  border-left: 3px solid var(--solo-text-secondary, #586474);
+.step-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
 
-.step-card.equity-step {
-  border-left: 3px solid var(--solo-income, #0f7354);
-  background: var(--solo-income-soft, #EAF7F1);
-}
-
-.step-label {
+.step-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   font-size: 12px;
   font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 6px;
+  line-height: 1.4;
+}
+
+.step-badge.asset {
+  background: var(--solo-bg-blue-soft, #edf3ff);
+  color: var(--solo-primary, #1747b0);
+}
+
+.step-badge.liability {
+  background: var(--solo-bg-soft, #f1f4f8);
   color: var(--solo-text-secondary, #586474);
 }
 
+.step-badge.equity {
+  background: var(--solo-income-bg, #eaf7f1);
+  color: var(--solo-income, #0f7354);
+}
+
+.step-alias {
+  font-size: 11px;
+  color: var(--solo-text-muted, #636e7c);
+}
+
+/* 步骤 3（净家底）：轻度高亮 */
+.step-card.equity-step {
+  background: var(--solo-bg-blue-soft, #edf3ff);
+  border: 1px solid var(--solo-border, #dde3ea);
+}
+
+.step-card.equity-step:hover {
+  border-color: var(--solo-primary, #1747b0);
+  box-shadow: 0 4px 12px rgba(23, 71, 176, 0.06);
+}
+
 .step-num {
-  font-size: 22px;
-  font-weight: 750;
+  font-size: 24px;
+  font-weight: 700;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
   font-variant-numeric: tabular-nums;
   line-height: 1.25;
+  letter-spacing: -0.5px;
+  color: var(--solo-text-primary, #182230);
+  margin: 2px 0;
+}
+
+.step-num.income {
+  color: var(--solo-income, #0f7354);
+}
+
+.step-num.expense {
+  color: var(--solo-expense, #bd3d3d);
 }
 
 .step-note {
@@ -402,11 +575,26 @@ onMounted(load)
   text-overflow: ellipsis;
 }
 
+/* 算式连接符：精致居中圆环徽章 */
 .step-operator {
-  font-size: 20px;
-  font-weight: 700;
-  color: var(--solo-text-muted, #636e7c);
+  display: flex;
+  align-items: center;
+  justify-content: center;
   flex-shrink: 0;
+}
+
+.operator-badge {
+  width: 26px;
+  height: 26px;
+  border-radius: 999px;
+  background: #ffffff;
+  border: 1px solid var(--solo-border, #dde3ea);
+  box-shadow: 0 1px 3px rgba(24, 34, 48, 0.04);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--solo-text-secondary, #586474);
+  font-size: 13px;
 }
 
 .section-title-box {
@@ -454,5 +642,77 @@ onMounted(load)
   .step-operator {
     text-align: center;
   }
+}
+
+/* ── 会计视图（会小企01表）── */
+.std-balance-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  border-radius: 8px;
+  background: var(--solo-warning-bg, #fff5e8);
+  color: var(--solo-warning, #a05c10);
+  font-size: 12.5px;
+}
+
+.std-table-wrapper {
+  overflow-x: auto;
+}
+
+.std-table {
+  min-width: 860px;
+}
+
+.std-item-col {
+  min-width: 190px;
+}
+
+.std-item-col-right {
+  border-left: 2px solid var(--solo-border, #e5e9ef);
+}
+
+.std-rowno-col,
+.std-rowno {
+  width: 44px;
+  text-align: center;
+  color: var(--solo-text-muted, #636e7c);
+  font-size: 12px;
+}
+
+.std-amt-col {
+  text-align: right;
+  width: 110px;
+}
+
+.std-item {
+  white-space: nowrap;
+}
+
+.std-item.std-leaf {
+  cursor: pointer;
+}
+
+.std-item.std-section {
+  font-weight: 600;
+}
+
+.std-table .std-subtotal td {
+  background: rgba(15, 23, 42, 0.025);
+  font-weight: 600;
+}
+
+.std-table .std-total td {
+  font-weight: 750;
+  border-top: 1px solid var(--solo-border, #e5e9ef);
+  background: rgba(15, 23, 42, 0.04);
+}
+
+.std-compiler-note {
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--solo-text-muted, #636e7c);
+  line-height: 1.6;
 }
 </style>

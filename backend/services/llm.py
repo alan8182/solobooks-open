@@ -35,6 +35,8 @@ from config import (
     QWEN_VL_MODEL,
     QWEN_ENABLE_THINKING,
 )
+from core.errors import AccountingError
+from services.quota_service import ensure_within_quota, ensure_within_quota_async
 
 logger = logging.getLogger(__name__)
 
@@ -118,50 +120,63 @@ def _extract_json(text: str) -> dict:
 
 
 _LLM_DISABLED = False
+_LLM_DISABLED_AT: Optional[float] = None
+# 熔断后半开冷却窗：超时后放行下一次真实请求试探，成功即自动恢复（无需重启进程）
+_LLM_CIRCUIT_COOLDOWN_SECONDS = 600.0
+
+
+def _circuit_is_open() -> bool:
+    """熔断是否仍然打开；冷却窗已过则转入半开（放行试探并复位）。"""
+    global _LLM_DISABLED, _LLM_DISABLED_AT
+    if not _LLM_DISABLED:
+        return False
+    if _LLM_DISABLED_AT is not None and (
+        time.monotonic() - _LLM_DISABLED_AT >= _LLM_CIRCUIT_COOLDOWN_SECONDS
+    ):
+        _LLM_DISABLED = False
+        _LLM_DISABLED_AT = None
+        logger.info("LLM 熔断冷却结束（%.0fs），恢复调用（半开试探）", _LLM_CIRCUIT_COOLDOWN_SECONDS)
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
-# 用量埋点（管理后台 M1）：一次逻辑调用记一行；fire-and-forget，绝不影响业务。
-# 调用方通过 kwargs 传归属：scene / user_id / company_id（不转发给供应商）。
+# 用量埋点（管理后台 M1 + 配额计数）：一次逻辑调用记一行；fire-and-forget，
+# 绝不影响业务。调用方通过 kwargs 传归属：scene / user_id / company_id（不转发给供应商）。
 # ---------------------------------------------------------------------------
-
-_usage_sync_engine = None
-
-
-def _usage_sync_engine_factory():
-    """线程池上下文（无事件循环）用的独立同步引擎，避免污染全局异步连接池。"""
-    global _usage_sync_engine
-    if _usage_sync_engine is None:
-        from sqlalchemy import create_engine
-
-        from db.session import database_url
-
-        url = database_url()
-        if url.startswith("postgresql+asyncpg://"):
-            url = "postgresql+psycopg://" + url[len("postgresql+asyncpg://"):]
-        elif url.startswith("sqlite+aiosqlite://"):
-            url = "sqlite://" + url[len("sqlite+aiosqlite"):]
-        _usage_sync_engine = create_engine(url, pool_pre_ping=True)
-    return _usage_sync_engine
 
 
 async def _write_usage_async(row: dict) -> None:
     from db.models import LlmUsage
     from db.session import session_scope
 
+    from services.quota_service import record_consumption_async
+
     async with session_scope() as session:
         session.add(LlmUsage(**row))
+        if _should_count_quota(row):
+            await record_consumption_async(session, user_id=row["user_id"], tokens=row["total_tokens"])
 
 
 def _write_usage_sync(row: dict) -> None:
     from sqlalchemy.orm import Session
 
     from db.models import LlmUsage
+    from db.session import get_sync_engine
 
-    engine = _usage_sync_engine_factory()
+    from services.quota_service import record_consumption_sync
+
+    engine = get_sync_engine()
     with Session(engine) as session:
         session.add(LlmUsage(**row))
+        if _should_count_quota(row):
+            record_consumption_sync(session, user_id=row["user_id"], tokens=row["total_tokens"])
         session.commit()
+
+
+def _should_count_quota(row: dict) -> bool:
+    """仅成功调用且有归属时累计周期计数（失败与无 user 的调用不占额度）。"""
+    return bool(row.get("user_id")) and row.get("status") == "ok" and int(row.get("total_tokens") or 0) > 0
 
 
 def _swallow_task_error(task: "asyncio.Task") -> None:
@@ -241,16 +256,18 @@ def llm_circuit_state() -> dict:
 
 def chat_text(system_prompt: str, user_message: str, **kwargs) -> str:
     global _LLM_DISABLED
+    # 配额卡口：套餐未设限（当前默认）时零开销直通；设限后超限抛 QuotaExceededError(402)
+    ensure_within_quota(kwargs.get("user_id"))
     model = kwargs.get("model", QWEN_TEXT_MODEL)
     attribution = _usage_kwargs(kwargs)
     started = time.monotonic()
 
-    if _LLM_DISABLED:
+    if _circuit_is_open():
         _record_usage(model=model, duration_ms=0, status="circuit_open", error_type="circuit_open", **attribution)
         raise RuntimeError("LLM calls are temporarily suspended due to previous quota/authorization errors.")
 
     def _call():
-        return _oai().chat.completions.create(
+        resp = _oai().chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -261,12 +278,16 @@ def chat_text(system_prompt: str, user_message: str, **kwargs) -> str:
             # 同步 JSON 提取路径固定关闭深度思考，控制时延（Qwen 专有参数，其他供应商不发送）
             **({"extra_body": {"enable_thinking": False}} if LLM_SEND_ENABLE_THINKING else {}),
         )
+        content = resp.choices[0].message.content
+        if not content:
+            # 空回复按可重试错误抛出：偶发空响应重打一次即可，
+            # 放在 _retry 内才吃得到自动重试，直接 raise 会让调用方白白失败
+            raise RuntimeError("LLM returned empty content")
+        return resp
 
     try:
         resp = _retry(_call, max_retries=kwargs.pop("max_retries", 3))
         content = resp.choices[0].message.content
-        if not content:
-            raise RuntimeError("LLM returned empty content")
         usage = getattr(resp, "usage", None)
         _record_usage(
             model=model,
@@ -314,7 +335,7 @@ def safe_chat_text_json(system_prompt: str, user_message: str, fallback: dict, *
     适用于非关键路径（如健康评分、月度总结等）
     """
     global _LLM_DISABLED
-    if _LLM_DISABLED:
+    if _circuit_is_open():
         _record_usage(
             model=kwargs.get("model", QWEN_TEXT_MODEL),
             duration_ms=0,
@@ -326,12 +347,21 @@ def safe_chat_text_json(system_prompt: str, user_message: str, fallback: dict, *
 
     try:
         return chat_text_json(system_prompt, user_message, **kwargs)
+    except AccountingError:
+        # 业务/配额类异常必须穿透兜底：配额超限要变成 402 让前端引导升级，
+        # 静默降级会让用户以为功能坏了而不是额度用完了
+        raise
     except Exception as e:
         logger.warning(f"LLM JSON 解析失败，使用 fallback: {e}")
         err_msg = str(e).lower()
+        global _LLM_DISABLED, _LLM_DISABLED_AT
         if "403" in err_msg or "401" in err_msg or "quota" in err_msg or "exhausted" in err_msg:
             _LLM_DISABLED = True
-            logger.warning("已触发 LLM 熔断 (Circuit Breaker)，后续请求将直接使用 fallback，不再发起网络请求。")
+            _LLM_DISABLED_AT = time.monotonic()
+            logger.warning(
+                "已触发 LLM 熔断 (Circuit Breaker)，%.0f 秒内直接使用 fallback；之后自动半开试探恢复。",
+                _LLM_CIRCUIT_COOLDOWN_SECONDS,
+            )
         return fallback
 
 
@@ -355,11 +385,12 @@ def _to_image_data_url(source: str) -> str:
 def chat_vision(system_prompt: str, image_url: str, **kwargs) -> str:
     """多模态调用（OpenAI 协议）：image_url 支持 http(s)/data URI/本地文件路径。"""
     global _LLM_DISABLED
+    ensure_within_quota(kwargs.get("user_id"))
     model = kwargs.get("model", QWEN_VL_MODEL)
     attribution = _usage_kwargs(kwargs)
     started = time.monotonic()
 
-    if _LLM_DISABLED:
+    if _circuit_is_open():
         _record_usage(model=model, duration_ms=0, status="circuit_open", error_type="circuit_open", **attribution)
         raise RuntimeError("LLM calls are temporarily suspended due to previous quota/authorization errors.")
 
@@ -449,11 +480,13 @@ async def chat_tools_stream_async(
     回合结束必然产出且仅产出一个 final 事件。
     """
     global _LLM_DISABLED
+    # 配额卡口：设限后每回合（一次 LLM 调用）检查一次，超限抛 QuotaExceededError(402)
+    await ensure_within_quota_async(kwargs.get("user_id"))
     model = kwargs.get("model", QWEN_TEXT_MODEL)
     attribution = _usage_kwargs(kwargs)
     started = time.monotonic()
 
-    if _LLM_DISABLED:
+    if _circuit_is_open():
         _record_usage(model=model, duration_ms=0, status="circuit_open", error_type="circuit_open", **attribution)
         raise RuntimeError("LLM calls are temporarily suspended due to previous quota/authorization errors.")
 

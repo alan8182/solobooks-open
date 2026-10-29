@@ -29,6 +29,7 @@ describe('tab page registry', () => {
     expect(resolveActiveTab('/vouchers/VOU-202610-000001')).toBe('/vouchers')
     expect(resolveActiveTab('/ledger/book')).toBe('/ledger/book')
     expect(resolveActiveTab('/ledger')).toBe('/ledger')
+    expect(resolveActiveTab('/intangibles/INT-202610-000001')).toBe('/assets')
     expect(resolveActiveTab('/mine/accounts')).toBeNull()
   })
 

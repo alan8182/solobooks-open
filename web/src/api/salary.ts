@@ -111,65 +111,65 @@ export interface RdSalaryAllocation {
   allocationBasis: string
 }
 
-export function getEmployees() {
+export function getEmployees(): Promise<Employee[]> {
   return apiClient.get<Employee[]>('/api/salary/employees')
 }
 
-export function addEmployee(data: Employee) {
+export function addEmployee(data: Employee): Promise<Employee> {
   return apiClient.post<Employee>('/api/salary/employees', data)
 }
 
-export function updateEmployee(id: string, data: Partial<Employee>) {
+export function updateEmployee(id: string, data: Partial<Employee>): Promise<Employee> {
   return apiClient.put<Employee>(`/api/salary/employees/${id}`, data)
 }
 
-export function deleteEmployee(id: string) {
+export function deleteEmployee(id: string): Promise<{ success: boolean }> {
   return apiClient.delete<{ success: boolean }>(`/api/salary/employees/${id}`)
 }
 
-export function getSalarySheet(month: string) {
+export function getSalarySheet(month: string): Promise<SalarySheet> {
   return apiClient.get<SalarySheet>(`/api/salary/sheets/${month}`)
 }
 
-export function updateSalaryRecords(month: string, records: Partial<SalaryRecord>[]) {
+export function updateSalaryRecords(month: string, records: Partial<SalaryRecord>[]): Promise<SalarySheet> {
   return apiClient.put<SalarySheet>(`/api/salary/sheets/${month}/records`, { records })
 }
 
-export function accrueSalarySheet(month: string) {
+export function accrueSalarySheet(month: string): Promise<SalarySheet> {
   return apiClient.post<SalarySheet>(`/api/salary/sheets/${month}/accrue`)
 }
 
-export function getSalaryPaymentSuggestions() {
+export function getSalaryPaymentSuggestions(): Promise<{ total: number; suggestions: SalaryPaymentSuggestion[] }> {
   return apiClient.get<{ total: number; suggestions: SalaryPaymentSuggestion[] }>('/api/salary/payments/suggestions')
 }
 
-export function applySalaryPayment(month: string, statementId: string) {
+export function applySalaryPayment(month: string, statementId: string): Promise<SalaryPaymentApplyResult> {
   return apiClient.post<SalaryPaymentApplyResult>('/api/salary/payments/apply', { month, statementId })
 }
 
-export function paySalarySheet(month: string, payDate?: string) {
+export function paySalarySheet(month: string, payDate?: string): Promise<SalarySheet> {
   // payDate：实际发薪日（YYYY-MM-DD）。真实发薪多在工资所属期次月，
   // 缺省由后端取操作当天；传入后作为发放凭证的发生日期。
   return apiClient.post<SalarySheet>(`/api/salary/sheets/${month}/pay`, { payDate: payDate || null })
 }
 
-export function paySalarySocial(month: string, payDate?: string) {
+export function paySalarySocial(month: string, payDate?: string): Promise<SalarySheet> {
   return apiClient.post<SalarySheet>(`/api/salary/sheets/${month}/pay-social`, { payDate: payDate || null })
 }
 
-export function paySalaryHousingFund(month: string, payDate?: string) {
+export function paySalaryHousingFund(month: string, payDate?: string): Promise<SalarySheet> {
   return apiClient.post<SalarySheet>(`/api/salary/sheets/${month}/pay-housing-fund`, { payDate: payDate || null })
 }
 
-export function paySalaryTax(month: string, payDate?: string) {
+export function paySalaryTax(month: string, payDate?: string): Promise<SalarySheet> {
   return apiClient.post<SalarySheet>(`/api/salary/sheets/${month}/pay-tax`, { payDate: payDate || null })
 }
 
-export function getPayrollLiabilitySuggestions() {
+export function getPayrollLiabilitySuggestions(): Promise<{ total: number; suggestions: PayrollLiabilitySuggestion[] }> {
   return apiClient.get<{ total: number; suggestions: PayrollLiabilitySuggestion[] }>('/api/salary/liabilities/suggestions')
 }
 
-export function applyPayrollLiability(month: string, kind: string, statementId: string) {
+export function applyPayrollLiability(month: string, kind: string, statementId: string): Promise<SalaryPaymentApplyResult> {
   return apiClient.post('/api/salary/liabilities/apply', { month, kind, statementId })
 }
 
@@ -188,14 +188,14 @@ export interface PayrollRates {
   isCustomized: boolean
 }
 
-export function getPayrollRates() {
+export function getPayrollRates(): Promise<PayrollRates> {
   return apiClient.get<PayrollRates>('/api/salary/rates')
 }
 
 export function updatePayrollRates(
   rates: Partial<Record<keyof PayrollRates['rates'], number>>,
   options?: { month?: string; recalculate?: boolean },
-) {
+): Promise<PayrollRates> {
   const params = new URLSearchParams()
   if (options?.month) params.set('month', options.month)
   if (options?.recalculate) params.set('recalculate', 'true')
@@ -238,7 +238,7 @@ export function previewSalaryTax(payload: {
   withheld: number
   specialAdditional?: number | null
   otherDeduction?: number
-}) {
+}): Promise<TaxPreview> {
   return apiClient.post<TaxPreview>('/api/salary/tax/preview', payload)
 }
 
@@ -257,18 +257,18 @@ export interface DepartmentsPayload {
   customized: boolean
 }
 
-export function getDepartments() {
+export function getDepartments(): Promise<DepartmentsPayload> {
   return apiClient.get<DepartmentsPayload>('/api/salary/departments')
 }
 
-export function updateDepartments(departments: Array<{ name: string; isRd: boolean }>) {
+export function updateDepartments(departments: Array<{ name: string; isRd: boolean }>): Promise<DepartmentsPayload> {
   return apiClient.put<DepartmentsPayload>('/api/salary/departments', { departments })
 }
 
-export function exportSalarySheet(month: string) {
+export function exportSalarySheet(month: string): Promise<Blob> {
   return apiClient.get(`/api/salary/sheets/${month}/export`, { responseType: 'blob' })
 }
 
-export function exportSalaryPayslip(month: string, recordId: string) {
+export function exportSalaryPayslip(month: string, recordId: string): Promise<Blob> {
   return apiClient.get(`/api/salary/sheets/${month}/payslip/${recordId}`, { responseType: 'blob' })
 }

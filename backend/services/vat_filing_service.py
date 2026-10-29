@@ -11,15 +11,18 @@ from typing import Any, Literal
 
 from core.money import ZERO, money
 from services.tax_filing_export_service import parse_period
-from services.vat_service import VAT_PAYABLE_ACCOUNT
+# 政策常量与 vat_service 单一来源（政策续期只改一处）
+from services.vat_service import (  # noqa: F401
+    MONTH_THRESHOLD,
+    QUARTER_THRESHOLD,
+    REDUCED_RATE,
+    STATUTORY_RATE,
+    VAT_PAYABLE_ACCOUNT,
+)
 
 PeriodType = Literal["month", "quarter"]
 
 POLICY_VERSION = "VAT-CN-2026-10+STA-2026-4"
-REDUCED_RATE = Decimal("0.01")
-STATUTORY_RATE = Decimal("0.03")
-MONTH_THRESHOLD = Decimal("100000.00")
-QUARTER_THRESHOLD = Decimal("300000.00")
 VAT_REVENUE_ACCOUNTS = {"5001", "5051"}
 GOODS_KEYWORDS = ("货物", "商品", "材料", "加工", "修理", "修配")
 
@@ -76,15 +79,16 @@ def _booked_vat(entry: dict[str, Any]) -> Decimal:
     return _d2(credit - debit)
 
 
-def _net_sales(entry: dict[str, Any], revenue: Decimal) -> tuple[Decimal, bool]:
+def _net_sales(entry: dict[str, Any], revenue: Decimal, rate_value: Decimal = REDUCED_RATE) -> tuple[Decimal, bool]:
     """返回（不含税销售额, 是否已由凭证完成价税分离）。
 
     新凭证在收入确认时已拆分，收入科目贷方就是不含税额；
-    历史凭证按含税全额入收入，需要按征收率还原。
+    历史凭证按含税全额入收入，需要按公司配置的征收率还原
+    （3% 征收率纳税人不能按 1% 优惠税率倒算）。
     """
     if entry.get("vatSeparated") or _booked_vat(entry) > ZERO:
         return revenue, True
-    return _round_tax(revenue / (Decimal("1") + REDUCED_RATE)), False
+    return _round_tax(revenue / (Decimal("1") + rate_value)), False
 
 
 def _sales_bucket(entry: dict[str, Any]) -> Literal["goods_labor", "services"]:
@@ -103,7 +107,13 @@ def build_small_scale_vat_assist(
     entries: list[dict[str, Any]],
     period: str,
     period_type: PeriodType,
+    rate_value: Decimal = REDUCED_RATE,
 ) -> dict[str, Any]:
+    """生成小规模纳税人申报辅助字段。
+
+    rate_value：公司配置的征收率（1% 优惠 / 3% 法定），用于历史含税凭证的
+    价税分离还原；新凭证已拆分不受影响。
+    """
     period_range = parse_period(period, period_type)
     threshold = MONTH_THRESHOLD if period_type == "month" else QUARTER_THRESHOLD
     goods_sales = ZERO
@@ -113,7 +123,19 @@ def build_small_scale_vat_assist(
     missing_invoice_count = 0
     inferred_category_count = 0
 
+    # 期末损益结转是汇总分录：借记收入科目把本期销售转平，按科目净额算销售额
+    # 会恒等于 0。结转凭证与其反结账红字一并退出销售口径。
+    closing_ids = {
+        str(entry.get("id") or "")
+        for entry in entries
+        if str(entry.get("entryType") or "") == "closing"
+    }
+
     for entry in entries:
+        if str(entry.get("entryType") or "") == "closing" or entry.get("isClosingTransfer"):
+            continue
+        if str(entry.get("reversalOf") or "") in closing_ids:
+            continue
         occurred_on = _parse_date(entry.get("occurDate") or entry.get("date"))
         if not occurred_on or not (period_range.start <= occurred_on <= period_range.end):
             continue
@@ -121,7 +143,7 @@ def build_small_scale_vat_assist(
         if revenue == ZERO:
             continue
         # 申报表销售额一律是不含税口径
-        net_revenue, separated = _net_sales(entry, revenue)
+        net_revenue, separated = _net_sales(entry, revenue, rate_value)
         booked_vat_total += _booked_vat(entry)
         bucket = _sales_bucket(entry)
         if not entry.get("vatSalesCategory"):

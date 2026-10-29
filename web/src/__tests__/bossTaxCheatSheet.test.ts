@@ -44,11 +44,11 @@ describe('BossTaxCheatSheet electronic tax bureau cheat sheet', () => {
       },
     })
 
-    expect(wrapper.text()).toContain('本期享受小微免税，增值税应缴 ¥0.00')
-    expect(wrapper.text()).toContain('已使用免税额度')
+    // 免税结论收进增值税步骤标签（hero banner 已并入小抄步骤流）
+    expect(wrapper.text()).toContain('免税申报 · 应缴 ¥0.00')
     expect(wrapper.text()).toContain('45,200.00')
-    expect(wrapper.text()).toContain('免税上限')
-    expect(wrapper.text()).toContain('300,000.00')
+    // 免税场景的主表核对要点：销售额自动归入第 10 栏小微企业免税销售额
+    expect(wrapper.text()).toContain('第 10 栏【小微企业免税销售额】')
   })
 
   it('renders step-by-step electronic tax bureau guide and copy amounts', () => {
@@ -59,7 +59,6 @@ describe('BossTaxCheatSheet electronic tax bureau cheat sheet', () => {
       },
     })
 
-    expect(wrapper.text()).toContain('电子税务局「照抄申报卡」')
     expect(wrapper.text()).toContain('增值税及附加税费申报')
     expect(wrapper.text()).toContain('第 1 栏【本期应税销售额】')
     expect(wrapper.text()).toContain('45,200.00')
@@ -123,9 +122,9 @@ describe('BossTaxCheatSheet electronic tax bureau cheat sheet', () => {
       },
     })
 
-    // 阻断项提醒明确展示，不再只有“申报受阻”四个字而无解释
-    expect(wrapper.find('.tax-hero-banner').classes()).toContain('has-blocker')
-    expect(wrapper.text()).toContain('1笔销售缺少发票类型或号码')
+    // 阻断项已上移到父页面导航卡（「存在阻断」标签）与底稿核对区，小抄本身专注申报步骤，
+    // 有阻断时步骤流仍需完整可渲染
+    expect(wrapper.text()).toContain('增值税及附加税费申报')
 
     // 企税必填三项（营业收入、营业成本、利润总额）齐全
     expect(wrapper.text()).toContain('第 1 栏【营业收入】（本年累计）')

@@ -106,8 +106,9 @@ async def test_difference_tool_scopes_suggestions_and_preserves_group(monkeypatc
     async def diff(company_id, month):
         assert month == "2026-07"
         return {"bank_only_count": 1}
-    async def suggestions(company_id, limit, month):
+    async def suggestions(company_id, limit, month, *, user_id=""):
         assert month == "2026-07"
+        assert user_id == "owner"  # MCP 工具路径也把 LLM 用量归属到发起用户
         return [
             {"statementId": "july", "type": "match", "matchedEntryId": "income", "matchedEntryIds": ["income", "fee"], "matchedEntries": [{"id": "income"}, {"id": "fee"}]},
             {"statementId": "june", "type": "match", "matchedEntryId": "other"},

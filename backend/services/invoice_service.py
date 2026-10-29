@@ -4,6 +4,7 @@
 """发票导入服务"""
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict, List, Optional
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -242,7 +243,38 @@ async def parse_invoice_rows(rows: List[Dict[str, Any]], company_id: str = "") -
 INCOME_CATEGORIES = ("主营业务收入", "其他业务收入", "营业外收入")
 
 
-async def classify_invoice(row: Dict[str, Any], company_name: str = "") -> Dict[str, Any]:
+def match_category_by_item(item_name: str, direction: str) -> str | None:
+    """按发票品名（货物/劳务名称）确定性匹配到规范二级科目分类。
+
+    只覆盖无争议的高频品名，命中返回的分类名必须是 ``CATEGORY_TO_ACCOUNT`` 里的 key；
+    否则返回 None 交给 LLM 分类。收入/往来方向不走这里（另有方向与科目口径）。
+    """
+    if direction != "expense":
+        return None
+    text = str(item_name or "").lower()
+    rules = (
+        (("房租", "租金", "租赁", "物业"), "租金物业"),
+        (("机票", "火车", "高铁", "住宿", "酒店", "差旅"), "差旅费"),
+        (("打车", "出租车", "网约车", "交通"), "交通费"),
+        (("办公用品", "文具", "打印", "纸张", "耗材", "办公"), "办公费"),
+        (("餐饮", "宴请", "招待", "饭"), "业务招待费"),
+        (("咨询", "顾问", "审计", "律师"), "咨询费"),
+        (("快递", "物流", "运输", "运费"), "运费及物流"),
+        (("电费", "水费", "水电", "燃气"), "水电通讯费"),
+        (("宽带", "话费", "通讯", "电信"), "通讯费"),
+        (("软件", "系统", "小程序", "域名", "云", "服务器", "技术服务", "信息技术", "saas", "接口"), "信息技术服务费"),
+        (("认证", "注册", "商标", "资质"), "信息技术服务费"),
+        (("手续费", "汇兑"), "银行及金融手续费"),
+    )
+    for keywords, category in rules:
+        if any(kw in text for kw in keywords):
+            return category
+    return None
+
+
+async def classify_invoice(
+    row: Dict[str, Any], company_name: str = "", *, user_id: str = "", company_id: str = ""
+) -> Dict[str, Any]:
     """Use LLM to suggest direction and category for an invoice row."""
     buyer = str(row.get("buyer_name") or "").strip()
     seller = str(row.get("seller_name") or "").strip()
@@ -252,7 +284,7 @@ async def classify_invoice(row: Dict[str, Any], company_name: str = "") -> Dict[
 
     suggested_direction_str = ""
     default_direction = "expense"
-    
+
     if company_name:
         co_norm = _normalize_name(company_name)
         seller_norm = _normalize_name(seller)
@@ -263,6 +295,12 @@ async def classify_invoice(row: Dict[str, Any], company_name: str = "") -> Dict[
         elif co_norm and buyer_norm and (co_norm in buyer_norm or buyer_norm in co_norm):
             suggested_direction_str = "\n(注：此发票购买方包含我司名称，属于我司采购进项，因此这笔交易方向应为 expense)"
             default_direction = "expense"
+
+    # 品名确定性匹配优先：命中规范二级科目分类就不再依赖 LLM，
+    # 避免发票品名多种多样时被 LLM 归到兜底「其他支出」
+    matched = match_category_by_item(item, default_direction)
+    if matched:
+        return {"direction": default_direction, "category": matched, "reason": f"品名关键词「{item}」匹配到规范分类"}
 
     # 根据真实方向过滤候选科目池，防止大模型跨类别乱分类
     all_categories = list(CATEGORY_TO_ACCOUNT.keys())
@@ -288,12 +326,15 @@ async def classify_invoice(row: Dict[str, Any], company_name: str = "") -> Dict[
         categories=", ".join(categories),
     )
     fallback = {"direction": default_direction, "category": "其他支出" if default_direction == "expense" else "主营业务收入", "reason": "LLM分类不可用，使用默认值"}
-    result = safe_chat_text_json(
+    result = await asyncio.to_thread(
+        safe_chat_text_json,
         "你是一个会计分类助手。请返回JSON。",
         prompt,
         fallback=fallback,
         max_retries=1,
         scene="invoice",
+        user_id=user_id,
+        company_id=company_id,
     )
     if isinstance(result, dict):
         direction = default_direction
@@ -355,12 +396,15 @@ def _attach_partner_auxiliary(
     return output
 
 
-def _validate_invoice_voucher(direction: str, voucher: Dict[str, Any]) -> Dict[str, Any]:
+def _validate_invoice_voucher(direction: str, voucher: Dict[str, Any], *, reversal: bool = False) -> Dict[str, Any]:
     """发票凭证的科目白名单：票是凭证，不是资金记录。
 
     - 费用票：贷方只能是 2241 应付（未付款状态），不允许直接贷 1002
     - 收入票：借方只能是 1122 应收，贷方只能是收入科目 + 应交增值税
     这条校验是"发票挂账被覆盖"事故的回归护栏，不通过就拒绝入账而不是静默降级。
+
+    reversal=True 是红冲进项冲销凭证：借贷已对调、金额已取正，
+    借方必须是 2241（冲销原应付），贷方是费用科目。
     """
     debit = voucher.get("debit") or []
     credit = voucher.get("credit") or []
@@ -369,9 +413,13 @@ def _validate_invoice_voucher(direction: str, voucher: Dict[str, Any]) -> Dict[s
     if debit_total != credit_total:
         raise ValueError(f"发票凭证借贷不平：借 {debit_total} 贷 {credit_total}")
     if direction == "expense":
-        codes = {str(line.get("accountCode") or "") for line in credit}
+        codes = {str(line.get("accountCode") or "") for line in (debit if reversal else credit)}
         if codes != {INVOICE_PENDING_PAYABLE["accountCode"]}:
-            raise ValueError("费用发票必须挂贷方 2241 其他应付款-发票待付款，不能直接冲减银行存款")
+            raise ValueError(
+                "红冲进项发票必须借 2241 其他应付款-发票待付款，冲销原应付"
+                if reversal
+                else "费用发票必须挂贷方 2241 其他应付款-发票待付款，不能直接冲减银行存款"
+            )
     elif direction == "income":
         debit_codes = {str(line.get("accountCode") or "") for line in debit}
         if debit_codes != {INVOICE_PENDING_RECEIVABLE["accountCode"]}:
@@ -420,7 +468,7 @@ async def import_invoices(company_id: str, user_id: str, rows: List[Dict[str, An
     async def process_row(index: int, row: Dict[str, Any]) -> Dict[str, Any]:
         async with sem:
             if classify:
-                suggestion = await classify_invoice(row, company_name)
+                suggestion = await classify_invoice(row, company_name, user_id=user_id, company_id=company_id)
             else:
                 direction = str(row.get("direction") or "expense")
                 category = str(row.get("category") or "").strip()
@@ -534,8 +582,16 @@ async def import_invoices(company_id: str, user_id: str, rows: List[Dict[str, An
                 hint["credit"] = [dict(line, accountCode="2241", accountName="其他应付款-发票待付款") for line in hint["credit"]]
             elif suggestion["direction"] == "income" and hint.get("debit"):
                 hint["debit"] = [dict(line, accountCode="1122", accountName="应收账款-发票待收") for line in hint["debit"]]
+            # 红冲进项（负金额）：借贷对调、金额取正，形成冲销凭证（借 2241 / 贷费用）。
+            # 销项红冲的增值税冲销暂不处理，仍按原样失败。
+            is_reversal = suggestion["direction"] == "expense" and money(row.get("amount", 0)) < ZERO
+            if is_reversal:
+                hint = {
+                    "debit": [{**line, "amount": abs(money(line.get("amount") or ZERO))} for line in hint.get("credit", [])],
+                    "credit": [{**line, "amount": abs(money(line.get("amount") or ZERO))} for line in hint.get("debit", [])],
+                }
             if hint.get("debit") and hint.get("credit"):
-                entry_data["voucherLines"] = _validate_invoice_voucher(suggestion["direction"], hint)
+                entry_data["voucherLines"] = _validate_invoice_voucher(suggestion["direction"], hint, reversal=is_reversal)
 
         # 往来单位挂到挂账分录（费用票贷 2241 / 收入票借 1122）上：
         # 往来账、账龄、核算项目余额表都以行级 auxiliary 为数据源。

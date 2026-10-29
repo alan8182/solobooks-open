@@ -132,7 +132,7 @@ async function loadStats(): Promise<void> {
     const failed = settled.filter((r) => r.status === 'rejected').length
     if (failed) message.warning(`${failed} 个维度的成员/规则读取失败，统计可能偏低`)
   } catch (err) {
-    message.error(errorText(err, '读取维度统计失败'))
+    message.error(errorText(err))
   } finally {
     statsLoading.value = false
   }
@@ -143,7 +143,7 @@ onMounted(async () => {
     await store.bootstrap()
     await loadStats()
   } catch (err) {
-    message.error(errorText(err, '加载归集维度失败'))
+    message.error(errorText(err))
   }
 })
 

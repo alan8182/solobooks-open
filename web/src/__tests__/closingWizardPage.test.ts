@@ -163,7 +163,7 @@ describe('closing wizard bulk confirm', () => {
 
     const cards = wrapper.findAll('.feed-card')
     expect(cards[0].text()).toContain('核对已有账目')
-    expect(cards[1].text()).toContain('核算明细')
+    expect(cards[1].text()).toContain('详细记账')
     // 兜底草稿不能冒充「建议分类」
     expect(cards[2].text()).toContain('系统兜底分类')
     expect(cards[2].text()).toContain('按此入账')
@@ -213,7 +213,7 @@ describe('closing wizard unified view', () => {
     expect(text).toContain('去整页管理')
 
     const headers = () => wrapper.findAll('.report-table th').map(th => th.text())
-    expect(headers()).toEqual(['日期', '发票名称', '记账分类', '发票金额', '状态', '下一步'])
+    expect(headers()).toEqual(['日期', '发票名称', '记账分类', '发票金额', '状态'])
 
     const toggle = wrapper.findAll('button').find(button => button.text().includes('展开明细'))!
     await toggle.trigger('click')
@@ -464,8 +464,87 @@ describe('closing wizard tiered matching and rule memory', () => {
     expect(confirmPayloads).toHaveLength(1)
     expect(confirmPayloads[0].rememberRule).toBe(true)
     expect(harness.success).toHaveBeenCalledWith(
-      expect.stringContaining('已沉淀规则：后续「招商银行股份有限公司深圳高新园科创支行」自动归入此科目')
+      expect.stringContaining('已沉淀规则：后续「招商银行股份有限公司深圳高新园科创支行」自动归入此科目'),
     )
+
+    wrapper.unmount()
+  })
+
+  it('opens boss ledger detail drawer when clicking summary card and navigates to target ledger', async () => {
+    const previousMonth = new Date(new Date().getFullYear(), new Date().getMonth() - 1, 1)
+    const month = `${previousMonth.getFullYear()}-${String(previousMonth.getMonth() + 1).padStart(2, '0')}`
+    const entries = reactive<any[]>([
+      {
+        id: 'e-reimb-1',
+        title: '快递费',
+        direction: 'expense',
+        amount: 140,
+        occurDate: `${month}-15`,
+        category: '办公费',
+        source: 'manual',
+        payer: 'employee_personal:张三',
+        billingStatus: 'reconciled',
+      },
+    ])
+    harness.store = {
+      entries,
+      activeEntries: entries,
+      loadAll: vi.fn(async () => entries),
+      updateEntry: vi.fn(),
+    }
+    harness.get.mockImplementation(async (url: string) => {
+      if (url === '/api/bank/statements') return { items: [], total: 0 }
+      if (url === '/api/bank/reconciliation-stats') return { total: 0, matched: 0, suggested: 0, pending: 0, manual: 0, rate: 100 }
+      if (url === '/api/bank/suggestions') return { suggestions: [] }
+      if (url === '/api/closing/readiness') return { checks: [] }
+      if (url === '/api/tax/filing-obligations') return { obligations: [] }
+      if (url === '/api/employees') return [{ id: 'emp-1', name: '张三' }]
+      return {}
+    })
+
+    const wrapper = mount(ClosingWizard, {
+      global: {
+        stubs: {
+          ClosingAgentPanel: true,
+          SoloDrawer: {
+            props: ['show', 'title'],
+            template: '<div v-if="show" class="stub-solo-drawer"><div class="drawer-title">{{ title }}</div><slot /><slot name="footer" /></div>',
+          },
+        },
+      },
+    })
+    await flushPromises()
+    await wrapper.findAll('.n-step')[1]!.trigger('click')
+    await flushPromises()
+
+    const cards = wrapper.findAll('.boss-ledger-card')
+    expect(cards.length).toBe(3)
+
+    // 第三张卡片为「公司欠老板/员工」，有 ¥140 垫付款，可点击
+    const cardEmp = cards[2]!
+    expect(cardEmp.text()).toContain('公司欠老板/员工')
+    expect(cardEmp.text()).toContain('¥140.00')
+    expect(cardEmp.classes()).toContain('clickable')
+
+    // 点击卡片，展开抽屉
+    await cardEmp.trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('.stub-solo-drawer').exists()).toBe(true)
+    expect(wrapper.find('.drawer-title').text()).toContain('公司欠老板/员工垫付款明细')
+    expect(wrapper.text()).toContain('快递费')
+    expect(wrapper.text()).toContain('员工垫付 · 张三')
+
+    // 抽屉底部提供直达「老板私账」台账按钮
+    const targetBtn = wrapper.findAll('button').find(b => b.text().includes('前往老板私账登记还款'))!
+    expect(targetBtn).toBeDefined()
+    await targetBtn.trigger('click')
+    await flushPromises()
+
+    expect(harness.push).toHaveBeenCalledWith({
+      path: '/private-expenses',
+      query: undefined,
+    })
 
     wrapper.unmount()
   })

@@ -12,6 +12,23 @@ const PSB_RECORD_URL = 'https://beian.mps.gov.cn/#/query/webSearch?code=33011002
 
 const router = useRouter()
 
+// 移动端折叠抽屉与吸底操作栏状态
+const mobileMenuOpen = ref(false)
+const showStickyCta = ref(false)
+
+function navigateToAnchor(hash: string) {
+  mobileMenuOpen.value = false
+  const target = document.querySelector(hash)
+  if (target) {
+    const top = target.getBoundingClientRect().top + window.scrollY - NAV_HEIGHT
+    window.scrollTo({ top, behavior: 'smooth' })
+  }
+}
+
+function onLandingScroll() {
+  showStickyCta.value = window.scrollY > 480
+}
+
 // ── PPT 式整页翻页：桌面滚轮由 JS 接管 ──
 // Chromium 对 CSS scroll-snap 的补位动画近似瞬移（实测 1024px 约 50ms 走完九成），
 // 滚轮翻页改走平滑滚动才有过渡过程；scroll-snap（proximity）兜底触屏/键盘/滚动条。
@@ -79,11 +96,13 @@ function onLandingWheel(e: WheelEvent) {
 onMounted(() => {
   document.documentElement.classList.add('landing-scroll-snap')
   window.addEventListener('wheel', onLandingWheel, { passive: false })
+  window.addEventListener('scroll', onLandingScroll, { passive: true })
 })
 
 onUnmounted(() => {
   document.documentElement.classList.remove('landing-scroll-snap')
   window.removeEventListener('wheel', onLandingWheel)
+  window.removeEventListener('scroll', onLandingScroll)
   clearTimeout(flipLockTimer)
 })
 
@@ -256,7 +275,7 @@ const complianceEvidence = [
     <!-- 1. 顶部导航：简单吸顶通栏 -->
     <header class="site-nav">
       <div class="nav-inner">
-        <a class="nav-brand" href="#" @click.prevent="router.push(isLoggedIn ? '/' : '/landing')">
+        <a class="nav-brand" href="#" @click.prevent="router.push('/')">
           <div class="nav-logo-box">
             <img src="/solo-logo.png" alt="梭罗记账" class="nav-logo" />
           </div>
@@ -276,17 +295,74 @@ const complianceEvidence = [
         </nav>
         <div class="nav-actions">
           <template v-if="isLoggedIn">
-            <NButton type="primary" size="small" class="btn-primary" @click="router.push('/')">
+            <NButton type="primary" size="small" class="btn-primary desktop-action-btn" @click="router.push('/')">
               进入工作台
             </NButton>
           </template>
           <template v-else>
-            <NButton type="primary" size="small" class="btn-primary" @click="router.push('/login')">
+            <NButton type="primary" size="small" class="btn-primary desktop-action-btn" @click="router.push('/login')">
               登录 / 注册
             </NButton>
           </template>
+          <!-- 移动端汉堡切换按钮 -->
+          <button
+            class="mobile-menu-btn"
+            :class="{ open: mobileMenuOpen }"
+            :aria-label="mobileMenuOpen ? '关闭导航菜单' : '打开导航菜单'"
+            @click="mobileMenuOpen = !mobileMenuOpen"
+          >
+            <i :class="mobileMenuOpen ? 'ri-close-line' : 'ri-menu-line'" />
+          </button>
         </div>
       </div>
+
+      <!-- 移动端折叠抽屉菜单 -->
+      <Transition name="mobile-drawer">
+        <div v-if="mobileMenuOpen" class="mobile-drawer-backdrop" @click="mobileMenuOpen = false">
+          <div class="mobile-drawer" @click.stop>
+            <div class="mobile-drawer-links">
+              <a href="#pillars" @click.prevent="navigateToAnchor('#pillars')">
+                <i class="ri-sparkling-line" />
+                <span>核心优势</span>
+              </a>
+              <a href="#showcase" @click.prevent="navigateToAnchor('#showcase')">
+                <i class="ri-layout-grid-line" />
+                <span>功能展台</span>
+              </a>
+              <a href="/ai-connect" @click.prevent="mobileMenuOpen = false; router.push('/ai-connect')">
+                <i class="ri-terminal-box-line" />
+                <span>AI 连接 (MCP & Skills)</span>
+                <span class="drawer-badge">新</span>
+              </a>
+              <a href="#compare" @click.prevent="navigateToAnchor('#compare')">
+                <i class="ri-scales-3-line" />
+                <span>方案对比</span>
+              </a>
+              <a href="#migrate" @click.prevent="navigateToAnchor('#migrate')">
+                <i class="ri-exchange-box-line" />
+                <span>账本迁移</span>
+              </a>
+              <a href="#personas" @click.prevent="navigateToAnchor('#personas')">
+                <i class="ri-user-star-line" />
+                <span>适用场景</span>
+              </a>
+              <a href="#trust" @click.prevent="navigateToAnchor('#trust')">
+                <i class="ri-shield-check-line" />
+                <span>合规保障</span>
+              </a>
+            </div>
+            <div class="mobile-drawer-bottom">
+              <button
+                class="mobile-drawer-login-btn"
+                @click="mobileMenuOpen = false; router.push(isLoggedIn ? '/' : '/login')"
+              >
+                {{ isLoggedIn ? '进入工作台' : '免费注册 / 登录' }}
+                <i class="ri-arrow-right-line" />
+              </button>
+            </div>
+          </div>
+        </div>
+      </Transition>
     </header>
 
     <!-- 2. Hero 区域：开阔舒展、大厂气度、深度视觉锚定 (对标企微) -->
@@ -971,6 +1047,20 @@ const complianceEvidence = [
         </div>
       </footer>
     </section>
+
+    <!-- 10. 移动端吸底浮动操作栏 (滑出首屏后呈现) -->
+    <Transition name="fade-slide-up">
+      <div v-if="showStickyCta" class="mobile-sticky-bar">
+        <div class="sticky-bar-info">
+          <b>梭罗记账 SoloBooks</b>
+          <span>AI 智能对账 · 免费体验</span>
+        </div>
+        <button class="sticky-bar-btn" @click="router.push(isLoggedIn ? '/' : '/login')">
+          <span>{{ isLoggedIn ? '进入工作台' : '免费试用' }}</span>
+          <i class="ri-arrow-right-line" />
+        </button>
+      </div>
+    </Transition>
   </div>
 </template>
 
@@ -986,6 +1076,8 @@ const complianceEvidence = [
 
 .landing-page {
   min-height: 100vh;
+  width: 100%;
+  overflow-x: hidden;
   background-color: #f8fafc;
   color: #0f172a;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Noto Sans SC", sans-serif;
@@ -1517,6 +1609,10 @@ const complianceEvidence = [
 .v-title {
   color: #1e293b;
   font-weight: 500;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .rate-tag {
@@ -1683,6 +1779,8 @@ const complianceEvidence = [
   padding: 60px 0;
   position: relative;
   min-height: calc(100vh - 56px);
+  width: 100%;
+  max-width: 100%;
   box-sizing: border-box;
   display: flex;
   flex-direction: column;
@@ -1692,12 +1790,17 @@ const complianceEvidence = [
 }
 
 .section-inner {
+  width: 100%;
   max-width: 1180px;
   margin: 0 auto;
   padding: 0 24px;
+  box-sizing: border-box;
 }
 
 .section-top {
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
   margin-bottom: 44px;
 }
 
@@ -1840,10 +1943,13 @@ const complianceEvidence = [
 }
 
 .mcp-anchor-proxy {
-  position: relative;
-  top: -80px;
-  visibility: hidden;
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 0;
   height: 0;
+  pointer-events: none;
+  visibility: hidden;
 }
 
 .showcase-nav-bar {
@@ -1855,7 +1961,9 @@ const complianceEvidence = [
   padding: 6px;
   border-radius: 12px;
   border: 1px solid #e2e8f0;
+  width: 100%;
   max-width: 860px;
+  box-sizing: border-box;
   margin: 0 auto 32px;
 }
 
@@ -3041,6 +3149,203 @@ const complianceEvidence = [
   gap: 16px;
 }
 
+/* ── 移动端汉堡切换按钮与折叠抽屉 ── */
+.mobile-menu-btn {
+  display: none;
+  width: 36px;
+  height: 36px;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  font-size: 20px;
+  color: #1e293b;
+  cursor: pointer;
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  padding: 0;
+  flex-shrink: 0;
+}
+
+.mobile-menu-btn:hover {
+  background: #f1f5f9;
+}
+
+.mobile-drawer-backdrop {
+  position: fixed;
+  top: 56px;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(15, 23, 42, 0.4);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  z-index: 99;
+}
+
+.mobile-drawer {
+  background: #ffffff;
+  border-bottom: 1px solid #e2e8f0;
+  box-shadow: 0 12px 32px rgba(15, 23, 42, 0.12);
+  padding: 16px 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-height: calc(100vh - 56px);
+  overflow-y: auto;
+}
+
+.mobile-drawer-links {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mobile-drawer-links a {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  font-size: 15px;
+  font-weight: 600;
+  color: #334155;
+  text-decoration: none;
+  transition: all 0.15s ease;
+}
+
+.mobile-drawer-links a i {
+  font-size: 18px;
+  color: #1747b0;
+}
+
+.mobile-drawer-links a:hover,
+.mobile-drawer-links a:active {
+  background: #f1f5f9;
+  color: #1747b0;
+}
+
+.drawer-badge {
+  font-size: 10px;
+  font-weight: 700;
+  background: #ede9fe;
+  color: #7c3aed;
+  padding: 1px 6px;
+  border-radius: 999px;
+  margin-left: auto;
+}
+
+.mobile-drawer-bottom {
+  padding-top: 8px;
+  border-top: 1px solid #f1f5f9;
+}
+
+.mobile-drawer-login-btn {
+  width: 100%;
+  height: 44px;
+  background: #1747b0;
+  color: #ffffff;
+  border: none;
+  border-radius: 8px;
+  font-size: 15px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(23, 71, 176, 0.25);
+}
+
+.mobile-drawer-enter-active,
+.mobile-drawer-leave-active {
+  transition: opacity 0.25s ease;
+}
+
+.mobile-drawer-enter-active .mobile-drawer,
+.mobile-drawer-leave-active .mobile-drawer {
+  transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.mobile-drawer-enter-from,
+.mobile-drawer-leave-to {
+  opacity: 0;
+}
+
+.mobile-drawer-enter-from .mobile-drawer,
+.mobile-drawer-leave-to .mobile-drawer {
+  transform: translateY(-12px);
+}
+
+/* ── 移动端浮动吸底操作栏 ── */
+.mobile-sticky-bar {
+  display: none;
+  position: fixed;
+  bottom: max(16px, env(safe-area-inset-bottom, 16px));
+  left: 16px;
+  right: 16px;
+  z-index: 90;
+  background: rgba(255, 255, 255, 0.94);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(203, 213, 225, 0.85);
+  border-radius: 12px;
+  padding: 10px 14px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  box-shadow:
+    0 10px 25px -5px rgba(15, 23, 42, 0.15),
+    0 2px 6px -1px rgba(15, 23, 42, 0.08);
+}
+
+.sticky-bar-info {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.sticky-bar-info b {
+  font-size: 13.5px;
+  color: #0f172a;
+  line-height: 1.2;
+}
+
+.sticky-bar-info span {
+  font-size: 11px;
+  color: #5b6a7c;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sticky-bar-btn {
+  background: #1747b0;
+  color: #ffffff;
+  border: none;
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  flex-shrink: 0;
+  box-shadow: 0 2px 6px rgba(23, 71, 176, 0.28);
+}
+
+.fade-slide-up-enter-active,
+.fade-slide-up-leave-active {
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.fade-slide-up-enter-from,
+.fade-slide-up-leave-to {
+  opacity: 0;
+  transform: translateY(16px);
+}
+
 /* ── 响应式适配 ── */
 /* 中窄屏：收紧导航间距并隐藏副标题，避免链接区被挤压 */
 @media (max-width: 1200px) {
@@ -3108,42 +3413,81 @@ const complianceEvidence = [
   }
 }
 
+/* 移动平板与手机通用适配 (<= 768px) */
 @media (max-width: 768px) {
   :global(html:has(.landing-page)),
   :global(html.landing-scroll-snap) {
     scroll-snap-type: none;
   }
 
-  .hero,
-  .section,
-  .landing-slide-end {
-    min-height: auto;
-    padding: 56px 0;
+  .mobile-menu-btn {
+    display: flex;
   }
 
-  .migrate-grid {
-    grid-template-columns: 1fr;
+  .mobile-sticky-bar {
+    display: flex;
   }
 
-  .migrate-bridge {
-    width: auto;
-    flex-direction: row;
-    gap: 10px;
-  }
-
-  .migrate-promises {
-    grid-template-columns: 1fr;
-  }
-}
-
-@media (max-width: 640px) {
   .nav-links {
     display: none;
   }
 
+  .hero,
+  .section,
+  .landing-slide-end {
+    min-height: auto;
+    padding: 42px 0 36px;
+    width: 100%;
+    max-width: 100%;
+    box-sizing: border-box;
+    overflow-x: hidden;
+  }
+
+  .section-inner {
+    width: 100%;
+    max-width: 100%;
+    padding: 0 16px;
+    box-sizing: border-box;
+  }
+
+  .section-top {
+    width: 100%;
+    max-width: 100%;
+    margin-bottom: 24px;
+    box-sizing: border-box;
+  }
+
+  .section-headline {
+    font-size: 24px;
+    line-height: 1.35;
+    word-break: break-word;
+    letter-spacing: -0.4px;
+  }
+
+  .section-subtitle {
+    font-size: 13.5px;
+    line-height: 1.55;
+    word-break: break-word;
+  }
+
+  .hero {
+    padding-top: 24px;
+  }
+
+  .hero-glow {
+    width: 100vw;
+    max-width: 100%;
+  }
+
+  .hero-inner {
+    padding: 24px 16px 0;
+  }
+
   .hero-title {
-    font-size: 32px;
+    font-size: 34px;
+    line-height: 1.2;
     letter-spacing: -0.6px;
+    margin-bottom: 14px;
   }
 
   .hero-br-mobile {
@@ -3151,33 +3495,497 @@ const complianceEvidence = [
   }
 
   .hero-sub {
-    font-size: 15px;
-    margin-bottom: 28px;
+    font-size: 14.5px;
+    line-height: 1.6;
+    margin-bottom: 22px;
   }
 
   .hero-action-block {
-    margin-bottom: 36px;
+    margin-bottom: 26px;
+    width: 100%;
+    max-width: 360px;
   }
 
-  .hero-proof-bento {
-    grid-template-columns: 1fr;
-  }
-
-  .stage-title {
-    font-size: 24px;
-  }
-
-  .pillars-grid,
-  .compare-grid,
-  .persona-grid,
-  .board-metrics-grid {
-    grid-template-columns: 1fr;
-  }
-
+  .hero-cta,
   .hero-cta button,
   .cta-buttons button {
     width: 100%;
     justify-content: center;
+  }
+
+  /* Bento 价值看板：移动端保持精巧 2x2 栅格，严防 1 列超长堆叠 */
+  .hero-proof-bento {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+  }
+
+  .proof-card {
+    padding: 12px 10px;
+    border-radius: 10px;
+  }
+
+  .proof-card-top {
+    margin-bottom: 8px;
+  }
+
+  .proof-icon-wrap {
+    width: 28px;
+    height: 28px;
+    font-size: 13px;
+  }
+
+  .proof-badge {
+    font-size: 10px;
+    padding: 1px 5px;
+  }
+
+  .proof-val {
+    font-size: 19px;
+    margin-bottom: 3px;
+  }
+
+  .proof-title {
+    font-size: 12.5px;
+    margin-bottom: 3px;
+    line-height: 1.3;
+  }
+
+  .proof-desc {
+    font-size: 10.5px;
+    line-height: 1.4;
+    color: #64748b;
+  }
+
+  /* 四大支柱 */
+  .pillars-grid {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .pillar-card {
+    padding: 16px 14px;
+  }
+
+  .pillar-head {
+    margin-bottom: 12px;
+  }
+
+  .pillar-icon-box {
+    width: 38px;
+    height: 38px;
+    font-size: 18px;
+  }
+
+  .pillar-title {
+    font-size: 17px;
+    margin-bottom: 6px;
+  }
+
+  .pillar-desc {
+    font-size: 13px;
+    margin-bottom: 14px;
+  }
+
+  /* 核心功能展台 Showcase */
+  .section-showcase {
+    padding: 32px 0 16px;
+  }
+
+  .showcase-nav-bar {
+    width: 100%;
+    max-width: 100%;
+    box-sizing: border-box;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    justify-content: flex-start;
+    padding: 4px;
+    gap: 4px;
+    margin-bottom: 18px;
+    border-radius: 10px;
+  }
+
+  .showcase-nav-bar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .showcase-tab-btn {
+    padding: 7px 11px;
+    font-size: 12px;
+    gap: 6px;
+  }
+
+  .tab-btn-title {
+    font-size: 12px;
+  }
+
+  .tab-mcp-badge {
+    font-size: 9px;
+    padding: 0 4px;
+  }
+
+  .stage-grid {
+    grid-template-columns: 1fr;
+    gap: 20px;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+  }
+
+  .stage-left,
+  .stage-right {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
+  }
+
+  .stage-title {
+    font-size: 22px;
+    line-height: 1.3;
+  }
+
+  .stage-desc {
+    font-size: 13.5px;
+    margin-bottom: 14px;
+  }
+
+  .stage-bullets {
+    gap: 8px;
+  }
+
+  .stage-bullet {
+    font-size: 12.5px;
+  }
+
+  .stage-cta-row {
+    flex-direction: column;
+    width: 100%;
+    margin-top: 16px;
+  }
+
+  .stage-cta-primary,
+  .stage-cta-ghost {
+    width: 100%;
+    justify-content: center;
+    padding: 9px 14px;
+  }
+
+  /* 展台视窗 Mockup */
+  .mockup-window {
+    border-radius: 10px;
+    box-shadow: 0 8px 24px -4px rgba(15, 23, 42, 0.08);
+  }
+
+  .window-bar {
+    height: 34px;
+    padding: 0 10px;
+  }
+
+  .window-title {
+    font-size: 10.5px;
+    max-width: 180px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .window-status {
+    font-size: 10px;
+  }
+
+  .window-content {
+    padding: 12px;
+    gap: 10px;
+  }
+
+  /* Tab 1: 批量归集单列完整排布 */
+  .batch-files {
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+
+  .file-chip {
+    padding: 7px 10px;
+  }
+
+  .file-name {
+    font-size: 11.5px;
+  }
+
+  .agent-parse-banner {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+    padding-top: 8px;
+  }
+
+  .voucher-top {
+    padding: 6px 8px;
+    font-size: 10.5px;
+  }
+
+  .voucher-bottom {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+    padding: 8px 10px;
+  }
+
+  .btn-confirm-demo {
+    text-align: center;
+    width: 100%;
+    padding: 5px 0;
+  }
+
+  /* Tab 2: 对账卡片 */
+  .recon-card-item {
+    padding: 10px 10px;
+    gap: 8px;
+  }
+
+  .recon-card-row {
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+
+  .recon-card-row b {
+    font-size: 12.5px;
+  }
+
+  /* Tab 3: 结账向导 */
+  .wizard-step-item {
+    padding: 9px 10px;
+    gap: 8px;
+  }
+
+  .w-info b {
+    font-size: 12px;
+  }
+
+  .w-info span {
+    font-size: 10.5px;
+  }
+
+  .btn-wizard-action {
+    padding: 5px 8px;
+    font-size: 11px;
+    white-space: nowrap;
+  }
+
+  /* Tab 4: 经营大盘 KPI 保持 2x2 */
+  .board-metrics-grid {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 8px;
+  }
+
+  .board-kpi-card {
+    padding: 10px 10px;
+  }
+
+  .kpi-label {
+    font-size: 11px;
+    margin-bottom: 4px;
+  }
+
+  .kpi-val {
+    font-size: 17px;
+  }
+
+  .kpi-decimal {
+    font-size: 11.5px;
+  }
+
+  .kpi-trend {
+    font-size: 10px;
+    margin-top: 4px;
+  }
+
+  /* Tab 5: MCP 终端视窗防破框 */
+  .mcp-terminal-body {
+    padding: 12px;
+    gap: 8px;
+    font-size: 11.5px;
+  }
+
+  .user-bubble {
+    max-width: 100%;
+  }
+
+  .mcp-skill-chip,
+  .mcp-call-chip {
+    word-break: break-all;
+    white-space: normal;
+    line-height: 1.4;
+    font-size: 10.5px;
+  }
+
+  .mcp-voucher-preview {
+    overflow-x: auto;
+    font-size: 11px;
+    padding: 8px 10px;
+  }
+
+  /* 痛点方案对比 */
+  .compare-grid {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .compare-card {
+    padding: 16px 14px;
+  }
+
+  /* 账本迁移 */
+  .migrate-grid {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  .migrate-bridge {
+    width: auto;
+    flex-direction: row;
+    gap: 8px;
+    margin: 4px 0;
+  }
+
+  .migrate-card {
+    padding: 16px 14px;
+  }
+
+  .migrate-promises {
+    grid-template-columns: 1fr;
+    gap: 8px;
+    margin-top: 18px;
+  }
+
+  /* 适用场景与合规保障 */
+  .persona-grid {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .persona-item {
+    padding: 16px 14px;
+  }
+
+  .compliance-evidence-grid {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .evidence-card {
+    padding: 16px 14px;
+  }
+
+  /* 底部 CTA 与页脚 */
+  .cta-title {
+    font-size: 22px;
+  }
+
+  .cta-sub {
+    font-size: 13.5px;
+    margin-bottom: 22px;
+  }
+
+  .site-footer {
+    padding: 24px 0 max(32px, env(safe-area-inset-bottom, 32px));
+  }
+
+  .footer-inner {
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    gap: 16px;
+  }
+
+  .footer-brand {
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    gap: 8px;
+  }
+
+  .footer-brand-info p {
+    text-align: center;
+  }
+
+  .footer-sub {
+    flex-direction: column;
+    gap: 8px;
+    text-align: center;
+    margin-top: 16px;
+    padding-top: 14px;
+  }
+
+  .footer-filings {
+    flex-direction: column;
+    gap: 6px;
+    align-items: center;
+  }
+}
+
+/* 极窄屏幕微调 (<= 480px, 如 iPhone SE / mini 等) */
+@media (max-width: 480px) {
+  .nav-inner {
+    padding: 0 12px;
+  }
+
+  .section-inner {
+    padding: 0 12px;
+  }
+
+  .hero-title {
+    font-size: 28px;
+    letter-spacing: -0.4px;
+  }
+
+  .hero-inner {
+    padding: 16px 10px 0;
+  }
+
+  .hero-proof-bento {
+    gap: 8px;
+  }
+
+  .proof-card {
+    padding: 10px 8px;
+  }
+
+  .proof-val {
+    font-size: 17px;
+  }
+
+  .proof-title {
+    font-size: 11.5px;
+  }
+
+  .proof-desc {
+    font-size: 10px;
+  }
+
+  .section-headline {
+    font-size: 20px;
+    line-height: 1.35;
+  }
+
+  .section-subtitle {
+    font-size: 12.5px;
+  }
+
+  .section-top {
+    margin-bottom: 20px;
+  }
+
+  .desktop-action-btn {
+    display: none;
+  }
+
+  .mobile-sticky-bar {
+    left: 10px;
+    right: 10px;
+    bottom: max(10px, env(safe-area-inset-bottom, 10px));
+    padding: 8px 12px;
   }
 }
 </style>

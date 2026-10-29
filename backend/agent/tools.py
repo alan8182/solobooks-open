@@ -20,6 +20,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from agent import actions as agent_actions
 from agent.memory import get_profile
+from core.errors import AccountingError
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +177,7 @@ async def _list_bank_statements(
             continue
         out.append({"id": row.get("id"), "date": str(row.get("transaction_date") or "")[:10],
                     "amount": row.get("amount"), "description": row.get("description"),
+                    "counterparty": row.get("counterparty") or "",
                     "direction": "income" if Decimal(str(row.get("amount") or 0)) >= 0 else "expense",
                     "matched": is_matched, "matchedEntryIds": matched_ids})
     cap = max(1, min(int(limit or 30), 100))
@@ -295,6 +297,111 @@ async def _get_advance_balances(ctx: ToolContext, month: Optional[str] = None) -
 
     target_month = month or datetime.now(timezone.utc).strftime("%Y-%m")
     return await query_advance_balances(ctx.company_id, target_month)
+
+
+async def _list_private_expenses(
+    ctx: ToolContext,
+    owner_name: Optional[str] = None,
+    direction: Optional[str] = None,
+    invoice_status: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 50,
+) -> Any:
+    """查询老板小私账台账与收支汇总（老板个人垫付与代收备忘）。"""
+    from services.private_expense_service import get_expense_summary, list_expenses
+
+    safe_page = max(1, min(int(page or 1), 1000))
+    safe_size = max(1, min(int(page_size or 50), 100))
+    resolved_owner = str(owner_name or "").strip()
+    result = await list_expenses(
+        company_id=ctx.company_id,
+        page=safe_page,
+        page_size=safe_size,
+        owner_name=resolved_owner,
+        direction=str(direction or "").strip(),
+        invoice_status=str(invoice_status or "").strip(),
+        start_date=str(start_date or "").strip(),
+        end_date=str(end_date or "").strip(),
+    )
+    summary = await get_expense_summary(company_id=ctx.company_id, owner_name=resolved_owner)
+
+    # 投影：保留私账核心字段，控制上下文体积
+    items = [
+        _pick(
+            it,
+            (
+                "id",
+                "title",
+                "amount",
+                "direction",
+                "category",
+                "occur_date",
+                "payer",
+                "owner_name",
+                "private_account",
+                "invoice_status",
+                "substitute_entry_id",
+                "substitute_memo",
+                "memo",
+            ),
+        )
+        for it in result.get("items", [])
+    ]
+    return {
+        "total": result.get("total", 0),
+        "count": len(items),
+        "page": safe_page,
+        "pageSize": safe_size,
+        "items": items,
+        "summary": {
+            "totalCount": summary.get("count", 0),
+            "expenseAmount": summary.get("expense_amount", "0.00"),
+            "incomeAmount": summary.get("income_amount", "0.00"),
+            "availableIncomeAmount": summary.get("available_income_amount", "0.00"),
+            "offsetAmount": summary.get("offset_amount", "0.00"),
+            "balanceAmount": summary.get("balance_amount", "0.00"),
+        },
+    }
+
+
+async def _record_private_expense(
+    ctx: ToolContext,
+    title: str,
+    amount: float,
+    direction: str = "expense",
+    category: Optional[str] = None,
+    occur_date: Optional[str] = None,
+    owner_name: Optional[str] = None,
+    private_account: Optional[str] = None,
+    invoice_status: str = "no_invoice",
+    memo: Optional[str] = None,
+) -> Any:
+    """直接记入老板小私账（老板个人垫付或代收备忘台账）。"""
+    from datetime import date
+    from services.private_expense_service import create_expense
+
+    target_date = str(occur_date or date.today().isoformat())[:10]
+    data = {
+        "title": str(title).strip(),
+        "amount": amount,
+        "direction": str(direction or "expense").strip(),
+        "category": str(category or "").strip(),
+        "occur_date": target_date,
+        "payer": "boss_personal",
+        "owner_name": str(owner_name or "本人").strip() or "本人",
+        "private_account": str(private_account or "").strip(),
+        "is_available": True,
+        "memo": str(memo or "").strip(),
+        "invoice_status": str(invoice_status or "no_invoice").strip(),
+    }
+    created = await create_expense(company_id=ctx.company_id, user_id=ctx.user_id, data=data)
+    return {
+        "success": True,
+        "expense": created,
+        "message": f"已记入小私账：{created['title']} {created['amount']} 元（{target_date}）",
+    }
 
 
 async def _get_aging(ctx: ToolContext, kind: str = "ar", group_by: str = "none") -> Any:
@@ -448,7 +555,9 @@ async def _list_unmatched(ctx: ToolContext, month: Optional[str] = None, limit: 
     # Preserve the complete group: income plus fees may settle one statement.
     suggestions_error: Optional[str] = None
     try:
-        raw_suggestions = await ai_suggest_matches(ctx.company_id, limit=max(1, min(int(limit or 20), 10)), month=month)
+        raw_suggestions = await ai_suggest_matches(ctx.company_id, limit=max(1, min(int(limit or 20), 10)), month=month, user_id=ctx.user_id)
+    except AccountingError:
+        raise  # 配额超限对 MCP 客户端可见（工具报错），不能伪装成「无建议」
     except Exception:
         # 降级必须对 agent 可见：空数组与「无可匹配」从外部看一模一样，会误导对账决策
         logger.exception("ai_suggest_matches failed")
@@ -830,9 +939,10 @@ async def _generate_close_report(ctx: ToolContext, month: str) -> Any:
 _PAYER_SCHEMA = {
     "type": "string",
     "description": (
-        "付款方，三种取值：company_account=公司对公账户（默认）；"
+        "付款方/资金渠道：company_account=公司对公账户（默认）；"
         "boss_personal=老板/股东个人垫付（贷「其他应付款-股东」）；"
-        "employee_personal:<姓名>=员工个人垫付（贷「其他应付款-员工往来(姓名)」）。"
+        "employee_personal:<姓名>=员工个人垫付（贷「其他应付款-员工往来(姓名)」）；"
+        "receivable=待到账/挂应收账款（收入类款项尚未到账、跨期到账或待银行流水核销时使用，借「应收账款」）。"
         "员工垫付但用户没说是谁时只传 employee_personal，让用户在确认卡里选人。"
         "用户说“我垫的/我自己付的/老板付的”用 boss_personal；"
         "绝不要编造员工姓名，不确定就只传 employee_personal。"
@@ -963,6 +1073,314 @@ async def _propose_voucher(
         "actionId": action["id"],
         "status": action["status"],
         "message": "草稿已创建，等待用户确认后才会入账",
+    }
+
+
+# ---------------------------------------------------------------------------
+# 建账与期初导入工具（新公司从零建账 / 代账旧账迁入）
+# ---------------------------------------------------------------------------
+
+_CONTAINER_TO_LEAF_CODE = {
+    "1221": "122103",
+    "2211": "2211001",
+    "2221": "2221026",
+    "2241": "224101",
+    "3104": "3104006",
+}
+
+_ACCOUNT_NAME_ALIASES = {
+    "现金": "1001",
+    "库存现金": "1001",
+    "银行存款": "1002",
+    "银行": "1002",
+    "应收账款": "1122",
+    "预付账款": "1123",
+    "其他应收款": "122103",
+    "原材料": "1403",
+    "库存商品": "1405",
+    "存货": "1405",
+    "固定资产": "1601",
+    "累计折旧": "1602",
+    "无形资产": "1701",
+    "累计摊销": "1702",
+    "长期待摊费用": "1801",
+    "短期借款": "2001",
+    "应付账款": "2202",
+    "预收账款": "2203",
+    "合同负债": "2203",
+    "应付职工薪酬": "2211001",
+    "应付工资": "2211001",
+    "工资": "2211001",
+    "应交税费": "2221026",
+    "未交增值税": "2221026",
+    "其他应付款": "224101",
+    "股东垫款": "224101",
+    "老板垫款": "224101",
+    "实收资本": "3001",
+    "注册资本": "3001",
+    "资本公积": "3002",
+    "盈余公积": "3101",
+    "本年利润": "3103",
+    "未分配利润": "3104006",
+    "利润分配": "3104006",
+}
+
+_OPENING_ITEM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "account_code": {"type": "string", "description": "科目代码（如 1002、1122、2202、3001、3104006），可选"},
+        "account_name": {"type": "string", "description": "科目名称（如 银行存款、应收账款、实收资本），可选"},
+        "debit_balance": {"type": "number", "description": "借方期初余额（元，>=0）", "minimum": 0},
+        "credit_balance": {"type": "number", "description": "贷方期初余额（元，>=0）", "minimum": 0},
+        "partner_name": {"type": "string", "description": "往来单位名称（应收/应付/其他应收/其他应付可选填）"},
+    },
+}
+
+
+async def _propose_company_setup(
+    ctx: ToolContext,
+    onboarding_type: str,
+    name: str,
+    tax_id: Optional[str] = None,
+    company_type: str = "有限责任公司",
+    taxpayer_type: str = "小规模纳税人",
+    start_date: Optional[str] = None,
+    industry: Optional[str] = None,
+    vat_filing_cycle: str = "quarter",
+    note: Optional[str] = None,
+) -> Any:
+    """创建建账/迁入主体配置草稿（待老板在卡片中确认后生效）。"""
+    from services.account_service import get_company
+
+    clean_name = str(name or "").strip()
+    if not clean_name:
+        return {"error": "缺少公司名称（name）"}
+
+    resolved_start = str(start_date or "").strip() or f"{datetime.now().strftime('%Y-%m')}-01"
+    _assert_real_date(resolved_start, "start_date ")
+
+    current = await get_company(ctx.company_id) or {}
+    is_from_demo = bool(current.get("isDemo"))
+    clean_tax_id = str(tax_id or current.get("taxId") or "").strip().upper()
+
+    payload: Dict[str, Any] = {
+        "onboardingType": onboarding_type,
+        "name": clean_name,
+        "taxId": clean_tax_id,
+        "type": company_type or "有限责任公司",
+        "taxpayerType": taxpayer_type or "小规模纳税人",
+        "startDate": resolved_start,
+        "industry": str(industry or current.get("industry") or "").strip(),
+        "vatFilingCycle": vat_filing_cycle or "quarter",
+        "isFromDemo": is_from_demo,
+    }
+    title = "新公司从零建账确认" if onboarding_type == "new" else "代账/旧账迁入建账确认"
+    action = await agent_actions.create_action(
+        company_id=ctx.company_id,
+        user_id=ctx.user_id,
+        action_type="propose_company_setup",
+        title=title,
+        payload=payload,
+        evidence={"note": note or "", "created_via": "agent_onboarding"},
+    )
+    return {
+        "actionId": action["id"],
+        "status": action["status"],
+        "onboardingType": onboarding_type,
+        "isFromDemo": is_from_demo,
+        "message": "主体建账确认卡已创建，等待老板在卡片中核对并点击确认",
+    }
+
+
+async def _propose_opening_balance(
+    ctx: ToolContext,
+    items: List[dict],
+    ytd_items: Optional[List[dict]] = None,
+    start_period: Optional[str] = None,
+    prior_year_loss: Optional[float] = 0.0,
+    prepaid_cit_tax: Optional[float] = 0.0,
+    auto_plug_difference: Optional[bool] = False,
+    note: Optional[str] = None,
+) -> Any:
+    """创建期初余额导入确认卡（试算借贷平衡，老板确认并完成验证后生成正式期初凭证）。"""
+    from sqlalchemy import select
+    from core.money import ZERO, money, money_text
+    from db.models import ChartAccount
+    from db.session import session_scope
+    from services.account_service import get_company
+    from services.accounting_core_service import ensure_tenant
+    from services.opening_balance_service import _is_expense_revenue
+
+    company = await get_company(ctx.company_id) or {}
+    raw_start = str(start_period or (company.get("startDate") or "")[:7] or datetime.now().strftime("%Y-%m")).strip()
+    if not re.fullmatch(MONTH_PATTERN, raw_start):
+        raw_start = datetime.now().strftime("%Y-%m")
+    fiscal_year = int(raw_start.split("-")[0])
+
+    async with session_scope() as session:
+        await ensure_tenant(session, ctx.company_id, ctx.user_id)
+        accounts = (
+            await session.execute(
+                select(ChartAccount)
+                .where(ChartAccount.company_id == ctx.company_id, ChartAccount.is_active.is_(True))
+                .order_by(ChartAccount.code)
+            )
+        ).scalars().all()
+
+    by_code = {a.code: a for a in accounts}
+    leaf_by_name = {a.name: a for a in accounts if a.is_leaf}
+
+    def _resolve_account(raw_code: str, raw_name: str) -> tuple[str, str]:
+        code = _CONTAINER_TO_LEAF_CODE.get(raw_code, raw_code)
+        if code and code in by_code:
+            acc = by_code[code]
+            if acc.is_leaf:
+                return acc.code, acc.name
+            # 容器科目：找第一个启用末级子科目
+            for c_code, c_acc in by_code.items():
+                if c_acc.is_leaf and c_code.startswith(code):
+                    return c_acc.code, c_acc.name
+        if raw_name:
+            if raw_name in leaf_by_name:
+                acc = leaf_by_name[raw_name]
+                return acc.code, acc.name
+            alias_code = _ACCOUNT_NAME_ALIASES.get(raw_name)
+            if alias_code and alias_code in by_code:
+                return alias_code, by_code[alias_code].name
+            for a_name, acc in leaf_by_name.items():
+                if raw_name in a_name or a_name in raw_name:
+                    return acc.code, acc.name
+        return code or "1002", raw_name or "银行存款"
+
+    norm_items: List[Dict[str, Any]] = []
+    norm_ytd: List[Dict[str, Any]] = []
+    total_debit = ZERO
+    total_credit = ZERO
+
+    for idx, raw in enumerate(items or []):
+        if not isinstance(raw, dict):
+            continue
+        cleaned = _enforce_schema(raw, _OPENING_ITEM_SCHEMA, f"items[{idx}]")
+        code, name = _resolve_account(
+            str(cleaned.get("account_code") or "").strip(),
+            str(cleaned.get("account_name") or "").strip(),
+        )
+        debit = money(cleaned.get("debit_balance") or 0, allow_negative=False)
+        credit = money(cleaned.get("credit_balance") or 0, allow_negative=False)
+        if debit == ZERO and credit == ZERO:
+            continue
+        # 备抵科目（1602 累计折旧 / 1702 累计摊销）余额恒在贷方
+        if code in ("1602", "1702") and debit > ZERO and credit == ZERO:
+            credit, debit = debit, ZERO
+
+        if _is_expense_revenue(code):
+            norm_ytd.append({
+                "account_code": code,
+                "account_name": name,
+                "debit_balance": money_text(debit),
+                "credit_balance": money_text(credit),
+            })
+            continue
+
+        total_debit += debit
+        total_credit += credit
+        norm_items.append({
+            "account_code": code,
+            "account_name": name,
+            "debit_balance": money_text(debit),
+            "credit_balance": money_text(credit),
+            "partner_name": str(cleaned.get("partner_name") or "").strip(),
+        })
+
+    for idx, raw in enumerate(ytd_items or []):
+        if not isinstance(raw, dict):
+            continue
+        cleaned = _enforce_schema(raw, _OPENING_ITEM_SCHEMA, f"ytd_items[{idx}]")
+        code, name = _resolve_account(
+            str(cleaned.get("account_code") or "").strip(),
+            str(cleaned.get("account_name") or "").strip(),
+        )
+        debit = money(cleaned.get("debit_balance") or 0, allow_negative=False)
+        credit = money(cleaned.get("credit_balance") or 0, allow_negative=False)
+        if debit == ZERO and credit == ZERO:
+            continue
+        norm_ytd.append({
+            "account_code": code,
+            "account_name": name,
+            "debit_balance": money_text(debit),
+            "credit_balance": money_text(credit),
+        })
+
+    if not norm_items:
+        return {"error": "请至少提供一项资产、负债或所有者权益的期初余额"}
+
+    auto_plugged: Optional[Dict[str, Any]] = None
+    if auto_plug_difference and total_debit != total_credit:
+        diff = total_debit - total_credit
+        plug_code, plug_name = _resolve_account("3104006", "未分配利润")
+        if diff > ZERO:
+            norm_items.append({
+                "account_code": plug_code,
+                "account_name": plug_name,
+                "debit_balance": "0.00",
+                "credit_balance": money_text(diff),
+                "partner_name": "",
+            })
+            total_credit += diff
+            auto_plugged = {"accountCode": plug_code, "accountName": plug_name, "direction": "credit", "amount": float(diff)}
+        else:
+            abs_diff = abs(diff)
+            norm_items.append({
+                "account_code": plug_code,
+                "account_name": plug_name,
+                "debit_balance": money_text(abs_diff),
+                "credit_balance": "0.00",
+                "partner_name": "",
+            })
+            total_debit += abs_diff
+            auto_plugged = {"accountCode": plug_code, "accountName": plug_name, "direction": "debit", "amount": float(abs_diff)}
+
+    balanced = bool(total_debit > ZERO and total_debit == total_credit)
+    diff_val = abs(total_debit - total_credit)
+    payload = {
+        "fiscalYear": fiscal_year,
+        "startPeriod": raw_start,
+        "items": norm_items,
+        "ytdItems": norm_ytd,
+        "taxMemory": {
+            "priorYearLoss": float(prior_year_loss or 0),
+            "prepaidCitTax": float(prepaid_cit_tax or 0),
+            "migrationNote": note or "AI 会计对话导入期初",
+        },
+        "totalDebit": money_text(total_debit),
+        "totalCredit": money_text(total_credit),
+        "difference": money_text(diff_val),
+        "balanced": balanced,
+        "autoPlugged": auto_plugged,
+    }
+    action = await agent_actions.create_action(
+        company_id=ctx.company_id,
+        user_id=ctx.user_id,
+        action_type="propose_opening_balance",
+        title=f"期初余额导入确认（{raw_start}）",
+        payload=payload,
+        evidence={"note": note or "", "created_via": "agent_onboarding"},
+    )
+    return {
+        "actionId": action["id"],
+        "status": action["status"],
+        "balanced": balanced,
+        "totalDebit": money_text(total_debit),
+        "totalCredit": money_text(total_credit),
+        "difference": money_text(diff_val),
+        "autoPlugged": auto_plugged,
+        "itemCount": len(norm_items),
+        "ytdItemCount": len(norm_ytd),
+        "message": (
+            "期初余额确认卡已生成（借贷已平衡），等待老板确认后入账"
+            if balanced
+            else f"期初余额确认卡已生成，当前借贷差额 {money_text(diff_val)} 元，可在卡片中一键计入未分配利润配平或去期初工作台细调"
+        ),
     }
 
 
@@ -1160,6 +1578,55 @@ TOOLS: List[Tool] = [
             }
         ),
         handler=_get_advance_balances,
+    ),
+    Tool(
+        name="list_private_expenses",
+        description=(
+            "查询老板小私账台账（老板个人垫付与代收明细及汇总统计）。"
+            "支持按收支方向(expense垫付/income代收)、发票状态(no_invoice/has_invoice/substitute)、日期范围及垫付人过滤。"
+        ),
+        parameters=_obj(
+            {
+                "owner_name": {"type": "string", "description": "可选，记账人/垫付人姓名，默认本人"},
+                "direction": {"type": "string", "enum": ["expense", "income"], "description": "可选，expense=个人垫付，income=代收款"},
+                "invoice_status": {
+                    "type": "string",
+                    "enum": ["no_invoice", "has_invoice", "substitute"],
+                    "description": "可选，发票状态：no_invoice=无发票，has_invoice=有发票，substitute=需冲抵",
+                },
+                "start_date": {"type": "string", "description": "起始日期 YYYY-MM-DD，可选", "pattern": DATE_PATTERN},
+                "end_date": {"type": "string", "description": "截止日期 YYYY-MM-DD，可选", "pattern": DATE_PATTERN},
+                "page": {"type": "integer", "description": "页码，默认 1"},
+                "page_size": {"type": "integer", "description": "每页条数，默认 50"},
+            }
+        ),
+        handler=_list_private_expenses,
+    ),
+    Tool(
+        name="record_private_expense",
+        description=(
+            "记入老板小私账台账（老板个人垫付或代收备忘，非正式凭证）。"
+            "当老板明确说'记私账'、'记小私账'、'个人垫付备忘'或无发票暂不报销时调用此工具。"
+        ),
+        parameters=_obj(
+            {
+                "title": {"type": "string", "description": "事项摘要，如'个人微信付打车费'"},
+                "amount": {"type": "number", "description": "金额（元），正数", "exclusiveMinimum": 0},
+                "direction": {"type": "string", "enum": ["expense", "income"], "description": "方向：expense=个人垫付（默认），income=代收款"},
+                "category": {"type": "string", "description": "费用分类，如 交通费、餐饮费、办公费，可选"},
+                "occur_date": {"type": "string", "description": "业务发生日期 YYYY-MM-DD，可选，默认当天", "pattern": DATE_PATTERN},
+                "owner_name": {"type": "string", "description": "垫付人/记账人，默认'本人'，可选"},
+                "private_account": {"type": "string", "description": "个人支付账户/工具，如'个人微信'、'个人支付宝'、'招行私卡'，可选"},
+                "invoice_status": {
+                    "type": "string",
+                    "enum": ["no_invoice", "has_invoice", "substitute"],
+                    "description": "发票状态，默认 no_invoice（无发票），可选",
+                },
+                "memo": {"type": "string", "description": "补充备注，可选"},
+            },
+            ["title", "amount"],
+        ),
+        handler=_record_private_expense,
     ),
     Tool(
         name="list_todos",
@@ -1419,6 +1886,99 @@ TOOLS: List[Tool] = [
         ),
         handler=_propose_vouchers,
     ),
+    Tool(
+        name="propose_company_setup",
+        description=(
+            "发起新公司从零建账或从其他代账/软件转入的主体建账确认卡（老板在卡片上核对/补填并确认后生效；"
+            "若当前为演示账套会自动新建正式账套并切换）。"
+            "onboarding_type=new（新成立公司从零记账）或 migration（从其他代账或财务软件转入）；"
+            "start_date 为启用日期 YYYY-MM-DD（新公司取成立日或当月1日，代账转入取交接起账月1日，如 2026-10-01）。"
+        ),
+        parameters=_obj(
+            {
+                "onboarding_type": {
+                    "type": "string",
+                    "enum": ["new", "migration"],
+                    "description": "new=新公司从零建账，migration=从其他代账/旧账转入",
+                },
+                "name": {"type": "string", "description": "公司/主体全称"},
+                "tax_id": {"type": "string", "description": "18 位统一社会信用代码，可选（不确定可留空让老板在卡片补填）"},
+                "company_type": {
+                    "type": "string",
+                    "enum": ["有限责任公司", "个人独资企业", "个体工商户"],
+                    "description": "主体类型，默认 有限责任公司",
+                },
+                "taxpayer_type": {
+                    "type": "string",
+                    "enum": ["小规模纳税人", "一般纳税人"],
+                    "description": "纳税人身份，默认 小规模纳税人",
+                },
+                "start_date": {
+                    "type": "string",
+                    "description": "启用日期 YYYY-MM-DD，可选（默认当月1日）",
+                    "pattern": DATE_PATTERN,
+                },
+                "industry": {"type": "string", "description": "所属行业，可选"},
+                "vat_filing_cycle": {
+                    "type": "string",
+                    "enum": ["quarter", "month"],
+                    "description": "增值税申报周期：quarter=按季（小规模默认），month=按月",
+                },
+                "note": {"type": "string", "description": "给老板的建账提示，可选"},
+            },
+            ["onboarding_type", "name"],
+        ),
+        handler=_propose_company_setup,
+    ),
+    Tool(
+        name="propose_opening_balance",
+        description=(
+            "发起代账转入/旧账交接的期初余额导入确认卡（老板核对并完成验证后生成正式期初凭证）。"
+            "items 为资产/负债/所有者权益期初余额列表："
+            "资产类（1001库存现金、1002银行存款、1122应收账款、122103其他应收款、1405库存商品、1601固定资产等）填 debit_balance；"
+            "备抵/负债/权益类（1602累计折旧、1702累计摊销、2001短期借款、2202应付账款、2211001应付职工薪酬-工资、"
+            "2221026应交税费-未交增值税、224101其他应付款-股东、3001实收资本、3104006未分配利润等）填 credit_balance"
+            "（若未分配利润为累计亏损则填 debit_balance）。"
+            "年中转入若有 1 月至起账前一月的累计收入/费用，放入 ytd_items。"
+            "若老板只报了主要资产负债且同意差额计入未分配利润，可设 auto_plug_difference=true 自动配平。"
+        ),
+        parameters=_obj(
+            {
+                "items": {
+                    "type": "array",
+                    "description": "资产/负债/权益期初余额列表",
+                    "items": _OPENING_ITEM_SCHEMA,
+                },
+                "ytd_items": {
+                    "type": "array",
+                    "description": "年中建账可选：本年 1 月至启用前一月的损益累计发生额（如 5001 主营业务收入 credit_balance、5602001 办公费 debit_balance）",
+                    "items": _OPENING_ITEM_SCHEMA,
+                },
+                "start_period": {
+                    "type": "string",
+                    "description": "启用期间 YYYY-MM，可选（默认取主体启用月份）",
+                    "pattern": MONTH_PATTERN,
+                },
+                "prior_year_loss": {
+                    "type": "number",
+                    "description": "以前年度待弥补亏损（元，>=0），可选",
+                    "minimum": 0,
+                },
+                "prepaid_cit_tax": {
+                    "type": "number",
+                    "description": "本年已预缴企业所得税（元，>=0），可选",
+                    "minimum": 0,
+                },
+                "auto_plug_difference": {
+                    "type": "boolean",
+                    "description": "当借贷不平时，是否自动将差额计入 3104006 未分配利润配平，默认 false",
+                },
+                "note": {"type": "string", "description": "给老板的期初核对说明，可选"},
+            },
+            ["items"],
+        ),
+        handler=_propose_opening_balance,
+    ),
 ]
 
 TOOLS_BY_NAME: Dict[str, Tool] = {t.name: t for t in TOOLS}
@@ -1477,10 +2037,16 @@ def _enforce_schema(value: Any, schema: Dict[str, Any], path: str = "参数") ->
         minimum = schema.get("exclusiveMinimum")
         if minimum is not None and value <= minimum:
             raise ValueError(f"{path} 必须大于 {minimum}，收到 {value!r}")
+        min_inc = schema.get("minimum")
+        if min_inc is not None and value < min_inc:
+            raise ValueError(f"{path} 不能小于 {min_inc}，收到 {value!r}")
     elif stype == "integer":
         is_int = isinstance(value, int) and not isinstance(value, bool)
         if not is_int and not (isinstance(value, float) and value.is_integer()):
             raise ValueError(f"{path} 应为整数，收到 {value!r}")
+    elif stype == "boolean":
+        if not isinstance(value, bool):
+            raise ValueError(f"{path} 应为布尔值，收到 {type(value).__name__}")
     if schema.get("enum") and value not in schema["enum"]:
         raise ValueError(f"{path} 只能取 {'/'.join(str(x) for x in schema['enum'])}，收到 {value!r}")
     return value

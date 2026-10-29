@@ -29,6 +29,21 @@ class AccountingError(Exception):
         return payload
 
 
+@dataclass
+class QuotaExceededError(AccountingError):
+    """AI 用量超出当前套餐额度（402 Payment Required）。
+
+    注意：message 刻意避开 "quota"/"401"/"403"/"exhausted" 关键词——
+    services/llm.py 的重试与熔断逻辑按这些关键词识别「供应商侧」配额故障，
+    用户侧额度超限不应触发平台级 LLM 熔断，也不能被 safe_* 兜底吞掉
+    （safe_chat_text_json 对 AccountingError 显式 re-raise）。
+    """
+
+    code: str = "QUOTA_EXCEEDED"
+    message: str = "AI 用量已达到当前套餐上限"
+    status_code: int = 402
+
+
 PERIOD_CLOSED = "PERIOD_CLOSED"
 PERIOD_BEFORE_BOOK_START = "PERIOD_BEFORE_BOOK_START"
 ENTRY_POSTED_IMMUTABLE = "ENTRY_POSTED_IMMUTABLE"

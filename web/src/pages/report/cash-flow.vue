@@ -4,13 +4,17 @@ import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { NCard, NSpin, useMessage, NSelect, NButton, NTag, NRadioGroup, NRadioButton } from 'naive-ui'
 import { getCashFlow } from '@/api/report'
-import { formatMoney, getCurrentMonth } from '@/utils/format'
+import { formatMoney, formatAmountPlain, getCurrentMonth } from '@/utils/format'
 import type { CashFlowResponse } from '@/api/types'
+import StatementViewToggle from '@/components/business/StatementViewToggle.vue'
+import ProStatementHeader from '@/components/business/ProStatementHeader.vue'
+import { useStatementViewMode } from '@/composables/useStatementViewMode'
 import { SoloEmpty } from '@/components/ui'
 
 const route = useRoute()
 const router = useRouter()
 const message = useMessage()
+const { mode } = useStatementViewMode()
 
 const requestedMonth = String(route.query.month || '')
 const hasRequestedMonth = /^\d{4}-(0[1-9]|1[0-2])$/.test(requestedMonth)
@@ -40,6 +44,42 @@ function handlePeriodTypeChange() {
   router.replace({ query: { ...route.query, month: month.value } })
   load()
 }
+
+// 会计视图表头的期间文字（与月报/季报口径一致）
+const proPeriodText = computed(() => {
+  const [year, monthValue] = month.value.split('-').map(Number)
+  if (periodType.value === 'quarter') {
+    return `${year}年第${Math.floor((monthValue - 1) / 3) + 1}季度`
+  }
+  return `${year}年${monthValue}月`
+})
+
+interface CashFlowProRow {
+  name: string
+  amount?: number | string
+  kind: 'item' | 'section' | 'subtotal' | 'total'
+}
+
+/** 会小企03表节次结构：一二三类活动 + 现金净增加额 + 期初/期末 */
+const proRows = computed<CashFlowProRow[]>(() => {
+  const data = result.value
+  if (!data) return []
+  const rows: CashFlowProRow[] = []
+  const pushItems = (title: string, items: CashFlowResponse['operating'], net: number | string, netLabel: string) => {
+    rows.push({ name: title, kind: 'section' })
+    for (const item of items) {
+      rows.push({ name: item.description, amount: item.netAmount, kind: 'item' })
+    }
+    rows.push({ name: netLabel, amount: net, kind: 'subtotal' })
+  }
+  pushItems('一、经营活动产生的现金流量：', data.operating, data.operatingNet, '经营活动产生的现金流量净额')
+  pushItems('二、投资活动产生的现金流量：', data.investing, data.investingNet, '投资活动产生的现金流量净额')
+  pushItems('三、筹资活动产生的现金流量：', data.financing, data.financingNet, '筹资活动产生的现金流量净额')
+  rows.push({ name: '四、现金净增加额', amount: data.netIncrease, kind: 'subtotal' })
+  rows.push({ name: '加：期初现金余额', amount: data.openingCash, kind: 'item' })
+  rows.push({ name: '五、期末现金余额', amount: data.endingCash, kind: 'total' })
+  return rows
+})
 
 function handleBack() {
   router.push({ path: '/reports', query: { month: month.value } })
@@ -73,6 +113,7 @@ onMounted(load)
         </div>
       </div>
       <div class="report-header-right">
+        <StatementViewToggle style="margin-right: 8px;" />
         <NRadioGroup
           v-model:value="periodType"
           size="small"
@@ -94,6 +135,7 @@ onMounted(load)
 
     <NSpin :show="loading">
       <template v-if="result">
+        <template v-if="mode === 'boss'">
 
         <!-- 经营活动 -->
         <NCard :bordered="false" class="report-card mb-4">
@@ -193,7 +235,37 @@ onMounted(load)
             </div>
           </div>
         </NCard>
-            </template>
+        </template>
+
+        <!-- 会计视图：会小企03表节次结构 -->
+        <template v-else>
+          <NCard :bordered="false" class="report-card">
+            <ProStatementHeader title="现金流量表" :period-text="proPeriodText" />
+            <div class="report-table-wrapper">
+              <table class="report-table pro-cf-table">
+                <thead>
+                  <tr>
+                    <th class="cf-item-col">项目</th>
+                    <th class="cf-amt-col">金额</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="row in proRows" :key="row.name" :class="`pro-${row.kind}`">
+                    <td class="cf-item-cell">{{ row.name }}</td>
+                    <td class="amount-cell">{{ row.amount === undefined ? '' : formatAmountPlain(row.amount) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="pro-cf-reconciliation">
+              <span>勾稽：三类活动净额＝现金净增加额 {{ result.classificationBalanced ? '✓' : `差额 ${formatAmountPlain(result.classificationDifference)}` }}</span>
+              <span>期初现金＋净增加额＝期末现金 {{ result.cashRollForwardBalanced ? '✓' : `差额 ${formatAmountPlain(result.cashRollForwardDifference)}` }}</span>
+              <span>期末现金＝资产负债表货币资金 {{ result.balanceSheetCashBalanced ? '✓' : `差额 ${formatAmountPlain(result.balanceSheetCashDifference)}` }}</span>
+            </div>
+            <p class="pro-compiler-note">编制基础：小企业会计准则；金额单位：元，支出以负数列示。</p>
+          </NCard>
+        </template>
+      </template>
       <SoloEmpty
         v-else-if="!loading"
         title="本期没有资金流水"
@@ -278,5 +350,56 @@ onMounted(load)
   padding: 6px 0;
   color: var(--solo-text-secondary);
   font-size: 13px;
+}
+
+/* ── 会计视图 ── */
+.pro-cf-table {
+  min-width: 560px;
+}
+
+.cf-item-col {
+  min-width: 360px;
+}
+
+.cf-amt-col {
+  text-align: right;
+  width: 140px;
+}
+
+.cf-item-cell {
+  white-space: nowrap;
+}
+
+.pro-cf-table .pro-section td {
+  font-weight: 600;
+}
+
+.pro-cf-table .pro-subtotal td {
+  font-weight: 600;
+  background: rgba(15, 23, 42, 0.025);
+}
+
+.pro-cf-table .pro-total td {
+  font-weight: 750;
+  border-top: 1px solid var(--solo-border, #e5e9ef);
+  background: rgba(15, 23, 42, 0.04);
+}
+
+.pro-cf-reconciliation {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--solo-border-light, #edf0f4);
+  font-size: 12px;
+  color: var(--solo-text-muted, #636e7c);
+}
+
+.pro-compiler-note {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--solo-text-muted, #636e7c);
+  line-height: 1.6;
 }
 </style>

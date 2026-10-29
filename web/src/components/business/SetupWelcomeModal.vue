@@ -136,18 +136,25 @@ function go(path: string) {
 
     <template v-else>
       <div class="start-options">
+        <button type="button" class="start-option" @click="go('/copilot?scene=new')">
+          <i class="ri-seedling-line" aria-hidden="true" />
+          <span class="start-copy">
+            <strong>我是新成立的公司 · 从零建账</strong>
+            <span>AI 会计对话引导录入主体信息，0 期初直接开记</span>
+          </span>
+        </button>
+        <button type="button" class="start-option" @click="go('/copilot?scene=migration')">
+          <i class="ri-exchange-box-line" aria-hidden="true" />
+          <span class="start-copy">
+            <strong>从其他代账/软件转入 · 导入期初</strong>
+            <span>支持在 AI 对话窗口口述余额或上传科目余额表 Excel</span>
+          </span>
+        </button>
         <button type="button" class="start-option" @click="go('/copilot')">
           <i class="ri-sparkling-fill" aria-hidden="true" />
           <span class="start-copy">
             <strong>说一句就记账</strong>
             <span>「昨天请客户吃饭 380 微信付」</span>
-          </span>
-        </button>
-        <button type="button" class="start-option" @click="go('/record/invoice-import')">
-          <i class="ri-receipt-line" aria-hidden="true" />
-          <span class="start-copy">
-            <strong>上传发票</strong>
-            <span>Excel 批量导入或票据图片</span>
           </span>
         </button>
         <button type="button" class="start-option" @click="go('/guide')">

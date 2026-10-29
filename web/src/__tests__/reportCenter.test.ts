@@ -12,12 +12,6 @@ describe('report center architecture and routing', () => {
     '/reports/income-statement',
     '/reports/comparison',
     '/reports/ar-aging',
-  ]
-
-  const taxCompliancePaths = [
-    '/reports/vat',
-    '/reports/cit',
-    '/tax-filing',
     '/reports/archive',
   ]
 
@@ -47,15 +41,19 @@ describe('report center architecture and routing', () => {
     '/reports/partner-balances': 'partner-balances',
   }
 
+  // 增值税与所得税申报辅助并入税务申报工作台（/tax-filing）的旧地址，同样保留重定向
+  const legacyTaxAssistPaths: Record<string, string> = {
+    '/reports/vat': 'vat',
+    '/reports/cit': 'cit',
+  }
+
   const allReportPaths = [
     ...businessHealthPaths,
-    ...taxCompliancePaths,
     ...financialStatementPaths,
   ]
 
-  it('groups cards by purpose instead of one flat tier per module', () => {
-    expect(businessHealthPaths).toHaveLength(4)
-    expect(taxCompliancePaths).toHaveLength(4)
+  it('groups cards by purpose into business health and financial statements', () => {
+    expect(businessHealthPaths).toHaveLength(5)
     expect(financialStatementPaths).toHaveLength(3)
 
     // 同一个入口不能在两个分组里各出现一次
@@ -81,6 +79,20 @@ describe('report center architecture and routing', () => {
       expect(target.path).toBe('/ledger/books')
       expect(target.query.book).toBe(book)
       // 期间必须原样带过去，否则从年度报表下钻会掉回默认月份
+      expect(target.query.month).toBe('2026-08')
+    }
+  })
+
+  it('redirects legacy tax assist links into tax-filing workspace and keeps period and card', () => {
+    for (const [path, card] of Object.entries(legacyTaxAssistPaths)) {
+      const record = router.resolve(path).matched.at(-1)
+      expect(typeof record?.redirect).toBe('function')
+      const redirect = record!.redirect as unknown as (to: {
+        query: Record<string, string>
+      }) => { path: string; query: Record<string, string> }
+      const target = redirect({ query: { month: '2026-08' } })
+      expect(target.path).toBe('/tax-filing')
+      expect(target.query.card).toBe(card)
       expect(target.query.month).toBe('2026-08')
     }
   })

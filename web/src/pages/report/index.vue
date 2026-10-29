@@ -130,7 +130,13 @@ const isReportEmpty = computed(
     Object.keys(report.value?.categoryBreakdown ?? {}).length === 0,
 )
 const balanceSheetData = ref<BalanceSheetResponse | null>(null)
-const showLegalBooks = ref(false)
+const showLegalBooks = ref(true)
+
+const isBalanceSheetBalanced = computed(() => {
+  if (!balanceSheetData.value) return true
+  const { totalAssets = 0, totalLiabilities = 0, totalEquity = 0 } = balanceSheetData.value
+  return Math.abs(totalAssets - (totalLiabilities + totalEquity)) < 0.01
+})
 
 async function fetchDiagnosis() {
   aiLoading.value = true
@@ -279,6 +285,15 @@ const profitMargin = computed(() => {
   return margin.toFixed(1)
 })
 
+// 资金安全跑道（Runway）：账上现钱按当期月均开支可维持月数
+const cashRunwayMonths = computed(() => {
+  const expense = report.value?.monthExpense || 0
+  if (!cashAmount.value || cashAmount.value <= 0) return 0
+  if (expense <= 0) return null
+  const months = cashAmount.value / expense
+  return Number(months.toFixed(1))
+})
+
 const categoryEntries = computed(() => {
   if (!report.value?.categoryBreakdown) return []
   return Object.entries(report.value.categoryBreakdown)
@@ -356,6 +371,12 @@ const businessHealthReports = computed(() => {
         desc: '企业综合健康评分，排查现金流与发票断档风险',
         icon: 'ri-heart-pulse-line',
       },
+      {
+        path: '/reports/archive',
+        label: '单据合规检查',
+        desc: '发票与付款单据合规性检查，追踪未归档凭证',
+        icon: 'ri-archive-line',
+      },
     ]
   }
 
@@ -388,6 +409,12 @@ const businessHealthReports = computed(() => {
       icon: 'ri-heart-pulse-line',
     },
     {
+      path: '/reports/archive',
+      label: '单据合规检查',
+      desc: '单据合规性检查与未归档凭证追踪',
+      icon: 'ri-archive-line',
+    },
+    {
       path: '/reports/advance-balances',
       label: '垫付台账',
       desc: '老板与员工垫付的其他应付款，按人拆到未报余额',
@@ -398,70 +425,6 @@ const businessHealthReports = computed(() => {
       label: '同比/环比',
       desc: '对比历史同期，追踪营收与支出趋势',
       icon: 'ri-bar-chart-grouped-line',
-    },
-  ]
-})
-
-const taxComplianceReports = computed(() => {
-  const vatDesc = periodType.value === 'quarter'
-    ? `小规模季免税 30 万额度 · 预计本季税额 ${formatMoney(estimatedVat.value)}`
-    : periodType.value === 'year'
-      ? `全年增值税预估 · 预计年税额 ${formatMoney(estimatedVat.value)}`
-      : `小规模季免税折算 · 预计本月税额 ${formatMoney(estimatedVat.value)}`
-
-  if (viewStore.isBoss) {
-    return [
-      {
-        path: '/reports/vat',
-        label: '增值税额度与预估',
-        desc: vatDesc,
-        icon: 'ri-receipt-line',
-      },
-      {
-        path: '/reports/cit',
-        label: '企业所得税优惠',
-        desc: `小微企业 5% 优惠税率 · 预计税额 ${formatMoney(estimatedCit.value)}`,
-        icon: 'ri-government-line',
-      },
-      {
-        path: '/tax-filing',
-        label: '税务申报',
-        desc: '增值税/所得税申报底稿、征期待办一站式办理',
-        icon: 'ri-stamp-line',
-      },
-      {
-        path: '/reports/archive',
-        label: '单据合规检查',
-        desc: '发票与付款单据合规性检查，追踪未归档凭证',
-        icon: 'ri-archive-line',
-      },
-    ]
-  }
-
-  return [
-    {
-      path: '/reports/vat',
-      label: '增值税辅助',
-      desc: vatDesc,
-      icon: 'ri-receipt-line',
-    },
-    {
-      path: '/reports/cit',
-      label: '企业所得税',
-      desc: `小微企业 5% 优惠税率 · 预计税额 ${formatMoney(estimatedCit.value)}`,
-      icon: 'ri-government-line',
-    },
-    {
-      path: '/tax-filing',
-      label: '税务申报',
-      desc: '增值税/所得税申报底稿、征期待办一站式办理',
-      icon: 'ri-stamp-line',
-    },
-    {
-      path: '/reports/archive',
-      label: '归档清单',
-      desc: '单据合规性检查与未归档凭证追踪',
-      icon: 'ri-archive-line',
     },
   ]
 })
@@ -662,7 +625,14 @@ watch(() => viewStore.mode, () => {
             <div class="position-info">
               <div class="position-label">{{ viewStore.isBoss ? '账上现钱' : '账上可用资金（货币资金）' }}</div>
               <div class="position-num text-primary">{{ formatMoney(cashAmount) }}</div>
-              <div class="position-desc">{{ viewStore.isBoss ? '公户结余与随时可支配资金' : '公司银行账户与手头随时可支配现金' }}</div>
+              <div class="position-desc">
+                <template v-if="viewStore.isBoss">
+                  {{ cashRunwayMonths !== null ? (cashRunwayMonths > 0 ? `公户结余 · 可支撑约 ${cashRunwayMonths} 个月开销` : '公户结余 · 现金流吃紧需关注') : '公户结余与随时可支配资金' }}
+                </template>
+                <template v-else>
+                  公司银行账户与手头随时可支配现金
+                </template>
+              </div>
             </div>
           </div>
 
@@ -776,35 +746,7 @@ watch(() => viewStore.mode, () => {
         </div>
       </section>
 
-      <!-- 板块 2：财税预警与合规（季末/月末申报） -->
-      <section class="report-section">
-        <div class="section-header">
-          <div class="section-title-wrap">
-            <i class="ri-file-shield-2-line section-icon" />
-            <h3>{{ viewStore.isBoss ? '税务预警与合规' : '税务预警与申报合规' }}</h3>
-          </div>
-          <span class="section-sub">{{ viewStore.isBoss ? '申报关切：免税额度预警、优惠测算与单据完整度' : '季末与月末关切：增值税免税额度、所得税优惠与发票凭证' }}</span>
-        </div>
-        <div class="report-grid">
-          <div
-            v-for="card in taxComplianceReports"
-            :key="card.path"
-            class="report-card"
-            @click="navigateToReport(card.path)"
-          >
-            <div class="card-icon">
-              <i :class="card.icon" />
-            </div>
-            <div class="card-body">
-              <div class="card-title">{{ card.label }}</div>
-              <div class="card-desc" :title="card.desc">{{ card.desc }}</div>
-            </div>
-            <i class="ri-arrow-right-s-line card-arrow" />
-          </div>
-        </div>
-      </section>
-
-      <!-- 板块 3：法定财务报表（外部做账/审计底册，支持折叠收纳）。
+      <!-- 板块 2：法定财务报表（外部做账/审计底册，支持折叠收纳）。
            账簿不在这里：五本账统一走侧栏「会计账簿」工作台，避免同一批账两套入口。 -->
       <section v-if="!viewStore.isBoss" class="report-section legal-books">
         <div class="section-header toggle-header" @click="showLegalBooks = !showLegalBooks">
@@ -812,6 +754,10 @@ watch(() => viewStore.mode, () => {
             <i class="ri-file-chart-line section-icon" />
             <h3>法定财务报表</h3>
             <span class="legal-badge">做账 / 审计 / 报税备查</span>
+            <span class="balance-tag" :class="isBalanceSheetBalanced ? 'balanced' : 'unbalanced'">
+              <i :class="isBalanceSheetBalanced ? 'ri-checkbox-circle-line' : 'ri-error-warning-line'" />
+              {{ isBalanceSheetBalanced ? '资产负债表已配平' : '试算未配平' }}
+            </span>
           </div>
           <button type="button" class="toggle-btn">
             <span>{{ showLegalBooks ? '收起报表' : '展开 3 张报表与税局导出' }}</span>
@@ -1439,11 +1385,32 @@ watch(() => viewStore.mode, () => {
     align-items: stretch;
   }
 }
+.balance-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: var(--solo-radius-pill, 999px);
+  font-weight: 600;
+}
+
+.balance-tag.balanced {
+  background: var(--solo-income-soft, #EAF7F1);
+  color: var(--solo-income, #0f7354);
+}
+
+.balance-tag.unbalanced {
+  background: var(--solo-expense-soft, #FBEEEE);
+  color: var(--solo-expense, #bd3d3d);
+}
+
 .report-empty {
-  padding: 56px 20px;
-  border: 1px solid var(--solo-border);
-  border-radius: var(--solo-radius-lg);
-  background: var(--solo-bg-card);
+  padding: 36px 20px;
+  border: 1px dashed var(--solo-border, #DDE3EA);
+  border-radius: var(--solo-radius-lg, 12px);
+  background: var(--solo-surface, #FFFFFF);
+  margin-bottom: 8px;
 }
 
 .empty-actions {

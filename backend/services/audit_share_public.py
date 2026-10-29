@@ -25,8 +25,10 @@ MAX_BODY_LENGTH = 500
 MAX_AUTHOR_LENGTH = 64
 DAILY_ANNOTATION_LIMIT = 50
 
-# 简单内存限流（每进程）：token -> 最近请求时间戳。云部署多进程时换 Redis。
-_REQUEST_WINDOW_SECONDS = 1.0
+# 简单内存限流（每进程）：token -> 最近请求时间戳。窗口 60s 内最多 60 次。
+# 云部署多进程时换 Redis。
+_REQUEST_WINDOW_SECONDS = 60.0
+_REQUEST_WINDOW_MAX = 60
 _recent_requests: dict[str, list[datetime]] = {}
 
 
@@ -41,8 +43,8 @@ class ShareAccessError(Exception):
 def _check_rate_limit(token_hash: str) -> bool:
     now = datetime.now(timezone.utc)
     window = _recent_requests.setdefault(token_hash, [])
-    window[:] = [ts for ts in window if (now - ts).total_seconds() < 60]
-    if len(window) >= 60:
+    window[:] = [ts for ts in window if (now - ts).total_seconds() < _REQUEST_WINDOW_SECONDS]
+    if len(window) >= _REQUEST_WINDOW_MAX:
         return False
     window.append(now)
     return True

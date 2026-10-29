@@ -6,7 +6,7 @@ from deps.auth import AuthContext, require_auth
 from models.schemas import CategoryCreate, CategoryUpdate, CategoryResponse
 from services.category_service import (
     list_categories, create_category, update_category, delete_category,
-    list_account_mapping,
+    list_account_mapping, get_ambiguity_groups,
 )
 
 router = APIRouter(prefix="/api/categories", tags=["categories"], dependencies=[Depends(require_auth)])
@@ -15,7 +15,7 @@ router = APIRouter(prefix="/api/categories", tags=["categories"], dependencies=[
 @router.get("/account-mapping")
 async def get_account_mapping(ctx: AuthContext = Depends(require_auth)):
     """分类 → 会计科目权威映射（前端下拉/凭证预览统一从这里取）。"""
-    return {"items": list_account_mapping()}
+    return {"items": list_account_mapping(), "ambiguityGroups": get_ambiguity_groups()}
 
 
 @router.get("", response_model=list[CategoryResponse])

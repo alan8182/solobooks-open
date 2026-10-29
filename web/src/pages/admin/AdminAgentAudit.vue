@@ -1,13 +1,10 @@
 <!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
-import { h, onMounted, ref } from 'vue'
+import { h, ref, watch } from 'vue'
 import {
   NButton,
   NCard,
-  NDataTable,
-  NModal,
   NPopconfirm,
-  NTag,
   useMessage,
   type DataTableColumns,
 } from 'naive-ui'
@@ -19,32 +16,56 @@ import {
   type AdminAgentActionItem,
   type AgentActionStatus,
 } from '@/api/admin'
+import { useAdminTable, formatAdminDateTime } from '@/composables/useAdminTable'
+import { SoloTable, SoloDrawer, SoloStatusBadge, SoloButton } from '@/components/ui'
 
 const message = useMessage()
-const loading = ref(false)
 const status = ref<'all' | AgentActionStatus>('all')
-const items = ref<AdminAgentActionItem[]>([])
-const total = ref(0)
-const page = ref(1)
-const pageSize = ref(20)
 
 const detailVisible = ref(false)
 const detail = ref<AdminAgentActionDetail | null>(null)
 const detailLoading = ref(false)
+const activeTab = ref<'payload' | 'evidence' | 'result'>('payload')
+
+const {
+  loading,
+  items,
+  total,
+  page,
+  pageSize,
+  load,
+  onPageChange,
+  onPageSizeChange,
+} = useAdminTable<AdminAgentActionItem>({
+  defaultPageSize: 20,
+  loadData: async ({ page, pageSize }) => {
+    return await fetchAdminAgentActions({
+      status: status.value,
+      page,
+      pageSize,
+    })
+  },
+})
+
+// 切换状态筛选时重新触发加载
+watch(status, () => {
+  page.value = 1
+  void load()
+})
 
 const STATUS_OPTIONS = [
-  { label: '全部', value: 'all' },
+  { label: '全部动作', value: 'all' },
   { label: '待确认', value: 'pending' },
   { label: '已执行', value: 'approved' },
   { label: '已驳回', value: 'rejected' },
   { label: '已过期', value: 'expired' },
 ]
 
-const STATUS_TAGS: Record<AgentActionStatus, { label: string; type: 'warning' | 'success' | 'error' | 'default' }> = {
-  pending: { label: '待确认', type: 'warning' },
-  approved: { label: '已执行', type: 'success' },
-  rejected: { label: '已驳回', type: 'error' },
-  expired: { label: '已过期', type: 'default' },
+const STATUS_MAP: Record<AgentActionStatus, { label: string; tone: 'warning' | 'success' | 'danger' | 'neutral' }> = {
+  pending: { label: '待确认', tone: 'warning' },
+  approved: { label: '已执行', tone: 'success' },
+  rejected: { label: '已驳回', tone: 'danger' },
+  expired: { label: '已过期', tone: 'neutral' },
 }
 
 const ACTION_LABELS: Record<string, string> = {
@@ -58,56 +79,36 @@ function actionLabel(type: string): string {
   return ACTION_LABELS[type] ?? type
 }
 
-function fmtDateTime(value: string | null): string {
-  if (!value) return '—'
-  const d = new Date(value)
-  if (Number.isNaN(d.getTime())) return value
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
-}
-
 function prettyJson(value: unknown): string {
+  if (value === null || value === undefined) return ''
   try {
     return JSON.stringify(value, null, 2)
   } catch {
-    return ''
-  }
-}
-
-async function load() {
-  loading.value = true
-  try {
-    const body = await fetchAdminAgentActions({
-      status: status.value,
-      page: page.value,
-      pageSize: pageSize.value,
-    })
-    items.value = body.items
-    total.value = body.total
-  } catch (err: any) {
-    message.error(err?.response?.data?.detail || 'Agent 动作加载失败')
-  } finally {
-    loading.value = false
+    return String(value)
   }
 }
 
 async function openDetail(row: AdminAgentActionItem) {
   detailVisible.value = true
   detailLoading.value = true
+  activeTab.value = 'payload'
   try {
     detail.value = await fetchAgentActionDetail(row.id)
   } catch (err: any) {
-    message.error(err?.response?.data?.detail || '详情加载失败')
+    message.error(err?.response?.data?.detail || '动作详情加载失败')
     detailVisible.value = false
   } finally {
     detailLoading.value = false
   }
 }
 
-async function mark(row: AdminAgentActionItem, target: Exclude<AgentActionStatus, 'pending'>) {
+async function mark(row: AdminAgentActionItem | AdminAgentActionDetail, target: Exclude<AgentActionStatus, 'pending'>) {
   try {
-    await markAgentAction(row.id, target, '管理后台手动标记')
-    message.success('已标记')
+    await markAgentAction(row.id, target, '管理控制台手动标记')
+    message.success('已更新动作状态')
+    if (detail.value && detail.value.id === row.id) {
+      detail.value.status = target
+    }
     await load()
   } catch (err: any) {
     message.error(err?.response?.data?.detail || '标记失败')
@@ -115,33 +116,54 @@ async function mark(row: AdminAgentActionItem, target: Exclude<AgentActionStatus
 }
 
 const columns: DataTableColumns<AdminAgentActionItem> = [
-  { title: '时间', key: 'createdAt', width: 150, render: (row) => fmtDateTime(row.createdAt) },
+  { title: '时间', key: 'createdAt', width: 155, render: (row) => formatAdminDateTime(row.createdAt) },
   {
-    title: '动作',
+    title: '动作与类型',
     key: 'title',
-    minWidth: 200,
+    minWidth: 220,
     render: (row) =>
-      h('div', { style: 'display:flex;flex-direction:column;line-height:1.5' }, [
-        h('span', { style: 'font-weight:600;color:var(--solo-text-primary)' }, row.title || '—'),
-        h('span', { style: 'font-size:12px;color:var(--solo-text-muted)' }, actionLabel(row.actionType)),
+      h('div', { class: 'action-title-cell', onClick: () => void openDetail(row) }, [
+        h('span', { class: 'action-title-text' }, row.title || '未命名动作'),
+        h('span', { class: 'action-type-sub' }, actionLabel(row.actionType)),
       ]),
   },
-  { title: '公司', key: 'companyId', minWidth: 150, ellipsis: { tooltip: true } },
-  { title: '用户', key: 'userId', minWidth: 120, ellipsis: { tooltip: true } },
   {
-    title: '状态',
+    title: '归属公司',
+    key: 'companyId',
+    minWidth: 150,
+    render: (row) => h('span', { class: 'monospace-cell' }, row.companyId),
+  },
+  {
+    title: '提交用户',
+    key: 'userId',
+    minWidth: 130,
+    render: (row) => h('span', { class: 'monospace-cell' }, row.userId),
+  },
+  {
+    title: '审核状态',
     key: 'status',
-    width: 90,
+    width: 105,
     render: (row) => {
-      const tag = STATUS_TAGS[row.status]
-      return h(NTag, { type: tag.type, size: 'small', round: true, bordered: false }, { default: () => tag.label })
+      const info = STATUS_MAP[row.status]
+      return h(SoloStatusBadge, { tone: info.tone, size: 'small' }, { default: () => info.label })
     },
   },
-  { title: '处理人 / 时间', key: 'resolvedAt', width: 170, render: (row) => (row.resolvedAt ? `${fmtDateTime(row.resolvedAt)} · ${row.resolvedBy || '—'}` : '—') },
+  {
+    title: '处理进度',
+    key: 'resolvedAt',
+    width: 175,
+    render: (row) =>
+      row.resolvedAt
+        ? h('div', { class: 'resolved-cell' }, [
+            h('span', null, formatAdminDateTime(row.resolvedAt)),
+            h('span', { class: 'resolved-by' }, row.resolvedBy ? `操作人: ${row.resolvedBy}` : ''),
+          ])
+        : h('span', { style: 'color:var(--solo-text-muted)' }, '待处理'),
+  },
   {
     title: '操作',
     key: 'actions',
-    width: 250,
+    width: 200,
     render: (row) => {
       const detailBtn = h(
         NButton,
@@ -149,52 +171,58 @@ const columns: DataTableColumns<AdminAgentActionItem> = [
         { default: () => '详情' },
       )
       if (row.status !== 'pending') return detailBtn
-      const markBtn = (target: 'approved' | 'rejected' | 'expired', label: string) =>
-        h(
-          NPopconfirm,
-          { onPositiveClick: () => mark(row, target) },
-          {
-            trigger: () => h(NButton, { size: 'tiny', quaternary: true, type: 'primary' }, { default: () => label }),
-            default: () => `仅改变状态为「${STATUS_TAGS[target].label}」，不执行任何业务逻辑，确认？`,
-          },
-        )
-      return h('div', { style: 'display:flex;gap:2px' }, [detailBtn, markBtn('approved', '标记已执行'), markBtn('rejected', '标记驳回'), markBtn('expired', '标记过期')])
+      const approveBtn = h(
+        NPopconfirm,
+        { onPositiveClick: () => mark(row, 'approved') },
+        {
+          trigger: () => h(NButton, { size: 'tiny', quaternary: true, type: 'success' }, { default: () => '通过' }),
+          default: () => '仅改变状态为「已执行」，不重放业务代码，确认？',
+        },
+      )
+      const rejectBtn = h(
+        NPopconfirm,
+        { onPositiveClick: () => mark(row, 'rejected') },
+        {
+          trigger: () => h(NButton, { size: 'tiny', quaternary: true, type: 'error' }, { default: () => '驳回' }),
+          default: () => '标记驳回该建议动作，确认？',
+        },
+      )
+      return h('div', { class: 'action-btns' }, [detailBtn, approveBtn, rejectBtn])
     },
   },
 ]
-
-onMounted(load)
 </script>
 
 <template>
   <div class="admin-agent-audit">
-    <NCard :bordered="false">
+    <NCard :bordered="false" class="filter-card">
       <div class="toolbar">
-        <NButton
-          v-for="opt in STATUS_OPTIONS"
-          :key="opt.value"
-          size="small"
-          :type="status === opt.value ? 'primary' : 'default'"
-          :quaternary="status !== opt.value"
-          @click="status = opt.value as any; page = 1; void load()"
-        >
-          {{ opt.label }}
-        </NButton>
+        <div class="status-tabs">
+          <SoloButton
+            v-for="opt in STATUS_OPTIONS"
+            :key="opt.value"
+            size="small"
+            :variant="status === opt.value ? 'primary' : 'secondary'"
+            @click="status = opt.value as any"
+          >
+            {{ opt.label }}
+          </SoloButton>
+        </div>
         <span class="toolbar-note">
           <i class="ri-information-line" />
-          手动标记仅改变状态（记录处理人），不执行业务逻辑
+          全链路留痕：追踪 Agent 推送的记账、对账与摊销建议流转状态
         </span>
       </div>
     </NCard>
 
-    <NCard :bordered="false">
-      <NDataTable
+    <NCard :bordered="false" class="table-card">
+      <SoloTable
         :columns="columns"
         :data="items"
         :loading="loading"
         :bordered="false"
         size="small"
-        remote
+        clickable
         :scroll-x="1100"
         :pagination="{
           page,
@@ -202,28 +230,134 @@ onMounted(load)
           itemCount: total,
           showSizePicker: true,
           pageSizes: [10, 20, 50],
-          onChange: (p: number) => { page = p; void load() },
-          onUpdatePageSize: (s: number) => { pageSize = s; page = 1; void load() },
+          onChange: onPageChange,
+          onUpdatePageSize: onPageSizeChange,
         }"
+        empty-title="暂无对应状态的 Agent 动作"
+        empty-description="切换筛选选项以查看更多历史动作流"
+        @row-click="openDetail"
       />
     </NCard>
 
-    <NModal v-model:show="detailVisible" preset="card" title="动作详情" style="max-width: 720px">
-      <div v-if="detailLoading" class="detail-loading">加载中…</div>
-      <div v-else-if="detail" class="detail-body">
-        <div class="detail-meta">
-          <span>{{ detail.title || detail.actionType }}</span>
-          <NTag size="small" round :bordered="false" :type="STATUS_TAGS[detail.status].type">
-            {{ STATUS_TAGS[detail.status].label }}
-          </NTag>
+    <!-- 动作详情抽屉 -->
+    <SoloDrawer
+      v-model:show="detailVisible"
+      :title="detail ? `动作详情 · ${detail.title || detail.id}` : '动作详情'"
+      :width="640"
+    >
+      <div v-if="detailLoading" class="detail-loading-box">
+        <i class="ri-loader-4-line spin-icon" />
+        <span>正在读取完整动作证据链...</span>
+      </div>
+      <div v-else-if="detail" class="detail-drawer-body">
+        <div class="action-hero-card">
+          <div class="action-avatar-box">
+            <i class="ri-robot-2-line" />
+          </div>
+          <div class="action-hero-meta">
+            <h3>{{ detail.title || actionLabel(detail.actionType) }}</h3>
+            <span class="action-id-text">ID: {{ detail.id }}</span>
+          </div>
+          <SoloStatusBadge :tone="STATUS_MAP[detail.status].tone">
+            {{ STATUS_MAP[detail.status].label }}
+          </SoloStatusBadge>
         </div>
-        <p class="detail-hint">{{ detail.companyId }} · {{ detail.userId }} · {{ fmtDateTime(detail.createdAt) }}</p>
-        <div v-for="section in (['payload', 'evidence', 'result'] as const)" :key="section" class="detail-section">
-          <h4>{{ section }}</h4>
-          <pre>{{ prettyJson((detail as any)[section]) || '（空）' }}</pre>
+
+        <div class="detail-section">
+          <h4 class="section-title">流转信息</h4>
+          <div class="info-grid">
+            <div class="info-item">
+              <span class="info-label">关联账套</span>
+              <span class="info-val monospace">{{ detail.companyId }}</span>
+            </div>
+            <div class="info-item">
+              <span class="info-label">触发用户</span>
+              <span class="info-val monospace">{{ detail.userId }}</span>
+            </div>
+            <div class="info-item">
+              <span class="info-label">动作分类</span>
+              <span class="info-val">{{ actionLabel(detail.actionType) }}</span>
+            </div>
+            <div class="info-item">
+              <span class="info-label">创建时间</span>
+              <span class="info-val">{{ formatAdminDateTime(detail.createdAt) }}</span>
+            </div>
+            <div v-if="detail.resolvedAt" class="info-item" style="grid-column: span 2">
+              <span class="info-label">处理结果</span>
+              <span class="info-val">{{ formatAdminDateTime(detail.resolvedAt) }} · 由 {{ detail.resolvedBy || '系统' }} 处理</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 数据查看 Tabs -->
+        <div class="detail-section">
+          <div class="data-tabs-header">
+            <button
+              class="data-tab-btn"
+              :class="{ active: activeTab === 'payload' }"
+              @click="activeTab = 'payload'"
+            >
+              参数内容 (Payload)
+            </button>
+            <button
+              class="data-tab-btn"
+              :class="{ active: activeTab === 'evidence' }"
+              @click="activeTab = 'evidence'"
+            >
+              决策证据 (Evidence)
+            </button>
+            <button
+              class="data-tab-btn"
+              :class="{ active: activeTab === 'result' }"
+              @click="activeTab = 'result'"
+            >
+              执行结果 (Result)
+            </button>
+          </div>
+
+          <div class="json-code-box">
+            <pre>{{ prettyJson(detail[activeTab]) || '（该项数据为空）' }}</pre>
+          </div>
+        </div>
+
+        <!-- 运维手动干预 -->
+        <div v-if="detail.status === 'pending'" class="detail-section mark-section">
+          <h4 class="section-title">运维干预（标记状态）</h4>
+          <p class="section-desc">仅修改数据库中动作审核记录，不触发真实记账回滚或入账代码。</p>
+          <div class="action-row">
+            <NPopconfirm :on-positive-click="() => mark(detail!, 'approved')">
+              <template #trigger>
+                <SoloButton size="small" variant="primary">
+                  <template #icon><i class="ri-check-line" /></template>
+                  标记为已执行
+                </SoloButton>
+              </template>
+              确认将该建议标记为已通过？
+            </NPopconfirm>
+
+            <NPopconfirm :on-positive-click="() => mark(detail!, 'rejected')">
+              <template #trigger>
+                <SoloButton size="small" variant="secondary">
+                  <template #icon><i class="ri-close-line" /></template>
+                  标记为已驳回
+                </SoloButton>
+              </template>
+              确认将该建议标记为已驳回？
+            </NPopconfirm>
+
+            <NPopconfirm :on-positive-click="() => mark(detail!, 'expired')">
+              <template #trigger>
+                <SoloButton size="small" variant="secondary">
+                  <template #icon><i class="ri-time-line" /></template>
+                  标记为已过期
+                </SoloButton>
+              </template>
+              确认将该动作设为已失效/过期？
+            </NPopconfirm>
+          </div>
         </div>
       </div>
-    </NModal>
+    </SoloDrawer>
   </div>
 </template>
 
@@ -237,8 +371,14 @@ onMounted(load)
 .toolbar {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 12px;
   flex-wrap: wrap;
+}
+
+.status-tabs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .toolbar-note {
@@ -250,41 +390,218 @@ onMounted(load)
   color: var(--solo-text-muted);
 }
 
-.detail-loading {
-  padding: 48px;
-  text-align: center;
-  color: var(--solo-text-muted);
+.action-title-cell {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.4;
+  cursor: pointer;
 }
 
-.detail-meta {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+.action-title-text {
   font-weight: 600;
   color: var(--solo-text-primary);
 }
 
-.detail-hint {
-  font-size: 12.5px;
+.action-type-sub {
+  font-size: 12px;
   color: var(--solo-text-muted);
-  margin: 6px 0 14px;
 }
 
-.detail-section h4 {
-  margin: 12px 0 6px;
-  font-size: 13px;
+.monospace-cell {
+  font-family: monospace;
+  font-size: 12px;
   color: var(--solo-text-secondary);
 }
 
-.detail-section pre {
-  margin: 0;
-  padding: 10px 12px;
+.resolved-cell {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.35;
+  font-size: 12.5px;
+}
+
+.resolved-by {
+  font-size: 11.5px;
+  color: var(--solo-text-muted);
+}
+
+.action-btns {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* 抽屉样式 */
+.detail-loading-box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 60px 0;
+  color: var(--solo-text-muted);
+}
+
+.spin-icon {
+  font-size: 24px;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.detail-drawer-body {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  padding: 8px 0;
+}
+
+.action-hero-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px;
   background: var(--solo-bg-soft);
-  border-radius: var(--solo-radius-sm);
+  border-radius: var(--solo-radius, 8px);
+}
+
+.action-avatar-box {
+  width: 44px;
+  height: 44px;
+  border-radius: var(--solo-radius, 8px);
+  background: var(--solo-bg-blue-soft, #edf3ff);
+  color: var(--solo-primary, #1747b0);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 22px;
+}
+
+.action-hero-meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+
+.action-hero-meta h3 {
+  margin: 0;
+  font-size: 15.5px;
+  font-weight: 650;
+  color: var(--solo-text-primary);
+}
+
+.action-id-text {
   font-size: 12px;
-  max-height: 220px;
+  color: var(--solo-text-muted);
+  font-family: monospace;
+}
+
+.detail-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.section-title {
+  margin: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--solo-text-primary);
+}
+
+.section-desc {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--solo-text-muted);
+}
+
+.info-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  background: var(--solo-bg-card);
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius, 8px);
+  padding: 14px 16px;
+}
+
+.info-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.info-label {
+  font-size: 12px;
+  color: var(--solo-text-muted);
+}
+
+.info-val {
+  font-size: 13px;
+  color: var(--solo-text-primary);
+}
+
+.monospace {
+  font-family: monospace;
+}
+
+.data-tabs-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid var(--solo-border);
+  padding-bottom: 6px;
+}
+
+.data-tab-btn {
+  background: transparent;
+  border: none;
+  font-size: 13px;
+  padding: 6px 12px;
+  color: var(--solo-text-muted);
+  cursor: pointer;
+  border-radius: var(--solo-radius-sm, 4px);
+  transition: all 0.15s ease-in-out;
+}
+
+.data-tab-btn:hover {
+  color: var(--solo-text-primary);
+  background: var(--solo-bg-soft);
+}
+
+.data-tab-btn.active {
+  color: var(--solo-primary);
+  background: var(--solo-bg-blue-soft, #edf3ff);
+  font-weight: 600;
+}
+
+.json-code-box {
+  background: var(--solo-bg-soft);
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius, 8px);
+  padding: 12px 14px;
+}
+
+.json-code-box pre {
+  margin: 0;
+  font-family: monospace;
+  font-size: 12px;
+  color: var(--solo-text-primary);
+  line-height: 1.45;
+  max-height: 280px;
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+.action-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 4px;
 }
 </style>

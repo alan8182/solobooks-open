@@ -62,6 +62,10 @@ class AuthUser(Base):
     # 平台级标记（管理后台）：管理员校验每次查库，不进 JWT claim，避免禁用后的旧 token 窗口期
     is_platform_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
     is_disabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
+    # AI 用量套餐（core/plans.py）：额度数值待定，None = 不限；周期锚点缺省回退 created_at
+    plan_code: Mapped[str] = mapped_column(String(32), nullable=False, default="trial", server_default="trial")
+    plan_anchor_at: Mapped[str | None] = mapped_column(Text, nullable=True)
+    quota_bonus_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     created_at: Mapped[str] = mapped_column(Text, nullable=False)
     last_login_at: Mapped[str] = mapped_column(Text, nullable=False)
     updated_at: Mapped[str] = mapped_column(Text, nullable=False, default="")
@@ -612,7 +616,7 @@ class AgentAction(Base):
     __table_args__ = (
         CheckConstraint("status IN ('pending','approved','rejected','expired')", name="ck_agent_action_status"),
         CheckConstraint(
-            "action_type IN ('propose_voucher','propose_vouchers','propose_match','propose_accrual')",
+            "action_type IN ('propose_voucher','propose_vouchers','propose_match','propose_accrual','propose_company_setup','propose_opening_balance')",
             name="ck_agent_action_type",
         ),
         Index("ix_agent_actions_company_status", "company_id", "status"),
@@ -658,6 +662,24 @@ class LlmUsage(Base):
         Index("ix_llm_usage_company_created", "company_id", "created_at"),
         Index("ix_llm_usage_user_created", "user_id", "created_at"),
     )
+
+
+class UserQuotaCounter(Base):
+    """用户 AI 用量周期计数（配额体系预留）。
+
+    一行 = 一个用户在一个配额周期内的累计 token；周期起点由
+    services/quota_service.py 按套餐锚点惰性推算（无 cron），新周期自然落新行。
+    由 services/llm.py 的用量埋点路径随 llm_usage 同事务 upsert 增量。
+    """
+
+    __tablename__ = "user_quota_counters"
+
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    period_type: Mapped[str] = mapped_column(String(16), primary_key=True)  # monthly / annual
+    # 周期起点 YYYY-MM-DD（推算产生的月周年/年周年），也充当周期唯一键
+    period_start: Mapped[str] = mapped_column(String(10), primary_key=True)
+    used_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class AdminAuditLog(Base):

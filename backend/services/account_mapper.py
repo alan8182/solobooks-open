@@ -16,6 +16,42 @@ CATEGORY_TO_ACCOUNT = {
         "accountType": "损益-收入",
         "defaultCounterparty": "1002"  # 银行存款
     },
+    "咨询服务收入": {
+        "accountCode": "5001001",
+        "accountName": "主营业务收入-咨询服务",
+        "accountType": "损益-收入",
+        "defaultCounterparty": "1002"
+    },
+    "咨询服务": {
+        "accountCode": "5001001",
+        "accountName": "主营业务收入-咨询服务",
+        "accountType": "损益-收入",
+        "defaultCounterparty": "1002"
+    },
+    "技术服务收入": {
+        "accountCode": "5001002",
+        "accountName": "主营业务收入-技术服务",
+        "accountType": "损益-收入",
+        "defaultCounterparty": "1002"
+    },
+    "技术服务": {
+        "accountCode": "5001002",
+        "accountName": "主营业务收入-技术服务",
+        "accountType": "损益-收入",
+        "defaultCounterparty": "1002"
+    },
+    "信息技术服务": {
+        "accountCode": "5001002",
+        "accountName": "主营业务收入-技术服务",
+        "accountType": "损益-收入",
+        "defaultCounterparty": "1002"
+    },
+    "信息技术服务收入": {
+        "accountCode": "5001002",
+        "accountName": "主营业务收入-技术服务",
+        "accountType": "损益-收入",
+        "defaultCounterparty": "1002"
+    },
     "其他业务收入": {
         "accountCode": "5051",
         "accountName": "其他业务收入",
@@ -87,6 +123,24 @@ CATEGORY_TO_ACCOUNT = {
     "办公": {
         "accountCode": "5602004",
         "accountName": "管理费用-办公费",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "咨询费": {
+        "accountCode": "5602011",
+        "accountName": "管理费用-咨询费",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "咨询": {
+        "accountCode": "5602011",
+        "accountName": "管理费用-咨询费",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "顾问费": {
+        "accountCode": "5602011",
+        "accountName": "管理费用-咨询费",
         "accountType": "损益-费用",
         "defaultCounterparty": "1002"
     },
@@ -294,8 +348,17 @@ CATEGORY_TO_ACCOUNT = {
         "defaultCounterparty": "1002"
     },
     "往来款": {
-        "accountCode": "122103",
-        "accountName": "其他应收款-员工往来",
+        # 中性待收户：非股东/员工的暂付款（平台验证款、供应商往来）不能挤占
+        # 122103 员工往来；员工报销/备用金走「其他应收款」分类仍落 122103
+        "accountCode": "122199",
+        "accountName": "其他应收款-待收款项",
+        "accountType": "资产",
+        "defaultCounterparty": "1002"
+    },
+    "往来退款": {
+        # 前期暂付的退回（如平台验证款退款），贷记冲减待收款项，不进损益
+        "accountCode": "122199",
+        "accountName": "其他应收款-待收款项",
         "accountType": "资产",
         "defaultCounterparty": "1002"
     },
@@ -413,6 +476,8 @@ def normalize_payer(payer: Any) -> str:
         return "platform_balance"
     if raw in ("advance_offset", "预收冲抵", "前期预收"):
         return "advance_offset"
+    if raw in ("receivable", "accounts_receivable", "待到账", "挂应收", "应收账款", "待收款", "挂账"):
+        return "receivable"
     if raw == EMPLOYEE_PAYER_PREFIX:
         return EMPLOYEE_PAYER_PREFIX
     if raw.startswith(f"{EMPLOYEE_PAYER_PREFIX}:"):
@@ -453,9 +518,11 @@ def get_voucher_hint(
     elif category == "老板垫付报销":
         category = "股东垫付报销"
     elif category == "老板取现":
-        category = "股东取现"
+        category = "老板取现"
     elif category == "往来款":
-        category = "其他应收款" if direction == "expense" else "其他应付款"
+        # 支出方向保留「往来款」→ 122199 待收款项；收入方向按暂收落 2241
+        if direction != "expense":
+            category = "其他应付款"
 
     # 报销结算分类只用于付款冲销。若旧客户端误将其用于费用确认，
     # 至少落入通用费用科目，避免生成 2241 借贷互抵、费用漏记的凭证。
@@ -463,8 +530,16 @@ def get_voucher_hint(
         category = "其他支出"
 
     acct = CATEGORY_TO_ACCOUNT.get(category)
-    if acct is None:
-        acct = INCOME_FALLBACK_ACCOUNT if direction == "income" else EXPENSE_FALLBACK_ACCOUNT
+    if direction == "income":
+        # 收入方向若未命中或命中了支出/费用类科目（如分类名写成了"咨询费"、"服务费"），纠正为收入科目。
+        # 利息收入是例外：贷记财务费用-利息收入（5603005）冲减财务费用是合法处理，不得纠正。
+        if acct is None or (
+            category != "利息收入"
+            and (acct.get("accountType") == "损益-费用" or str(acct.get("accountCode", "")).startswith(("54", "56", "66")))
+        ):
+            acct = INCOME_FALLBACK_ACCOUNT
+    elif acct is None:
+        acct = EXPENSE_FALLBACK_ACCOUNT
     acct_code = acct.get("accountCode", "5602999")
     acct_name = acct.get("accountName", "管理费用-其他")
     counterparty = acct.get("defaultCounterparty", "1002")
@@ -524,6 +599,13 @@ def get_voucher_hint(
         else:
             counterparty = acct.get("defaultCounterparty", "1002")
             payable_name = COUNTERPARTY_ACCOUNTS.get(counterparty, {}).get("accountName", "银行存款")
+    elif payer == "receivable":
+        if direction == "income":
+            counterparty = "1122"
+            payable_name = "应收账款"
+        else:
+            counterparty = acct.get("defaultCounterparty", "1002")
+            payable_name = COUNTERPARTY_ACCOUNTS.get(counterparty, {}).get("accountName", "银行存款")
     else:
         counterparty = acct.get("defaultCounterparty", "1002")
         payable_name = acct_name if acct_code == "2241" else "其他应付款-其他"
@@ -533,14 +615,14 @@ def get_voucher_hint(
         counterparty = acct.get("defaultCounterparty", "1002")
 
     cp_name = COUNTERPARTY_ACCOUNTS.get(counterparty, {}).get("accountName", payable_name)
-    if counterparty in ("2241", "122102", "122103", "1123", "1012099", "2203"):
+    if counterparty in ("2241", "122102", "122103", "1123", "1012099", "2203", "1122"):
         cp_name = payable_name
 
     if direction == "income":
         # 借: 银行存款（含税全额）  贷: 主营业务收入（不含税）+ 应交增值税
         net_amount = amount
         tax_amount = ZERO
-        if is_vat_sales_entry(category) and (vat_rate not in (None, "") or vat_amount not in (None, "")):
+        if is_vat_sales_entry(category, acct_code) and (vat_rate not in (None, "") or vat_amount not in (None, "")):
             net_amount, tax_amount = split_income_vat(amount, vat_rate, vat_amount)
         credit_lines = [{"accountCode": acct_code, "accountName": acct_name, "amount": net_amount}]
         if tax_amount > ZERO:

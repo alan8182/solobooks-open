@@ -86,13 +86,13 @@ const COPY: Record<string, Omit<ClosingReadinessItem, 'status'>> = {
     code: 'REPORT_TO_TAX', title: '申报财务报表校验', detail: '检查记账规则及申报财务报表内部勾稽；不代表已完成税务申报。', actionLabel: '查看本月凭证', step: 1, route: '/vouchers',
   },
   INTANGIBLE_AMORTIZATION: {
-    code: 'INTANGIBLE_AMORTIZATION', title: '无形资产摊销', detail: '本月无形资产摊销已计提入账。', actionLabel: '去摊销', step: 4, route: '/intangibles',
+    code: 'INTANGIBLE_AMORTIZATION', title: '无形资产摊销', detail: '本月无形资产摊销已计提入账。', actionLabel: '去摊销', step: 4, route: '/assets?tab=intangible',
   },
   FIXED_ASSET_DEPRECIATION: {
     code: 'FIXED_ASSET_DEPRECIATION', title: '固定资产折旧', detail: '固定资产折旧已按期间计提入账', actionLabel: '去计提折旧', step: 4, route: '/assets',
   },
   IMPAIRMENT_TEST_DUE: {
-    code: 'IMPAIRMENT_TEST_DUE', title: '无形资产减值迹象', detail: '存在未复核的减值迹象记录，请评估。', actionLabel: '去评估', step: 4, route: '/intangibles',
+    code: 'IMPAIRMENT_TEST_DUE', title: '无形资产减值迹象', detail: '存在未复核的减值迹象记录，请评估。', actionLabel: '去评估', step: 4, route: '/assets?tab=intangible',
   },
   PAYROLL_ACCRUAL: {
     code: 'PAYROLL_ACCRUAL', title: '工资计提', detail: '本月工资已按权责发生制计提，发放可延至次月。', actionLabel: '去计提工资', step: 2, route: '/mine/salary',
@@ -222,11 +222,50 @@ export function firstActionableReadinessItem(items: ClosingReadinessItem[]): Clo
   return items.find((item) => ['blocked', 'needs_review', 'incomplete'].includes(item.status))
 }
 
+// ── 五项核对常显条 ──────────────────────────────────────────────
+// 结账检查里最核心的五项，按「账证 → 账账 → 账实 → 账表 → 申报」固定顺序展示。
+// 其余准备项（折旧、摊销、工资、关账顺序）不进入这条，避免把五项扩成十项。
+
+export const FIVE_CLOSING_CHECKS = [
+  { code: 'VOUCHER_TO_SOURCE', label: '凭证与来源' },
+  { code: 'LEDGER_TO_LEDGER', label: '账账核对' },
+  { code: 'BOOK_TO_ACTUAL', label: '银行流水核对' },
+  { code: 'LEDGER_TO_REPORT', label: '账表核对' },
+  { code: 'REPORT_TO_TAX', label: '申报校验' },
+] as const
+
+export interface FiveCheckSummaryItem {
+  code: string
+  label: string
+  status: CloseCheckStatus
+  detail: string
+}
+
+export function summarizeFiveChecks(items: ClosingReadinessItem[]): FiveCheckSummaryItem[] {
+  return FIVE_CLOSING_CHECKS.map(({ code, label }) => {
+    const item = items.find(row => row.code === code)
+    return {
+      code,
+      label,
+      status: item?.status ?? 'incomplete',
+      detail: item?.detail ?? '本期未返回该项核验结果。',
+    }
+  })
+}
+
+/** 五项之外、仍未完成的准备项数量（折旧、摊销、工资、关账顺序等）。 */
+export function countOtherPendingReadiness(items: ClosingReadinessItem[]): number {
+  return items.filter(
+    item => !FIVE_CLOSING_CHECKS.some(def => def.code === item.code)
+      && !['complete', 'not_required'].includes(item.status),
+  ).length
+}
+
 // ── P1: 根因聚合 —— 把五项检查结果折叠成"还差几步能结账"的任务队列 ──
 
 export interface ClosingTaskAction {
   label: string
-  kind: 'run-closing' | 'vouchers' | 'match' | 'detail'
+  kind: 'run-closing' | 'vouchers' | 'match' | 'detail' | 'walkthrough' | 'balance-detail'
   statementId?: string
   route?: string
   /** detail 动作：切到该月份继续处理（关账顺序） */
@@ -288,7 +327,7 @@ export function deriveClosingTasks(checks: PeriodCloseChecks | null | undefined)
     if (draft > 0) {
       const actions: ClosingTaskAction[] = []
       if (canBatchPostDrafts(checks)) actions.push({ label: `自动过账 ${draft} 张并结账`, kind: 'run-closing' })
-      actions.push({ label: '去凭证页', kind: 'vouchers', route: '/vouchers' })
+      actions.push({ label: '逐笔过账', kind: 'walkthrough', route: '/vouchers' })
       tasks.push({
         id: 'post',
         title: draft === 1 ? '有 1 张凭证还没过账' : `有 ${draft} 张凭证还没过账`,
@@ -369,7 +408,15 @@ export function deriveClosingTasks(checks: PeriodCloseChecks | null | undefined)
         severity: 'needs_review',
       })
     }
-    const balance = issues.filter(i => i.type === 'bank_balance_mismatch' || i.type === 'statement_balance_mismatch')
+    // 账面余额只统计已过账凭证，故「账面 vs 银行期末」差异在还有凭证未过账时，
+    // 大概率是未过账的下游结果——先隐藏，避免与「还没过账」重复展示成两个阻断；
+    // 过账后若仍有差异会重新浮现。「流水不连续」与过账无关，始终展示。
+    const voucherCheckForBalance = find('VOUCHER_TO_SOURCE')
+    const voucherUnposted = Number((voucherCheckForBalance as any)?.autoPostAtCloseCount ?? (voucherCheckForBalance as any)?.draftCount ?? 0)
+      + Number((voucherCheckForBalance as any)?.pendingReviewCount || 0)
+    const balance = issues
+      .filter(i => i.type === 'bank_balance_mismatch' || i.type === 'statement_balance_mismatch')
+      .filter(i => i.type === 'statement_balance_mismatch' || voucherUnposted <= 0)
     if (balance.length > 0) {
       const difference = (balance[0] as any).difference
       tasks.push({
@@ -377,7 +424,7 @@ export function deriveClosingTasks(checks: PeriodCloseChecks | null | undefined)
         title: '账面银行存款与银行期末余额对不上',
         detail: difference ? `差额 ${difference}` : undefined,
         affects: ['银行流水核对'],
-        actions: [{ label: '查看核对明细', kind: 'detail' }],
+        actions: [{ label: '查看核对明细', kind: 'balance-detail' }],
         severity: 'blocked',
       })
     }
@@ -403,7 +450,7 @@ export function deriveClosingTasks(checks: PeriodCloseChecks | null | undefined)
         title: pending === 1 ? '有 1 项无形资产还没摊销' : `有 ${pending} 项无形资产还没摊销`,
         count: pending,
         affects: ['无形资产摊销'],
-        actions: [{ label: '去摊销', kind: 'detail', route: '/intangibles' }],
+        actions: [{ label: '去摊销', kind: 'detail', route: '/assets?tab=intangible' }],
         severity: 'blocked',
       })
     }

@@ -64,7 +64,6 @@ from routers.category import router as category_router
 from routers.opening import router as opening_router
 from routers.aging import router as aging_router
 from routers.bank import router as bank_router
-from routers.recurring import router as recurring_router
 from routers.search import router as search_router
 from routers.invoice import router as invoice_router
 from routers.invoices import router as invoices_router
@@ -84,6 +83,7 @@ from routers.tax_filing import router as tax_filing_router
 from routers.tax_registration import router as tax_registration_router
 from routers.admin import router as admin_router
 from routers.mcp_tokens import router as mcp_tokens_router
+from routers.usage import router as usage_router
 from routers.setup import router as setup_router
 from routers.audit_share import owner_router as audit_share_owner_router
 from routers.audit_share import public_router as audit_share_public_router
@@ -101,7 +101,6 @@ app.include_router(category_router)
 app.include_router(opening_router)
 app.include_router(aging_router)
 app.include_router(bank_router)
-app.include_router(recurring_router)
 app.include_router(search_router)
 app.include_router(invoice_router)
 app.include_router(invoices_router)
@@ -121,6 +120,7 @@ app.include_router(tax_filing_router)
 app.include_router(tax_registration_router)
 app.include_router(admin_router)
 app.include_router(mcp_tokens_router)
+app.include_router(usage_router)
 # 上手引导：必须注册在 app.mount("/", mcp_asgi_app) 之前，否则会被 MCP 兜底吞掉
 app.include_router(setup_router)
 app.include_router(audit_share_owner_router)

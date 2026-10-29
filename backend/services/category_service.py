@@ -15,6 +15,7 @@ from services.account_mapper import CATEGORY_TO_ACCOUNT
 _DIRECTION_MAP = {
     # ── 收入类 ──
     "主营业务收入": "income", "其他业务收入": "income", "营业外收入": "income", "利息收入": "income",
+    "往来退款": "income",
 
     # ── 资本与往来 / 资产负债表科目 ──
     "股东投入": "owner_transfer", "资本公积": "owner_transfer",
@@ -241,3 +242,33 @@ def list_account_mapping() -> List[Dict[str, Any]]:
         }
         for name, info in CATEGORY_TO_ACCOUNT.items()
     ]
+
+
+# ── 模糊分类组 ──
+# 这些分类在银行流水层面不可判定：正确科目取决于账外事实（认缴进度、缴款
+# 性质、合同条款），同一附言未必每次同科目。前端在置信度不足时展开组内候选
+# 交由用户选择，且组内分类禁止沉淀自动入账规则（见 confirm_suggestion）。
+AMBIGUITY_GROUPS: Dict[str, List[str]] = {
+    "股东投入": ["股东投入", "资本公积", "股东垫付"],
+    "资本公积": ["股东投入", "资本公积", "股东垫付"],
+    "股东垫付": ["股东投入", "资本公积", "股东垫付"],
+    "主营业务收入": ["主营业务收入", "其他业务收入", "营业外收入"],
+    "其他业务收入": ["主营业务收入", "其他业务收入", "营业外收入"],
+    "营业外收入": ["主营业务收入", "其他业务收入", "营业外收入"],
+    # 其他支出（管理费用-其他）只对支出方向有意义，前端按流水方向过滤后再展示
+    "往来款": ["往来款", "主营业务收入", "营业外收入", "其他支出"],
+}
+
+
+def get_ambiguity_group(category: str) -> List[str]:
+    """返回该分类所属模糊组的完整候选；非模糊分类返回空列表。"""
+    return list(AMBIGUITY_GROUPS.get(str(category or "").strip(), []))
+
+
+def is_ambiguity_category(category: str) -> bool:
+    return str(category or "").strip() in AMBIGUITY_GROUPS
+
+
+def get_ambiguity_groups() -> Dict[str, List[str]]:
+    """全量模糊组（随 /account-mapping 下发，与前端 chips 同源）。"""
+    return {name: list(members) for name, members in AMBIGUITY_GROUPS.items()}

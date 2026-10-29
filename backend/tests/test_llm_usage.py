@@ -18,9 +18,14 @@ from tests.conftest import TEST_CORE_DB
 
 
 def _seed_usage(rows: list[tuple]) -> None:
-    """rows: (user_id, company_id, scene, model, prompt, completion, created_at)"""
+    """rows: (user_id, company_id, scene, model, prompt, completion, created_at)
+
+    先清空整表再播种：本文件的断言是平台级精确总数，任何其他用例留下的
+    llm_usage 行（fire-and-forget 埋点跨文件落地）都会污染统计。
+    """
     conn = sqlite3.connect(TEST_CORE_DB)
     try:
+        conn.execute("DELETE FROM llm_usage")
         conn.executemany(
             """
             INSERT INTO llm_usage (
@@ -249,6 +254,8 @@ async def test_stream_usage_recorded(client, monkeypatch):
     assert row is not None, "埋点未写入 llm_usage"
     assert row.prompt_tokens == 100 and row.completion_tokens == 50 and row.total_tokens == 150
     assert row.model == "test-stream-model" and row.status == "ok"
+
+    _cleanup_usage(("u-stream",))
 
 
 async def _ensure_schema() -> None:

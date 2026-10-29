@@ -2,7 +2,11 @@
 # Licensed under the SoloBooks License v2.0.
 
 """V3 记账路由：文字/语音/拍单据/确认"""
+import asyncio
 import base64
+import ipaddress
+import socket
+from urllib.parse import urlparse
 import httpx
 from decimal import Decimal
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Header, Request
@@ -20,6 +24,7 @@ from models.schemas import (
     CloudFileRequest,
 )
 from config import ZHIPU_API_KEY
+from core.errors import AccountingError
 from services.asr import transcribe_uploaded_audio
 from services.llm import _uid, chat_text_json, chat_vision_json
 from services.classifier import CLASSIFIER_V3_PROMPT, BATCH_SPLIT_V3_PROMPT
@@ -186,8 +191,35 @@ async def _attach_quantity(
     return output
 
 
+_SSRF_BLOCKED_HOSTNAMES = {"metadata.google.internal", "metadata.goog"}
+
+
+async def _assert_public_https_url(file_url: str) -> None:
+    """防 SSRF：仅放行 https 公网地址（云存储临时链接均为 https）。
+
+    拒绝非 https、保留/环回/链路本地/私网目标（含 DNS 解析后的真实 IP）与
+    云厂商元数据主机名，防止客户端借服务端探测内网或云元数据。
+    """
+    parsed = urlparse(file_url)
+    if parsed.scheme != "https":
+        raise HTTPException(status_code=400, detail="文件地址必须为 https 链接")
+    host = (parsed.hostname or "").strip().lower()
+    if not host or host in _SSRF_BLOCKED_HOSTNAMES or host.endswith(".local"):
+        raise HTTPException(status_code=400, detail="文件地址不受支持")
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            host, parsed.port or 443, type=socket.SOCK_STREAM
+        )
+    except socket.gaierror as e:
+        raise HTTPException(status_code=400, detail="文件地址域名无法解析") from e
+    for info in infos:
+        if not ipaddress.ip_address(info[4][0]).is_global:
+            raise HTTPException(status_code=400, detail="文件地址不受支持")
+
+
 async def _fetch_cloud_file(file_url: str) -> tuple[bytes, str]:
     """下载云存储临时文件 URL，返回文件字节和响应 content-type。"""
+    await _assert_public_https_url(file_url)
     try:
         async with httpx.AsyncClient(timeout=_FETCH_TIMEOUT_SECONDS) as client:
             resp = await client.get(file_url)
@@ -223,7 +255,8 @@ async def _parse_receipt_from_bytes(
     data_url = f"data:{mime};base64,{base64.b64encode(content).decode('ascii')}"
     try:
         result = _ensure_receipt_dict(
-            chat_vision_json(
+            await asyncio.to_thread(
+                chat_vision_json,
                 RECEIPT_VL_V3_PROMPT,
                 data_url,
                 # 4096：DeepSeek 输出偏长，2048 会截断 JSON 导致误入 OCR 降级路径
@@ -234,6 +267,9 @@ async def _parse_receipt_from_bytes(
             )
         )
         ocr_text = str(result.get("rawText") or "") or result.get("explanation") or ""
+    except AccountingError:
+        # 配额超限要变成 402 引导升级，不能静默降级到智谱 OCR 继续消耗
+        raise
     except Exception:
         # ── 降级路径：智谱 OCR 提取文字 + 文本模型结构化 ─────────────────
         try:
@@ -259,7 +295,8 @@ async def _parse_receipt_from_bytes(
 
         try:
             result = _ensure_receipt_dict(
-                chat_text_json(
+                await asyncio.to_thread(
+                    chat_text_json,
                     RECEIPT_FROM_OCR_V3_PROMPT,
                     user_msg,
                     max_tokens=1536,
@@ -303,7 +340,11 @@ async def _parse_receipt_from_bytes(
 
 
 @router.post("/text", response_model=RecordTextResponse)
-async def record_text(req: RecordTextRequest, ctx: AuthContext = Depends(require_auth)):
+async def record_text(
+    req: RecordTextRequest,
+    ctx: AuthContext = Depends(require_auth),
+    session: AsyncSession = Depends(get_db_session),
+):
     """文字/语音记账 — LLM 分类 + 科目映射 + 税务标签（注入公司画像 top-K 分类习惯）"""
     user_msg = req.text
     if req.client_time:
@@ -326,31 +367,60 @@ async def record_text(req: RecordTextRequest, ctx: AuthContext = Depends(require
     except Exception:
         pass  # 画像注入失败不阻塞记账主路径
 
-    result = chat_text_json(
+    result = await asyncio.to_thread(
+        chat_text_json,
         CLASSIFIER_V3_PROMPT,
         user_msg,
         scene="classify",
         user_id=ctx.user_id,
         company_id=ctx.company_id,
     )
+
+    direction = result.get("direction")
+    category = result.get("category") or "其他支出"
+    amount = result.get("amount") or 0
+    payer = result.get("payer", "company_account")
+
+    vat_rate = result.get("vatRate")
+    vat_amount = result.get("vatAmount")
+    voucher_hint = result.get("voucherHint")
+    explanation = result.get("explanation") or ""
+
+    # 确定性增值税价税分离覆盖：销售收入不依赖大模型随意发挥，直接按小规模纳税人征收率精准拆分
+    if direction == "income" and is_vat_sales_entry(category) and amount:
+        try:
+            vat_config = await get_vat_config_from_session(session, ctx.company_id)
+            net_amount, tax_amount = split_income_vat(amount, vat_config.rate)
+            vat_rate = vat_config.rate
+            vat_amount = tax_amount
+            voucher_hint = get_voucher_hint(
+                direction, category, amount, payer=payer, vat_rate=vat_config.rate
+            )
+            explanation = (
+                f"{explanation}（按小规模征收率价税分离，计提增值税 ¥{tax_amount}；"
+                "季度未超 30 万元时结账将全额免税转入营业外收入）"
+            )
+        except Exception:
+            pass
+
     return RecordTextResponse(
         id=_uid(),
-        direction=result["direction"],
-        amount=result["amount"],
+        direction=direction,
+        amount=amount,
         title=result["title"],
-        category=result["category"],
+        category=category,
         confidence=result["confidence"],
-        explanation=result["explanation"],
+        explanation=explanation,
         accountCode=result.get("accountCode"),
         accountName=result.get("accountName"),
-        vatRate=result.get("vatRate"),
-        vatAmount=result.get("vatAmount"),
+        vatRate=vat_rate,
+        vatAmount=vat_amount,
         taxDeductible=result.get("taxDeductible"),
         riskTags=sanitize_risk_tags(result.get("riskTags", [])),
-        voucherHint=result.get("voucherHint"),
+        voucherHint=voucher_hint,
         askFollowUp=result.get("askFollowUp"),
         followUpOptions=result.get("followUpOptions"),
-        payer=result.get("payer", "company_account"),
+        payer=payer,
     )
 
 
@@ -394,7 +464,8 @@ async def record_speech(audio: UploadFile = File(...), ctx: AuthContext = Depend
     """
     content = await audio.read()
     try:
-        text = transcribe_uploaded_audio(
+        text = await asyncio.to_thread(
+            transcribe_uploaded_audio,
             content,
             audio.filename,
             audio.content_type,
@@ -413,7 +484,8 @@ async def record_speech_url(req: CloudFileRequest, ctx: AuthContext = Depends(re
     filename = req.filename or "speech.wav"
     content_type = req.contentType or resp_ct
     try:
-        text = transcribe_uploaded_audio(
+        text = await asyncio.to_thread(
+            transcribe_uploaded_audio,
             content,
             filename,
             content_type,
@@ -428,7 +500,8 @@ async def record_speech_url(req: CloudFileRequest, ctx: AuthContext = Depends(re
 @router.post("/batch", response_model=RecordBatchResponse)
 async def record_batch(req: RecordBatchRequest, ctx: AuthContext = Depends(require_auth)):
     """连续日志拆分"""
-    result = chat_text_json(
+    result = await asyncio.to_thread(
+        chat_text_json,
         BATCH_SPLIT_V3_PROMPT,
         req.text,
         scene="batch_split",

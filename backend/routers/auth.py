@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import JWT_EXPIRES_IN, WECHAT_APPID
-from deps.auth import AuthContext, require_auth
+from deps.auth import AuthContext, require_auth, _dev_fallback_enabled
 from models.schemas import (
     WechatLoginRequest,
     WechatLoginResponse,
@@ -98,16 +98,32 @@ async def _prepare_signup_company(
 @router.post("/step-up", response_model=StepUpResponse)
 async def step_up_auth(
     req: StepUpRequest,
+    request: Request,
     ctx: AuthContext = Depends(require_auth),
     session: AsyncSession = Depends(get_db_session),
 ):
-    """Issue a single-use, action-scoped token after SMS verification."""
+    """Issue a single-use, action-scoped token after SMS verification.
+
+    二次验证的验证码同样做失败锁定（按手机号+IP）：step-up 通往期初改账、
+    注销等敏感操作，验证码可被穷举时等于敏感操作只隔一层 6 位码。
+    """
     await ensure_tenant(session, ctx.company_id, ctx.user_id)
     user = await session.get(AuthUser, ctx.user_id)
     if user is None or not user.phone or user.phone != req.phone or not user.phone_verified_at:
         raise AccountingError(FORBIDDEN, "请先绑定并验证当前账号手机号", 403)
-    if not (req.phone == "13800000000" and req.code == "123456"):
-        await check_verify_code(req.phone, req.code, req.bizId)
+    # 测试手机号万能验证码仅限开发兜底模式（AUTH_DEV_FALLBACK=1）；生产模式强制走真实短信校验。
+    if not (_dev_fallback_enabled() and req.phone == "13800000000" and req.code == "123456"):
+        ip = request.client.host if request.client else ""
+        keys = [("phone", (req.phone or "").strip())]
+        if ip:
+            keys.append(("ip", ip))
+        assert_not_locked(*keys)
+        try:
+            await check_verify_code(req.phone, req.code, req.bizId)
+        except HTTPException:
+            register_failure(*keys)
+            raise
+        clear_failures(*keys)
     token = await issue_step_up_token(
         session,
         company_id=ctx.company_id,
@@ -223,7 +239,7 @@ async def wechat_login(req: WechatLoginRequest, request: Request):
 @router.post("/phone/send-code", response_model=PhoneSendCodeResponse)
 async def phone_send_code(req: PhoneSendCodeRequest, request: Request):
     """Send SMS verification code for passwordless login/register."""
-    if req.phone == "13800000000":
+    if _dev_fallback_enabled() and req.phone == "13800000000":
         return {
             "biz_id": "test-sms-biz-id",
             "request_id": "test-sms-request-id",
@@ -237,12 +253,26 @@ async def phone_send_code(req: PhoneSendCodeRequest, request: Request):
 
 
 @router.post("/phone/login", response_model=WechatLoginResponse)
-async def phone_login(req: PhoneLoginRequest):
-    """Verify phone code then login/register and issue JWT."""
-    if req.phone == "13800000000" and req.code == "123456":
-        pass
-    else:
-        await check_verify_code(req.phone, req.code, req.biz_id or req.bizId)
+async def phone_login(req: PhoneLoginRequest, request: Request):
+    """Verify phone code then login/register and issue JWT.
+
+    验证码爆破防线：与密码登录共用同一套失败锁定（按手机号+IP，进程内计数）。
+    6 位码仅百万组合，无锁定时可以在线穷举；错误 5 次锁 15 分钟后，
+    在线穷举与离线字典都失去可行性。开发兜底身份不占用失败额度。
+    """
+    dev_bypass = _dev_fallback_enabled() and req.phone == "13800000000" and req.code == "123456"
+    ip = request.client.host if request.client else ""
+    keys = [("phone", (req.phone or "").strip())]
+    if ip:
+        keys.append(("ip", ip))
+    if not dev_bypass:
+        assert_not_locked(*keys)
+        try:
+            await check_verify_code(req.phone, req.code, req.biz_id or req.bizId)
+        except HTTPException:
+            register_failure(*keys)
+            raise
+        clear_failures(*keys)
     user, company, is_new = await get_or_create_user_by_phone(req.phone)
     company = await _prepare_signup_company(user, company, is_new)
     token = create_access_token(
@@ -332,7 +362,7 @@ async def password_reset(req: ResetPasswordRequest):
     """Reset password by SMS verify code (no login state)."""
     phone = (req.phone or "").strip()
     new_password = ensure_password_acceptable(req.new_password or req.newPassword or "")
-    if phone == "13800000000" and req.code == "123456":
+    if _dev_fallback_enabled() and phone == "13800000000" and req.code == "123456":
         pass
     else:
         await check_verify_code(phone, req.code, req.biz_id or req.bizId)

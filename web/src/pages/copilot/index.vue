@@ -1,6 +1,7 @@
 <!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { usePageRefresh } from '@/composables/usePageRefresh'
+import { accountingErrorText } from '@/utils/errors'
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { NButton, NCard, NInput, NSpin, useMessage } from 'naive-ui'
@@ -10,7 +11,10 @@ import {
   type AgentActionItem,
   type AgentStreamEvent,
 } from '@/api/agent'
+import * as XLSX from 'xlsx'
+import apiClient from '@/api/client'
 import { recordReceipt, recordSpeech } from '@/api/record'
+import { parseOpeningWorkbook } from '@/utils/openingBalanceImport'
 import { useEntryStore } from '@/stores/entry'
 import { useWorkspaceViewStore } from '@/stores/workspaceView'
 import AgentActionCard from '@/components/business/AgentActionCard.vue'
@@ -54,8 +58,13 @@ const TOOL_LABELS: Record<string, string> = {
   search_books: '全局搜索',
   get_company_profile: '读取公司画像',
   propose_voucher: '创建记账草稿',
+  propose_vouchers: '批量创建记账草稿',
+  propose_company_setup: '创建主体建账确认卡',
+  propose_opening_balance: '创建期初余额确认卡',
   preview_asset_actions: '检查资产处理事项',
   propose_asset_closure: '发起资产处理确认',
+  list_private_expenses: '查询小私账',
+  record_private_expense: '记入小私账',
 }
 
 const messages = ref<ChatMessage[]>([])
@@ -113,11 +122,69 @@ const examplePrompts = computed(() => (
 
 // ── 图片附件（发票/单据识别 → 交给 agent 起草）─────────────────────
 const imageInput = ref<HTMLInputElement | null>(null)
+const excelInput = ref<HTMLInputElement | null>(null)
 const attaching = ref(false)
+const parsingExcel = ref(false)
 
 function pickImage() {
   if (streaming.value || attaching.value) return
   imageInput.value?.click()
+}
+
+function pickOpeningExcel() {
+  if (streaming.value || parsingExcel.value) return
+  excelInput.value?.click()
+}
+
+async function onOpeningExcelPicked(event: Event) {
+  const picker = event.target as HTMLInputElement
+  const file = picker.files?.[0]
+  picker.value = ''
+  if (!file || streaming.value) return
+  parsingExcel.value = true
+  try {
+    const [buf, balResp] = await Promise.all([
+      file.arrayBuffer(),
+      apiClient
+        .get('/api/opening/balances', { params: { fiscal_year: new Date().getFullYear() } })
+        .catch(() => ({ items: [], ytd_items: [] })),
+    ])
+    const wb = XLSX.read(buf, { type: 'array' })
+    const allAccounts = [
+      ...(((balResp as any)?.items as any[]) || []),
+      ...(((balResp as any)?.ytd_items as any[]) || []),
+    ]
+    const parsed = parseOpeningWorkbook(wb, allAccounts)
+    const filledItems = parsed.items.filter((i) => i.debit_balance > 0 || i.credit_balance > 0)
+    const filledYtd = parsed.ytdItems.filter((i) => i.debit_balance > 0 || i.credit_balance > 0)
+    if (!filledItems.length && !filledYtd.length) {
+      message.warning(parsed.warnings[0] || '未能从该表格中识别出有效的期初科目余额，请检查表头或直接口述余额')
+      return
+    }
+    const lines = [
+      `我上传了期初科目余额表《${file.name}》，识别到以下期初数据，请直接调用 propose_opening_balance 为我生成期初余额确认卡：`,
+      '【资产/负债/权益期初余额】',
+      ...filledItems.map(
+        (i) =>
+          `- account_code=${i.account_code}, account_name=${i.account_name}, debit_balance=${i.debit_balance}, credit_balance=${i.credit_balance}${i.partner_name ? `, partner_name=${i.partner_name}` : ''}`,
+      ),
+    ]
+    if (filledYtd.length) {
+      lines.push(
+        '【本年损益累计发生额 ytd_items】',
+        ...filledYtd.map(
+          (i) =>
+            `- account_code=${i.account_code}, account_name=${i.account_name}, debit_balance=${i.debit_balance}, credit_balance=${i.credit_balance}`,
+        ),
+      )
+    }
+    input.value = lines.join('\n')
+    await send()
+  } catch (err) {
+    message.error(accountingErrorText(err))
+  } finally {
+    parsingExcel.value = false
+  }
 }
 
 function receiptMessage(r: Record<string, unknown>): string {
@@ -144,7 +211,7 @@ async function onImagePicked(event: Event) {
     input.value = receiptMessage(receipt)
     await send(previewUrl)
   } catch (err) {
-    message.error(err instanceof Error ? err.message : '发票识别失败，请重试')
+    message.error(accountingErrorText(err))
   } finally {
     attaching.value = false
   }
@@ -185,7 +252,7 @@ async function toggleRecording() {
         input.value = cleaned
         await send()
       } catch (err) {
-        message.error(err instanceof Error ? err.message : '语音识别失败')
+        message.error(accountingErrorText(err))
       } finally {
         transcribing.value = false
       }
@@ -383,10 +450,11 @@ function clearChat() {
 
 async function consumeRouteQuery() {
   const mode = route.query.mode
+  const scene = route.query.scene
   const q = route.query.q
   const autoSend = route.query.autoSend
 
-  if (!mode && !q && !autoSend) return
+  if (!mode && !scene && !q && !autoSend) return
 
   // 消费完后立即清除 URL 参数，避免刷新页面时重复提问或反复弹出附件选择器
   await router.replace({ path: route.path, query: {} })
@@ -395,6 +463,19 @@ async function consumeRouteQuery() {
     nextTick(() => {
       pickImage()
     })
+  }
+
+  if (scene === 'new') {
+    handleQuickAsk('我是新成立的公司，刚开始记账，请带我完成建账初始化。')
+    return
+  }
+  if (scene === 'migration') {
+    handleQuickAsk('我之前在其他代账公司/财务软件记账，现在想转到梭罗记账，请带我办理账套交接和期初余额导入。')
+    return
+  }
+  if (scene === 'onboarding') {
+    handleQuickAsk('你好，我准备开始在梭罗记账，请引导我选择「新公司从零建账」还是「从其他代账转入」，并帮我完成初始化。')
+    return
   }
 
   if (typeof q === 'string' && q.trim()) {
@@ -417,7 +498,7 @@ onMounted(async () => {
 watch(
   () => route.query,
   async (newQuery) => {
-    if (newQuery.q || newQuery.mode || newQuery.autoSend) {
+    if (newQuery.q || newQuery.mode || newQuery.scene || newQuery.autoSend) {
       await consumeRouteQuery()
     }
   },
@@ -546,7 +627,32 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
 
           <div v-else class="chat-empty">
             <div class="empty-icon"><i class="ri-sparkling-2-fill"></i></div>
-            <p>你好，我是梭罗，你的 AI 会计。可以试着问我：</p>
+            <p>你好，我是梭罗，你的 AI 会计。刚开始用？可以先选你的建账情况：</p>
+            <div class="onboarding-entry-cards">
+              <button
+                type="button"
+                class="onboarding-entry-card is-new"
+                @click="handleQuickAsk('我是新成立的公司，刚开始记账，请带我完成建账初始化。')"
+              >
+                <div class="onboarding-card-head">
+                  <i class="ri-seedling-line" />
+                  <strong>我是新成立的公司 · 从零记账</strong>
+                </div>
+                <span>刚拿营业执照、之前没记过账，0 期初快速建账</span>
+              </button>
+              <button
+                type="button"
+                class="onboarding-entry-card is-migration"
+                @click="handleQuickAsk('我之前在其他代账公司/财务软件记账，现在想转到梭罗记账，请带我办理账套交接和期初余额导入。')"
+              >
+                <div class="onboarding-card-head">
+                  <i class="ri-exchange-box-line" />
+                  <strong>已记账公司 · 从其他代账/软件转入</strong>
+                </div>
+                <span>支持直接说余额或上传科目余额表 Excel，无缝衔接旧账</span>
+              </button>
+            </div>
+            <p class="empty-sub-label">或者直接问我日常账务问题：</p>
             <div class="prompt-list">
               <button
                 v-for="prompt in examplePrompts"
@@ -570,6 +676,13 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
             style="display: none"
             @change="onImagePicked"
           />
+          <input
+            ref="excelInput"
+            type="file"
+            accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel"
+            style="display: none"
+            @change="onOpeningExcelPicked"
+          />
           <NButton
             size="small"
             quaternary
@@ -579,6 +692,16 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
             @click="pickImage"
           >
             <i class="ri-attachment-2" />
+          </NButton>
+          <NButton
+            size="small"
+            quaternary
+            title="上传原代账导出的期初科目余额表 Excel (.xlsx/.xls)"
+            :disabled="streaming || parsingExcel"
+            :loading="parsingExcel"
+            @click="pickOpeningExcel"
+          >
+            <i class="ri-file-excel-2-line" />
           </NButton>
           <NButton
             size="small"
@@ -643,7 +766,10 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
   margin: 0 auto;
   display: flex;
   flex-direction: column;
-  height: calc(100vh - var(--navbar-height) - 52px - var(--page-tabs-height));
+  /* ponytail: 紧贴视口底部，覆盖全局 .content > * 的 56px 底部留白，消除工作台悬空空隙 */
+  height: calc(100vh - var(--navbar-height) - var(--page-tabs-height));
+  padding: 16px 0 16px !important;
+  box-sizing: border-box;
 }
 .page-header {
   display: flex;
@@ -1135,6 +1261,53 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
   font-size: 12px;
   color: var(--solo-text-muted);
 }
+.empty-sub-label {
+  margin: 10px 0 0;
+  font-size: 12px;
+  color: var(--solo-text-muted);
+}
+.onboarding-entry-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+  width: 100%;
+  max-width: 520px;
+  margin-top: 10px;
+}
+.onboarding-entry-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--solo-border, #dde3ea);
+  background: #fff;
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.16s ease;
+}
+.onboarding-entry-card:hover {
+  border-color: var(--solo-ai, var(--solo-primary));
+  background: #f5f8ff;
+  transform: translateY(-1px);
+}
+.onboarding-card-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--solo-text-primary);
+}
+.onboarding-card-head i {
+  font-size: 16px;
+  color: var(--solo-ai, var(--solo-primary));
+}
+.onboarding-entry-card span {
+  font-size: 11.5px;
+  color: var(--solo-text-muted);
+  line-height: 1.45;
+}
 
 .loading-indicator {
   display: flex;
@@ -1203,7 +1376,8 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
 }
 @media (max-width: 768px) {
   .copilot-page {
-    height: calc(100vh - var(--navbar-height) - 24px);
+    height: calc(100vh - var(--navbar-height) - var(--page-tabs-height));
+    padding: 12px 0 12px !important;
   }
   .page-header h2 {
     font-size: 17px;

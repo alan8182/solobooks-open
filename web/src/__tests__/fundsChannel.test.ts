@@ -96,6 +96,7 @@ describe('确认卡片的付款方三值', () => {
 
   it('payerCardLabel 带出垫付人姓名', () => {
     expect(payerCardLabel('company_account')).toBe('公司对公')
+    expect(payerCardLabel('receivable')).toBe('待到账（挂应收账款）')
     expect(payerCardLabel('boss_personal')).toBe('老板个人垫付')
     expect(payerCardLabel('employee_personal:张三')).toBe('员工垫付 · 张三')
     expect(payerCardLabel('employee_personal')).toBe('员工垫付')

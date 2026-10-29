@@ -46,7 +46,10 @@ backend/data/*.log
 测试发票.jpg
 *.pdf
 1777620180673.txt
-# 小程序端（含真实 appid / uniCloud 环境）
+# 小程序端源码：**保持 git 跟踪**（2026-10-27 决策）。仅含公开 appid（无
+# secret/地图 key，模板残留的腾讯 LBS 演示 key 已于 2026-10-27 清除），
+# 开源发布走 scripts/sync_to_open.sh 白名单隔离；
+# 本条仅拦截未来误放的未跟踪新文件，对已跟踪文件不生效。
 solobooks/
 # 私有运维脚本（含服务器 IP / 凭据）
 deploy/deploy.sh
@@ -97,3 +100,12 @@ web/dist-verify/
 
 # Office 锁文件（Word/WPS 打开时的 ~$ 临时文件）
 ~$*
+
+# 本地归档（过期工作文件与历史备份，仅留本机，不入库）
+archive/
+
+# 编辑器/构建残留备份文件
+*.bak
+
+# 本地引入的外部技能库
+.vendor/

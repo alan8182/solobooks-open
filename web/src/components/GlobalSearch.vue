@@ -69,7 +69,7 @@ const DEFAULT_ACTIONS: CommandAction[] = [
     description: 'Excel 批量导入或发票文件上传',
     icon: 'ri-receipt-line',
     keywords: ['发票', '导入发票', '上传发票', 'fp', 'daoru', 'fapiao'],
-    handler: () => router.push('/record/invoice-import'),
+    handler: () => router.push('/invoices?import=true'),
   },
   {
     id: 'act-bank',

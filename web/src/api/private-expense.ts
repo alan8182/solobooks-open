@@ -72,17 +72,39 @@ export interface PrivateExpenseOwnerSummary {
   balance_amount: number
 }
 
-export function getExpenses(page = 1, pageSize = 20, ownerName = ''): Promise<PrivateExpenseListResponse> {
-  return apiClient.get('/api/private-expenses', { params: { page, page_size: pageSize, owner_name: ownerName } })
+export interface PrivateExpenseFilter {
+  direction?: string
+  invoiceStatus?: string
+  startDate?: string
+  endDate?: string
 }
 
-export async function getAllExpenses(ownerName = ''): Promise<PrivateExpense[]> {
+export function getExpenses(
+  page = 1,
+  pageSize = 20,
+  ownerName = '',
+  filter?: PrivateExpenseFilter
+): Promise<PrivateExpenseListResponse> {
+  const params: Record<string, any> = {
+    page,
+    page_size: pageSize,
+    owner_name: ownerName || undefined,
+  }
+  if (filter?.direction) params.direction = filter.direction
+  if (filter?.invoiceStatus) params.invoice_status = filter.invoiceStatus
+  if (filter?.startDate) params.start_date = filter.startDate
+  if (filter?.endDate) params.end_date = filter.endDate
+
+  return apiClient.get('/api/private-expenses', { params })
+}
+
+export async function getAllExpenses(ownerName = '', filter?: PrivateExpenseFilter): Promise<PrivateExpense[]> {
   const pageSize = 200
   const items: PrivateExpense[] = []
   let page = 1
 
   while (true) {
-    const response = await getExpenses(page, pageSize, ownerName)
+    const response = await getExpenses(page, pageSize, ownerName, filter)
     items.push(...response.items)
     if (items.length >= response.total || response.items.length === 0) break
     page += 1

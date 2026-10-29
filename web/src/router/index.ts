@@ -54,7 +54,9 @@ export const routes: RouteRecordRaw[] = [
   },
   {
     // 平台管理后台：独立于业务布局；管理员身份由 AdminLayout 调 /api/admin/overview 探测（403 拒绝），不落 localStorage
-    path: '/admin',
+    // 路径刻意不用 /admin：公开后台路径是爆破工具的高频字典目标，改用非通用词降低被扫到的概率；
+    // 后端 require_admin 仍是真正的门（每次请求查库校验 is_platform_admin）
+    path: '/console',
     component: () => import('@/pages/admin/AdminLayout.vue'),
     meta: { requiresAuth: true },
     children: [
@@ -96,10 +98,18 @@ export const routes: RouteRecordRaw[] = [
     ],
   },
   {
+    // 根路径按登录态分流：未登录在 / 直接呈现官网落地页（对外官网地址即根域名），
+    // 已登录透传给 AppLayout 工作台。/landing 保留为兼容旧链接的公开路由。
+    // 注意：AppLayout 下沉一级后所有业务子路径不变（仍是 /reports 等绝对路径）。
     path: '/',
-    component: () => import('@/pages/layout/AppLayout.vue'),
-    meta: { requiresAuth: true },
+    component: () => import('@/pages/layout/RootSwitch.vue'),
+    meta: { requiresAuth: false },
     children: [
+      {
+        path: '',
+        component: () => import('@/pages/layout/AppLayout.vue'),
+        meta: { requiresAuth: true },
+        children: [
       {
         path: '',
         name: 'Home',
@@ -160,10 +170,11 @@ export const routes: RouteRecordRaw[] = [
         name: 'RecordBatch',
         redirect: '/copilot',
       },
+      // ponytail: consolidated invoice import into unified invoice ledger (/invoices?import=true)
       {
         path: 'record/invoice-import',
         name: 'InvoiceImport',
-        component: () => import('@/pages/record/invoice-import.vue'),
+        redirect: '/invoices?import=true',
       },
       {
         path: 'reports',
@@ -181,17 +192,19 @@ export const routes: RouteRecordRaw[] = [
         name: 'HealthScore',
         component: () => import('@/pages/report/health.vue'),
       },
+      // ponytail: 增值税与企业所得税申报辅助已全面并入统一税务申报工作台（/tax-filing）。
+      // 旧地址保留为重定向并带上 card 参数，确保历史书签、报表中心深链与外部调用不失效。
       {
         path: 'reports/vat',
         name: 'VatAssist',
         meta: { workspace: ['accounting'] },
-        component: () => import('@/pages/report/vat-assist.vue'),
+        redirect: (to) => ({ path: '/tax-filing', query: { ...to.query, card: 'vat' } }),
       },
       {
         path: 'reports/cit',
         name: 'CitAssist',
         meta: { workspace: ['accounting'] },
-        component: () => import('@/pages/report/cit-assist.vue'),
+        redirect: (to) => ({ path: '/tax-filing', query: { ...to.query, card: 'cit' } }),
       },
       {
         path: 'reports/archive',
@@ -310,10 +323,11 @@ export const routes: RouteRecordRaw[] = [
         name: 'AssetDetail',
         component: () => import('@/pages/asset/detail.vue'),
       },
+      // ponytail: consolidated intangible assets into unified long-term assets page (/assets?tab=intangible)
       {
         path: 'intangibles',
         name: 'Intangibles',
-        component: () => import('@/pages/intangible/index.vue'),
+        redirect: (to) => ({ path: '/assets', query: { tab: 'intangible', ...to.query } }),
       },
       {
         path: 'intangibles/create',
@@ -381,11 +395,10 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('@/pages/mine/contacts.vue'),
       },
       {
-        // 旧账导入（P0 WP4）：科目余额表 → 期初 / 凭证分录 → 历史凭证
+        // 旧账导入合并至期初建账（Tab: legacy）
         path: 'mine/legacy-import',
         name: 'LegacyImport',
-        meta: { workspace: ['accounting'] },
-        component: () => import('@/pages/mine/legacy-import.vue'),
+        redirect: '/mine/opening?tab=legacy',
       },
       {
         // 备份与归档（P0 WP5）
@@ -407,24 +420,6 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('@/pages/mine/salary.vue'),
       },
       {
-        path: 'recurring',
-        name: 'Recurring',
-        meta: { workspace: ['accounting'] },
-        component: () => import('@/pages/recurring/index.vue'),
-      },
-      {
-        path: 'recurring/create',
-        name: 'RecurringCreate',
-        meta: { workspace: ['accounting'] },
-        component: () => import('@/pages/recurring/create.vue'),
-      },
-      {
-        path: 'recurring/:id',
-        name: 'RecurringEdit',
-        meta: { workspace: ['accounting'] },
-        component: () => import('@/pages/recurring/create.vue'),
-      },
-      {
         path: 'private-expenses',
         name: 'PrivateExpenses',
         component: () => import('@/pages/private-expense/index.vue'),
@@ -442,8 +437,7 @@ export const routes: RouteRecordRaw[] = [
       {
         path: 'mine/audit-log',
         name: 'AuditLog',
-        meta: { workspace: ['accounting'] },
-        component: () => import('@/pages/mine/audit-log.vue'),
+        redirect: '/mine/backup?tab=audit',
       },
       {
         path: 'mine/mcp',
@@ -502,6 +496,8 @@ export const routes: RouteRecordRaw[] = [
         path: ':pathMatch(.*)*',
         name: 'NotFound',
         component: () => import('@/pages/NotFound.vue'),
+      },
+        ],
       },
     ],
   },

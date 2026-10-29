@@ -20,6 +20,7 @@ import { getLedgerAccounts, type LedgerAccountOption } from '@/api/ledger'
 import {
   adjustEntryVoucherLines,
   approveEntry,
+  correctEntryCategory,
   getPostingOptions,
   postEntry,
   reverseEntry,
@@ -43,6 +44,10 @@ const deleting = ref(false)
 const showReverseConfirm = ref(false)
 const reversing = ref(false)
 const reverseForm = ref({ reason: '', reversalDate: null as number | null })
+const showCorrectCategory = ref(false)
+const correctingCategory = ref(false)
+const correctCategoryValue = ref('')
+const correctCategoryReason = ref('')
 const showPostConfirm = ref(false)
 const posting = ref(false)
 const postingOptions = ref<PostingOptions | null>(null)
@@ -95,12 +100,10 @@ async function confirmPost() {
     posting.value = false
   }
 }
-// ponytail: default collapsed to avoid accounting terminology cognitive overload for solo business owners
-const showVoucherDetails = ref(false)
 
 const voucherStatus = computed(() => String(entry.value?.voucherStatus || ''))
-const settlementOriginalIds = computed<string[]>(() => (entry.value as any)?.originalEntryIds || [])
-const settlementBankId = computed<string>(() => (entry.value as any)?.linkedStatementId || '')
+const settlementOriginalIds = computed<string[]>(() => entry.value?.originalEntryIds || [])
+const settlementBankId = computed<string>(() => entry.value?.linkedStatementId || '')
 const isPosted = computed(() => voucherStatus.value === 'posted')
 const isReversed = computed(() => voucherStatus.value === 'reversed')
 
@@ -156,7 +159,7 @@ function payerLabel(record: Entry) {
   const { kind, employeeName } = splitPayer(record.payer)
   if (kind === 'employee_personal') return employeeName ? `员工垫付 · ${employeeName}` : '员工垫付'
   if (kind === 'boss_personal') return '股东个人'
-  return payerDisplayLabel(record.payer, (record as any).voucherLines)
+  return payerDisplayLabel(record.payer, record.voucherLines)
 }
 
 const billingOptions = [
@@ -173,7 +176,7 @@ const categoryOptions = computed(() =>
 
 const voucherLines = computed(() => {
   if (!entry.value) return []
-  const storedLines = normalizeVoucherLines((entry.value as any).voucherLines)
+  const storedLines = normalizeVoucherLines(entry.value.voucherLines)
   if (storedLines.length > 0) return storedLines
   return generateVoucherLines({
     type: entry.value.direction as 'income' | 'expense' | 'owner_transfer',
@@ -194,6 +197,9 @@ const voucherBalanced = computed(() =>
   voucherLines.value.length > 0
   && Math.abs(totalVoucherDebit.value - totalVoucherCredit.value) < 0.005,
 )
+const hasVatPayableLine = computed(() =>
+  voucherLines.value.some(line => line.code === '2221026' && line.side === 'credit' && line.amount > 0),
+)
 const rdVoucherLines = computed(() => voucherLines.value.filter(line => line.rdDetail))
 
 // ── 人工调整分录（会计纠错）────────────────────────────────────────────────
@@ -213,7 +219,7 @@ const showResetVoucherConfirm = ref(false)
 const ledgerAccounts = ref<LedgerAccountOption[]>([])
 const loadingAccounts = ref(false)
 
-const isManuallyAdjusted = computed(() => !!(entry.value as any)?.voucherManuallyAdjusted)
+const isManuallyAdjusted = computed(() => !!entry.value?.voucherManuallyAdjusted)
 const showOverwriteVoucherConfirm = ref(false)
 // 「改交易」的哪些字段会触发按规则重算分录（与后端 financial_fields 对齐）
 const editTouchesVoucher = computed(() => {
@@ -237,14 +243,6 @@ const canAdjustVoucher = computed(() =>
   && !settlementBankId.value
   && !isSystemVoucher.value
 )
-const adjustBlockedReason = computed(() => {
-  if (viewStore.isBoss) return '会计视图下可调整分录'
-  if (isPosted.value) return '已过账凭证不能直接改分录，请先冲销'
-  if (isSystemVoucher.value) return '期初/结转/冲销凭证的分录由系统生成'
-  if (settlementBankId.value) return '银行结算凭证按净额生成，请取消对账后重做'
-  return ''
-})
-
 const accountOptions = computed(() =>
   ledgerAccounts.value
     // 只给末级科目：容器科目（1221/2211/2221）本身不允许记账
@@ -298,7 +296,6 @@ async function startAdjustVoucher() {
   }))
   adjustReason.value = ''
   editingVoucher.value = true
-  showVoucherDetails.value = true
 }
 
 function cancelAdjustVoucher() {
@@ -375,6 +372,64 @@ async function resetVoucherToSystem() {
     reportErrorToast(message, err, '恢复系统分录失败')
   } finally {
     adjusting.value = false
+  }
+}
+
+// ── P2: 未开票收入补开发票 ──
+const showBackfillInvoiceModal = ref(false)
+const backfillingInvoice = ref(false)
+const backfillInvoiceForm = ref({
+  invoiceType: '增值税普通发票',
+  invoiceNumber: '',
+  invoiceDate: null as number | null,
+})
+
+const invoiceTypeOptions = [
+  { label: '增值税普通发票', value: '增值税普通发票' },
+  { label: '增值税专用发票', value: '增值税专用发票' },
+  { label: '全电普通发票', value: '全电普通发票' },
+  { label: '全电专用发票', value: '全电专用发票' },
+]
+
+function openBackfillInvoiceModal() {
+  backfillInvoiceForm.value = {
+    invoiceType: '增值税普通发票',
+    invoiceNumber: '',
+    invoiceDate: entry.value?.occurDate ? new Date(entry.value.occurDate).getTime() : Date.now(),
+  }
+  showBackfillInvoiceModal.value = true
+}
+
+async function confirmBackfillInvoice() {
+  if (!entry.value) return
+  if (!backfillInvoiceForm.value.invoiceNumber.trim()) {
+    message.warning('请输入发票号码')
+    return
+  }
+  backfillingInvoice.value = true
+  try {
+    const updated = await entryStore.updateEntryField(entry.value.id, {
+      billingStatus: 'has_invoice',
+      invoiceType: backfillInvoiceForm.value.invoiceType,
+      invoiceNumber: backfillInvoiceForm.value.invoiceNumber.trim(),
+    })
+    entry.value = updated || {
+      ...entry.value,
+      billingStatus: 'has_invoice',
+      invoiceType: backfillInvoiceForm.value.invoiceType,
+      invoiceNumber: backfillInvoiceForm.value.invoiceNumber.trim(),
+    }
+    showBackfillInvoiceModal.value = false
+    message.success('🎉 发票关联成功！该笔未开票收入已转为已开票状态，申报表将自动归入开票收入并冲减未开票额度。')
+    try {
+      await entryStore.fetchEntries()
+    } catch {
+      // ignore
+    }
+  } catch (err) {
+    reportErrorToast(message, err, '补开发票关联失败')
+  } finally {
+    backfillingInvoice.value = false
   }
 }
 
@@ -534,6 +589,37 @@ async function confirmReverse() {
   }
 }
 
+function openCorrectCategory() {
+  if (!entry.value) return
+  correctCategoryValue.value = entry.value.category || ''
+  correctCategoryReason.value = ''
+  showCorrectCategory.value = true
+}
+
+async function submitCorrectCategory() {
+  if (!entry.value) return
+  if (!correctCategoryValue.value) {
+    message.warning('请选择更正后的分类')
+    return
+  }
+  if (correctCategoryValue.value === entry.value.category) {
+    message.info('分类未变化，无需更正')
+    return
+  }
+  correctingCategory.value = true
+  try {
+    await correctEntryCategory(entry.value.id, correctCategoryValue.value, correctCategoryReason.value.trim())
+    showCorrectCategory.value = false
+    message.success('已红字冲销原凭证，并按新分类重建过账')
+    await entryStore.fetchEntries()
+    entry.value = entryStore.activeEntries.find((e) => e.id === entry.value?.id) || entry.value
+  } catch (err) {
+    reportErrorToast(message, err, '更正科目失败')
+  } finally {
+    correctingCategory.value = false
+  }
+}
+
 async function deleteEntry() {
   if (!entry.value) return
   deleting.value = true
@@ -629,11 +715,25 @@ async function deleteEntry() {
           </div>
           <div class="info-item" v-if="entry.billingStatus">
             <span class="label">票据状态</span>
-            <span class="value">
-              <NTag size="small" :type="entry.billingStatus === 'no_document' ? 'warning' : 'success'" :bordered="false">
-                {{ { has_invoice: '有发票', has_receipt: '有收据', no_document: '无票据', reconciled: '已对账' }[entry.billingStatus] || entry.billingStatus }}
+            <span class="value doc-status-row">
+              <NTag size="small" :type="entry.billingStatus === 'no_invoice' ? 'info' : entry.billingStatus === 'no_document' ? 'warning' : 'success'" :bordered="false">
+                {{ entry.direction === 'income' && entry.billingStatus === 'no_invoice' ? '未开票收入（免税申报）' : { has_invoice: '有发票', has_receipt: '有收据', no_document: '无票据', no_invoice: '不开票', reconciled: '已对账' }[entry.billingStatus] || entry.billingStatus }}
               </NTag>
+              <NButton
+                v-if="entry.direction === 'income' && entry.billingStatus === 'no_invoice'"
+                size="tiny"
+                type="primary"
+                secondary
+                @click="openBackfillInvoiceModal"
+              >
+                <template #icon><i class="ri-file-add-line" /></template>
+                补开发票
+              </NButton>
             </span>
+          </div>
+          <div class="info-item" v-if="entry.invoiceNumber">
+            <span class="label">关联发票</span>
+            <span class="value">{{ entry.invoiceType || '发票' }} · {{ entry.invoiceNumber }}</span>
           </div>
           <div class="info-item" v-if="entry.riskTags?.length">
             <span class="label">风险标签</span>
@@ -741,16 +841,151 @@ async function deleteEntry() {
       </div>
     </NCard>
 
-    <!-- Voucher Preview: 可折叠会计底账分录 -->
-    <NCard :bordered="false" class="voucher-card mt-4" v-if="voucherLines.length > 0">
-      <div class="voucher-toggle-header" @click="showVoucherDetails = !showVoucherDetails">
+    <!-- 待入账引导区：未入账前彻底不展示正式会计分录表格，避免模板分录误导 -->
+    <NCard :bordered="false" class="detail-card unposted-guide-card mt-4" v-if="!isPosted && !isReversed">
+      <div class="unposted-guide-content">
+        <div class="guide-text">
+          <div class="guide-title">
+            <i class="ri-time-line" />
+            <span>该交易尚未正式入账</span>
+            <NTag size="tiny" type="warning" :bordered="false">未生成记账凭证</NTag>
+            <NTooltip v-if="isManuallyAdjusted">
+              <template #trigger>
+                <NTag size="tiny" type="info" :bordered="false">已预设科目</NTag>
+              </template>
+              <div style="max-width: 260px;">
+                <div>{{ entry?.voucherAdjustment?.reason || '会计已手工预设调整过科目' }}</div>
+                <div v-if="entry?.voucherAdjustment?.adjustedAt" style="opacity: 0.75;">
+                  {{ formatDate(entry.voucherAdjustment.adjustedAt) }}
+                </div>
+              </div>
+            </NTooltip>
+          </div>
+          <p class="guide-desc">
+            当前处于待处理原始单据阶段。核对上方摘要、分类与收支信息无误后，点击确认过账即可生成正式会计凭证。
+          </p>
+        </div>
+        <div class="guide-actions">
+          <NButton
+            v-if="postingOptions?.canPost || postingOptions?.canApprove || postingOptions?.canSubmit"
+            type="primary"
+            size="medium"
+            @click="showPostConfirm = true"
+          >
+            <template #icon><i class="ri-check-line" /></template>
+            {{ postingLabel }}
+          </NButton>
+          <NButton
+            v-if="!viewStore.isBoss && canAdjustVoucher && !editingVoucher"
+            size="medium"
+            secondary
+            @click="startAdjustVoucher"
+          >
+            {{ isManuallyAdjusted ? '修改预设科目' : '预设会计科目' }}
+          </NButton>
+        </div>
+      </div>
+
+      <!-- 会计调整态：仅在会计主动点击预设科目时才展开编辑 -->
+      <div v-if="editingVoucher" class="voucher-editor mt-4">
+        <div class="editor-tip">
+          <i class="ri-information-line" />
+          <span>预设入账分录科目（过账时将按此科目生成正式凭证）：</span>
+        </div>
+        <table class="voucher-table voucher-table-edit" style="margin-top: 8px;">
+          <thead>
+            <tr>
+              <th class="col-name">科目</th>
+              <th class="col-side">方向</th>
+              <th class="col-amount">金额</th>
+              <th class="col-op" />
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="(line, index) in voucherDraft" :key="index">
+              <td>
+                <NSelect
+                  v-model:value="line.accountCode"
+                  :options="accountOptions"
+                  size="small"
+                  filterable
+                  placeholder="搜索科目编码或名称"
+                  :loading="loadingAccounts"
+                />
+              </td>
+              <td>
+                <NSelect
+                  v-model:value="line.direction"
+                  size="small"
+                  :options="[{ label: '借方', value: 'debit' }, { label: '贷方', value: 'credit' }]"
+                />
+              </td>
+              <td>
+                <NInputNumber
+                  v-model:value="line.amount"
+                  size="small"
+                  :show-button="false"
+                  :precision="2"
+                  :min="0"
+                  style="width: 100%;"
+                />
+              </td>
+              <td class="col-op">
+                <NButton text size="tiny" type="error" @click="removeDraftLine(index)">
+                  <template #icon><i class="ri-delete-bin-line" /></template>
+                </NButton>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="voucher-add-row">
+          <NButton size="tiny" dashed @click="addDraftLine('debit')">+ 借方行</NButton>
+          <NButton size="tiny" dashed @click="addDraftLine('credit')">+ 贷方行</NButton>
+        </div>
+
+        <div class="voucher-draft-summary">
+          <span>借 {{ centsText(draftDebitCents) }} · 贷 {{ centsText(draftCreditCents) }}</span>
+          <span :class="draftBalanced ? 'ok' : 'bad'">
+            {{ draftBalanced ? '借贷平衡' : `差额 ${centsText(Math.abs(draftDiffCents))}` }}
+          </span>
+          <span :class="draftAmountMatches ? 'ok' : 'bad'">
+            交易金额 {{ formatMoney(entry.amount) }}{{ draftAmountMatches ? '' : '（借方合计需等于交易金额）' }}
+          </span>
+        </div>
+
+        <NInput
+          v-model:value="adjustReason"
+          size="small"
+          placeholder="调整原因（选填，例如：客户赊账，应记应收账款）"
+          style="margin-top: 10px;"
+        />
+
+        <NSpace justify="end" style="margin-top: 12px;">
+          <NButton size="small" @click="cancelAdjustVoucher">取消</NButton>
+          <NButton v-if="isManuallyAdjusted" size="small" @click="showResetVoucherConfirm = true">
+            恢复系统建议
+          </NButton>
+          <NButton
+            size="small"
+            type="primary"
+            :loading="adjusting"
+            :disabled="!canSaveVoucherDraft"
+            @click="saveVoucherAdjustment"
+          >
+            保存预设
+          </NButton>
+        </NSpace>
+      </div>
+    </NCard>
+
+    <!-- Voucher Preview: 已入账正式底账凭证分录（固定展开） -->
+    <NCard :bordered="false" class="voucher-card mt-4" v-else-if="isPosted && voucherLines.length > 0">
+      <div class="voucher-toggle-header">
         <div class="toggle-title-group">
           <i class="ri-file-list-3-line" />
           <span class="toggle-heading">
             {{ viewStore.isBoss ? '查看会计处理（借贷分录）' : '会计凭证分录（合规底账）' }}
-          </span>
-          <span class="toggle-badge">
-            {{ showVoucherDetails ? '点击收起' : (viewStore.isBoss ? '需要时展开' : '点击展开查看') }}
           </span>
           <NTooltip v-if="isManuallyAdjusted">
             <template #trigger>
@@ -766,139 +1001,67 @@ async function deleteEntry() {
             </div>
           </NTooltip>
         </div>
-        <i :class="showVoucherDetails ? 'ri-arrow-up-s-line' : 'ri-arrow-down-s-line'" class="toggle-chevron" />
       </div>
 
-      <div v-show="showVoucherDetails" class="voucher-table-wrapper">
-        <template v-if="!editingVoucher">
-          <table class="voucher-table">
-            <thead>
-              <tr>
-                <th class="col-code">科目编码</th>
-                <th class="col-name">科目名称</th>
-                <th class="col-side">方向</th>
-                <th class="col-amount">金额</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="line in voucherLines" :key="line.code + line.side">
-                <td>{{ line.code }}</td>
-                <td>{{ line.name }}</td>
-                <td>
-                  <NTag size="tiny" :type="line.side === 'debit' ? 'error' : 'success'" :bordered="false">
-                    {{ line.side === 'debit' ? '借方' : '贷方' }}
-                  </NTag>
-                </td>
-                <td class="amount-cell">{{ formatMoney(line.amount) }}</td>
-              </tr>
-            </tbody>
-            <tfoot>
-              <tr>
-                <td colspan="3" class="total-label">合计</td>
-                <td class="amount-cell">{{ formatMoney(Math.max(totalVoucherDebit, totalVoucherCredit)) }}</td>
-              </tr>
-            </tfoot>
-          </table>
-          <div class="voucher-footer-row">
-            <span class="voucher-footer" v-if="entry.voucherRef">凭证号：{{ entry.voucherRef }}</span>
-            <span v-else class="voucher-footer" />
-            <NTooltip v-if="!viewStore.isBoss" placement="top">
-              <template #trigger>
-                <NButton size="tiny" secondary :disabled="!canAdjustVoucher" @click="startAdjustVoucher">
-                  调整科目
-                </NButton>
-              </template>
-              {{ canAdjustVoucher ? '可修改科目、方向和金额，也可增删分录行' : adjustBlockedReason }}
-            </NTooltip>
+      <div class="voucher-table-wrapper">
+        <table class="voucher-table">
+          <thead>
+            <tr>
+              <th class="col-code">科目编码</th>
+              <th class="col-name">科目名称</th>
+              <th class="col-side">方向</th>
+              <th class="col-amount">金额</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="line in voucherLines" :key="line.code + line.side">
+              <td>{{ line.code }}</td>
+              <td>
+                <div class="line-name-with-badge">
+                  <span>{{ line.name }}</span>
+                  <NTooltip v-if="line.code === '2221026' && line.side === 'credit'" trigger="hover" placement="top">
+                    <template #trigger>
+                      <span class="vat-exempt-badge" role="note" aria-label="小微免税预告">
+                        <i class="ri-shield-check-line" /> 免税预告
+                      </span>
+                    </template>
+                    💡 小微企业免税政策：小规模纳税人季度销售额 ≤ 30 万元时，期末结账系统将自动生成免税凭证全额冲平转入收益，无需实际缴税。
+                  </NTooltip>
+                </div>
+              </td>
+              <td>
+                <NTag size="tiny" :type="line.side === 'debit' ? 'error' : 'success'" :bordered="false">
+                  {{ line.side === 'debit' ? '借方' : '贷方' }}
+                </NTag>
+              </td>
+              <td class="amount-cell">{{ formatMoney(line.amount) }}</td>
+            </tr>
+          </tbody>
+          <tfoot>
+            <tr>
+              <td colspan="3" class="total-label">合计</td>
+              <td class="amount-cell">{{ formatMoney(Math.max(totalVoucherDebit, totalVoucherCredit)) }}</td>
+            </tr>
+          </tfoot>
+        </table>
+        <div v-if="hasVatPayableLine" class="vat-policy-banner">
+          <i class="ri-information-line banner-icon" />
+          <div class="banner-content">
+            <strong>小微免税预告：</strong>
+            本单据按小规模征收率标准计提增值税（价税分离）。若当季度销售额累计未超 30 万元且非专票，<strong>期末结账时将自动减免转入营业外收入</strong>，无需实际缴税。
           </div>
-        </template>
-
-        <!-- 调整态：会计手工纠错 -->
-        <div v-else class="voucher-editor">
-          <table class="voucher-table voucher-table-edit">
-            <thead>
-              <tr>
-                <th class="col-name">科目</th>
-                <th class="col-side">方向</th>
-                <th class="col-amount">金额</th>
-                <th class="col-op" />
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="(line, index) in voucherDraft" :key="index">
-                <td>
-                  <NSelect
-                    v-model:value="line.accountCode"
-                    :options="accountOptions"
-                    size="small"
-                    filterable
-                    placeholder="搜索科目编码或名称"
-                    :loading="loadingAccounts"
-                  />
-                </td>
-                <td>
-                  <NSelect
-                    v-model:value="line.direction"
-                    size="small"
-                    :options="[{ label: '借方', value: 'debit' }, { label: '贷方', value: 'credit' }]"
-                  />
-                </td>
-                <td>
-                  <NInputNumber
-                    v-model:value="line.amount"
-                    size="small"
-                    :show-button="false"
-                    :precision="2"
-                    :min="0"
-                    style="width: 100%;"
-                  />
-                </td>
-                <td class="col-op">
-                  <NButton text size="tiny" type="error" @click="removeDraftLine(index)">
-                    <template #icon><i class="ri-delete-bin-line" /></template>
-                  </NButton>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-
-          <div class="voucher-add-row">
-            <NButton size="tiny" dashed @click="addDraftLine('debit')">+ 借方行</NButton>
-            <NButton size="tiny" dashed @click="addDraftLine('credit')">+ 贷方行</NButton>
-          </div>
-
-          <div class="voucher-draft-summary">
-            <span>借 {{ centsText(draftDebitCents) }} · 贷 {{ centsText(draftCreditCents) }}</span>
-            <span :class="draftBalanced ? 'ok' : 'bad'">
-              {{ draftBalanced ? '借贷平衡' : `差额 ${centsText(Math.abs(draftDiffCents))}` }}
-            </span>
-            <span :class="draftAmountMatches ? 'ok' : 'bad'">
-              交易金额 {{ formatMoney(entry.amount) }}{{ draftAmountMatches ? '' : '（借方合计需等于交易金额）' }}
-            </span>
-          </div>
-
-          <NInput
-            v-model:value="adjustReason"
-            size="small"
-            placeholder="调整原因（选填，例如：客户赊账，应记应收账款）"
-            style="margin-top: 10px;"
-          />
-
-          <NSpace justify="end" style="margin-top: 12px;">
-            <NButton size="small" @click="cancelAdjustVoucher">取消</NButton>
-            <NButton v-if="isManuallyAdjusted" size="small" @click="showResetVoucherConfirm = true">
-              恢复系统建议
-            </NButton>
-            <NButton
-              size="small"
-              type="primary"
-              :loading="adjusting"
-              :disabled="!canSaveVoucherDraft"
-              @click="saveVoucherAdjustment"
-            >
-              保存调整
-            </NButton>
-          </NSpace>
+        </div>
+        <div class="voucher-footer-row">
+          <span class="voucher-footer" v-if="entry.voucherRef">凭证号：{{ entry.voucherRef }}</span>
+          <span v-else class="voucher-footer" />
+          <NTooltip v-if="!viewStore.isBoss && !isSystemVoucher" placement="top">
+            <template #trigger>
+              <NButton size="tiny" secondary @click="openCorrectCategory">
+                更正科目
+              </NButton>
+            </template>
+            红字冲销原凭证并按新分类重建，符合会计规范
+          </NTooltip>
         </div>
       </div>
     </NCard>
@@ -1021,6 +1184,63 @@ async function deleteEntry() {
         <NSpace justify="end">
           <NButton @click="showReverseConfirm = false">取消</NButton>
           <NButton type="warning" :loading="reversing" @click="confirmReverse">确认冲销</NButton>
+        </NSpace>
+      </template>
+    </NModal>
+
+    <NModal v-model:show="showCorrectCategory" title="更正科目（分类）" preset="card" style="width: 460px;">
+      <p style="margin: 0 0 12px;">
+        系统将红字冲销原凭证，再按你选择的新分类重建一张凭证并双双过账，
+        原凭证与冲销凭证均留档（符合会计规范）。
+      </p>
+      <NForm>
+        <NFormItem label="更正后的分类">
+          <NSelect
+            v-model:value="correctCategoryValue"
+            :options="categoryOptions"
+            filterable
+            placeholder="选择新分类"
+          />
+        </NFormItem>
+        <NFormItem label="更正原因（选填）">
+          <NInput
+            v-model:value="correctCategoryReason"
+            type="textarea"
+            :rows="2"
+            placeholder="例如：原分类选错，应为办公费"
+          />
+        </NFormItem>
+      </NForm>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton @click="showCorrectCategory = false">取消</NButton>
+          <NButton type="primary" :loading="correctingCategory" @click="submitCorrectCategory">确认更正</NButton>
+        </NSpace>
+      </template>
+    </NModal>
+
+    <!-- 补开发票弹窗 (P2) -->
+    <NModal v-model:show="showBackfillInvoiceModal" title="未开票收入 · 补开发票核销" preset="card" style="width: 460px;">
+      <p style="font-size: 13px; color: var(--solo-text-secondary); margin-bottom: 16px;">
+        客户索要发票并已补开时，请在此录入发票信息。系统将把本单据状态更新为「已有发票」，后续增值税申报表会自动转入开票收入并冲减未开票申报额度。
+      </p>
+      <NForm label-placement="left" label-width="84">
+        <NFormItem label="发票类型">
+          <NSelect v-model:value="backfillInvoiceForm.invoiceType" :options="invoiceTypeOptions" />
+        </NFormItem>
+        <NFormItem label="发票号码">
+          <NInput v-model:value="backfillInvoiceForm.invoiceNumber" placeholder="请输入发票号码（如全电20位或普票8位）" />
+        </NFormItem>
+        <NFormItem label="开票日期">
+          <NDatePicker v-model:value="backfillInvoiceForm.invoiceDate" type="date" style="width: 100%;" />
+        </NFormItem>
+      </NForm>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton @click="showBackfillInvoiceModal = false">取消</NButton>
+          <NButton type="primary" :loading="backfillingInvoice" @click="confirmBackfillInvoice">
+            确认关联发票
+          </NButton>
         </NSpace>
       </template>
     </NModal>
@@ -1371,6 +1591,111 @@ async function deleteEntry() {
 .voucher-draft-summary .bad {
   color: var(--solo-expense, #bd3d3d);
   font-weight: 600;
+}
+.line-name-with-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.vat-exempt-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(15, 115, 84, 0.1);
+  color: var(--solo-income, #0f7354);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: help;
+}
+.vat-policy-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: var(--solo-bg-secondary, #f8f9fa);
+  border: 1px solid var(--solo-border-light, #eaecf0);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--solo-text-secondary, #475467);
+}
+.vat-policy-banner .banner-icon {
+  font-size: 15px;
+  color: var(--solo-primary, #1890ff);
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.vat-policy-banner strong {
+  color: var(--solo-text-primary, #1d2939);
+}
+.doc-status-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* 待入账引导卡片 */
+.unposted-guide-card {
+  border: 1px dashed var(--solo-border, #dde3ea);
+  background: var(--solo-bg-page, #f6f7f9);
+}
+.unposted-guide-content {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+.guide-text {
+  flex: 1;
+  min-width: 0;
+}
+.guide-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--solo-text-primary, #182230);
+  flex-wrap: wrap;
+}
+.guide-title i {
+  color: var(--solo-warning, #a05c10);
+  font-size: 16px;
+}
+.guide-desc {
+  margin: 6px 0 0;
+  font-size: 12.5px;
+  color: var(--solo-text-muted, #636e7c);
+  line-height: 1.5;
+}
+.guide-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+.editor-tip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--solo-text-secondary, #586474);
+  font-weight: 500;
+}
+@media (max-width: 640px) {
+  .unposted-guide-content {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .guide-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
 }
 
 </style>

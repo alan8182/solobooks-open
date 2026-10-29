@@ -142,6 +142,9 @@ async def fixed_asset_entry_prefill(
         "availableForUseDate": prefill["availableForUseDate"],
         "originalValue": prefill["originalValue"],
         "suggestedCategory": prefill["suggestedCategory"],
+        "voucherNo": prefill.get("voucherNo"),
+        "summary": prefill.get("summary"),
+        "sourceAccount": prefill.get("sourceAccount"),
     }
 
 

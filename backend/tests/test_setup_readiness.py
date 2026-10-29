@@ -162,6 +162,18 @@ async def test_zero_start_book_waives_opening_balance(session):
     assert result["total"] == 4
 
 
+async def test_migration_book_in_current_year_requires_opening_balance(session):
+    """年中从其他代账转入（onboardingType='migration'）时，即使 startDate 在本年内，期初也不能被跳过（waived），必须为 todo。"""
+    await _fill_profile(session, startDate="2026-10-01", onboardingType="migration")
+
+    result = await compute_readiness(session, CID, user_id=UID, today=TODAY)
+    opening = by_key(result, "opening_balance")
+
+    assert opening["status"] == "todo"
+    assert "迁入" in (opening["detail"] or "")
+    assert result["total"] == 5
+
+
 async def test_tax_registration_counts_as_done(session):
     await _fill_profile(session)
     session.add(

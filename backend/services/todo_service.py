@@ -6,15 +6,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 from decimal import Decimal
 
 from config import TODO_SMALL_AMOUNT_THRESHOLD
+from core.errors import AccountingError
 from services.database import get_conn
 from services.entry_service import list_entries
 from core.money import ZERO, money, money_text
+
+logger = logging.getLogger(__name__)
 
 # 待办按事项分类（rule_id -> category），前端据此分组展示。
 # unmatched_statement / filing_deadline 在各自构造处直接写死 category。
@@ -356,8 +360,13 @@ def _derive_entry_todos(
             missing_doc_candidates.append(entry)
 
         # 2. 待报销/付款（发票未关联流水支出）候选
+        # 垫付去向已确认（老板/员工垫付）的发票不再催付款——核销由公户打款给垫付人时完成，
+        # 且结账向导「已确认入账去向」区已在跟踪，再催就是让用户重复确认同一件事
+        payer_str = payer
+        advancement_confirmed = payer_str == "boss_personal" or payer_str.startswith("employee_personal")
         if (source == "invoice_import" and entry_id not in matched_entry_ids
-                and not is_archive_only and str(entry.get("billingStatus") or "") != "reconciled"):
+                and not is_archive_only and not advancement_confirmed
+                and str(entry.get("billingStatus") or "") != "reconciled"):
             invoice_unpaid_candidates.append(entry)
 
         # 3. 待开票（经营性收入确认）：静默豁免平台提现、银行结息、股东注资及往来款
@@ -574,7 +583,8 @@ async def _load_linked_fixed_asset_entry_ids(company_id: str) -> Set[str]:
                 (company_id,),
             )
             rows = await cursor.fetchall()
-        except Exception:
+        except Exception as exc:
+            logger.debug("关联台账查询失败，按无关联处理 company: %s", exc)
             return set()
     finally:
         await conn.close()
@@ -591,7 +601,8 @@ async def _load_linked_intangible_entry_ids(company_id: str) -> Set[str]:
                 (company_id,),
             )
             rows = await cursor.fetchall()
-        except Exception:
+        except Exception as exc:
+            logger.debug("关联台账查询失败，按无关联处理 company: %s", exc)
             return set()
     finally:
         await conn.close()
@@ -599,7 +610,10 @@ async def _load_linked_intangible_entry_ids(company_id: str) -> Set[str]:
 
 
 async def list_todos(user_id: str, company_id: str) -> List[Dict[str, Any]]:
-    entries = await list_entries(user_id, company_id)
+    # lite：待办派生只读 metadata 级字段（billingStatus/invoiceNumber/payer 等），
+    # 不读 voucherLines——跳过分录行/研发明细/科目名装配，待办页不再为全量凭证
+    # 序列化分录行（配合 list_journals 批量预取，此前为每条凭证 5-7 查询）
+    entries = await list_entries(user_id, company_id, lite=True)
     from services.bank_service import get_matched_entry_ids
 
     matched_entry_ids = await get_matched_entry_ids(company_id)
@@ -628,8 +642,8 @@ async def list_todos(user_id: str, company_id: str) -> List[Dict[str, Any]]:
     # 无形资产（P2）：待复核资产卡 + 权利即将到期提醒
     try:
         derived.extend(await _derive_intangible_todos(company_id))
-    except Exception:
-        pass  # 无形资产表未就绪时不阻塞账务待办
+    except Exception as exc:
+        logger.debug("无形资产待办派生失败，跳过: %s", exc)  # 表未就绪不阻塞账务待办
 
     # 征期提醒（M3）：临近/逾期的申报事项注入待办
     try:
@@ -637,11 +651,35 @@ async def list_todos(user_id: str, company_id: str) -> List[Dict[str, Any]]:
 
         await filing_deadline_service.refresh_deadlines(company_id)
         deadlines = await filing_deadline_service.list_deadlines(company_id)
-        derived.extend(filing_deadline_service.deadline_todos(deadlines))
-    except Exception:
-        pass  # 征期服务异常不阻塞账务待办
+        derived.extend(filing_deadline_service.deadline_todos(deadlines, window_days=30))
+    except Exception as exc:
+        logger.debug("征期待办刷新/派生失败，可能展示过期征期: %s", exc)  # 不阻塞账务待办
 
-    
+    # 税费种认定未同步：强提醒。按内置清单生成的征期可能与税局实际认定不一致，
+    # 同步后自动按真实税种生成申报义务，这条待办随同步自动消失。
+    try:
+        from services import tax_registration_service
+
+        registrations = await tax_registration_service.list_registrations(company_id)
+        if not registrations:
+            derived.append({
+                "id": "tax-registration-unsynced",
+                "todoKey": "tax-registration-unsynced",
+                "type": "filing",
+                "category": "filing",
+                "level": "high",
+                "priority": "high",
+                "title": "同步税费种认定表",
+                "desc": "尚未同步税费种认定表，当前按内置税种清单生成征期，可能与税局实际认定不一致。同步后按真实税种生成申报义务与征期。",
+                "done": False,
+                "dismissed": False,
+                "amount": 0,
+                "meta": {"ruleId": "tax_registration_unsynced"},
+            })
+    except Exception as exc:
+        logger.debug("税种认定同步/派生失败，跳过: %s", exc)  # 不阻塞账务待办
+
+
     # Derive todos from unmatched statements
     for stmt in unmatched_statements:
         stmt_id = stmt["id"]
@@ -744,6 +782,8 @@ async def advise_todos_with_llm(user_id: str, company_id: str) -> List[Dict[str,
             fallback={},
             max_retries=1,
             scene="todo_advice",
+            user_id=user_id,
+            company_id=company_id,
         )
         if isinstance(res, dict):
             for t in need_llm:
@@ -759,8 +799,10 @@ async def advise_todos_with_llm(user_id: str, company_id: str) -> List[Dict[str,
                     }
                     _AI_SUGGESTION_CACHE[(company_id, k)] = enriched
                     t["meta"]["aiSuggestion"] = enriched
-    except Exception:
-        pass  # LLM 不可用时优雅保留默认 rule 建议
+    except AccountingError:
+        raise  # 配额超限保持 402，不静默降级成默认建议
+    except Exception as exc:
+        logger.debug("AI 建议不可用，保留默认 rule 建议: %s", exc)
 
     return todos
 
@@ -798,8 +840,8 @@ async def link_invoice_to_expense(
             try:
                 p_data = json.loads(inv_proj.payload) if isinstance(inv_proj.payload, str) else dict(inv_proj.payload)
                 inv_meta.update(p_data)
-            except Exception:
-                pass
+            except (TypeError, ValueError):
+                logger.debug("发票投影 payload 损坏，跳过元数据合并")
 
         inv_number = str(inv_meta.get("invoiceNumber") or inv_meta.get("invoice_number") or "")
         inv_type = str(inv_meta.get("invoiceType") or inv_meta.get("invoice_type") or "")

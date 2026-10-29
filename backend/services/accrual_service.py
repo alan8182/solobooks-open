@@ -330,12 +330,15 @@ async def list_pending_accruals(
             .order_by(JournalEntry.period_start, JournalEntry.occurred_on)
         )
     ).scalars().all()
-    records = [_serialize_accrual(entry) for entry in entries]
-    total = sum((money(record["amount"]) for record in records), ZERO)
+    # count/amount 始终按全量口径（结账体检依赖），但只序列化前 limit 条省去无谓开销
+    total = sum(
+        (money((entry.metadata_json or {}).get("amount") or ZERO) for entry in entries), ZERO
+    )
+    shown = entries[:limit] if limit else entries
     return {
-        "count": len(records),
+        "count": len(entries),
         "amount": money_text(total),
-        "records": records[:limit] if limit else records,
+        "records": [_serialize_accrual(entry) for entry in shown],
     }
 
 

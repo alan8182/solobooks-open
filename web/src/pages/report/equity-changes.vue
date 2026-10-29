@@ -5,12 +5,16 @@ import { useRoute, useRouter } from 'vue-router'
 import { NButton, NCard, NFormItem, NSelect, NSpin, useMessage } from 'naive-ui'
 import { getEquityChanges } from '@/api/report'
 import type { EquityChangesResponse } from '@/api/report'
-import { formatMoney } from '@/utils/format'
+import { formatMoney, formatAmountPlain } from '@/utils/format'
+import StatementViewToggle from '@/components/business/StatementViewToggle.vue'
+import ProStatementHeader from '@/components/business/ProStatementHeader.vue'
+import { useStatementViewMode } from '@/composables/useStatementViewMode'
 import { SoloEmpty } from '@/components/ui'
 
 const route = useRoute()
 const router = useRouter()
 const message = useMessage()
+const { mode } = useStatementViewMode()
 
 const currentYear = new Date().getFullYear()
 const initialYear = Number(route.query.year) || currentYear
@@ -29,6 +33,13 @@ const result = ref<EquityChangesResponse | null>(null)
 
 function handleBack() {
   router.push({ path: '/reports', query: {} })
+}
+
+// 会计视图行的样式类
+function standardRowClass(row: NonNullable<EquityChangesResponse['standard']>['rows'][number]) {
+  if (row.kind === 'section') return 'pro-section'
+  if (row.kind === 'total') return 'pro-total'
+  return 'pro-item'
 }
 
 async function query() {
@@ -58,6 +69,9 @@ onMounted(query)
           <p class="report-subtitle">小企业会计准则简化年度口径：实收资本 / 资本公积 / 盈余公积 / 未分配利润（含本年利润）</p>
         </div>
       </div>
+      <div class="report-header-right">
+        <StatementViewToggle />
+      </div>
     </div>
 
     <div class="filter-bar mb-4">
@@ -69,6 +83,7 @@ onMounted(query)
 
     <NSpin :show="loading">
       <template v-if="result">
+        <template v-if="mode === 'boss'">
 
         <NCard :bordered="false" class="report-card mb-4">
           <div class="report-summary-row">
@@ -124,6 +139,58 @@ onMounted(query)
             与资产负债表「权益合计 − 实收资本 − 资本公积 − 盈余公积 − 本年利润」的列示口径一致。
           </p>
         </NCard>
+        </template>
+
+        <!-- 会计视图：会企04表节次结构 × 小企业四组件 -->
+        <template v-else>
+          <NCard :bordered="false" class="report-card">
+            <template v-if="result.standard">
+              <ProStatementHeader title="所有者权益变动表" :period-text="`${result.year}年度`" />
+              <div class="report-table-wrapper">
+                <table class="report-table pro-eq-table">
+                  <thead>
+                    <tr>
+                      <th class="col-item">项目</th>
+                      <th
+                        v-for="col in result.standard.columns"
+                        :key="col.key"
+                        style="text-align: right; width: 150px;"
+                      >
+                        {{ col.label }}
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr
+                      v-for="row in result.standard.rows"
+                      :key="row.key"
+                      :class="standardRowClass(row)"
+                    >
+                      <td class="col-item" :style="row.level ? { paddingLeft: '18px' } : undefined">{{ row.label }}</td>
+                      <td
+                        v-for="col in result.standard!.columns"
+                        :key="col.key"
+                        class="amount-cell"
+                      >
+                        {{ formatAmountPlain(row.values[col.key] ?? 0) }}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <p class="simplify-note">
+                编制基础：小企业会计准则（简化年度口径，未分配利润含本年利润）；
+                每列满足「年初 + 净利润 + 所有者投入 + 利润分配 + 内部结转 = 年末」。
+              </p>
+            </template>
+            <SoloEmpty
+              v-else
+              title="暂无会计视图数据"
+              description="当前版本数据不含节次分解，请刷新后重试。"
+              icon="ri-file-chart-line"
+            />
+          </NCard>
+        </template>
             </template>
       <SoloEmpty
         v-else-if="!loading"
@@ -162,5 +229,20 @@ tr.retained td { background: rgba(23, 71, 176, 0.04); }
   margin-bottom: 0;
   width: auto;
   flex: 0 0 auto;
+}
+
+/* ── 会计视图 ── */
+.pro-eq-table {
+  min-width: 720px;
+}
+
+.pro-eq-table .pro-section td {
+  font-weight: 600;
+}
+
+.pro-eq-table .pro-total td {
+  font-weight: 750;
+  border-top: 1px solid var(--solo-border, #e5e9ef);
+  background: rgba(15, 23, 42, 0.04);
 }
 </style>

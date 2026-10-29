@@ -1,20 +1,25 @@
 <!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { usePageRefresh } from '@/composables/usePageRefresh'
-import { computed, onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
-import { NButton, NCard, NDatePicker, NFormItem, NInput, NPagination, NSelect, NSpin, NTag, useMessage } from 'naive-ui'
+import { computed, h, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { NButton, NCard, NFormItem, NInput, NSelect, NTag, useMessage } from 'naive-ui'
+import type { DataTableColumns } from 'naive-ui'
 import { backfillInvoices, getInvoices, getInvoiceSummary } from '@/api/invoices'
 import type { InvoiceLedgerItem, InvoiceSummaryResponse } from '@/api/invoices'
-import { SoloEmpty, SoloFieldHelp, SoloSkeleton } from '@/components/ui'
+import { SoloFieldHelp, SoloMonthPicker, SoloTable } from '@/components/ui'
 import { formatDate, formatMoney, getCurrentMonth } from '@/utils/format'
+import InvoiceImportDrawer from './InvoiceImportDrawer.vue'
 
+const route = useRoute()
 const router = useRouter()
 const message = useMessage()
 
-const monthFrom = ref(getCurrentMonth())
-const monthTo = ref(getCurrentMonth())
-const direction = ref<string>('')
+const initialMonth = typeof route.query.month === 'string' && route.query.month ? route.query.month : getCurrentMonth()
+const monthFrom = ref(initialMonth)
+const monthTo = ref(initialMonth)
+const direction = ref<string>(typeof route.query.direction === 'string' ? route.query.direction : '')
+const posting = ref<string>('')
 const keyword = ref('')
 const loading = ref(false)
 const items = ref<InvoiceLedgerItem[]>([])
@@ -23,11 +28,22 @@ const page = ref(1)
 const pageSize = ref(20)
 const summary = ref<InvoiceSummaryResponse | null>(null)
 const backfilling = ref(false)
+const showImport = ref(false)
+
+function openImport() {
+  showImport.value = true
+}
 
 const directionOptions = [
   { label: '全部', value: '' },
   { label: '销项', value: 'income' },
   { label: '进项', value: 'expense' },
+]
+
+const postingOptions = [
+  { label: '全部', value: '' },
+  { label: '待过账', value: 'pending' },
+  { label: '已过账', value: 'posted' },
 ]
 
 const totals = computed(() => summary.value?.totals)
@@ -40,6 +56,7 @@ async function load() {
         month_from: monthFrom.value || undefined,
         month_to: monthTo.value || undefined,
         direction: direction.value || undefined,
+        posting: posting.value || undefined,
         keyword: keyword.value.trim() || undefined,
         page: page.value,
         page_size: pageSize.value,
@@ -85,7 +102,127 @@ async function runBackfill() {
   }
 }
 
-onMounted(load)
+const columns: DataTableColumns<InvoiceLedgerItem> = [
+  {
+    title: '类型',
+    key: 'direction',
+    width: 70,
+    render(row) {
+      return h(
+        NTag,
+        {
+          size: 'small',
+          type: row.direction === 'income' ? 'success' : 'info',
+          bordered: false,
+        },
+        { default: () => (row.direction === 'income' ? '销项' : '进项') },
+      )
+    },
+  },
+  {
+    title: '开票日期',
+    key: 'invoiceDate',
+    width: 110,
+    render(row) {
+      return row.invoiceDate ? formatDate(row.invoiceDate) : '—'
+    },
+  },
+  {
+    title: '发票号码',
+    key: 'invoiceNumber',
+    width: 170,
+    className: 'mono',
+    render(row) {
+      return row.invoiceNumber || '—'
+    },
+  },
+  {
+    title: '对方单位',
+    key: 'counterparty',
+    minWidth: 160,
+    ellipsis: { tooltip: true },
+    render(row) {
+      return (row.direction === 'income' ? row.buyerName : row.sellerName) || '—'
+    },
+  },
+  {
+    title: '货物/服务',
+    key: 'itemName',
+    width: 160,
+    ellipsis: { tooltip: true },
+    render(row) {
+      return row.itemName || '—'
+    },
+  },
+  {
+    title: '不含税',
+    key: 'amountExclTax',
+    width: 120,
+    align: 'right',
+    className: 'amount-cell',
+    render(row) {
+      return formatMoney(Number(row.amountExclTax))
+    },
+  },
+  {
+    title: '税额',
+    key: 'taxAmount',
+    width: 100,
+    align: 'right',
+    className: 'amount-cell',
+    render(row) {
+      return formatMoney(Number(row.taxAmount))
+    },
+  },
+  {
+    title: '价税合计',
+    key: 'amountInclTax',
+    width: 120,
+    align: 'right',
+    className: 'amount-cell balance',
+    render(row) {
+      return formatMoney(Number(row.amountInclTax))
+    },
+  },
+  {
+    title: '凭证号',
+    key: 'voucherRef',
+    width: 120,
+    render(row) {
+      return row.voucherRef || '待过账'
+    },
+  },
+]
+
+const pagination = computed(() => ({
+  page: page.value,
+  pageSize: pageSize.value,
+  itemCount: total.value,
+  pageSizes: [20, 50, 100],
+  showSizePicker: true,
+  onChange: (p: number) => {
+    page.value = p
+    load()
+  },
+  onUpdatePageSize: (s: number) => {
+    pageSize.value = s
+    page.value = 1
+    load()
+  },
+}))
+
+onMounted(() => {
+  load()
+  if (route.query.import === 'true' || route.query.import === '1') {
+    showImport.value = true
+  }
+})
+
+watch(() => route.query.import, (val) => {
+  if (val === 'true' || val === '1') {
+    showImport.value = true
+  }
+})
 
 // 从别的标签切回来时静默重拉，避免对着旧数字干活
 usePageRefresh(load)
@@ -102,7 +239,7 @@ usePageRefresh(load)
       </div>
       <div class="report-header-right">
         <NButton secondary :loading="backfilling" @click="runBackfill">回填历史发票</NButton>
-        <NButton type="primary" @click="router.push('/record/invoice-import')">导入发票</NButton>
+        <NButton type="primary" @click="openImport">导入发票</NButton>
       </div>
     </div>
 
@@ -132,13 +269,16 @@ usePageRefresh(load)
 
     <div class="filter-bar mb-4">
       <NFormItem label="起始月份" label-placement="left" :show-feedback="false">
-        <NDatePicker v-model:formatted-value="monthFrom" type="month" value-format="yyyy-MM" format="yyyy-MM" style="width: 130px;" clearable />
+        <SoloMonthPicker v-model:value="monthFrom" style="width: 130px;" clearable placeholder="起始月份" />
       </NFormItem>
       <NFormItem label="截止月份" label-placement="left" :show-feedback="false">
-        <NDatePicker v-model:formatted-value="monthTo" type="month" value-format="yyyy-MM" format="yyyy-MM" style="width: 130px;" clearable />
+        <SoloMonthPicker v-model:value="monthTo" style="width: 130px;" clearable placeholder="截止月份" />
       </NFormItem>
       <NFormItem label="方向" label-placement="left" :show-feedback="false">
         <NSelect v-model:value="direction" :options="directionOptions" style="width: 110px;" />
+      </NFormItem>
+      <NFormItem label="过账状态" label-placement="left" :show-feedback="false">
+        <NSelect v-model:value="posting" :options="postingOptions" style="width: 110px;" />
       </NFormItem>
       <NFormItem label="关键字" label-placement="left" :show-feedback="false">
         <NInput v-model:value="keyword" placeholder="发票号 / 对方 / 项目" style="width: 220px;" clearable @keyup.enter="search" />
@@ -146,98 +286,33 @@ usePageRefresh(load)
       <NButton type="primary" @click="search">查询</NButton>
     </div>
 
-    <NSpin :show="loading">
-      <NCard :bordered="false" class="report-card">
-        <div class="report-table-wrapper">
-          <table class="report-table">
-            <thead>
-              <tr>
-                <th style="width: 70px;">类型</th>
-                <th style="width: 110px;">开票日期</th>
-                <th style="width: 150px;">发票号码</th>
-                <th>对方单位</th>
-                <th style="width: 160px;">货物/服务</th>
-                <th style="width: 120px; text-align: right;">不含税</th>
-                <th style="width: 100px; text-align: right;">税额</th>
-                <th style="width: 120px; text-align: right;">价税合计</th>
-                <th style="width: 120px;">凭证号</th>
-              </tr>
-            </thead>
-            <tbody>
-              <!-- 加载态用骨架行，不用转圈：表格的列宽和行高都在，感知上"马上就来" -->
-              <template v-if="loading && items.length === 0">
-                <tr v-for="n in 8" :key="'sk-' + n" class="skeleton-row">
-                  <td><SoloSkeleton variant="rect" height="12px" width="36px" /></td>
-                  <td><SoloSkeleton variant="rect" height="12px" width="72px" /></td>
-                  <td><SoloSkeleton variant="rect" height="12px" width="104px" /></td>
-                  <td><SoloSkeleton variant="rect" height="12px" width="62%" /></td>
-                  <td><SoloSkeleton variant="rect" height="12px" width="70%" /></td>
-                  <td class="amount-cell"><SoloSkeleton variant="rect" height="12px" width="70px" /></td>
-                  <td class="amount-cell"><SoloSkeleton variant="rect" height="12px" width="54px" /></td>
-                  <td class="amount-cell"><SoloSkeleton variant="rect" height="12px" width="74px" /></td>
-                  <td><SoloSkeleton variant="rect" height="12px" width="44px" /></td>
-                </tr>
-              </template>
-              <tr v-else-if="items.length === 0">
-                <td colspan="9" class="report-empty-cell is-component">
-                  <SoloEmpty
-                    variant="hint"
-                    title="本期没有发票"
-                    description="该期间没有发票记录；可批量导入或回填历史发票。"
-                  >
-                    <template #action>
-                      <NButton size="small" @click="router.push('/record/invoice-import')">
-                        导入发票
-                      </NButton>
-                    </template>
-                  </SoloEmpty>
-                </td>
-              </tr>
-              <template v-else>
-                <tr v-for="row in items" :key="row.id" class="clickable" @click="openEntry(row)">
-                  <td>
-                    <NTag size="small" :type="row.direction === 'income' ? 'success' : 'info'" :bordered="false">
-                      {{ row.direction === 'income' ? '销项' : '进项' }}
-                    </NTag>
-                  </td>
-                  <td>{{ row.invoiceDate ? formatDate(row.invoiceDate) : '—' }}</td>
-                  <td class="mono">{{ row.invoiceNumber || '—' }}</td>
-                  <td>{{ row.direction === 'income' ? row.buyerName : row.sellerName }}</td>
-                  <td class="ellipsis" :title="row.itemName">{{ row.itemName || '—' }}</td>
-                  <td class="amount-cell">{{ formatMoney(Number(row.amountExclTax)) }}</td>
-                  <td class="amount-cell">{{ formatMoney(Number(row.taxAmount)) }}</td>
-                  <td class="amount-cell balance">{{ formatMoney(Number(row.amountInclTax)) }}</td>
-                  <td>{{ row.voucherRef || '待过账' }}</td>
-                </tr>
-              </template>
-            </tbody>
-          </table>
-        </div>
-        <div class="pager">
-          <NPagination
-            v-model:page="page"
-            v-model:page-size="pageSize"
-            :item-count="total"
-            :page-sizes="[20, 50, 100]"
-            show-size-picker
-            @update:page="load"
-            @update:page-size="() => { page = 1; load() }"
-          />
-        </div>
-      </NCard>
-    </NSpin>
+    <NCard :bordered="false" class="report-card">
+      <SoloTable
+        :columns="columns"
+        :data="items"
+        :loading="loading"
+        :scroll-x="1050"
+        :pagination="pagination"
+        clickable
+        empty-title="本期没有发票"
+        empty-description="该期间没有发票记录；可批量导入或回填历史发票。"
+        @row-click="openEntry"
+      >
+        <template #empty-action>
+          <NButton size="small" @click="openImport">
+            导入发票
+          </NButton>
+        </template>
+      </SoloTable>
+    </NCard>
+
+    <!-- 发票导入抽屉：合并自原 /record/invoice-import 页面 -->
+    <InvoiceImportDrawer v-model:show="showImport" @success="load" />
   </div>
 </template>
 
 <style scoped>
 .mb-4 { margin-bottom: 16px; }
-/* 空态单元格里放的是 SoloEmpty 组件，内边距与斜体交给组件自己表达 */
-.report-empty-cell.is-component {
-  padding: 0;
-  font-style: normal;
-}
-/* 骨架行与真实行同高，加载完不会跳一下 */
-.skeleton-row td { padding-top: 13px; padding-bottom: 13px; }
 .report-header { align-items: flex-start; }
 .report-header-right { display: flex; gap: 8px; }
 .summary-cards {
@@ -268,12 +343,5 @@ usePageRefresh(load)
   border-radius: 8px;
 }
 .filter-bar :deep(.n-form-item) { margin-bottom: 0; width: auto; flex: 0 0 auto; }
-.report-table-wrapper { overflow-x: auto; }
-.clickable { cursor: pointer; }
-.clickable:hover td { background: var(--solo-primary-50); }
-.mono { font-variant-numeric: tabular-nums; }
-.ellipsis { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.amount-cell { text-align: right; font-variant-numeric: tabular-nums; }
-.balance { font-weight: 700; color: var(--solo-primary); }
-.pager { display: flex; justify-content: flex-end; margin-top: 12px; }
+:deep(.balance) { font-weight: 700; color: var(--solo-primary); }
 </style>

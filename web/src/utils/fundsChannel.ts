@@ -46,6 +46,7 @@ export function payerDisplayLabel(
   voucherLines?: VoucherLinesLike | null,
 ): string {
   const normalized = String(payer || '')
+  if (normalized === 'receivable' || normalized === 'accounts_receivable') return '应收挂账（待对账）'
   if (normalized.startsWith('employee_personal')) return '员工垫付'
   if (normalized === 'boss_personal') return '股东个人'
   const channel = fundsChannelFromVoucher(voucherLines)
@@ -56,11 +57,11 @@ export function payerDisplayLabel(
 
 // ---------------------------------------------------------------------------
 // 付款方三值：AI 记账确认卡片的选择器与后端 payer 的互转
-// 后端标准值 company_account / boss_personal / employee_personal:<姓名>，
+// 后端标准值 company_account / boss_personal / employee_personal:<姓名> / receivable，
 // 其中 employee_personal 可无姓名（等用户在卡片里选人）。
 // ---------------------------------------------------------------------------
 
-export type PayerKind = 'company_account' | 'boss_personal' | 'employee_personal'
+export type PayerKind = 'company_account' | 'boss_personal' | 'employee_personal' | 'receivable'
 
 const EMPLOYEE_PAYER_PREFIX = 'employee_personal'
 
@@ -71,9 +72,19 @@ export const PAYER_OPTIONS: Array<{ label: string; value: PayerKind }> = [
   { label: '员工个人垫付', value: 'employee_personal' },
 ]
 
+/** 收入类业务的结算方式选项（支持待到账挂应收） */
+export const INCOME_PAYER_OPTIONS: Array<{ label: string; value: PayerKind }> = [
+  { label: '公司对公（已到账）', value: 'company_account' },
+  { label: '待到账（挂应收账款/待流水对账）', value: 'receivable' },
+  { label: '老板个人代收', value: 'boss_personal' },
+]
+
 /** payer 字符串 → 付款方类型 + 垫付人姓名。历史值 personal 视同老板垫付。 */
 export function splitPayer(payer?: unknown): { kind: PayerKind; employeeName: string } {
   const raw = String(payer || '').trim()
+  if (raw === 'receivable' || raw === 'accounts_receivable' || raw === '待到账' || raw === '挂应收') {
+    return { kind: 'receivable', employeeName: '' }
+  }
   if (raw === EMPLOYEE_PAYER_PREFIX || raw.startsWith(`${EMPLOYEE_PAYER_PREFIX}:`)) {
     const sep = raw.indexOf(':')
     const name = sep >= 0 ? raw.slice(sep + 1).trim() : ''
@@ -87,6 +98,7 @@ export function splitPayer(payer?: unknown): { kind: PayerKind; employeeName: st
 
 /** 付款方类型 + 姓名 → 后端 payer。员工垫付选人前保持无姓名的 employee_personal。 */
 export function joinPayer(kind: PayerKind, employeeName?: string): string {
+  if (kind === 'receivable') return 'receivable'
   if (kind === 'employee_personal') {
     const name = String(employeeName || '').trim()
     return name ? `${EMPLOYEE_PAYER_PREFIX}:${name}` : EMPLOYEE_PAYER_PREFIX
@@ -97,6 +109,7 @@ export function joinPayer(kind: PayerKind, employeeName?: string): string {
 /** 卡片上的付款方文字（带垫付人姓名），用于已入账后的只读展示。 */
 export function payerCardLabel(payer?: unknown): string {
   const { kind, employeeName } = splitPayer(payer)
+  if (kind === 'receivable') return '待到账（挂应收账款）'
   if (kind === 'boss_personal') return '老板个人垫付'
   if (kind === 'employee_personal') return employeeName ? `员工垫付 · ${employeeName}` : '员工垫付'
   return '公司对公'

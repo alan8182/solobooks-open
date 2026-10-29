@@ -13,13 +13,19 @@ import type {
   IncomeStatementViewMode,
 } from '@/api/types'
 import ReportScopeNote from '@/components/business/ReportScopeNote.vue'
+import StatementViewToggle from '@/components/business/StatementViewToggle.vue'
+import ProStatementHeader from '@/components/business/ProStatementHeader.vue'
+import { useStatementViewMode } from '@/composables/useStatementViewMode'
+import { formatAmountPlain } from '@/utils/format'
 import { SoloEmpty } from '@/components/ui'
 
 // ponytail: Boss-centric income statement: 3-step formula card, simplified view hiding zero-balance tax rows
+// 会计视图：小企业会计准则利润表全量 32 行（本年累计/本月金额等列），与申报表同构
 const route = useRoute()
 const router = useRouter()
 const message = useMessage()
 const entryStore = useEntryStore()
+const { mode } = useStatementViewMode()
 
 const requestedMonth = String(route.query.month || '')
 const hasRequestedMonth = /^\d{4}-(0[1-9]|1[0-2])$/.test(requestedMonth)
@@ -164,6 +170,15 @@ const hiddenRowsCount = computed(() => {
   return result.value.rows.length - visibleRows.value.length
 })
 
+// 会计视图表头的期间文字（总表=月份；季报=所在季度）
+const proPeriodText = computed(() => {
+  const [year, monthValue] = month.value.split('-').map(Number)
+  if (viewMode.value === 'quarterly') {
+    return `${year}年第${Math.floor((monthValue - 1) / 3) + 1}季度`
+  }
+  return `${year}年${monthValue}月`
+})
+
 function handleMonthChange() {
   router.replace({ query: { ...route.query, month: month.value } })
   load()
@@ -248,6 +263,7 @@ onMounted(load)
         </div>
       </div>
       <div class="report-header-right income-header-actions">
+        <StatementViewToggle />
         <NRadioGroup
           v-model:value="basis"
           size="small"
@@ -286,7 +302,7 @@ onMounted(load)
 
     <NSpin :show="loading">
       <template v-if="result">
-
+        <template v-if="mode === 'boss'">
         <!-- 老板利润三步公式卡 -->
         <NCard :bordered="false" class="report-card boss-formula-card mb-4">
           <div class="formula-head">
@@ -299,24 +315,57 @@ onMounted(load)
 
           <div class="formula-steps">
             <div class="step-card income-step">
-              <div class="step-label">1. 营业收入 (开票/收款)</div>
-              <div class="step-num income">{{ formatMoney(revenueVal) }}</div>
+              <div class="step-header">
+                <span class="step-badge income">
+                  <i class="ri-arrow-up-circle-line" />
+                  <span>营业收入</span>
+                </span>
+                <span class="step-alias">开票 / 收款</span>
+              </div>
+              <div
+                class="step-num"
+                :class="revenueVal > 0 ? 'income' : ''"
+              >
+                {{ formatMoney(revenueVal) }}
+              </div>
               <div class="step-note">日常主营业务与销售总额</div>
             </div>
 
-            <div class="step-operator">－</div>
+            <div class="step-operator">
+              <span class="operator-badge">
+                <i class="ri-subtract-line" />
+              </span>
+            </div>
 
             <div class="step-card expense-step">
-              <div class="step-label">2. 综合成本与费用</div>
-              <div class="step-num expense">{{ formatMoney(costExpenseVal) }}</div>
+              <div class="step-header">
+                <span class="step-badge expense">
+                  <i class="ri-arrow-down-circle-line" />
+                  <span>成本与费用</span>
+                </span>
+                <span class="step-alias">采购 / 薪税 / 开销</span>
+              </div>
+              <div
+                class="step-num"
+                :class="costExpenseVal > 0 ? 'expense' : ''"
+              >
+                {{ formatMoney(costExpenseVal) }}
+              </div>
               <div class="step-note">采购成本、房租、人工与税金费</div>
             </div>
 
-            <div class="step-operator">＝</div>
+            <div class="step-operator">
+              <span class="operator-badge">
+                <i class="ri-equal-line" />
+              </span>
+            </div>
 
-            <div class="step-card profit-step">
-              <div class="step-label-wrap">
-                <span class="step-label">3. 净利润 (真正净赚)</span>
+            <div class="step-card profit-step" :class="{ 'is-loss': netProfitVal < 0 }">
+              <div class="step-header">
+                <span class="step-badge profit">
+                  <i class="ri-funds-line" />
+                  <span>落袋净利润</span>
+                </span>
                 <span
                   v-if="currentMargin !== null"
                   class="margin-pill"
@@ -327,9 +376,9 @@ onMounted(load)
               </div>
               <div
                 class="step-num"
-                :class="netProfitVal >= 0 ? 'income' : 'expense'"
+                :class="netProfitVal > 0 ? 'income' : (netProfitVal < 0 ? 'expense' : '')"
               >
-                {{ (netProfitVal >= 0 ? '+' : '') + formatMoney(netProfitVal) }}
+                {{ (netProfitVal > 0 ? '+' : '') + formatMoney(netProfitVal) }}
               </div>
               <div class="step-note">最终属于企业的纯利润</div>
             </div>
@@ -401,6 +450,53 @@ onMounted(load)
             </table>
           </div>
         </NCard>
+        </template>
+
+        <!-- 会计视图：小企业会计准则利润表全量行次 -->
+        <template v-else>
+          <NCard :bordered="false" class="report-card">
+            <ProStatementHeader title="利润表" :period-text="proPeriodText" />
+            <div class="report-table-wrapper income-table-wrapper">
+              <table class="report-table income-table pro-income-table">
+                <thead>
+                  <tr>
+                    <th class="rowno-col">行次</th>
+                    <th class="item-col">项目</th>
+                    <th
+                      v-for="column in result.columns"
+                      :key="column.key"
+                      class="amount-head"
+                    >
+                      {{ column.label }}
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr
+                    v-for="(row, idx) in result.rows"
+                    :key="row.key"
+                    :class="{ 'subtotal-row': row.isSubtotal, 'clickable-row': Boolean(getDrillDownAccount(row)) }"
+                    @click="getDrillDownAccount(row) ? drillDown(row) : undefined"
+                  >
+                    <td class="rowno-cell">{{ idx + 1 }}</td>
+                    <td class="item-cell" :style="{ paddingLeft: rowPadding(row) }">
+                      <span :class="{ 'account-link': Boolean(getDrillDownAccount(row)) }">{{ rowLabel(row) }}</span>
+                      <span v-if="getDrillDownAccount(row)" class="drill-tag">明细账 ↗</span>
+                    </td>
+                    <td
+                      v-for="column in result.columns"
+                      :key="column.key"
+                      class="amount-cell"
+                    >
+                      {{ formatAmountPlain(row.values[column.key] || 0) }}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="pro-compiler-note">编制基础：小企业会计准则；金额单位：元。</p>
+          </NCard>
+        </template>
             </template>
       <SoloEmpty
         v-else-if="!loading"
@@ -478,16 +574,20 @@ onMounted(load)
 
 /* 老板利润三步公式卡 */
 .boss-formula-card {
-  padding: 18px 20px;
+  padding: 18px 22px;
+  background: var(--solo-bg-card, #ffffff);
+  border: 1px solid var(--solo-border-light, #edf0f4);
+  border-radius: var(--solo-radius-lg, 12px);
+  box-shadow: 0 1px 3px rgba(24, 34, 48, 0.03);
 }
 
 .formula-head {
   display: flex;
   justify-content: space-between;
-  align-items: baseline;
+  align-items: center;
   gap: 12px;
-  margin-bottom: 16px;
-  border-bottom: 1px solid var(--solo-border-light, #EDF0F4);
+  margin-bottom: 18px;
+  border-bottom: 1px solid var(--solo-border-light, #edf0f4);
   padding-bottom: 10px;
   flex-wrap: wrap;
 }
@@ -495,10 +595,15 @@ onMounted(load)
 .formula-title {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   font-size: 14px;
   font-weight: 700;
   color: var(--solo-text-primary, #182230);
+}
+
+.formula-title i {
+  color: var(--solo-primary, #1747b0);
+  font-size: 16px;
 }
 
 .formula-tip {
@@ -508,52 +613,102 @@ onMounted(load)
 
 .formula-steps {
   display: flex;
-  align-items: center;
+  align-items: stretch;
   justify-content: space-between;
-  gap: 12px;
+  gap: 14px;
 }
 
 .step-card {
   flex: 1;
   padding: 14px 16px;
-  background: var(--solo-surface-soft, #F1F4F8);
-  border-radius: var(--solo-radius-md, 8px);
+  background: #ffffff;
+  border: 1px solid var(--solo-border, #dde3ea);
+  border-radius: var(--solo-radius-md, 10px);
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  justify-content: space-between;
+  gap: 6px;
   min-width: 0;
+  box-shadow: 0 1px 2px rgba(24, 34, 48, 0.02);
+  transition: all 0.2s ease;
 }
 
-.step-card.income-step {
-  border-left: 3px solid var(--solo-income, #0f7354);
+.step-card:hover {
+  border-color: #c7d2fe;
+  box-shadow: 0 4px 12px rgba(23, 71, 176, 0.05);
 }
 
-.step-card.expense-step {
-  border-left: 3px solid var(--solo-expense, #bd3d3d);
-}
-
-.step-card.profit-step {
-  border-left: 3px solid var(--solo-primary, #1747b0);
-  background: var(--solo-primary-soft, #EDF3FF);
-}
-
-.step-label-wrap {
+.step-header {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 8px;
 }
 
-.step-label {
+.step-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   font-size: 12px;
   font-weight: 600;
-  color: var(--solo-text-secondary, #586474);
+  padding: 2px 8px;
+  border-radius: 6px;
+  line-height: 1.4;
+}
+
+.step-badge.income {
+  background: var(--solo-income-bg, #eaf7f1);
+  color: var(--solo-income, #0f7354);
+}
+
+.step-badge.expense {
+  background: var(--solo-expense-bg, #fbeeee);
+  color: var(--solo-expense, #bd3d3d);
+}
+
+.step-badge.profit {
+  background: var(--solo-bg-blue-soft, #edf3ff);
+  color: var(--solo-primary, #1747b0);
+}
+
+.step-alias {
+  font-size: 11px;
+  color: var(--solo-text-muted, #636e7c);
+}
+
+/* 步骤 3（净利润）：作为计算目标卡片轻度高亮 */
+.step-card.profit-step {
+  background: var(--solo-bg-blue-soft, #edf3ff);
+  border: 1px solid var(--solo-border, #dde3ea);
+}
+
+.step-card.profit-step:hover {
+  border-color: var(--solo-primary, #1747b0);
+  box-shadow: 0 4px 12px rgba(23, 71, 176, 0.06);
+}
+
+.step-card.profit-step.is-loss {
+  background: var(--solo-expense-bg, #fbeeee);
+  border-color: var(--solo-expense, #bd3d3d);
 }
 
 .step-num {
-  font-size: 22px;
-  font-weight: 750;
+  font-size: 24px;
+  font-weight: 700;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
   font-variant-numeric: tabular-nums;
   line-height: 1.25;
+  letter-spacing: -0.5px;
+  color: var(--solo-text-primary, #182230);
+  margin: 2px 0;
+}
+
+.step-num.income {
+  color: var(--solo-income, #0f7354);
+}
+
+.step-num.expense {
+  color: var(--solo-expense, #bd3d3d);
 }
 
 .step-note {
@@ -564,28 +719,43 @@ onMounted(load)
   text-overflow: ellipsis;
 }
 
+/* 算式连接符：精致居中圆环徽章 */
 .step-operator {
-  font-size: 20px;
-  font-weight: 700;
-  color: var(--solo-text-muted, #636e7c);
+  display: flex;
+  align-items: center;
+  justify-content: center;
   flex-shrink: 0;
+}
+
+.operator-badge {
+  width: 26px;
+  height: 26px;
+  border-radius: 999px;
+  background: #ffffff;
+  border: 1px solid var(--solo-border, #dde3ea);
+  box-shadow: 0 1px 3px rgba(24, 34, 48, 0.04);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--solo-text-secondary, #586474);
+  font-size: 13px;
 }
 
 .margin-pill {
   font-size: 11px;
   font-weight: 600;
-  padding: 1px 6px;
+  padding: 2px 8px;
   border-radius: 999px;
   line-height: 1.3;
 }
 
 .margin-pill.pos {
-  background: var(--solo-income-soft, #EAF7F1);
+  background: var(--solo-income-bg, #EAF7F1);
   color: var(--solo-income, #0f7354);
 }
 
 .margin-pill.neg {
-  background: var(--solo-expense-soft, #FBEEEE);
+  background: var(--solo-expense-bg, #FBEEEE);
   color: var(--solo-expense, #bd3d3d);
 }
 
@@ -687,6 +857,26 @@ onMounted(load)
   .step-operator {
     text-align: center;
   }
+}
+
+/* ── 会计视图 ── */
+.rowno-col,
+.rowno-cell {
+  width: 48px;
+  text-align: center;
+  color: var(--solo-text-muted, #636e7c);
+  font-size: 12px;
+}
+
+.pro-income-table {
+  min-width: 720px;
+}
+
+.pro-compiler-note {
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--solo-text-muted, #636e7c);
+  line-height: 1.6;
 }
 
 @media (max-width: 720px) {

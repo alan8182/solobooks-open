@@ -213,4 +213,50 @@ describe('voucher posting workflow', () => {
 
     wrapper.unmount()
   })
+
+  it('hides accounting voucher table before transaction is posted, and shows it after posting', async () => {
+    const unpostedEntry = {
+      id: 'draft',
+      title: '银行流水待处理',
+      amount: 100,
+      direction: 'expense',
+      category: '办公费',
+      occurDate: '2026-07-15',
+      voucherStatus: 'draft',
+      voucherLines: {
+        debit: [{ accountCode: '5602', accountName: '管理费用', amount: 100 }],
+        credit: [{ accountCode: '1002', accountName: '银行存款', amount: 100 }],
+      },
+    }
+    h.store = { activeEntries: [unpostedEntry], fetchEntries: vi.fn(async () => {}) }
+    h.options.mockResolvedValue({ canPost: true })
+
+    const wrapper = mount(EntryDetail)
+    await flushPromises()
+
+    // 未入账态：不渲染正式会计分录卡片与表格，只显示待入账引导区
+    expect(wrapper.find('.voucher-card').exists()).toBe(false)
+    expect(wrapper.find('.voucher-table').exists()).toBe(false)
+    expect(wrapper.find('.unposted-guide-card').exists()).toBe(true)
+    expect(wrapper.text()).toContain('该交易尚未正式入账')
+
+    // 模拟已过账数据
+    const postedEntry = {
+      ...unpostedEntry,
+      voucherStatus: 'posted',
+      voucherRef: 'VOU-202607-000008',
+    }
+    h.store = { activeEntries: [postedEntry], fetchEntries: vi.fn(async () => {}) }
+    const postedWrapper = mount(EntryDetail)
+    await flushPromises()
+
+    // 已过账态：渲染正式会计分录表格及凭证号
+    expect(postedWrapper.find('.unposted-guide-card').exists()).toBe(false)
+    expect(postedWrapper.find('.voucher-card').exists()).toBe(true)
+    expect(postedWrapper.find('.voucher-table').exists()).toBe(true)
+    expect(postedWrapper.text()).toContain('VOU-202607-000008')
+
+    wrapper.unmount()
+    postedWrapper.unmount()
+  })
 })

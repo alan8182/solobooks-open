@@ -94,7 +94,7 @@ export interface NavChildItem {
 }
 
 export type NavGroup = '日常' | '账务' | '周期' | '工具'
-// 「设置」在老板视图里也要留着：公司信息、税费种认定、个人设置都是老板自己要看的东西
+// 「设置」在老板视图里也要留着：税费种认定、个人设置都是老板自己要看的东西（公司信息通过顶部公司管理进入）
 export type BossGroup = '每天' | '每月' | '复盘' | '设置'
 
 export interface NavItem {
@@ -115,19 +115,11 @@ export const NAV_ITEMS: NavItem[] = [
   { path: '/', label: '工作台', bossLabel: '工作台', bossGroup: '每天', icon: 'ri-dashboard-3-line', group: '日常' },
   { path: '/copilot', label: 'AI 会计', bossGroup: '每天', icon: 'ri-sparkling-fill', group: '日常' },
   { path: '/todos', label: '待办', bossGroup: '每天', icon: 'ri-checkbox-circle-line', group: '日常' },
+  { path: '/private-expenses', label: '小私账', bossLabel: '小私账', bossGroup: '每天', icon: 'ri-wallet-3-line', group: '日常', workspace: ['boss'] },
 
   // 账务处理（原始单据 → 流水 → 凭证 → 账簿）
   { path: '/ledger', label: '经营账本', icon: 'ri-book-open-line', group: '账务', workspace: ['accounting'] },
-  {
-    label: '发票',
-    icon: 'ri-receipt-line',
-    group: '账务',
-    workspace: ['accounting'],
-    children: [
-      { path: '/invoices', label: '发票台账', icon: 'ri-file-list-2-line' },
-      { path: '/record/invoice-import', label: '导入发票', icon: 'ri-upload-2-line' },
-    ],
-  },
+  { path: '/invoices', label: '发票台账', icon: 'ri-receipt-line', group: '账务', workspace: ['accounting'] },
   { path: '/bank', label: '银行流水', icon: 'ri-bank-line', group: '账务', workspace: ['accounting'] },
   {
     label: '凭证与账簿',
@@ -139,6 +131,7 @@ export const NAV_ITEMS: NavItem[] = [
       // 会计账簿＝查数工作台（五本账共用左侧导航）；电子账簿＝整册签发与打印。两者是「查」和「出」的分工
       { path: '/ledger/books', label: '会计账簿', icon: 'ri-book-3-line' },
       { path: '/ledger/book', label: '电子账簿', icon: 'ri-book-2-line' },
+      { path: '/reports/archive', label: '单据归档', icon: 'ri-archive-line' },
     ],
   },
 
@@ -155,34 +148,49 @@ export const NAV_ITEMS: NavItem[] = [
     group: '工具',
     workspace: ['accounting'],
     children: [
-      { path: '/assets', label: '固定资产', icon: 'ri-archive-line' },
-      { path: '/intangibles', label: '无形资产', icon: 'ri-copyright-line' },
+      { path: '/assets', label: '长期资产', icon: 'ri-archive-line' },
       { path: '/rd-expenses', label: '研发费用', icon: 'ri-flask-line', workspace: ['accounting'] },
       { path: '/mine/salary', label: '薪酬管理', icon: 'ri-coins-line' },
-      { path: '/private-expenses', label: '老板私账', icon: 'ri-wallet-3-line' },
-      { path: '/recurring', label: '周期记账', icon: 'ri-repeat-2-line', workspace: ['accounting'] },
+      { path: '/private-expenses', label: '老板私账', icon: 'ri-wallet-3-line', workspace: ['accounting'] },
       { path: '/aggregation', label: '归集与分摊', icon: 'ri-node-tree', workspace: ['accounting'] },
     ],
   },
   {
-    // 不再限制 workspace：老板视图默认首页，藏掉设置会让「公司信息 / 税费种认定」无从进入。
+    // 不再限制 workspace：老板视图默认首页，藏掉设置会让「税费种认定 / 上手引导」无从进入。
     // 组内仍然按 workspace 过滤，会计科目、期初、备份这类专业项在老板视图看不到。
     label: '设置',
     icon: 'ri-settings-4-line',
     group: '工具',
     bossGroup: '设置',
     children: [
-      { path: '/mine/companies', label: '公司信息', icon: 'ri-building-line' },
-      { path: '/guide', label: '上手引导', icon: 'ri-rocket-2-line' },
       { path: '/tax-registration', label: '税费种认定', icon: 'ri-government-line' },
       { path: '/mine/accounts', label: '会计科目', icon: 'ri-node-tree', workspace: ['accounting'] },
-      { path: '/mine/contacts', label: '辅助核算', icon: 'ri-contacts-book-line', workspace: ['accounting'] },
-      { path: '/mine/opening', label: '期初设置', icon: 'ri-calendar-check-line', workspace: ['accounting'] },
-      { path: '/mine/legacy-import', label: '旧账导入', icon: 'ri-history-line', workspace: ['accounting'] },
+      { path: '/mine/contacts', label: '往来单位', icon: 'ri-contacts-book-line', workspace: ['accounting'] },
+      { path: '/mine/opening', label: '期初建账', icon: 'ri-calendar-check-line', workspace: ['accounting'] },
       { path: '/mine/backup', label: '备份与归档', icon: 'ri-archive-drawer-line', workspace: ['accounting'] },
-      { path: '/mine/audit-log', label: '审计日志', icon: 'ri-file-history-line', workspace: ['accounting'] },
       { path: '/mine/mcp', label: 'AI 连接（MCP）', icon: 'ri-plug-line', workspace: ['accounting'] },
       { path: '/mine', label: '个人设置', icon: 'ri-user-settings-line' },
     ],
   },
 ]
+
+// AI 功能场景的中文标签：对应后端 llm_usage 埋点的 scene 字段（services/llm.py）。
+// 个人设置页「AI 用量」与管理后台用量页共用，新增 scene 时两处一起生效。
+export const AI_SCENE_LABELS: Record<string, string> = {
+  agent_chat: 'AI 会计对话',
+  copilot: '经营助手',
+  invoice_ocr: '单据识别',
+  classify: '智能分类',
+  batch_split: '连续日志拆分',
+  report: '报表洞察',
+  bank_statement: '银行流水',
+  invoice: '发票处理',
+  tax_registration_ocr: '税费种认定识别',
+  todo_advice: '待办建议',
+  asr: '语音转写',
+  other: '其他',
+}
+
+export function aiSceneLabel(scene: string): string {
+  return AI_SCENE_LABELS[scene] ?? scene
+}

@@ -1,10 +1,11 @@
 <!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, h, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { NDropdown, useMessage } from 'naive-ui'
 import type { DropdownOption } from 'naive-ui'
 import { useAuthStore } from '@/stores/auth'
+import { useUsageStore } from '@/stores/usage'
 import { SoloStatusBadge } from '@/components/ui'
 import WorkspaceViewSwitch from '@/components/layout/WorkspaceViewSwitch.vue'
 
@@ -13,7 +14,19 @@ const emit = defineEmits<{ toggleSidebar: []; openSearch: [] }>()
 const router = useRouter()
 const message = useMessage()
 const authStore = useAuthStore()
+const usageStore = useUsageStore()
 const shortcutLabel = /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘ K' : 'Ctrl K'
+
+// 导航栏摘要只读缓存；个人设置页会强制刷新
+onMounted(() => {
+  usageStore.ensureLoaded()
+})
+
+function formatTokens(n: number): string {
+  if (!n) return '0'
+  if (n >= 10000) return `${(n / 10000).toFixed(2)} 万`
+  return n.toLocaleString()
+}
 
 const currentCompanyName = computed(() => {
   if (!authStore.user) return '加载中...'
@@ -39,12 +52,37 @@ const companyOptions = computed<DropdownOption[]>(() => {
   return items
 })
 
-const userOptions: DropdownOption[] = [
-  { label: '个人设置', key: 'mine' },
-  { label: '公司管理', key: 'companies' },
-  { type: 'divider' as const },
-  { label: '退出登录', key: 'logout' },
-]
+// 下拉渲染在 body 传送门里，scoped 样式够不到，用量行用内联样式
+const userOptions = computed<DropdownOption[]>(() => {
+  const usageTokens = usageStore.summary?.currentMonth.totalTokens ?? null
+  return [
+    {
+      key: 'usage',
+      label: () =>
+        h('div', { style: 'display:flex;align-items:center;gap:8px;min-width:200px;' }, [
+          h('i', {
+            class: 'ri-sparkling-2-line',
+            style: 'font-size:15px;color:var(--solo-primary,#175cff);',
+          }),
+          h('span', { style: 'font-size:13px;color:var(--solo-text-secondary,#555);' }, '本月 AI 用量'),
+          h(
+            'span',
+            {
+              style:
+                'margin-left:auto;font-size:12.5px;font-weight:600;color:var(--solo-text-primary,#1a1a1a);font-variant-numeric:tabular-nums;',
+            },
+            usageTokens === null ? '—' : `${formatTokens(usageTokens)} tokens`,
+          ),
+        ]),
+    },
+    { type: 'divider' as const },
+    { label: '上手引导', key: 'guide' },
+    { label: '个人设置', key: 'mine' },
+    { label: '公司管理', key: 'companies' },
+    { type: 'divider' as const },
+    { label: '退出登录', key: 'logout' },
+  ]
+})
 
 async function handleCompanyAction(key: string) {
   if (key === 'manage') {
@@ -64,7 +102,12 @@ async function handleCompanyAction(key: string) {
 function handleUserAction(key: string) {
   if (key === 'logout') {
     authStore.logout()
+    usageStore.reset()
     router.push('/login')
+  } else if (key === 'usage') {
+    router.push('/mine')
+  } else if (key === 'guide') {
+    router.push('/guide')
   } else if (key === 'mine') {
     router.push('/mine')
   } else if (key === 'companies') {
@@ -113,8 +156,8 @@ function handleUserAction(key: string) {
         @keydown.enter="emit('openSearch')"
         @keydown.space.prevent="emit('openSearch')"
       >
-        <i class="ri-search-2-line" />
-        <span>搜索与命令...</span>
+        <i class="ri-search-2-line search-icon" />
+        <span class="search-text">搜索或输入命令...</span>
         <span class="kbd">{{ shortcutLabel }}</span>
       </div>
     </div>
@@ -155,6 +198,8 @@ function handleUserAction(key: string) {
   display: flex;
   align-items: center;
   gap: 12px;
+  flex-shrink: 0;
+  min-width: 0;
 }
 .workspace-view-switch {
   margin-left: 2px;
@@ -204,20 +249,26 @@ function handleUserAction(key: string) {
   font-size: 14px;
   font-weight: 600;
   color: var(--solo-text-primary);
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .arrow-icon {
   font-size: 14px;
   color: var(--solo-text-muted);
 }
 .navbar-center {
-  flex: 1;
-  max-width: 420px;
-  margin: 0 24px;
+  flex: 0 1 240px;
+  min-width: 0;
+  margin: 0 12px;
 }
 .search-trigger {
+  width: 100%;
+  box-sizing: border-box;
   background: var(--solo-bg-soft);
   border: 1px solid var(--solo-border);
-  border-radius: 8px;
+  border-radius: var(--solo-radius, 8px);
   height: 36px;
   padding: 0 12px;
   display: flex;
@@ -226,29 +277,52 @@ function handleUserAction(key: string) {
   color: var(--solo-text-muted);
   cursor: pointer;
   font-size: 13px;
-  transition: all 0.2s;
+  white-space: nowrap;
+  user-select: none;
+  transition: all 0.2s ease;
 }
 .search-trigger:hover {
   border-color: var(--solo-primary-light);
-  background: #fff;
+  background: var(--solo-bg-card);
+  box-shadow: var(--solo-shadow-sm);
+  color: var(--solo-text-primary);
 }
-.search-trigger span {
+.search-icon {
+  font-size: 15px;
+  color: var(--solo-text-muted);
+  flex-shrink: 0;
+  transition: color 0.2s ease;
+}
+.search-trigger:hover .search-icon {
+  color: var(--solo-primary);
+}
+.search-text {
   flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
 }
 .kbd {
-  background: #fff;
+  flex-shrink: 0;
+  margin-left: auto;
+  background: var(--solo-bg-card);
   border: 1px solid var(--solo-border);
-  box-shadow: 0 1px 1px rgba(0,0,0,0.05);
-  border-radius: 4px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  border-radius: var(--solo-radius-sm, 4px);
   padding: 1px 6px;
   font-size: 11px;
   font-weight: 500;
+  font-family: inherit;
   color: var(--solo-text-secondary);
+  line-height: 1.4;
 }
 .navbar-right {
   display: flex;
   align-items: center;
   gap: 12px;
+  flex-shrink: 0;
 }
 .user-profile-btn {
   display: flex;
@@ -290,12 +364,24 @@ function handleUserAction(key: string) {
   font-size: 13px;
   font-weight: 600;
   color: var(--solo-text-primary);
+  max-width: 90px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .user-arrow {
   font-size: 14px;
   color: var(--solo-text-muted);
 }
-@media (max-width: 900px) {
+@media (max-width: 1180px) {
+  .company-name {
+    max-width: 130px;
+  }
+  .kbd {
+    display: none;
+  }
+}
+@media (max-width: 960px) {
   .navbar {
     padding: 0 16px;
   }
@@ -306,10 +392,7 @@ function handleUserAction(key: string) {
     display: none;
   }
   .company-name {
-    max-width: 180px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    max-width: 160px;
   }
 }
 @media (max-width: 560px) {

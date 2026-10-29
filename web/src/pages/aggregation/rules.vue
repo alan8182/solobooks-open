@@ -261,7 +261,7 @@ async function loadRules(): Promise<void> {
     draft.value = ruleList.map(toDraft)
     members.value = memberList
   } catch (err) {
-    message.error(errorText(err, '加载归集规则失败'))
+    message.error(errorText(err))
   } finally {
     loading.value = false
   }
@@ -271,7 +271,7 @@ onMounted(async () => {
   try {
     await store.bootstrap()
   } catch (err) {
-    message.error(errorText(err, '加载归集维度失败'))
+    message.error(errorText(err))
     return
   }
   // 从「执行规则」结果卡跳回来时，把期间带进执行弹层
@@ -391,7 +391,7 @@ async function confirmSave(): Promise<void> {
     message.success(`已保存 ${result.length} 条规则。规则只影响后续「执行规则」，不会改动已有归集。`)
   } catch (err) {
     // 保存失败**不清空草稿**，让用户改完再试（后端整批回滚，库里的旧规则没丢）
-    message.error(errorText(err, '保存规则失败，草稿已保留，请修正后重试'))
+    message.error(errorText(err))
   } finally {
     saving.value = false
   }
@@ -430,7 +430,7 @@ async function runApply(): Promise<void> {
     })
     message.success('规则执行完成')
   } catch (err) {
-    message.error(errorText(err, '执行规则失败'))
+    message.error(errorText(err))
   } finally {
     applying.value = false
   }

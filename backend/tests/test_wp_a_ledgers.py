@@ -150,8 +150,8 @@ async def test_multi_column_credit_mode_for_income_and_no_children_hint():
     assert result["columnTotals"].get("5301001") == "500.00"
     assert result["mainTotal"] == "500.00"
 
-    # 5001 无子科目 → 提示而非空报错
-    hint = await query_multi_column(company_id, "5001", "2026-10")
+    # 5051 无子科目 → 提示而非空报错（5001 自咨询服务/技术服务映射后已有明细子级）
+    hint = await query_multi_column(company_id, "5051", "2026-10")
     assert hint["columns"] == []
     assert "没有启用的明细子科目" in (hint["hint"] or "")
 

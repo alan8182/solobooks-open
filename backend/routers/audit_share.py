@@ -71,9 +71,9 @@ async def create_share(req: CreateShareRequest, ctx: AuthContext = Depends(requi
         )
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         logger.exception("create audit share failed company=%s", ctx.company_id)
-        raise HTTPException(status_code=500, detail=f"生成体检快照失败：{exc}") from exc
+        raise HTTPException(status_code=500, detail="生成体检快照失败，请稍后重试") from None
     overview["url"] = f"/share/{token}"
     overview["token"] = token
     return overview
@@ -86,9 +86,9 @@ async def preview_share(req: PreviewShareRequest, ctx: AuthContext = Depends(req
         return await audit_share_service.preview_snapshot(
             ctx.company_id, ctx.user_id, req.month, anonymized=req.anonymized
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         logger.exception("preview audit share failed company=%s", ctx.company_id)
-        raise HTTPException(status_code=500, detail=f"生成预览失败：{exc}") from exc
+        raise HTTPException(status_code=500, detail="生成预览失败，请稍后重试") from None
 
 
 @owner_router.get("")

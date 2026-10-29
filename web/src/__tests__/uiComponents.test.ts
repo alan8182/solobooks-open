@@ -7,6 +7,7 @@ import {
   SoloButton,
   SoloEmpty,
   SoloSkeleton,
+  SoloTable,
 } from '@/components/ui'
 
 describe('SoloDesignSystem UI Components', () => {
@@ -107,6 +108,43 @@ describe('SoloDesignSystem UI Components', () => {
         props: { variant: 'table', rows: 4 },
       })
       expect(wrapper.findAll('.skeleton-table-row')).toHaveLength(4)
+    })
+  })
+
+  describe('SoloTable', () => {
+    const columns = [
+      { title: '名称', key: 'name' },
+      { title: '金额', key: 'amount' },
+    ]
+
+    it('renders data rows properly', () => {
+      const data = [
+        { id: '1', name: '收入1', amount: '100.00' },
+        { id: '2', name: '收入2', amount: '200.00' },
+      ]
+      const wrapper = mount(SoloTable, {
+        props: { columns, data },
+      })
+      expect(wrapper.text()).toContain('收入1')
+      expect(wrapper.text()).toContain('收入2')
+      expect(wrapper.text()).toContain('名称')
+    })
+
+    it('renders empty state when data is empty', () => {
+      const wrapper = mount(SoloTable, {
+        props: {
+          columns,
+          data: [],
+          emptyTitle: '暂无记录',
+          emptyDescription: '请先导入数据',
+        },
+        slots: {
+          'empty-action': '<button id="import-btn">导入</button>',
+        },
+      })
+      expect(wrapper.text()).toContain('暂无记录')
+      expect(wrapper.text()).toContain('请先导入数据')
+      expect(wrapper.find('#import-btn').exists()).toBe(true)
     })
   })
 })

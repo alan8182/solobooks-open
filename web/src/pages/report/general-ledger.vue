@@ -11,6 +11,8 @@ import type { LedgerDetailPage, LedgerGeneralPage } from '@/api/ledger'
 import * as XLSX from 'xlsx'
 import { formatMoney, formatDate, getCurrentMonth } from '@/utils/format'
 import { deriveOpeningBalance } from '@/utils/accounting'
+import { saveWorkbook } from '@/utils/export'
+import { SoloMonthPicker } from '@/components/ui'
 
 interface LedgerItem {
   date: string
@@ -201,7 +203,7 @@ function exportSummary() {
   ]
   const wb = XLSX.utils.book_new()
   XLSX.utils.book_append_sheet(wb, ws, '科目余额表')
-  XLSX.writeFile(wb, `科目余额表_${month.value}.xlsx`)
+  saveWorkbook(wb, `科目余额表_${month.value}.xlsx`)
   message.success('科目余额表已导出')
 }
 
@@ -294,21 +296,19 @@ onMounted(async () => {
         <NSelect v-model:value="accountCode" :options="accountOptions" style="width: 220px;" filterable />
       </NFormItem>
       <NFormItem v-if="view !== 'annual'" label="会计月份" label-placement="left" :show-feedback="false">
-        <NDatePicker v-model:formatted-value="month" type="month" value-format="yyyy-MM" format="yyyy-MM" style="width: 150px;" />
+        <SoloMonthPicker v-model:value="month" style="width: 150px;" />
       </NFormItem>
       <NButton type="primary" @click="runQuery">查询</NButton>
-      <NButton v-if="view === 'summary'" secondary @click="exportSummary">
-        <template #icon><i class="ri-download-2-line" /></template>
-        导出 Excel
-      </NButton>
-      <NButton secondary @click="printPage">
-        <template #icon><i class="ri-printer-line" /></template>
-        打印
-      </NButton>
-      <NButton secondary @click="router.push({ path: '/ledger/book', query: { month } })">
-        <template #icon><i class="ri-book-2-line" /></template>
-        电子账簿
-      </NButton>
+      <div class="filter-actions">
+        <NButton v-if="view === 'summary'" secondary @click="exportSummary">
+          <template #icon><i class="ri-download-2-line" /></template>
+          导出 Excel
+        </NButton>
+        <NButton secondary @click="printPage">
+          <template #icon><i class="ri-printer-line" /></template>
+          打印
+        </NButton>
+      </div>
     </div>
 
     <!-- Summary Stats Card (明细视图) -->
@@ -546,6 +546,12 @@ onMounted(async () => {
   margin-bottom: 0;
   width: auto;
   flex: 0 0 auto;
+}
+.filter-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
 }
 /* 视图切换（总账 / 科目余额表） */
 .view-tabs {

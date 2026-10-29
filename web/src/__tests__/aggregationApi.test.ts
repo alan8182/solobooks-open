@@ -341,10 +341,12 @@ describe('aggregation routing and menu wiring', () => {
     expect(router.resolve('/aggregation/pending').name).toBe('AggregationPending')
   })
 
-  it('inherits auth from the root layout instead of declaring its own meta', () => {
-    // 既有 children 一律不写 meta，鉴权由父级 '/' 继承；写了反而会与父级不一致
+  it('inherits auth from the workbench shell instead of declaring its own meta', () => {
+    // 既有 children 一律不写 requiresAuth，鉴权由工作台壳（/ 下的 AppLayout 层）继承；
+    // 根路径 '/' 本身公开（匿名由 RootSwitch 呈现官网），壳层保持 requiresAuth
     const root = routes.find((route) => route.path === '/')
-    const children = root?.children ?? []
+    const workbenchShell = root?.children?.find((route) => route.path === '')
+    const children = workbenchShell?.children ?? []
     const aggregationChildren = children.filter((child) =>
       (child as RouteRecordRaw).path?.startsWith('aggregation'),
     )
@@ -357,7 +359,7 @@ describe('aggregation routing and menu wiring', () => {
         expect(meta.workspace, `${(child as RouteRecordRaw).path} 的工作区标记`).toContain('accounting')
       }
     })
-    expect(root?.meta?.requiresAuth).toBe(true)
+    expect(workbenchShell?.meta?.requiresAuth).toBe(true)
   })
 
   it('keeps the aggregation entry reachable from the low-frequency tools menu', () => {

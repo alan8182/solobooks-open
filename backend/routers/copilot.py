@@ -2,8 +2,11 @@
 # Licensed under the SoloBooks License v2.0.
 
 """V3 Copilot 路由：经营助手 + 税务顾问双模式"""
+import asyncio
+
 from fastapi import APIRouter, Depends
 from models.schemas import CopilotChatRequest, CopilotChatResponse
+from core.errors import AccountingError
 from services.llm import chat_text_json
 from services.classifier import COPILOT_V3_PROMPT, TAX_ADVISOR_PROMPT, SECRETARY_PROMPT, COACH_PROMPT
 from deps.auth import AuthContext, require_auth
@@ -58,13 +61,16 @@ async def copilot_chat(req: CopilotChatRequest, ctx: AuthContext = Depends(requi
     user_msg = f"对话:\n{history}\n\n经营数据: {context_text or '暂无'}\n请用中文回复，只输出 JSON。"
 
     try:
-        result = chat_text_json(
+        result = await asyncio.to_thread(
+            chat_text_json,
             system_prompt,
             user_msg,
             scene="copilot",
             user_id=ctx.user_id,
             company_id=ctx.company_id,
         )
+    except AccountingError:
+        raise  # 配额超限保持 402，不静默降级成「暂时无法回复」
     except Exception:
         return CopilotChatResponse(
             reply="抱歉，暂时无法回复，请稍后再试。",

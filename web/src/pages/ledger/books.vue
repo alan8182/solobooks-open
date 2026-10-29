@@ -15,11 +15,6 @@ interface BookEntry {
 
 /**
  * 账册清单是这一层壳的唯一真值：导航、高亮、内容渲染共用同一份定义。
- *
- * 为什么用 ?book= 而不是 /ledger/books/:kind 子路由：
- * 子路由会让 route.name 变成每本账一个，而 <KeepAlive :include> 是按路由 name 缓存的，
- * 结果五本账各占一个缓存壳、页内标签也建不出来。一个 path 一个 name 才能让「会计账簿」
- * 始终是一个标签，切账册只是换内容。
  */
 const BOOK_GROUPS: { title: string; items: BookEntry[] }[] = [
   {
@@ -60,7 +55,7 @@ const BOOK_GROUPS: { title: string; items: BookEntry[] }[] = [
       },
       {
         key: 'partner-balances',
-        label: '核算项目余额',
+        label: '往来项目余额',
         hint: '按往来单位汇总余额',
         icon: 'ri-user-search-line',
         view: defineAsyncComponent(() => import('@/pages/report/partner-balances.vue')),
@@ -82,7 +77,6 @@ const currentBook = computed(
 
 function openBook(book: BookEntry) {
   if (book.key === currentBook.value.key) return
-  // 切账册必须把当前期间带过去，否则用户挑好的月份会被重置成默认值
   router.push({ path: '/ledger/books', query: { ...route.query, book: book.key } })
 }
 
@@ -93,224 +87,171 @@ function openWholeBook() {
 
 <template>
   <div class="books-page">
-    <header class="books-bar">
-      <div class="books-bar-copy">
-        <h1 class="books-bar-title">会计账簿</h1>
-        <span class="books-bar-sub">五本账共用同一套凭证，切换账册会保留当前期间</span>
+    <!-- 第一行：页面标题栏 + 右侧整册打印/签发动作 -->
+    <header class="books-header">
+      <div class="books-title-group">
+        <h1 class="books-title">会计账簿</h1>
+        <p class="books-subtitle">五本账共用凭证底数，切换账册保留当前期间</p>
       </div>
-      <NButton secondary @click="openWholeBook">
-        <template #icon><i class="ri-book-2-line" /></template>
-        整册打印 / 签发
-      </NButton>
+
+      <div class="books-actions">
+        <NButton secondary @click="openWholeBook">
+          <template #icon><i class="ri-book-2-line" /></template>
+          整册打印 / 签发
+        </NButton>
+      </div>
     </header>
 
-    <div class="books-body">
-      <nav class="books-nav" aria-label="切换账册">
-        <div v-for="group in BOOK_GROUPS" :key="group.title" class="books-group">
-          <div class="books-group-title">{{ group.title }}</div>
+    <!-- 第二行：账册切换分段标签栏，独立一行平铺 -->
+    <nav class="books-nav-bar" aria-label="切换账册">
+      <div class="books-tabs" role="tablist">
+        <template v-for="(group, gIdx) in BOOK_GROUPS" :key="group.title">
+          <span v-if="gIdx > 0" class="books-tabs-divider" aria-hidden="true" />
           <button
             v-for="item in group.items"
             :key="item.key"
             type="button"
-            class="books-item"
+            role="tab"
+            class="books-tab-btn"
             :class="{ active: item.key === currentBook.key }"
-            :aria-current="item.key === currentBook.key ? 'page' : undefined"
+            :aria-selected="item.key === currentBook.key"
             @click="openBook(item)"
           >
             <i :class="item.icon" aria-hidden="true" />
-            <span class="books-item-text">
-              <span class="books-item-label">{{ item.label }}</span>
-              <span class="books-item-hint">{{ item.hint }}</span>
-            </span>
+            <span>{{ item.label }}</span>
           </button>
-        </div>
-      </nav>
+        </template>
+      </div>
+    </nav>
 
-      <section class="books-main">
-        <component :is="currentBook.view" />
-      </section>
-    </div>
+    <!-- 第三行：所选账册主内容 -->
+    <main class="books-main">
+      <component :is="currentBook.view" />
+    </main>
   </div>
 </template>
 
 <style scoped>
 .books-page {
   width: 100%;
-  max-width: 1240px;
+  max-width: 1360px;
   margin: 0 auto;
 }
 
-.books-bar {
+/* 第一行：标题 + 右侧操作按钮 */
+.books-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 18px;
-  padding-bottom: 14px;
-  border-bottom: 1px solid var(--solo-border-light);
+  margin-bottom: 14px;
 }
 
-.books-bar-copy {
+.books-title-group {
   display: flex;
-  min-width: 0;
   align-items: baseline;
   gap: 10px;
   flex-wrap: wrap;
 }
 
-/* 刻意压在 15px：下面每本账自己的 h2 是 22px，两个大标题会打架 */
-.books-bar-title {
+.books-title {
   margin: 0;
   color: var(--solo-text-primary);
-  font-size: 15px;
-  font-weight: 600;
-  letter-spacing: -0.01em;
+  font-size: 20px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
 }
 
-.books-bar-sub {
+.books-subtitle {
+  margin: 0;
   color: var(--solo-text-muted);
-  font-size: 12px;
+  font-size: 13px;
 }
 
-.books-body {
+.books-actions {
   display: flex;
-  align-items: flex-start;
-  gap: 20px;
-}
-
-.books-nav {
-  position: sticky;
-  top: 12px;
-  display: flex;
-  width: 196px;
-  flex-direction: column;
+  align-items: center;
+  gap: 8px;
   flex-shrink: 0;
-  gap: 18px;
 }
 
-.books-group {
+/* 第二行：账册分段切换栏，整行居左排列 */
+.books-nav-bar {
   display: flex;
-  flex-direction: column;
+  align-items: center;
+  margin-bottom: 16px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--solo-border-light);
+}
+
+.books-tabs {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px;
+  background: var(--solo-bg-page, #f4f6fa);
+  border: 1px solid var(--solo-border-light, #e5e9ef);
+  border-radius: var(--solo-radius-md, 8px);
   gap: 2px;
 }
 
-.books-group-title {
-  padding: 0 10px 6px;
-  color: var(--solo-text-muted);
-  font-size: 11px;
-  letter-spacing: 0.04em;
+.books-tabs-divider {
+  width: 1px;
+  height: 14px;
+  background: var(--solo-border-light, #dcdfe6);
+  margin: 0 6px;
 }
 
-.books-item {
-  display: flex;
-  width: 100%;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 8px 10px;
-  border: 1px solid transparent;
-  border-radius: var(--solo-radius-md);
+.books-tab-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border: none;
   background: transparent;
-  color: var(--solo-text-secondary);
-  cursor: pointer;
-  font: inherit;
-  text-align: left;
-  transition: background-color 150ms ease-out, border-color 150ms ease-out, color 150ms ease-out;
-}
-
-.books-item:hover {
-  background: var(--solo-bg-page);
-  color: var(--solo-text-primary);
-}
-
-.books-item:focus-visible {
-  outline: 2px solid var(--solo-primary);
-  outline-offset: 1px;
-}
-
-.books-item.active {
-  border-color: var(--solo-primary-soft);
-  background: var(--solo-primary-soft);
-  color: var(--solo-primary);
-}
-
-.books-item i {
-  margin-top: 2px;
-  flex-shrink: 0;
-  font-size: 16px;
-}
-
-.books-item-text {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.books-item-label {
+  color: var(--solo-text-secondary, #606266);
   font-size: 13px;
   font-weight: 500;
+  border-radius: calc(var(--solo-radius-md, 8px) - 2px);
+  cursor: pointer;
+  transition: all 160ms ease;
+  white-space: nowrap;
 }
 
-.books-item-hint {
-  color: var(--solo-text-muted);
-  font-size: 11px;
-  line-height: 1.4;
+.books-tab-btn:hover {
+  color: var(--solo-text-primary, #303133);
+  background: rgba(0, 0, 0, 0.04);
 }
 
-.books-item.active .books-item-hint {
-  color: var(--solo-primary);
-  opacity: 0.78;
+.books-tab-btn.active {
+  background: #ffffff;
+  color: var(--solo-primary, #1747b0);
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+.books-tab-btn i {
+  font-size: 15px;
 }
 
 .books-main {
+  width: 100%;
   min-width: 0;
-  flex: 1;
 }
 
-/* 壳里左边已经有账册导航，子页那句「← 返回报表中心」留着只会把用户弹出工作台。
-   general-ledger 的「返回科目余额表」在 filter-bar 里，同 class 但不同容器，不受影响。
-   必须 !important：layout.css 给 .report-back-btn 打了 display: inline-flex !important。 */
-.books-main :deep(.report-header .report-back-btn) {
+/* 消除子页面内嵌入时产生的多余顶部包裹、重复标题和误弹出的“返回报表中心”按钮 */
+.books-main :deep(.report-header) {
   display: none !important;
 }
 
-@media (max-width: 1024px) {
-  .books-body {
-    flex-direction: column;
-    gap: 12px;
-  }
+.books-main :deep(.report-container) {
+  padding: 0 !important;
+  max-width: 100% !important;
+}
 
-  .books-nav {
-    position: static;
-    width: 100%;
-    flex-direction: row;
-    gap: 10px;
-    overflow-x: auto;
-    padding-bottom: 2px;
-  }
-
-  .books-group {
-    flex-direction: row;
-    align-items: center;
-    gap: 6px;
-  }
-
-  .books-group-title {
-    display: none;
-  }
-
-  .books-item {
-    width: auto;
-    flex-shrink: 0;
-    align-items: center;
-  }
-
-  .books-item i {
-    margin-top: 0;
-  }
-
-  .books-item-hint {
-    display: none;
-  }
+.books-main :deep(.filter-bar) {
+  display: flex !important;
+  align-items: center !important;
+  width: 100% !important;
+  box-sizing: border-box !important;
 }
 </style>

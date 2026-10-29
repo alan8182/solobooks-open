@@ -49,6 +49,13 @@ def _seed_user(user_id: str, phone: str, password: str | None = None) -> None:
             """,
             (user_id, phone, password_hash),
         )
+        # 生产登录流程必建成员关系（_prepare_signup_company / ensure_tenant）；
+        # require_auth 现按 ensure_tenant 同口径校验成员归属，播种需对齐。
+        conn.execute(
+            "INSERT OR REPLACE INTO company_members (company_id, user_id, role, status)"
+            " VALUES ('c1', ?, 'accountant', 'active')",
+            (user_id,),
+        )
         conn.commit()
     finally:
         conn.close()

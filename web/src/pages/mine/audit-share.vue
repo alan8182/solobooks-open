@@ -9,13 +9,15 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import {
-  NButton, NCard, NDatePicker, NEmpty, NModal, NSelect, NSwitch, NTag, useMessage,
+  NButton, NCard, NEmpty, NModal, NSelect, NSwitch, NTag, useMessage,
 } from 'naive-ui'
 import {
   createAuditShare, getAuditShare, listAuditShares, previewAuditShare,
   revokeAuditShare, updateShareAnnotationStatus,
   type OwnerShareOverview, type SharePreview,
 } from '@/api/auditShare'
+import { getCurrentMonth } from '@/utils/format'
+import { SoloMonthPicker } from '@/components/ui'
 
 const router = useRouter()
 const message = useMessage()
@@ -26,7 +28,7 @@ const loading = ref(false)
 
 // 生成弹窗
 const createVisible = ref(false)
-const createMonth = ref<number>(Date.now())
+const createMonth = ref<string>(getCurrentMonth())
 const createAnonymized = ref(true)
 const createExpiry = ref(30)
 const creating = ref(false)
@@ -41,10 +43,7 @@ const expiryOptions = [
   { label: '永久有效（不推荐）', value: 0 },
 ]
 
-const monthText = computed(() => {
-  const d = new Date(createMonth.value)
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
-})
+const monthText = computed(() => createMonth.value || getCurrentMonth())
 
 // 批注收件箱
 const inboxShare = ref<OwnerShareOverview | null>(null)
@@ -204,7 +203,7 @@ onMounted(load)
       <template v-if="!createdShare">
         <div class="form-row">
           <span class="form-label">体检月份</span>
-          <NDatePicker v-model:value="createMonth" type="month" clearable :is-date-disabled="(ts: number) => ts > Date.now()" />
+          <SoloMonthPicker v-model:value="createMonth" clearable :is-date-disabled="(ts: number) => ts > Date.now()" style="width: 160px" />
         </div>
         <div class="form-row">
           <span class="form-label">脱敏身份信息</span>

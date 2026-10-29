@@ -49,7 +49,7 @@ export const GLOSSARY: GlossaryEntry[] = [
   },
   {
     term: '进项',
-    plain: '你收进来的发票，代表你可以抵扣的增值税。',
+    plain: '你收进来的发票，代表采购付出的增值税。小规模不能抵扣、按价税合计入成本；一般纳税人才可抵扣。',
     see: '/invoices',
   },
   {

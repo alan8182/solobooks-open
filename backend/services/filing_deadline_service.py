@@ -81,7 +81,7 @@ TAX_KINDS: Dict[str, Dict[str, str]] = {
     "iit_withholding": {
         "name": "个税扣缴",
         "freq": "month",
-        "guide": "自然人电子税务局（扣缴端，桌面客户端）申报。无员工、无工资发放时可零申报或暂不处理；有员工必须每月申报。",
+        "guide": "自然人电子税务局（扣缴端，桌面客户端）申报。每月必须申报；无员工或无工资发放时，需至少添加一人（如法定代表人）完成零申报。",
     },
     "annual_report": {
         "name": "工商年报（市监局）",
@@ -335,17 +335,25 @@ def compute_due_date_for_rule(
 
 
 async def _company_onboard_date(company_id: str) -> Optional[date]:
-    """公司建档日（系统内创建时间）。征期物化以其为起点：建档前已截止的期间不制造逾期。"""
+    """征期物化起点，优先取记账起点（主体档案 startDate）。
+
+    公司可能成立已久、近期才在系统建账套：用系统建档日（created_at）会把真实
+    存在的历史申报义务误判成「建档前」而跳过，导致该期申报事项无征期记录、无法标记办结。
+    """
     from db.models import Company
 
     async with session_scope() as session:
-        row = (
-            await session.execute(select(Company.created_at).where(Company.company_id == company_id))
-        ).scalar_one_or_none()
+        row = await session.get(Company, company_id)
     if not row:
         return None
+    raw = str((row.payload or {}).get("startDate") or "").strip()
+    if raw:
+        try:
+            return date.fromisoformat(raw[:10])
+        except ValueError:
+            pass
     try:
-        return date.fromisoformat(str(row)[:10])
+        return date.fromisoformat(str(row.created_at)[:10])
     except ValueError:
         return None
 

@@ -14,13 +14,16 @@ from datetime import date
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
+from fastapi import HTTPException
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.database import get_conn
 from services.account_mapper import get_voucher_hint
 from services.audit_service import log_action
+from core.errors import AccountingError
 from core.money import ZERO, money, money_text
 from services.json_utils import json_dumps
 
@@ -99,7 +102,17 @@ _NON_RULE_CATEGORIES = {
     "微信支付结算",
     "支付宝结算",
     "平台提现结算",
+    # 退款对冲是上下文相关的（跟具体哪笔付款配对），沉淀成对手方规则
+    # 会把以后真正的收入也吞掉
+    "往来退款",
 }
+
+
+def extract_statement_counterparty(description: str) -> str:
+    """Extract counterparty name from statement description like '... (对方: xxx)'."""
+    text = str(description or "").strip()
+    match = re.search(r"\(对方\s*[:：]\s*(.+?)\)\s*$", text)
+    return match.group(1).strip() if match else ""
 
 
 def extract_statement_rule_pattern(description: str) -> str:
@@ -132,9 +145,13 @@ async def save_company_category_rule(
     conn = await get_conn()
     try:
         await conn.execute(
-            "INSERT OR REPLACE INTO bank_category_rules "
+            # SQLite/PG 双方言的 upsert：INSERT OR REPLACE 不是 PG 语法，
+            # 兼容层也不会翻译它，必须显式写 ON CONFLICT 冲突目标。
+            "INSERT INTO bank_category_rules "
             "(company_id, direction, match_pattern, category, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT (company_id, direction, match_pattern) DO UPDATE SET "
+            "category = excluded.category, updated_at = excluded.updated_at",
             (company_id, direction, pattern, cat, _now_iso()),
         )
         await conn.commit()
@@ -202,8 +219,21 @@ def identify_statement_fast_rule(stmt: Dict[str, Any]) -> Optional[Dict[str, Any
     amount = safe_money(stmt.get("amount"))
     date_str = str(stmt.get("transaction_date") or "")[:10]
 
-    # 1. 微信/财付通提现到账（收入方向，平台划转）
-    if re.search(r"财付通|微信|WeChat|Tenpay", desc, re.I) and amount > ZERO:
+    # 「退款/退回」是自有资金退回，绝不能进平台结算或营业外收入——
+    # 应冲减前期付款挂的往来（见 _detect_refund_pairs），交给记忆规则/LLM。
+    is_refund = bool(re.search(r"退款|退回|退还", desc))
+    # 微额打款验证走第 4 条 micro_auth，不能被平台关键词截胡
+    is_verification = bool(re.search(r"验证|认证|核验|测试", desc))
+
+    # 1. 微信/财付通提现到账（收入方向，平台划转）。
+    #    描述形如「财付通」「财付通支付科技有限公司 | 附言: 提现」等，
+    #    平台名命中即视为划转；退款/验证两类已显式排除。
+    if (
+        re.search(r"财付通|微信|WeChat|Tenpay", desc, re.I)
+        and amount > ZERO
+        and not is_refund
+        and not is_verification
+    ):
         return {
             "type": "new",
             "category": "微信支付结算",
@@ -214,7 +244,12 @@ def identify_statement_fast_rule(stmt: Dict[str, Any]) -> Optional[Dict[str, Any
         }
 
     # 2. 支付宝提现到账（收入方向，平台划转）
-    if re.search(r"支付宝|蚂蚁金服|Alipay", desc, re.I) and amount > ZERO:
+    if (
+        re.search(r"支付宝|蚂蚁金服|Alipay", desc, re.I)
+        and amount > ZERO
+        and not is_refund
+        and not is_verification
+    ):
         return {
             "type": "new",
             "category": "支付宝结算",
@@ -235,15 +270,17 @@ def identify_statement_fast_rule(stmt: Dict[str, Any]) -> Optional[Dict[str, Any
             "reason": "检测到银行存款利息，自动计入财务费用-利息收入",
         }
 
-    # 4. 企业实名打款验证微额 (<= 1.00 元)
-    if amount > ZERO and amount <= Decimal("1.00") and any(k in desc for k in ["认证", "验证", "打款", "测试"]):
+    # 4. 微额收款兜底（<= 1.00 元）：验证/测试类打款，无对价不构成经营收入。
+    #    ponytail: 金额极小本身就是强信号——银行摘要常不写「验证」二字；退款已排除，
+    #    微信/支付宝/利息在第 1-3 条先拦截，故不再要求关键词。
+    if amount > ZERO and amount <= Decimal("1.00") and not is_refund:
         return {
             "type": "new",
             "category": "营业外收入",
-            "title": f"企业认证打款-{date_str}" if date_str else "企业认证打款",
+            "title": f"微额验证款-{date_str}" if date_str else "微额验证款",
             "confidence": 1.0,
             "rule": "micro_auth",
-            "reason": "检测到平台企业实名认证小额打款，自动计入营业外收入",
+            "reason": "金额极小（≤1.00 元）且非退款，判定为验证/测试类小额打款，计入营业外收入",
         }
 
     return None
@@ -607,7 +644,21 @@ def diagnose_matched_statement_effect(
         "entryTitles": titles,
     }
 
+_schema_ready = False
+
+
 async def _ensure_schema() -> None:
+    """进程级一次性 schema 守卫。
+
+    建表/补列/历史描述归一化都是幂等迁移动作：首次调用执行，之后整个进程
+    短路（此前每个银行接口都重复跑 DDL 判定 + 全表扫 description_normalized=0；
+    新写入行在导入时已带 normalized 描述，补记只针对存量数据）。
+    PostgreSQL 下这些 DDL 经 database._translate_postgres 翻译为 no-op，
+    正式 schema 依赖 Alembic 迁移先行。
+    """
+    global _schema_ready
+    if _schema_ready:
+        return
     conn = await get_conn()
     try:
         await conn.execute(
@@ -716,6 +767,7 @@ async def _ensure_schema() -> None:
                         (json_dumps(payload, ensure_ascii=False), row["entry_id"]),
                     )
         await conn.commit()
+        _schema_ready = True
     finally:
         await conn.close()
 
@@ -786,7 +838,8 @@ async def import_statements(company_id: str, csv_content: str, statement_id: str
                     skipped += 1
                     continue
 
-                sid = f"bs-{company_id}-{int(datetime.now(timezone.utc).timestamp() * 1000000)}-{imported}"
+                # uuid4：微秒时间戳+循环下标在同公司并发导入时可撞主键
+                sid = f"bs-{company_id}-{uuid4().hex}"
 
                 await conn.execute(
                     "INSERT INTO bank_statements "
@@ -841,7 +894,8 @@ async def import_statements_json(company_id: str, rows: List[Dict[str, Any]], st
                     skipped += 1
                     continue
 
-                sid = f"bs-{company_id}-{int(datetime.now(timezone.utc).timestamp() * 1000000)}-{imported}"
+                # uuid4：微秒时间戳+循环下标在同公司并发导入时可撞主键
+                sid = f"bs-{company_id}-{uuid4().hex}"
 
                 await conn.execute(
                     "INSERT INTO bank_statements "
@@ -905,8 +959,10 @@ async def import_statements_core(
 
     for row in rows:
         try:
-            txn_date_text = str(row.get("transaction_date") or row.get("date") or "").strip()[:10]
-            txn_date = date.fromisoformat(txn_date_text)
+            # 保留完整时间：同日多笔流水的先后（时分秒）决定余额连续性与排序，
+            # 截成纯日期会让同日流水顺序错乱，期初/期末余额反推全错
+            txn_date_text = str(row.get("transaction_date") or row.get("date") or "").strip()
+            txn_date = date.fromisoformat(txn_date_text[:10])
             desc = normalize_statement_description(
                 str(row.get("description") or row.get("desc") or row.get("摘要") or "")
             )
@@ -1090,6 +1146,7 @@ async def get_statements(company_id: str, statement_id: Optional[str] = None) ->
                 # first even when the link rows share the same timestamp.
                 ids = [legacy_id, *(entry_id for entry_id in ids if entry_id != legacy_id)]
             row["matched_entry_ids"] = ids
+            row["counterparty"] = extract_statement_counterparty(row.get("description", ""))
         return rows
     finally:
         await conn.close()
@@ -1122,6 +1179,73 @@ def _has_text_similarity(desc: str, title: str) -> bool:
     return False
 
 
+def _build_match_candidates(
+    rows: List[Any],
+    already_matched_ids,
+    *,
+    allow_advancement: bool,
+) -> List[Dict]:
+    """把 entries 行装配成对账候选（auto_match 与 ai_suggest 共用，防口径漂移）。
+
+    allow_advancement：股东/员工个人垫付凭证银行效果为零，也允许作为报销流水
+    的配对候选（ai_suggest 需要该能力；auto_match 规则匹配不需要）。
+    待核销发票（贷2241/借1122）挂账分录不含银行科目，配对金额取票面金额。
+    """
+    entries: List[Dict] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
+            entry_id = payload.get("id", row["id"])
+            if entry_id in already_matched_ids:
+                continue
+
+            voucher = payload.get("voucherLines") or {}
+            bank_effect = _bank_effect_from_voucher(voucher) if voucher else ZERO
+            payer = payload.get("payer") or ""
+            is_advancement = payer == "boss_personal" or payer == "employee_personal" or payer.startswith("employee_personal:")
+            is_invoice_pending = bool(voucher) and (
+                any(str(line.get("accountCode")) == "2241" for line in (voucher.get("credit") or []))
+                or any(str(line.get("accountCode")) == "1122" for line in (voucher.get("debit") or []))
+            )
+
+            if (
+                voucher
+                and abs(bank_effect) < RECONCILIATION_AMOUNT_TOLERANCE
+                and not (allow_advancement and is_advancement)
+                and not is_invoice_pending
+            ):
+                continue
+
+            orig_amount = (
+                safe_money(payload.get("amount"))
+                if (allow_advancement and is_advancement)
+                else (bank_effect if voucher else safe_money(payload.get("amount")))
+            )
+            if is_invoice_pending and abs(bank_effect) < RECONCILIATION_AMOUNT_TOLERANCE:
+                # 待核销发票的挂账分录不含银行科目，配对金额取票面金额
+                orig_amount = safe_money(payload.get("amount"))
+            direction = "income" if bank_effect > 0 else "expense" if bank_effect < 0 else payload.get("direction", "expense")
+
+            # 方向修正（负数冲减时对冲方向）
+            if not voucher and orig_amount < 0:
+                if direction == "income":
+                    direction = "expense"
+                elif direction == "expense":
+                    direction = "income"
+
+            entries.append({
+                "id": entry_id,
+                "title": payload.get("title", ""),
+                "amount": abs(orig_amount),
+                "direction": direction,
+                "category": payload.get("category", ""),
+                "occurDate": str(payload.get("occurDate", ""))[:10],
+            })
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+    return entries
+
+
 async def auto_match(company_id: str) -> dict:
     """Return rule-based match suggestions without changing reconciliation state."""
     await _ensure_schema()
@@ -1150,38 +1274,8 @@ async def auto_match(company_id: str) -> dict:
     finally:
         await conn.close()
 
-    entries: List[Dict] = []
-    for row in rows:
-        try:
-            payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
-            entry_id = payload.get("id", row["id"])
-            if entry_id in already_matched_ids:
-                continue
 
-            voucher = payload.get("voucherLines") or {}
-            bank_effect = _bank_effect_from_voucher(voucher) if voucher else ZERO
-            if voucher and abs(bank_effect) < RECONCILIATION_AMOUNT_TOLERANCE:
-                continue
-
-            orig_amount = bank_effect if voucher else safe_money(payload.get("amount"))
-            direction = "income" if bank_effect > 0 else "expense" if bank_effect < 0 else payload.get("direction", "expense")
-
-            if not voucher and orig_amount < 0:
-                if direction == "income":
-                    direction = "expense"
-                elif direction == "expense":
-                    direction = "income"
-
-            entries.append({
-                "id": entry_id,
-                "occurDate": str(payload.get("occurDate", ""))[:10],
-                "amount": abs(orig_amount),
-                "direction": direction,
-                "title": payload.get("title", ""),
-                "category": payload.get("category", ""),
-            })
-        except (json.JSONDecodeError, TypeError, ValueError):
-            continue
+    entries = _build_match_candidates(rows, already_matched_ids, allow_advancement=False)
 
     suggestions = []
     used_entry_ids = set(already_matched_ids)
@@ -1721,7 +1815,107 @@ async def get_wechat_settlement_candidates(
     return candidates
 
 
-async def ai_suggest_matches(company_id: str, limit: int = 20, month: str | None = None) -> List[Dict[str, Any]]:
+_REFUND_KW_PATTERN = re.compile(r"退款|退回|退还")
+
+
+def _statement_counterparty(desc: Any) -> str:
+    match = re.search(r"\(对方[:：]\s*(.+?)\)", str(desc or ""))
+    return match.group(1).strip() if match else ""
+
+
+def _detect_refund_pairs(statements: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """识别「一付一退」对：同对手方、等额、反向、30 天内、任一侧含退款字样。
+
+    返回 {statement_id: {"other": 对侧流水, "is_refund": 本侧是否退款侧}}。
+    认证/注册类验证款先付后退：两侧都应挂往来对冲（付款 122199 暂付、
+    收款冲减 122199），而不是退款进平台结算、付款挂往来永远悬空。
+    """
+    candidates = []
+    for stmt in statements:
+        counterparty = _statement_counterparty(stmt.get("description"))
+        amount = safe_money(stmt.get("amount"))
+        date_str = str(stmt.get("transaction_date") or "")[:10]
+        if not counterparty or amount == ZERO:
+            continue
+        candidates.append((stmt, counterparty, amount, date_str))
+
+    pairs: Dict[str, Dict[str, Any]] = {}
+    consumed: set[str] = set()
+    for index, (stmt_a, cp_a, amt_a, date_a) in enumerate(candidates):
+        if stmt_a["id"] in consumed:
+            continue
+        for stmt_b, cp_b, amt_b, date_b in candidates[index + 1:]:
+            if stmt_b["id"] in consumed or cp_a != cp_b or amt_a != -amt_b:
+                continue
+            if not (_REFUND_KW_PATTERN.search(str(stmt_a.get("description") or ""))
+                    or _REFUND_KW_PATTERN.search(str(stmt_b.get("description") or ""))):
+                continue
+            try:
+                gap_days = abs((date.fromisoformat(date_a) - date.fromisoformat(date_b)).days)
+            except ValueError:
+                continue
+            if gap_days > 30:
+                continue
+            a_is_refund = bool(_REFUND_KW_PATTERN.search(str(stmt_a.get("description") or "")))
+            pairs[stmt_a["id"]] = {"other": stmt_b, "is_refund": a_is_refund}
+            pairs[stmt_b["id"]] = {"other": stmt_a, "is_refund": not a_is_refund}
+            consumed.update({stmt_a["id"], stmt_b["id"]})
+            break
+    return pairs
+
+
+def _refund_pair_suggestion(stmt: Dict[str, Any], pair: Dict[str, Any]) -> Dict[str, Any]:
+    is_refund = pair["is_refund"]
+    other = pair["other"]
+    amount = abs(safe_money(stmt.get("amount")))
+    date_str = str(stmt.get("transaction_date") or "")[:10]
+    other_date = str(other.get("transaction_date") or "")[:10]
+    other_amount = abs(safe_money(other.get("amount")))
+    if is_refund:
+        category = "往来退款"
+        direction = "income"
+        title = f"往来退款对冲-{date_str}" if date_str else "往来退款对冲"
+        reason = (
+            f"与本笔对应的 {other_date} 付款 ¥{other_amount} 构成一付一退，"
+            "收款冲减其他应收款-待收款项，不进平台结算或损益"
+        )
+    else:
+        category = "往来款"
+        direction = "expense"
+        title = f"往来暂付款-{date_str}" if date_str else "往来暂付款"
+        reason = (
+            f"与本笔对应的 {other_date} 退款 ¥{other_amount} 构成一付一退，"
+            "付款暂挂其他应收款-待收款项，与退款对冲"
+        )
+    return {
+        "statementId": stmt["id"],
+        "statement": {
+            "date": stmt["transaction_date"],
+            "description": stmt["description"],
+            "amount": stmt["amount"],
+            "balance": stmt["balance"],
+        },
+        "type": "new",
+        "confidence": 0.9,
+        "rule": "refund_pair",
+        "reason": reason,
+        "suggestedEntry": {
+            "title": title,
+            "category": category,
+            "accountCode": "122199",
+            "accountName": "其他应收款-待收款项",
+            "amount": amount,
+            "direction": direction,
+            "occurDate": date_str,
+            "confidence": 0.9,
+            "reason": reason,
+        },
+    }
+
+
+async def ai_suggest_matches(
+    company_id: str, limit: int = 20, month: str | None = None, *, user_id: str = ""
+) -> List[Dict[str, Any]]:
     """AI-powered matching suggestions for unmatched bank statements.
 
     Improvements:
@@ -1766,63 +1960,103 @@ async def ai_suggest_matches(company_id: str, limit: int = 20, month: str | None
                 (company_id,),
             )
             rows = await cursor.fetchall()
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            # 同下方 rules：表缺失只降级为无候选，不能让 ai-suggest 整体 500
+            logger.warning("读取 entries 失败，AI 对账候选为空 company=%s: %s", company_id, exc)
             rows = []
-        rule_cursor = await conn.execute(
-            "SELECT direction, match_pattern, category FROM bank_category_rules WHERE company_id = ?",
-            (company_id,),
-        )
-        company_rules = {
-            (str(r["direction"]), str(r["match_pattern"])): str(r["category"])
-            for r in await rule_cursor.fetchall()
-        }
+        company_rules = {}
+        try:
+            rule_cursor = await conn.execute(
+                "SELECT direction, match_pattern, category FROM bank_category_rules WHERE company_id = ?",
+                (company_id,),
+            )
+            company_rules = {
+                (str(r["direction"]), str(r["match_pattern"])): str(r["category"])
+                for r in await rule_cursor.fetchall()
+            }
+        except Exception as exc:  # noqa: BLE001
+            # 表缺失（如 Postgres 未跑迁移）只降级为无记忆规则，不能让整个
+            # ai-suggest 500——否则对账建议全灭且前端无提示。
+            logger.warning("读取 bank_category_rules 失败，本次跳过企业记忆规则: %s", exc)
     finally:
         await conn.close()
 
-    entries = []
-    for row in rows:
-        try:
-            payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
-            entry_id = payload.get("id", row["id"])
-            # Skip entries already matched to a bank statement
-            if entry_id in already_matched_ids:
-                continue
-
-            voucher = payload.get("voucherLines") or {}
-            bank_effect = _bank_effect_from_voucher(voucher) if voucher else ZERO
-            payer = payload.get("payer") or ""
-            is_advancement = payer == "boss_personal" or payer == "employee_personal" or payer.startswith("employee_personal:")
-            
-            # ponytail: allow advancements (zero bank effect) to match reimbursement outflow
-            if voucher and abs(bank_effect) < RECONCILIATION_AMOUNT_TOLERANCE and not is_advancement:
-                continue
-
-            orig_amount = safe_money(payload.get("amount")) if is_advancement else (bank_effect if voucher else safe_money(payload.get("amount")))
-            direction = "income" if bank_effect > 0 else "expense" if bank_effect < 0 else payload.get("direction", "")
-
-            # 方向修正（负数冲减时对冲方向）
-            if not voucher and orig_amount < 0:
-                if direction == "income":
-                    direction = "expense"
-                elif direction == "expense":
-                    direction = "income"
-
-            entries.append({
-                "id": entry_id,
-                "title": payload.get("title", ""),
-                "amount": abs(orig_amount),
-                "direction": direction,
-                "category": payload.get("category", ""),
-                "occurDate": payload.get("occurDate", ""),
-            })
-        except (json.JSONDecodeError, TypeError):
-            continue
+    entries = _build_match_candidates(rows, already_matched_ids, allow_advancement=True)
 
     suggestions = []
     used_suggested_entry_ids = set(already_matched_ids)
-    
+
+    # B. 一付一退对冲：退款与原付款互相挂钩，双双挂往来不进损益/平台结算
+    refund_pairs = _detect_refund_pairs(statements)
+
     need_ai_statements = []
     for stmt in statements:
+        pair = refund_pairs.get(stmt["id"])
+        if pair:
+            suggestions.append(_refund_pair_suggestion(stmt, pair))
+            continue
+
+        # 与已入账凭证配对（优先于一切新建建议：账上记过的钱要核销而不是重记）
+        available_entries = [
+            e for e in entries
+            if e.get("id") not in used_suggested_entry_ids
+            and _direction_matches_statement(stmt["amount"], e.get("direction", "expense"))
+        ]
+        rule_match = _try_rule_match(stmt, available_entries)
+        if rule_match:
+            if rule_match.get("type") == "match":
+                used_suggested_entry_ids.add(rule_match["entry_id"])
+            suggestions.append({
+                "statementId": stmt["id"],
+                "statement": {
+                    "date": stmt["transaction_date"],
+                    "description": stmt["description"],
+                    "amount": stmt["amount"],
+                    "balance": stmt["balance"],
+                },
+                "type": rule_match.get("type", "match"),
+                "matchedEntryId": rule_match["entry_id"],
+                "matchedEntry": rule_match["entry"],
+                "confidence": rule_match["confidence"],
+                "reason": rule_match["reason"],
+                "amountDifference": rule_match.get("amount_difference", 0),
+            })
+            continue
+
+        # C. 企业记忆规则（用户确认过的规则压过系统关键词启发式——否则
+        #    「记住此规则」在快规则命中的流水上永远不生效）
+        stmt_dir = "income" if safe_money(stmt["amount"]) > ZERO else "expense"
+        stmt_pattern = extract_statement_rule_pattern(str(stmt.get("description") or ""))
+        remembered_category = company_rules.get((stmt_dir, stmt_pattern)) if stmt_pattern else None
+        if remembered_category:
+            date_str = str(stmt.get("transaction_date") or "")[:10]
+            reason = f"命中企业记忆规则：「{stmt_pattern}」自动归入{remembered_category}"
+            suggestions.append({
+                "statementId": stmt["id"],
+                "statement": {
+                    "date": stmt["transaction_date"],
+                    "description": stmt["description"],
+                    "amount": stmt["amount"],
+                    "balance": stmt["balance"],
+                },
+                "type": "new",
+                "confidence": 0.98,
+                "rule": "company_memory_rule",
+                "rulePattern": stmt_pattern,
+                "reason": reason,
+                "suggestedEntry": {
+                    "title": f"{remembered_category}-{stmt_pattern[:16]}",
+                    "category": remembered_category,
+                    "amount": abs(safe_money(stmt["amount"])),
+                    "direction": stmt_dir,
+                    "occurDate": date_str,
+                    "confidence": 0.98,
+                    "reason": reason,
+                },
+            })
+            continue
+
+        # A. 系统关键词快规则（已收窄：退款/验证类不再误中平台结算）
         fast_rule = identify_statement_fast_rule(stmt)
         if fast_rule and fast_rule["rule"] != "wechat_withdrawal":
             suggestions.append({
@@ -1899,63 +2133,6 @@ async def ai_suggest_matches(company_id: str, limit: int = 20, month: str | None
                     },
                 })
             continue
-        # First try rule-based match (fast path)
-        available_entries = [
-            e for e in entries
-            if e.get("id") not in used_suggested_entry_ids
-            and _direction_matches_statement(stmt["amount"], e.get("direction", "expense"))
-        ]
-        rule_match = _try_rule_match(stmt, available_entries)
-        if rule_match:
-            if rule_match.get("type") == "match":
-                used_suggested_entry_ids.add(rule_match["entry_id"])
-            suggestions.append({
-                "statementId": stmt["id"],
-                "statement": {
-                    "date": stmt["transaction_date"],
-                    "description": stmt["description"],
-                    "amount": stmt["amount"],
-                    "balance": stmt["balance"],
-                },
-                "type": rule_match.get("type", "match"),
-                "matchedEntryId": rule_match["entry_id"],
-                "matchedEntry": rule_match["entry"],
-                "confidence": rule_match["confidence"],
-                "reason": rule_match["reason"],
-                "amountDifference": rule_match.get("amount_difference", 0),
-            })
-            continue
-
-        stmt_dir = "income" if safe_money(stmt["amount"]) > ZERO else "expense"
-        stmt_pattern = extract_statement_rule_pattern(str(stmt.get("description") or ""))
-        remembered_category = company_rules.get((stmt_dir, stmt_pattern)) if stmt_pattern else None
-        if remembered_category:
-            date_str = str(stmt.get("transaction_date") or "")[:10]
-            reason = f"命中企业记忆规则：「{stmt_pattern}」自动归入{remembered_category}"
-            suggestions.append({
-                "statementId": stmt["id"],
-                "statement": {
-                    "date": stmt["transaction_date"],
-                    "description": stmt["description"],
-                    "amount": stmt["amount"],
-                    "balance": stmt["balance"],
-                },
-                "type": "new",
-                "confidence": 0.98,
-                "rule": "company_memory_rule",
-                "rulePattern": stmt_pattern,
-                "reason": reason,
-                "suggestedEntry": {
-                    "title": f"{remembered_category}-{stmt_pattern[:16]}",
-                    "category": remembered_category,
-                    "amount": abs(safe_money(stmt["amount"])),
-                    "direction": stmt_dir,
-                    "occurDate": date_str,
-                    "confidence": 0.98,
-                    "reason": reason,
-                },
-            })
-            continue
 
         need_ai_statements.append(stmt)
 
@@ -1980,6 +2157,9 @@ async def ai_suggest_matches(company_id: str, limit: int = 20, month: str | None
                         BANK_MATCH_PROMPT, user_msg,
                         fallback={"matchedEntryId": None, "confidence": 0, "reason": "无法判断"},
                         max_retries=1,
+                        scene="bank_statement",
+                        user_id=user_id,
+                        company_id=company_id,
                     )
 
                     if match_result.get("matchedEntryId") and match_result.get("confidence", 0) >= 0.5:
@@ -2010,6 +2190,9 @@ async def ai_suggest_matches(company_id: str, limit: int = 20, month: str | None
                     fallback=_fallback_classification_for_statement(stmt),
                     max_retries=1,
                     retry_on_parse=True,
+                    scene="bank_statement",
+                    user_id=user_id,
+                    company_id=company_id,
                 )
                 classify_result = _ensure_classification_direction(stmt, classify_result)
 
@@ -2026,6 +2209,8 @@ async def ai_suggest_matches(company_id: str, limit: int = 20, month: str | None
                     "confidence": classify_result.get("confidence", 0.5),
                     "reason": classify_result.get("reason", ""),
                 }
+            except AccountingError:
+                raise  # 配额超限必须对上层可见（402），不能伪装成单条兜底建议
             except Exception:
                 logger.exception("ai_suggest_single 兜底：statement=%s", stmt.get("id"))
                 fb = _fallback_classification_for_statement(stmt, confidence=0.2)
@@ -2182,7 +2367,9 @@ def _try_rule_match(stmt: Dict, entries: List[Dict]) -> Optional[Dict]:
     return best
 
 
-async def classify_single_statement(company_id: str, statement_id: str, business_context: str = "") -> Optional[Dict[str, Any]]:
+async def classify_single_statement(
+    company_id: str, statement_id: str, business_context: str = "", *, user_id: str = ""
+) -> Optional[Dict[str, Any]]:
     """Classify a single bank statement using LLM on-demand."""
     from services.bank_ai_prompts import BANK_CLASSIFY_PROMPT
     from services.llm import safe_chat_text_json
@@ -2258,7 +2445,8 @@ async def classify_single_statement(company_id: str, statement_id: str, business
 
 请优先根据用户补充说明判断业务用途；当补充说明与摘要、发票项目或银行流水描述冲突时，以用户补充说明为准。"""
 
-    classify_result = safe_chat_text_json(
+    classify_result = await asyncio.to_thread(
+        safe_chat_text_json,
         BANK_CLASSIFY_PROMPT, classify_msg,
         fallback={"direction": "expense" if stmt["amount"] < 0 else "income",
                   "category": "其他支出" if stmt["amount"] < 0 else "其他业务收入",
@@ -2269,6 +2457,7 @@ async def classify_single_statement(company_id: str, statement_id: str, business
         max_retries=1,
         retry_on_parse=True,
         scene="bank_statement",
+        user_id=user_id,
         company_id=company_id,
     )
     return _ensure_classification_direction(stmt, classify_result)
@@ -2294,3 +2483,512 @@ async def apply_statement_match(
         raise ValueError("至少需要一笔要匹配的账目记录")
     return await confirm_statement_match(session, company_id=company_id, user_id=user_id,
         statement_id=statement_id, entry_ids=entry_ids, request_id=request_id or _now_iso())
+
+
+def _looks_like_salary_payment(entry_data: Dict[str, Any], description: str) -> bool:
+    """工资流水不得在银行页直接记费用，否则与工资计提重复。"""
+    if is_salary_payment_description(description):
+        return True
+    category = str(entry_data.get("category") or "")
+    if category in {"工资", "工资支出", "工资发放", "职工薪酬", "薪资", "薪酬"}:
+        return True
+    account_code = str(entry_data.get("accountCode") or "")
+    return account_code in {"5602001", "221101"}
+
+
+def _looks_like_payroll_liability(entry_data: Dict[str, Any], description: str) -> bool:
+    """社保/公积金流水必须走工资模块核销，不能直接记费用导致重复列支。"""
+    if is_payroll_liability_description(description):
+        return True
+    category = str(entry_data.get("category") or "")
+    if category in {"社保公积金", "社保", "公积金", "住房公积金"}:
+        return True
+    return str(entry_data.get("accountCode") or "") in {"221102", "221104"}
+
+
+async def confirm_suggestion_flow(
+    *,
+    req: Any,
+    session: Optional[AsyncSession],
+    company_id: str,
+    user_id: str,
+    request: Any = None,
+    respond,
+    sync_core,
+) -> Dict[str, Any]:
+    """确认 AI 建议的业务体（自 routers/bank.py 下沉）。
+
+    生产路径（session 为 AsyncSession）走 bank_settlement_service 的权威事务；
+    单测/legacy 夹具（session 非会话）走本函数内的 legacy 裸 SQL 路径。原样保留
+    HTTPException 错误契约：前端按 detail.code 分流（EXISTING_WECHAT_ENTRIES /
+    PAYROLL_LIABILITY_REQUIRES_PAYROLL / SALARY_REQUIRES_PAYROLL / EXISTING_ENTRY_MATCH）。
+    """
+    from services.entry_service import save_entry
+
+    if req.type == "match":
+        await ensure_bank_schema()
+        requested_raw = req.matched_entry_ids if req.matched_entry_ids else [req.matched_entry_id]
+        requested_ids: List[str] = []
+        for raw_id in requested_raw:
+            entry_id = str(raw_id or "").strip()
+            if entry_id and entry_id not in requested_ids:
+                requested_ids.append(entry_id)
+        if len([entry_id for entry_id in requested_ids
+                if entry_id != f"bank-settlement-{req.statement_id}"]) > 500:
+            raise HTTPException(status_code=400, detail="一次最多合并 500 笔账目记录")
+
+        if isinstance(session, AsyncSession):
+            from sqlalchemy import select
+
+            from db.models import JournalEntry, LegacyEntryProjection
+            from services.bank_settlement_service import confirm_statement_match
+            # 批量两次查询替代逐条 get_journal+serialize_journal（500 笔上限时原为
+            # 千级串行查询）。判定所需的 payer 可能来自投影回填（与 serialize_journal
+            # 同优先级：metadata 打底、投影覆盖），voucherLines 仅存于 metadata。
+            personal = False
+            payloads: Dict[str, Dict[str, Any]] = {}
+            for row in (await session.execute(
+                select(JournalEntry.id, JournalEntry.metadata_json).where(
+                    JournalEntry.company_id == company_id,
+                    JournalEntry.id.in_(requested_ids),
+                )
+            )).all():
+                payloads[row[0]] = dict(row[1] or {})
+            for row in (await session.execute(
+                select(LegacyEntryProjection.id, LegacyEntryProjection.payload).where(
+                    LegacyEntryProjection.company_id == company_id,
+                    LegacyEntryProjection.id.in_(requested_ids),
+                )
+            )).all():
+                try:
+                    legacy = json.loads(row[1]) if isinstance(row[1], str) else (row[1] or {})
+                except (json.JSONDecodeError, TypeError):
+                    legacy = {}
+                if isinstance(legacy, dict) and legacy.get("payer") is not None and row[0] in payloads:
+                    payloads[row[0]]["payer"] = legacy["payer"]
+            for payload in payloads.values():
+                payer = str(payload.get("payer") or "")
+                if (payer in {"boss_personal", "employee_personal"} or payer.startswith("employee_personal:")) and \
+                        _bank_effect_from_voucher(payload.get("voucherLines") or {}) == ZERO:
+                    personal = True
+            if not personal:
+                return await respond(await confirm_statement_match(session,
+                    company_id=company_id, user_id=user_id, statement_id=req.statement_id,
+                    entry_ids=requested_ids,
+                    request_id=(request.headers.get("X-Request-ID") if request else None) or str(uuid4()),
+                    auto_post=bool(req.auto_post),
+                    allow_backfill=bool(req.allowBackfill),
+                    backfill_reason=req.backfillReason))
+
+        conn = await get_conn()
+        try:
+            cursor = await conn.execute(
+                "SELECT id, amount, matched_entry_id, transaction_date, description "
+                "FROM bank_statements WHERE id = ? AND company_id = ?",
+                (req.statement_id, company_id),
+            )
+            stmt = await cursor.fetchone()
+            if not stmt:
+                raise HTTPException(status_code=404, detail="流水不存在")
+
+            cursor = await conn.execute(
+                "SELECT entry_id, previous_billing_status, previous_payment_date FROM bank_statement_matches "
+                "WHERE statement_id = ? AND company_id = ? ORDER BY created_at ASC, entry_id ASC",
+                (req.statement_id, company_id),
+            )
+            existing_rows = [dict(row) for row in await cursor.fetchall()]
+            existing_ids = [str(row["entry_id"]) for row in existing_rows]
+            legacy_id = str(stmt["matched_entry_id"] or "").strip()
+            if legacy_id and legacy_id not in existing_ids:
+                existing_ids.insert(0, legacy_id)
+
+            if not requested_ids:
+                previous_statuses = {
+                    str(row["entry_id"]): row.get("previous_billing_status")
+                    for row in existing_rows
+                }
+                previous_payment_dates = {
+                    str(row["entry_id"]): row.get("previous_payment_date")
+                    for row in existing_rows
+                }
+                await conn.execute(
+                    "DELETE FROM bank_statement_matches WHERE statement_id = ? AND company_id = ?",
+                    (req.statement_id, company_id),
+                )
+                await conn.execute(
+                    "UPDATE bank_statements SET matched_entry_id = NULL WHERE id = ? AND company_id = ?",
+                    (req.statement_id, company_id),
+                )
+
+                for entry_id in existing_ids:
+                    cursor = await conn.execute(
+                        "SELECT 1 FROM bank_statement_matches "
+                        "WHERE company_id = ? AND entry_id = ? AND statement_id != ? LIMIT 1",
+                        (company_id, entry_id, req.statement_id),
+                    )
+                    still_matched = await cursor.fetchone()
+                    if not still_matched:
+                        cursor = await conn.execute(
+                            "SELECT 1 FROM bank_statements "
+                            "WHERE company_id = ? AND matched_entry_id = ? AND id != ? LIMIT 1",
+                            (company_id, entry_id, req.statement_id),
+                        )
+                        still_matched = await cursor.fetchone()
+                    if still_matched:
+                        continue
+
+                    cursor = await conn.execute(
+                        "SELECT payload FROM entries WHERE id = ? AND company_id = ?",
+                        (entry_id, company_id),
+                    )
+                    entry_row = await cursor.fetchone()
+                    if not entry_row:
+                        continue
+                    payload = json.loads(entry_row["payload"]) if isinstance(entry_row["payload"], str) else entry_row["payload"]
+                    if (
+                        isinstance(payload, dict)
+                        and payload.get("source") == "bank_reconciliation_repair"
+                        and payload.get("linkedStatementId") == req.statement_id
+                    ):
+                        await conn.execute(
+                            "DELETE FROM entries WHERE id = ? AND company_id = ?",
+                            (entry_id, company_id),
+                        )
+                        continue
+                    previous_status = previous_statuses.get(entry_id)
+                    current_status = payload.get("billingStatus") if isinstance(payload, dict) else None
+                    if previous_status is None and current_status != "reconciled":
+                        previous_status = current_status
+                    if previous_status is None and isinstance(payload, dict):
+                        if payload.get("source") == "invoice_import" or payload.get("invoiceNumber"):
+                            previous_status = "has_invoice"
+                    if previous_status:
+                        await conn.execute(
+                            "UPDATE entries SET payload = json_set(payload, '$.billingStatus', ?) "
+                            "WHERE id = ? AND company_id = ?",
+                            (previous_status, entry_id, company_id),
+                        )
+                    else:
+                        await conn.execute(
+                            "UPDATE entries SET payload = json_remove(payload, '$.billingStatus') "
+                            "WHERE id = ? AND company_id = ?",
+                            (entry_id, company_id),
+                        )
+                    previous_payment_date = previous_payment_dates.get(entry_id)
+                    if previous_payment_date:
+                        await conn.execute(
+                            "UPDATE entries SET payload = json_set(payload, '$.paymentDate', ?) "
+                            "WHERE id = ? AND company_id = ?",
+                            (previous_payment_date, entry_id, company_id),
+                        )
+                    else:
+                        await conn.execute(
+                            "UPDATE entries SET payload = json_remove(payload, '$.paymentDate') "
+                            "WHERE id = ? AND company_id = ?",
+                            (entry_id, company_id),
+                        )
+                await conn.commit()
+                await sync_core(stmt, [])
+                return await respond({"status": "unmatched", "entryId": None, "entryIds": existing_ids})
+
+            if existing_ids and set(existing_ids) != set(requested_ids):
+                raise HTTPException(status_code=409, detail="该流水已匹配其他账目记录")
+
+            placeholders = ",".join("?" for _ in requested_ids)
+            cursor = await conn.execute(
+                f"SELECT id, payload FROM entries WHERE company_id = ? AND id IN ({placeholders})",
+                (company_id, *requested_ids),
+            )
+            entry_rows = await cursor.fetchall()
+            payloads_by_id: Dict[str, Dict[str, Any]] = {}
+            for entry_row in entry_rows:
+                payload = json.loads(entry_row["payload"]) if isinstance(entry_row["payload"], str) else entry_row["payload"]
+                if isinstance(payload, dict):
+                    payloads_by_id[str(entry_row["id"])] = payload
+            missing_ids = [entry_id for entry_id in requested_ids if entry_id not in payloads_by_id]
+            if missing_ids:
+                raise HTTPException(status_code=404, detail={"message": "账目记录不存在", "entryIds": missing_ids})
+            payloads = [payloads_by_id[entry_id] for entry_id in requested_ids]
+
+            cursor = await conn.execute(
+                f"SELECT entry_id FROM bank_statement_matches "
+                f"WHERE company_id = ? AND statement_id != ? AND entry_id IN ({placeholders}) LIMIT 1",
+                (company_id, req.statement_id, *requested_ids),
+            )
+            conflict = await cursor.fetchone()
+            if not conflict:
+                cursor = await conn.execute(
+                    f"SELECT matched_entry_id AS entry_id FROM bank_statements "
+                    f"WHERE company_id = ? AND id != ? AND matched_entry_id IN ({placeholders}) LIMIT 1",
+                    (company_id, req.statement_id, *requested_ids),
+                )
+                conflict = await cursor.fetchone()
+            if conflict:
+                raise HTTPException(status_code=409, detail="其中一笔账目已匹配其他银行流水")
+
+            advancement_payloads = []
+            for payload in payloads:
+                payer = str(payload.get("payer") or "")
+                voucher = payload.get("voucherLines") or {}
+                bank_effect = _bank_effect_from_voucher(voucher) if voucher else ZERO
+                is_personal_payer = payer in ("boss_personal", "employee_personal") or payer.startswith("employee_personal:")
+                if is_personal_payer and abs(bank_effect) < money("0.01"):
+                    advancement_payloads.append(payload)
+            if advancement_payloads and len(payloads) > 1:
+                raise HTTPException(status_code=400, detail="垫付报销暂不支持与其他条目合并对账")
+
+            stmt_amount = money(stmt["amount"] or ZERO)
+            if advancement_payloads:
+                payload = advancement_payloads[0]
+                entry_id = requested_ids[0]
+                payer = str(payload.get("payer") or "")
+                if stmt_amount >= 0:
+                    raise HTTPException(status_code=400, detail="垫付报销流水必须为付款流出")
+                if abs(abs(stmt_amount) - money(payload.get("amount") or ZERO)) > money("0.05"):
+                    raise HTTPException(status_code=400, detail="金额不一致，请核对垫付金额与打款金额")
+
+                reim_entry_id = f"reim-{req.statement_id}-{entry_id}"
+                reim_category = "股东垫付报销" if payer == "boss_personal" else "员工垫付报销"
+                reim_data = {
+                    "id": reim_entry_id,
+                    "title": f"报销垫付款-{payload.get('title', '')}",
+                    "amount": abs(stmt_amount),
+                    "direction": "owner_transfer",
+                    "category": reim_category,
+                    "payer": payer,
+                    "billingStatus": "reconciled",
+                    "occurDate": str(stmt["transaction_date"][:10]),
+                    "paymentDate": str(stmt["transaction_date"][:10]),
+                    "source": "bank_import",
+                }
+                await save_entry(reim_data, user_id=user_id, company_id=company_id)
+                if isinstance(session, AsyncSession):
+                    await assert_bank_reconciliable(session, company_id=company_id, entry_ids=[reim_entry_id])
+                now = datetime.now(timezone.utc).isoformat()
+                await conn.execute(
+                    "INSERT OR IGNORE INTO bank_statement_matches "
+                    "(statement_id, company_id, entry_id, previous_billing_status, previous_payment_date, created_at) "
+                    "VALUES (?, ?, ?, NULL, NULL, ?)",
+                    (req.statement_id, company_id, reim_entry_id, now),
+                )
+                await conn.execute(
+                    "UPDATE bank_statements SET matched_entry_id = ? WHERE id = ? AND company_id = ?",
+                    (reim_entry_id, req.statement_id, company_id),
+                )
+                await conn.execute(
+                    "UPDATE entries SET payload = json_set(payload, '$.billingStatus', 'reconciled') "
+                    "WHERE id = ? AND company_id = ?",
+                    (entry_id, company_id),
+                )
+                await conn.commit()
+                await sync_core(stmt, [reim_entry_id])
+                return await respond({"status": "matched", "entryId": reim_entry_id})
+
+            check = build_group_reconciliation_check(stmt_amount, payloads)
+            if not check["directionMatches"]:
+                raise HTTPException(status_code=400, detail={
+                    "message": "所选账目合计方向与银行流水方向不一致",
+                    **check,
+                })
+            if not check["amountMatches"]:
+                raise HTTPException(status_code=400, detail={
+                    "message": "所选账目合计与银行流水金额不一致",
+                    **check,
+                })
+
+            if existing_ids and set(existing_ids) == set(requested_ids):
+                if isinstance(session, AsyncSession):
+                    await assert_bank_reconciliable(session, company_id=company_id, entry_ids=requested_ids)
+                await conn.execute(
+                    f"UPDATE entries SET payload = json_set(payload, '$.billingStatus', 'reconciled') "
+                    f"WHERE company_id = ? AND id IN ({placeholders})",
+                    (company_id, *requested_ids),
+                )
+                await conn.commit()
+                await sync_core(stmt, requested_ids)
+                result: Dict[str, Any] = {"status": "already_matched", "entryId": requested_ids[0]}
+                if len(requested_ids) > 1:
+                    result["entryIds"] = requested_ids
+                return await respond(result)
+
+            if isinstance(session, AsyncSession):
+                await assert_bank_reconciliable(session, company_id=company_id, entry_ids=requested_ids)
+            now = datetime.now(timezone.utc).isoformat()
+            for entry_id, payload in zip(requested_ids, payloads):
+                await conn.execute(
+                    "INSERT INTO bank_statement_matches "
+                    "(statement_id, company_id, entry_id, previous_billing_status, previous_payment_date, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        req.statement_id,
+                        company_id,
+                        entry_id,
+                        payload.get("billingStatus"),
+                        payload.get("paymentDate"),
+                        now,
+                    ),
+                )
+            await conn.execute(
+                "UPDATE bank_statements SET matched_entry_id = ? WHERE id = ? AND company_id = ?",
+                (requested_ids[0], req.statement_id, company_id),
+            )
+            await conn.execute(
+                f"UPDATE entries SET payload = json_set(payload, '$.billingStatus', 'reconciled', '$.paymentDate', ?) "
+                f"WHERE company_id = ? AND id IN ({placeholders})",
+                (str(stmt["transaction_date"][:10]), company_id, *requested_ids),
+            )
+            await conn.commit()
+        finally:
+            await conn.close()
+
+        result = {"status": "matched", "entryId": requested_ids[0]}
+        await sync_core(stmt, requested_ids)
+        if len(requested_ids) > 1:
+            result["entryIds"] = requested_ids
+        return await respond(result)
+
+    elif req.type == "new" and req.new_entry:
+        entry_data = req.new_entry.copy()
+        entry_data.pop("voucherLines", None)
+        entry_data.pop("voucherHint", None)
+        if entry_data.get("category") == "研发支出-费用化支出" and not (
+            entry_data.get("rdProjectId") and entry_data.get("rdExpenseType")
+        ):
+            raise HTTPException(status_code=422, detail="研发费用必须选择研发项目和费用类别")
+        conn = await get_conn()
+        try:
+            cursor = await conn.execute(
+                "SELECT amount, matched_entry_id, transaction_date, description FROM bank_statements WHERE id = ? AND company_id = ?",
+                (req.statement_id, company_id),
+            )
+            stmt = await cursor.fetchone()
+            if not stmt:
+                raise HTTPException(status_code=404, detail="流水不存在")
+
+            existing_match = str(stmt["matched_entry_id"] or "").strip()
+            if existing_match:
+                if isinstance(session, AsyncSession):
+                    await assert_bank_reconciliable(session, company_id=company_id, entry_ids=[existing_match])
+                await conn.execute(
+                    "UPDATE entries SET payload = json_set(payload, '$.billingStatus', 'reconciled') WHERE id = ? AND company_id = ?",
+                    (existing_match, company_id),
+                )
+                await conn.commit()
+                await sync_core(stmt, [existing_match])
+                return await respond({"status": "already_matched", "entryId": existing_match})
+        finally:
+            await conn.close()
+
+        if money(stmt["amount"] or ZERO) < ZERO and _looks_like_payroll_liability(entry_data, str(stmt["description"] or "")):
+            liability = await salary_service.list_payroll_liability_payment_suggestions(company_id)
+            raise HTTPException(status_code=409, detail={
+                "code": "PAYROLL_LIABILITY_REQUIRES_PAYROLL",
+                "message": "识别为社保/公积金缴纳，不能在银行页直接记费用。请到工资模块按流水确认缴纳，系统会生成应付职工薪酬核销凭证。",
+                "suggestions": liability.get("suggestions", []),
+            })
+
+        if money(stmt["amount"] or ZERO) < ZERO and _looks_like_salary_payment(entry_data, str(stmt["description"] or "")):
+            import services.salary_service as salary_service
+
+            payroll = await salary_service.list_salary_payment_suggestions(company_id)
+            raise HTTPException(status_code=409, detail={
+                "code": "SALARY_REQUIRES_PAYROLL",
+                "message": "识别为工资发放，不能在银行页直接记费用。请到工资模块先计提，再按流水确认发放，系统会生成应付职工薪酬核销凭证。",
+                "suggestions": payroll.get("suggestions", []),
+            })
+
+        if entry_data.get("category") not in ("微信支付结算", "支付宝结算", "平台提现结算"):
+            settlement_candidates = await get_wechat_settlement_candidates(company_id, dict(stmt))
+            if settlement_candidates:
+                raise HTTPException(status_code=409, detail={
+                    "code": "EXISTING_WECHAT_ENTRIES",
+                    "message": "该微信结算已有收入及手续费账目，请合并核销原账目，不能再次记为收入或支出",
+                    "candidateEntryGroups": [[entry["id"] for entry in group] for group in settlement_candidates],
+                })
+
+        # 防重复记账：账上已有等额同向、尚未对账的银行凭证时，应直接配对而不是再记一笔
+        if isinstance(session, AsyncSession) and not req.skipDuplicateCheck:
+            try:
+                stmt_day = date.fromisoformat(str(stmt["transaction_date"])[:10])
+            except (TypeError, ValueError):
+                stmt_day = None
+            if stmt_day is not None:
+                duplicates = await find_duplicate_bank_entries(
+                    session, company_id, stmt_day, money(stmt["amount"] or ZERO)
+                )
+                if duplicates:
+                    raise HTTPException(status_code=409, detail={
+                        "code": "EXISTING_ENTRY_MATCH",
+                        "message": "账上已有一笔金额相同的凭证，直接配对即可，避免重复记账",
+                        "candidateEntryIds": [item["id"] for item in duplicates],
+                        "entries": duplicates,
+                    })
+
+        stmt_amount = money(stmt["amount"] or ZERO)
+        direction = str(entry_data.get("direction") or "")
+        if entry_data.get("category") in ("微信支付结算", "支付宝结算", "平台提现结算") and not direction:
+            direction = "income" if stmt_amount > ZERO else "expense"
+            entry_data["direction"] = direction
+        if not _direction_matches_statement(stmt_amount, direction):
+            if stmt_amount > 0:
+                raise HTTPException(status_code=400, detail="收款流水只能记为收入或股东投入/往来")
+            if stmt_amount < 0:
+                raise HTTPException(status_code=400, detail="付款流水只能记为支出或资本/往来")
+
+        entry_id = f"bank-{req.statement_id}"
+        entry_data["id"] = entry_id
+        entry_data["source"] = "bank_import"
+        entry_data["payer"] = entry_data.get("payer", "company_account")
+        entry_data["billingStatus"] = "reconciled"
+        entry_data["paymentDate"] = str(stmt["transaction_date"][:10])
+        if "amount" in entry_data:
+            raw_amount = money(entry_data["amount"])
+            # income/expense 用方向表意，取绝对值；owner_transfer 保留原始符号表达现金流向
+            if entry_data.get("direction") in ("income", "expense"):
+                entry_data["amount"] = abs(raw_amount)
+            else:
+                entry_data["amount"] = raw_amount
+
+        await save_entry(
+            entry_data, user_id=user_id, company_id=company_id,
+            allow_backfill=bool(req.allowBackfill), backfill_reason=req.backfillReason,
+        )
+        if isinstance(session, AsyncSession):
+            await assert_bank_reconciliable(session, company_id=company_id, entry_ids=[entry_id])
+
+        # Link statement to new entry
+        conn = await get_conn()
+        try:
+            await conn.execute(
+                "INSERT OR IGNORE INTO bank_statement_matches "
+                "(statement_id, company_id, entry_id, previous_billing_status, previous_payment_date, created_at) "
+                "VALUES (?, ?, ?, NULL, NULL, ?)",
+                (req.statement_id, company_id, entry_id, datetime.now(timezone.utc).isoformat()),
+            )
+            await conn.execute(
+                "UPDATE bank_statements SET matched_entry_id = ? WHERE id = ? AND company_id = ?",
+                (entry_id, req.statement_id, company_id),
+            )
+            await conn.commit()
+        finally:
+            await conn.close()
+
+        await log_action(company_id, user_id, "create", "entry", entry_id,
+                         {"source": "bank_ai_suggest", "title": entry_data.get("title", "")})
+        await sync_core(stmt, [entry_id])
+        saved_rule_pattern = None
+        # 模糊分类组的正确科目取决于账外事实（认缴进度、缴款性质），同一附言
+        # 未必每次同科目；沉淀自动规则会把本月的判断错误套用到未来流水。
+        if req.rememberRule and not is_ambiguity_category(str(entry_data.get("category") or "")):
+            saved_rule_pattern = await save_company_category_rule(
+                company_id,
+                str(stmt["description"] or ""),
+                stmt["amount"],
+                str(entry_data.get("category") or ""),
+            )
+        response_data: Dict[str, Any] = {"status": "created", "entryId": entry_id}
+        if saved_rule_pattern:
+            response_data["savedRulePattern"] = saved_rule_pattern
+        return await respond(response_data)
+
+    return await respond({"status": "error", "message": "无效的请求"})

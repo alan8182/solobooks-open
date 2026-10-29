@@ -7,8 +7,6 @@ dashscope>=1.20.0
 pydantic==2.14.1
 httpx==0.28.1
 certifi>=2025.1.31
-pytest==8.3.4
-pytest-asyncio==0.24.0
 aiosqlite==0.21.0
 alembic==1.15.1
 SQLAlchemy[asyncio]==2.0.44

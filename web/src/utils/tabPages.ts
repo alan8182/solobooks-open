@@ -25,17 +25,16 @@ export const TAB_PATHS = [
   '/vouchers',
   '/ledger/books',
   '/ledger/book',
+  '/reports/archive',
   // 周期
   '/closing-wizard',
   '/tax-filing',
   '/reports',
   // 专项核算（列表页，进得去就要能开着）
   '/assets',
-  '/intangibles',
   '/rd-expenses',
   '/mine/salary',
   '/private-expenses',
-  '/recurring',
   '/aggregation',
 ] as const
 
@@ -83,6 +82,8 @@ export function matchTabPath(path: string | null | undefined): string | null {
  */
 export function resolveActiveTab(path: string | null | undefined): string | null {
   if (!path) return null
+  // 无形资产已合并至长期资产，详情与新增页归属 /assets 标签
+  if (path.startsWith('/intangibles')) return '/assets'
   const exact = matchTabPath(path)
   if (exact) return exact
   const parents = (TAB_PATHS as readonly string[]).filter(

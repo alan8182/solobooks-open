@@ -4,7 +4,7 @@ import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { reportErrorToast } from '@/utils/errorPresenter'
 import {
-  NAlert, NButton, NCard, NCheckbox, NDatePicker, NFormItem, NInput, NModal, NSelect, NSpin, NTabPane, NTabs, useMessage,
+  NAlert, NButton, NCard, NCheckbox, NFormItem, NInput, NModal, NSelect, NSpin, NTabPane, NTabs, useMessage,
 } from 'naive-ui'
 import * as XLSX from 'xlsx'
 import apiClient from '@/api/client'
@@ -13,9 +13,14 @@ import {
   confirmLegacyBalance, confirmLegacyVouchers, parseLegacyBalance, parseLegacyVouchers,
 } from '@/api/legacy'
 import type { BalanceParseResponse, MappingSuggestion, ParseIssue, VoucherParseResponse } from '@/api/legacy'
+import { SoloMonthPicker } from '@/components/ui'
 import { formatMoney } from '@/utils/format'
+import { saveWorkbook } from '@/utils/export'
 
 type Mode = 'balance' | 'voucher'
+
+const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false })
+const emit = defineEmits<{ imported: [] }>()
 
 const router = useRouter()
 const message = useMessage()
@@ -55,7 +60,7 @@ function downloadTemplate() {
   worksheet['!cols'] = headers.map(() => ({ wch: 16 }))
   const workbook = XLSX.utils.book_new()
   XLSX.utils.book_append_sheet(workbook, worksheet, mode.value === 'balance' ? '科目余额表' : '凭证分录')
-  XLSX.writeFile(workbook, mode.value === 'balance' ? '科目余额表导入模板.xlsx' : '凭证分录导入模板.xlsx')
+  saveWorkbook(workbook, mode.value === 'balance' ? '科目余额表导入模板.xlsx' : '凭证分录导入模板.xlsx')
 }
 
 async function onFilePicked(event: Event) {
@@ -114,6 +119,29 @@ function reset() {
   voucherResult.value = null
   mappingOverrides.value = {}
   postDirectly.value = false
+}
+
+function transferToOpening() {
+  if (!balanceResult.value || balanceResult.value.valid.length === 0) return
+  const payload = {
+    items: balanceResult.value.valid,
+    ytdItems: balanceResult.value.valid
+      .filter((it: any) => parseFloat(it.ytdDebit || 0) > 0 || parseFloat(it.ytdCredit || 0) > 0)
+      .map((it: any) => ({
+        accountCode: it.accountCode,
+        accountName: it.accountName,
+        debitBalance: it.ytdDebit,
+        creditBalance: it.ytdCredit,
+      })),
+    fiscalYear: fiscalYear.value,
+    startPeriod: startPeriod.value,
+  }
+  sessionStorage.setItem('solobooks:pending_opening_import', JSON.stringify(payload))
+  message.success('已将解析数据带入期初草稿，正在前往期初设置...')
+  emit('imported')
+  if (!props.embedded) {
+    router.push('/mine/opening')
+  }
 }
 
 async function startConfirm() {
@@ -190,7 +218,10 @@ async function confirmBalanceWithStepUp() {
     )
     stepUpVisible.value = false
     message.success('期初余额已导入并生成期初凭证')
-    router.push('/mine/opening')
+    emit('imported')
+    if (!props.embedded) {
+      router.push('/mine/opening')
+    }
   } catch (error: unknown) {
     reportErrorToast(message, error, '导入失败')
   } finally {
@@ -217,13 +248,13 @@ onMounted(loadAccounts)
   <div class="report-container">
     <div class="report-header">
       <div class="report-header-left">
-        <NButton text class="report-back-btn" @click="router.push('/mine')">
+        <NButton v-if="!props.embedded" text class="report-back-btn" @click="router.push('/mine')">
           <template #icon><i class="ri-arrow-left-line" /></template>
           返回设置
         </NButton>
         <div class="report-title-section">
           <h2>旧账导入</h2>
-          <p class="report-subtitle">从金蝶 / 用友 / 柠檬云等迁移：科目余额表导入期初，或凭证分录导入历史凭证</p>
+          <p class="report-subtitle">从金蝶 / 用友 / 柠檬云等迁移：支持凭证分录批量导入历史流水，或将科目余额表快速转入期初</p>
         </div>
       </div>
       <div class="report-header-right">
@@ -240,8 +271,7 @@ onMounted(loadAccounts)
     </NTabs>
 
     <NAlert v-if="mode === 'balance'" type="info" :bordered="false" class="hint-alert">
-      余额表导入会写入期初凭证（需短信二次验证），天然带借贷平衡校验与年中建账 YTD 过渡。
-      启用日期之前的业务请走这条路径，不要用凭证导入。
+      科目余额表导入将作为期初建账凭证。建议优先前往<b>「期初设置」</b>直接维护或导入（支持试算平衡、固定资产对账与年中损益校验）；在此处解析后，您也可以点击<b>「带入期初设置细调」</b>一键前往核算。
     </NAlert>
     <NAlert v-else type="info" :bordered="false" class="hint-alert">
       凭证导入默认生成<b>草稿待审</b>凭证，逐张校验借贷平衡；同一批次重复导入会自动跳过，原凭证号会保留。
@@ -404,10 +434,13 @@ onMounted(loadAccounts)
               <NInput :value="String(fiscalYear)" style="width: 110px;" @update:value="(value: string) => (fiscalYear = Number(value) || fiscalYear)" />
             </NFormItem>
             <NFormItem label="启用期间" label-placement="left" :show-feedback="false">
-              <NDatePicker v-model:formatted-value="startPeriod" type="month" value-format="yyyy-MM" format="yyyy-MM" clearable style="width: 140px;" />
+              <SoloMonthPicker v-model:value="startPeriod" clearable style="width: 140px;" />
             </NFormItem>
-            <span class="confirm-hint">导入即生成期初凭证，需短信二次验证</span>
-            <NButton type="primary" :loading="confirming" :disabled="issues.length > 0" @click="startConfirm">验证并导入</NButton>
+            <span class="confirm-hint">可先带入期初设置细调，或直接验证生成期初凭证</span>
+            <NButton secondary type="primary" :disabled="issues.length > 0" @click="transferToOpening">
+              带入期初设置细调
+            </NButton>
+            <NButton type="primary" :loading="confirming" :disabled="issues.length > 0" @click="startConfirm">直接验证并导入</NButton>
           </div>
           <div v-else class="confirm-row">
             <NCheckbox v-model:checked="postDirectly">导入后直接过账（默认生成草稿待审）</NCheckbox>

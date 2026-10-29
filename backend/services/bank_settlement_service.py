@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 
 from sqlalchemy import delete, select, text
@@ -18,6 +19,8 @@ from services.accounting_core_service import (
     record_audit, require_role, serialize_journal, sync_bank_reconciliation,
 )
 from services.wechat_bill_service import WECHAT_CLEARING_CODE
+
+logger = logging.getLogger(__name__)
 from services.bank_service import (
     _account_effect_from_voucher, _entry_bank_effect_from_payload,
     build_group_reconciliation_check,
@@ -195,7 +198,14 @@ async def confirm_statement_match(
             projection = await session.get(LegacyEntryProjection, row["entry_id"])
             if not projection or projection.company_id != company_id:
                 continue
-            payload = json.loads(projection.payload)
+            try:
+                payload = json.loads(projection.payload)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "结算回滚跳过损坏的投影 payload entry=%s company=%s",
+                    row["entry_id"], company_id,
+                )
+                continue
             # 配对转销的发票回滚：draft 发票改回待付款（2241/1122）；
             # posted 发票去掉转销标记并删除对应付款凭证（draft 可删）
             pending_mark_statement = str(payload.get(_INVOICE_PENDING_MARK) or "")
@@ -222,7 +232,11 @@ async def confirm_statement_match(
                     projection.payload = json.dumps(payload, ensure_ascii=False)
                     payment_id = f"invoice-payment-{statement['id']}-{row['entry_id'][:8]}"
                     payment_entry = await session.get(JournalEntry, payment_id)
-                    if payment_entry is not None and payment_entry.company_id == company_id                             and payment_entry.status == "draft":
+                    if (
+                        payment_entry is not None
+                        and payment_entry.company_id == company_id
+                        and payment_entry.status == "draft"
+                    ):
                         await delete_draft(session, payment_id, company_id=company_id,
                             user_id=user_id, request_id=request_id)
                         await session.execute(delete(JournalLine).where(
@@ -326,7 +340,17 @@ async def confirm_statement_match(
     now = datetime.now(timezone.utc).isoformat()
     for entry_id in dict.fromkeys(linked + draft_invoice_ids + posted_invoice_ids):
         projection = await session.get(LegacyEntryProjection, entry_id)
-        payload = json.loads(projection.payload)
+        try:
+            payload = json.loads(projection.payload)
+        except (TypeError, ValueError) as exc:
+            # payload 随后会被改写回投影：坏数据不能静默覆盖（丢失原始现场），
+            # 也绝不能让未知状态的 payload 混入财务写路径——整体回滚并提示人工修复。
+            logger.error("结算确认遇到损坏的投影 payload entry=%s company=%s", entry_id, company_id)
+            raise AccountingError(
+                "PROJECTION_CORRUPTED",
+                f"凭证 {entry_id} 的底层数据损坏，已中止结算，请人工核对该凭证",
+                500,
+            ) from exc
         await session.execute(text(
             "INSERT INTO bank_statement_matches (company_id,statement_id,entry_id,previous_billing_status,previous_payment_date,created_at) "
             "VALUES (:company,:statement,:entry,:billing,:payment,:now) ON CONFLICT DO NOTHING"

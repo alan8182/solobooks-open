@@ -46,6 +46,7 @@ MCP_READ_TOOLS = frozenset(
         "list_fixed_assets",
         "list_intangible_assets",
         "get_advance_balances",
+        "list_private_expenses",
         "get_aging",
         "list_todos",
         "search_books",
@@ -73,6 +74,7 @@ MCP_WRITE_TOOLS = frozenset(
         "propose_asset_closure",
         "propose_voucher",
         "propose_vouchers",
+        "record_private_expense",
     }
 )
 

@@ -181,15 +181,17 @@ class TestPatTokenService:
 
 class TestMcpToolRegistration:
     async def test_open_tools_registered(self):
-        """读 + 写草稿全集注册（24 = 内部 25 - 刻意不开放的 update_company_profile）。"""
+        """读 + 写草稿全集注册（26 = 内部 27 - 刻意不开放的 update_company_profile）。"""
         from agent.mcp_server import MCP_READ_TOOLS, MCP_WRITE_TOOLS, mcp
 
         tools = await mcp.list_tools()
         names = {t.name for t in tools}
         assert names == MCP_READ_TOOLS | MCP_WRITE_TOOLS
-        assert len(names) == 24
+        assert len(names) == 26
         assert "get_advance_balances" in names
         assert "list_intangible_assets" in names
+        assert "list_private_expenses" in names
+        assert "record_private_expense" in names
 
     async def test_company_profile_write_not_exposed(self):
         """画像写入不对 MCP 开放：工具仍在内部层，但 MCP 侧不可见不可调。"""
@@ -708,3 +710,50 @@ class TestListFixedAssets:
         assert paged["count"] == 1
         assert paged["pageSize"] == 1
         assert paged["total"] >= 2
+
+
+class TestMcpPrivateExpenses:
+    """小私账 MCP 与 Agent 读写工具测试。"""
+
+    async def test_private_expenses_tools_registered(self):
+        from agent.mcp_server import MCP_READ_TOOLS, MCP_WRITE_TOOLS
+        from agent.tools import TOOLS_BY_NAME
+
+        assert "list_private_expenses" in MCP_READ_TOOLS
+        assert "record_private_expense" in MCP_WRITE_TOOLS
+        assert "list_private_expenses" in TOOLS_BY_NAME
+        assert "record_private_expense" in TOOLS_BY_NAME
+
+    async def test_record_and_list_private_expenses(self):
+        from agent.tools import ToolContext, execute_tool
+
+        await _ensure_user("test_user_pe_001")
+        ctx = ToolContext(user_id="test_user_pe_001", company_id="c1")
+
+        rec = await execute_tool(
+            "record_private_expense",
+            {
+                "title": "个人打车见客户",
+                "amount": 65.5,
+                "direction": "expense",
+                "category": "交通费",
+                "occur_date": "2026-10-28",
+                "private_account": "微信零钱",
+                "memo": "无发票备忘",
+            },
+            ctx,
+        )
+        assert rec["success"] is True
+        assert rec["expense"]["amount"] == "65.50"
+        assert rec["expense"]["title"] == "个人打车见客户"
+
+        listed = await execute_tool(
+            "list_private_expenses",
+            {"direction": "expense"},
+            ctx,
+        )
+        assert listed["total"] >= 1
+        assert any(it["title"] == "个人打车见客户" for it in listed["items"])
+        assert "summary" in listed
+        assert "expenseAmount" in listed["summary"]
+

@@ -35,14 +35,28 @@ QWEN_ENABLE_THINKING = os.getenv("QWEN_ENABLE_THINKING", "false").strip().lower(
 # 服务配置
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8001"))
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
+# CORS：默认仅本地开发前端（vite 5173）。allow_credentials=True 时通配符源
+# 等效全开（Starlette 回显任意 Origin），生产必须显式配置白名单。
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
 
 # 微信小程序登录配置（个人开发者主体：仅用于 code2session 获取 openid）
 WECHAT_APPID = os.getenv("WECHAT_APPID", "").strip()
 WECHAT_SECRET = os.getenv("WECHAT_SECRET", "").strip()
 
 # JWT 配置
-JWT_SECRET = os.getenv("JWT_SECRET", "solobooks-dev-secret")
+# 生产环境必须显式配置高强度随机串（deploy/docker-compose.yml 已强制 :?）；
+# 仅 ACCOUNTING_TEST_MODE=1 的测试进程回落到固定 dev 值，缺失即拒绝启动，
+# 防止弱默认密钥被用于离线伪造任意用户/公司身份的 JWT。
+_JWT_SECRET_ENV = os.getenv("JWT_SECRET", "").strip()
+if _JWT_SECRET_ENV:
+    JWT_SECRET = _JWT_SECRET_ENV
+elif os.getenv("ACCOUNTING_TEST_MODE", "").strip().lower() in ("1", "true", "yes", "on"):
+    JWT_SECRET = "solobooks-dev-secret"
+else:
+    raise RuntimeError(
+        "JWT_SECRET 未配置：请在 backend/.env 或环境变量中设置高强度随机串"
+        "（测试进程由 conftest 自动设置 ACCOUNTING_TEST_MODE=1）"
+    )
 JWT_EXPIRES_IN = int(os.getenv("JWT_EXPIRES_IN", "604800"))
 
 # 阿里云号码认证短信（Dypnsapi）

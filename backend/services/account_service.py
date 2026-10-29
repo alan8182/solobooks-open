@@ -28,10 +28,6 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# 小规模征收率只允许 1%（优惠期）与 3%（法定）；申报周期只允许月报/季报。
-_ALLOWED_VAT_RATES = {"0.01", "0.03", "1%", "3%", "0.010000", "0.030000"}
-
-
 def _normalize_vat_fields(payload: Dict) -> Dict:
     """把前端传来的增值税配置收敛成可计算的值，不做纳税人身份校验。
 
@@ -640,10 +636,19 @@ async def update_company(user_id: str, company_id: str, updates: dict) -> Dict:
             "name", "type", "taxpayerType", "startDate", "taxId",
             "restrictedIndustry", "industry",
             "vatRate", "vatFilingCycle", "businessIncomeIitFilingCycle",
+            "onboardingType",
         ]:
             if key in updates:
                 company[key] = updates[key]
-        company.update(_normalize_vat_fields(company))
+        # 只归一/校验本次提交的增值税字段：对存量 payload 整体重跑会让历史脏数据
+        # 阻断任何无关字段的更新（如改名也 500）
+        vat_update = {
+            key: updates[key]
+            for key in ("vatRate", "vatFilingCycle", "businessIncomeIitFilingCycle")
+            if key in updates
+        }
+        if vat_update:
+            company.update(_normalize_vat_fields(vat_update))
 
         await _assert_start_date_not_before_entries(conn, company_id, company.get("startDate"))
         company["updated_at"] = _now_iso()

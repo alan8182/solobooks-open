@@ -1,6 +1,7 @@
 <!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { usePageRefresh } from '@/composables/usePageRefresh'
+import { accountingErrorText } from '@/utils/errors'
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
@@ -54,6 +55,7 @@ interface ChecklistItem {
   needsEmployeeSetup?: boolean
   actionPath?: string | null
   actionLabel?: string | null
+  itemPeriod?: string
 }
 interface CrossDiff {
   code: string
@@ -185,7 +187,9 @@ function buildPeriodOptions(cycle: 'month' | 'quarter') {
 
 const periodOptions = ref(buildPeriodOptions(vatCycle.value))
 
-const rawQueryPeriod = route.query.period ? String(route.query.period) : ''
+const rawQueryPeriod = route.query.period
+  ? String(route.query.period)
+  : (route.query.month ? String(route.query.month) : '')
 // 月报公司不能再把月度折算成季度，否则会拿季度包当月度报；
 // 但允许显式看季度汇总（页头会提示口径不一致，仅作参考）。
 const queryPeriod = /^\d{4}-Q[1-4]$/.test(rawQueryPeriod)
@@ -204,7 +208,12 @@ const filingBusy = ref('')
 const hideZeroFields = ref(true)
 
 // 当前激活的可切换卡片：第 1 张为「报前核对与总览」，后 4 张为独立申报事项卡片
-const activeCard = ref<FilingCardKey>('overview')
+// 支持通过 route.query.card（如 ?card=vat 或 ?card=cit）直接锚定对应卡片
+const validCards: FilingCardKey[] = ['overview', 'vat', 'cit', 'fin_statements', 'other_taxes']
+const queryCard = String(route.query.card || '')
+const activeCard = ref<FilingCardKey>(
+  validCards.includes(queryCard as FilingCardKey) ? (queryCard as FilingCardKey) : 'overview',
+)
 
 const cardTitleMap: Record<FilingCardKey, string> = {
   overview: '报前核对与总览',
@@ -220,7 +229,7 @@ async function load() {
     const data = await apiClient.get(`/api/tax-filing/packages/${period.value}`)
     pkg.value = data as unknown as Package
   } catch (err) {
-    message.error(err instanceof Error ? err.message : '税务申报数据加载失败')
+    message.error(accountingErrorText(err))
   } finally {
     loading.value = false
   }
@@ -257,7 +266,7 @@ async function markFiled(deadlineId: string | null, kindName: string, zero = fal
     await load()
     advanceAfterResolve(currentCard, `${kindName} 已标记完成`)
   } catch (err) {
-    message.error(err instanceof Error ? err.message : '操作失败')
+    message.error(accountingErrorText(err))
   } finally {
     filingBusy.value = ''
   }
@@ -332,7 +341,7 @@ async function loadIitAnnual() {
     }
     iitAnnual.value = data
   } catch (err) {
-    message.error(err instanceof Error ? err.message : '汇算测算失败')
+    message.error(accountingErrorText(err))
   } finally {
     iitAnnualLoading.value = false
   }
@@ -350,7 +359,7 @@ async function waiveDeadline(deadlineId: string | null, kindName: string) {
     await load()
     advanceAfterResolve(currentCard, `「${kindName}」已标记为本期不适用`)
   } catch (err) {
-    message.error(err instanceof Error ? err.message : '操作失败')
+    message.error(accountingErrorText(err))
   } finally {
     filingBusy.value = ''
   }
@@ -378,7 +387,7 @@ async function exportFinancialXls() {
     URL.revokeObjectURL(url)
     message.success('财务报表 XLS 已导出，请在电子税务局「财务报表报送」模块上传')
   } catch (err) {
-    let detail = err instanceof Error ? err.message : '导出失败'
+    let detail = accountingErrorText(err, '导出失败')
     const respData = (err as { response?: { data?: unknown } }).response?.data
     if (respData instanceof Blob) {
       try {
@@ -570,7 +579,7 @@ const taskStats = computed(() => {
     pkg.value.vat?.deadline,
     pkg.value.cit?.deadline,
     ...(pkg.value.checklist ?? []),
-  ].filter((s): s is DeadlineInfo | ChecklistItem => !!s && !!s.status && s.status !== 'untracked')
+  ].filter((s): s is DeadlineInfo | ChecklistItem => !!s && !!s.status)
   const filed = slots.filter(s => s.status === 'filed').length
   const waived = slots.filter(s => s.status === 'waived').length
   return {
@@ -754,6 +763,23 @@ usePageRefresh(load)
       <NButton size="tiny" text type="primary" @click="router.push('/tax-registration')">
         {{ pkg?.taxRegistrations?.synced ? '维护认定' : '去同步认定' }}
       </NButton>
+    </div>
+
+    <!-- 本期申报进度条 -->
+    <div v-if="pkg" class="filing-progress-strip">
+      <div class="filing-progress-strip-head">
+        <span class="filing-progress-strip-title">本期申报进度</span>
+        <span class="filing-progress-strip-count">
+          {{ taskStats.resolved }} / {{ taskStats.total }} 已办结
+          <template v-if="taskStats.pending > 0"> · 还有 {{ taskStats.pending }} 项待办</template>
+        </span>
+      </div>
+      <div class="progress-track">
+        <div
+          class="progress-fill"
+          :style="{ width: `${(taskStats.resolved / Math.max(1, taskStats.total)) * 100}%` }"
+        />
+      </div>
     </div>
 
     <!-- 首次加载（还没有任何数据）走骨架：先摆出卡片结构，比整屏转圈的感知速度快一个量级。
@@ -951,7 +977,7 @@ usePageRefresh(load)
                       1. 账载销售额
                       <NTooltip trigger="hover">
                         <template #trigger><i class="ri-information-line sub-info-icon" /></template>
-                        梭罗记账已确认的经营收入合计
+                        已确认的经营收入合计（含税口径，与回款对齐；申报表仍按不含税填报）
                       </NTooltip>
                     </span>
                     <span class="col-count" v-if="pkg.crossCheck.bookCount != null">{{ pkg.crossCheck.bookCount }} 笔入账</span>
@@ -977,7 +1003,7 @@ usePageRefresh(load)
                       3. 银行/微信入账
                       <NTooltip trigger="hover">
                         <template #trigger><i class="ri-information-line sub-info-icon" /></template>
-                        对公账户与经营钱包实际到账资金
+                        销售回款到账（微信/平台打款与直接销售收款，已剔除利息、退款、注资等非销售进账）
                       </NTooltip>
                     </span>
                     <span class="col-count" v-if="pkg.crossCheck.bankInflowCount != null">{{ pkg.crossCheck.bankInflowCount }} 笔流水</span>
@@ -1662,7 +1688,7 @@ usePageRefresh(load)
             <div class="other-items-grid" v-if="otherChecklistItems.length">
               <div
                 v-for="(item, idx) in otherChecklistItems"
-                :key="item.taxKind"
+                :key="item.deadlineId || (item.taxKind + (item.itemPeriod || ''))"
                 class="other-item-card"
                 :class="{ 'is-done': item.status === 'filed' || item.status === 'waived' }"
               >
@@ -2045,6 +2071,28 @@ usePageRefresh(load)
   font-size: 11px;
   color: var(--solo-text-muted, #636e7c);
   flex-shrink: 0;
+}
+.filing-progress-strip {
+  background: #fff;
+  border: 1px solid #e5e9ef;
+  border-radius: 8px;
+  padding: 10px 16px;
+  margin-bottom: 12px;
+}
+.filing-progress-strip-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.filing-progress-strip-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--solo-text-primary, #182230);
+}
+.filing-progress-strip-count {
+  font-size: 12px;
+  color: var(--solo-text-secondary, #636e7c);
 }
 
 /* 智能税情简报条 */

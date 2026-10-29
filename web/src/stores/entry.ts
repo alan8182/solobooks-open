@@ -49,20 +49,31 @@ export const useEntryStore = defineStore('entry', () => {
 
   const netProfit = computed(() => monthlyIncome.value - monthlyExpense.value)
 
-  async function fetchEntries() {
+  // 首屏并发去重：AppLayout / RecentEntriesWidget / StatsWidget 首帧各调一次
+  // fetchEntries，原实现同帧发 3 个相同的 GET /api/record/entries。共享同一个
+  // 在途 Promise；进行中的加载失败时所有等待方拿到同一错误（error 状态照常记录）。
+  let inflight: Promise<void> | null = null
+
+  async function fetchEntries(): Promise<void> {
+    if (inflight) return inflight
     loading.value = true
-    try {
-      const resp = await getEntries()
-      entries.value = resp.entries ?? []
-      error.value = ''
-    } catch (err) {
-      // 保留失败原因供页面渲染「加载失败 + 重试」，但继续向上抛：
-      // 调用点原有的 catch / 补记确认语义不能因为这次改动被吞掉。
-      error.value = errorSummary(err, '记账记录加载失败')
-      throw err
-    } finally {
-      loading.value = false
-    }
+    const run = (async () => {
+      try {
+        const resp = await getEntries()
+        entries.value = resp.entries ?? []
+        error.value = ''
+      } catch (err) {
+        // 保留失败原因供页面渲染「加载失败 + 重试」，但继续向上抛：
+        // 调用点原有的 catch / 补记确认语义不能因为这次改动被吞掉。
+        error.value = errorSummary(err, '记账记录加载失败')
+        throw err
+      } finally {
+        loading.value = false
+        inflight = null
+      }
+    })()
+    inflight = run
+    return run
   }
 
   async function confirmEntry(data: ConfirmRequest): Promise<Entry> {

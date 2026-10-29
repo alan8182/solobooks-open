@@ -59,10 +59,10 @@ def _dev_fallback_enabled() -> bool:
     """开发兜底开关（读取自 .env / 环境变量，改后需重启进程）。
 
     兜底行为：test-token 前缀与非 JWT 垃圾 token 一律按测试身份放行，
-    仅供本地联调；生产部署（deploy/docker-compose.yml）必须显式
-    AUTH_DEV_FALLBACK=0 关闭，否则管理员接口形同虚设。
+    仅供本地联调；默认关闭，联调时在 backend/.env 显式打开。
+    deploy/docker-compose.yml 生产部署强制 AUTH_DEV_FALLBACK=0。
     """
-    return os.getenv("AUTH_DEV_FALLBACK", "1").strip().lower() in ("1", "true", "yes", "on")
+    return os.getenv("AUTH_DEV_FALLBACK", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _parse_identity(authorization: Optional[str]) -> AuthContext:
@@ -91,20 +91,23 @@ def _parse_identity(authorization: Optional[str]) -> AuthContext:
     return AuthContext(user_id=user_id, company_id=company_id)
 
 
-async def _load_user_flags(user_id: str) -> Optional[tuple[bool, bool]]:
-    """查询用户的 (is_platform_admin, is_disabled)。
+async def _load_auth_state(
+    user_id: str, company_id: str
+) -> tuple[Optional[tuple[bool, bool]], Optional[bool]]:
+    """查询用户的 (is_platform_admin, is_disabled) 与对公司归属（单会话两次查询）。
 
-    - 用户不存在时返回 None：JWT 只由登录签发、兜底身份可能无库记录，
-      此处 fail-open，禁用拦截只对真实存在的用户行生效。
-    - 查询本身失败（如迁移 a7c3e9f1b2d4 未执行、auth_users 缺新列）时
-      降级为 None 并只告警一次：业务请求不因缺列整体 500，管理员接口
-      仍按「非管理员」默认拒绝，安全面不受影响。
+    - 用户不存在时 flags 返回 None（兜底身份可能无库记录），成员校验一并跳过：
+      此处 fail-open，禁用/成员拦截只对真实存在的用户行生效。
+    - has_access 与 ensure_tenant / PAT 校验（has_company_access）严格同口径：
+      成员行存在须 status == 'active'，行缺失时 owner 放行；None 表示查询失败
+      降级为不拦截。
     """
     global _column_check_warned
     from sqlalchemy import select
 
     from db.models import AuthUser
     from db.session import session_scope
+    from services.mcp_token_service import has_company_access
 
     try:
         async with session_scope() as session:
@@ -115,15 +118,20 @@ async def _load_user_flags(user_id: str) -> Optional[tuple[bool, bool]]:
                     )
                 )
             ).first()
+            if row is None:
+                return None, None
+            has_access = await has_company_access(
+                session=session, user_id=user_id, company_id=company_id
+            )
     except Exception as exc:  # noqa: BLE001
         if not _column_check_warned:
             _column_check_warned = True
             logger.warning(
-                "auth_users 标记列查询失败，禁用/管理员校验降级为放行（迁移 a7c3e9f1b2d4 未执行？）: %s",
+                "auth 校验状态查询失败，禁用/成员校验降级为放行（迁移未执行或表缺失？）: %s",
                 exc,
             )
-        return None
-    return (row[0], row[1]) if row else None
+        return None, None
+    return (row[0], row[1]), has_access
 
 
 async def require_auth(authorization: Optional[str] = Header(default=None)) -> AuthContext:
@@ -132,7 +140,8 @@ async def require_auth(authorization: Optional[str] = Header(default=None)) -> A
     支持两类令牌：
     1. 外部/插件长效 PAT (sbk_...)：查 mcp_tokens 表并校验
     2. Web 前端短效 JWT (或开发兜底 test-token)
-    每次请求顺路查库校验 is_disabled，禁用即时生效（返回 401）。
+    每次请求顺路查库校验 is_disabled 与公司成员归属：
+    禁用/移出公司即时生效（与 JWT 7 天有效期的撤销时效缺口收口）。
     """
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="未登录或缺少 Authorization")
@@ -146,9 +155,11 @@ async def require_auth(authorization: Optional[str] = Header(default=None)) -> A
         return pat.context
 
     ctx = _parse_identity(authorization)
-    flags = await _load_user_flags(ctx.user_id)
+    flags, has_access = await _load_auth_state(ctx.user_id, ctx.company_id)
     if flags and flags[1]:
         raise HTTPException(status_code=401, detail="账号已被禁用，请联系管理员")
+    if flags is not None and has_access is False:
+        raise HTTPException(status_code=403, detail="无权访问该企业账套")
     return ctx
 
 
@@ -156,9 +167,10 @@ async def require_admin(authorization: Optional[str] = Header(default=None)) -> 
     """平台管理员依赖：在 require_auth 之上校验 is_platform_admin。
 
     管理员身份不进 JWT claim，每次请求查库校验——撤销管理员权限即时生效。
+    平台管理员按定义跨公司操作，不适用公司成员归属校验（忽略 has_access）。
     """
     ctx = _parse_identity(authorization)
-    flags = await _load_user_flags(ctx.user_id)
+    flags, _has_access = await _load_auth_state(ctx.user_id, ctx.company_id)
     # 禁用优先于管理员校验：被禁账号无论访问什么都返回 401
     if flags and flags[1]:
         raise HTTPException(status_code=401, detail="账号已被禁用，请联系管理员")

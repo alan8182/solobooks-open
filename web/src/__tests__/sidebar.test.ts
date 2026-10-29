@@ -18,9 +18,11 @@ function makeRouter() {
     routes: [
       { path: '/', component: { template: '<div />' } },
       { path: '/invoices', component: { template: '<div />' } },
-      { path: '/record/invoice-import', component: { template: '<div />' } },
       { path: '/vouchers', component: { template: '<div />' } },
+      { path: '/ledger/books', component: { template: '<div />' } },
       { path: '/ledger/book', component: { template: '<div />' } },
+      { path: '/assets', component: { template: '<div />' } },
+      { path: '/rd-expenses', component: { template: '<div />' } },
     ],
   })
 }
@@ -49,21 +51,28 @@ describe('sidebar accordion behavior', () => {
   it('keeps only one secondary menu expanded at a time', async () => {
     const { wrapper } = await mountSidebar()
 
-    await navButton(wrapper, '发票')!.trigger('click')
-    expect(wrapper.text()).toContain('发票台账')
-    expect(wrapper.text()).toContain('导入发票')
-
     await navButton(wrapper, '凭证与账簿')!.trigger('click')
-    expect(wrapper.text()).not.toContain('导入发票')
+    expect(wrapper.text()).toContain('记账凭证')
+    expect(wrapper.text()).toContain('电子账簿')
+
+    await navButton(wrapper, '专项核算')!.trigger('click')
+    expect(wrapper.text()).not.toContain('记账凭证')
+    expect(wrapper.text()).toContain('长期资产')
+    expect(wrapper.text()).toContain('研发费用')
+  })
+
+  it('auto-expands the parent that owns the current route', async () => {
+    const { wrapper } = await mountSidebar({ path: '/vouchers' })
+
     expect(wrapper.text()).toContain('记账凭证')
     expect(wrapper.text()).toContain('电子账簿')
   })
 
-  it('auto-expands the parent that owns the current route', async () => {
-    const { wrapper } = await mountSidebar({ path: '/invoices' })
+  it('renders invoice ledger as a direct top-level link', async () => {
+    const { wrapper } = await mountSidebar()
 
-    expect(wrapper.text()).toContain('发票台账')
-    expect(wrapper.text()).toContain('导入发票')
+    const invoiceBtn = navButton(wrapper, '发票台账')
+    expect(invoiceBtn?.exists()).toBe(true)
   })
 
   it('opens the settings flyout on click and closes it when clicking elsewhere', async () => {
@@ -115,6 +124,7 @@ describe('sidebar workspace filtering', () => {
     expect(wrapper.text()).toContain('工作台')
     expect(wrapper.text()).toContain('AI 会计')
     expect(wrapper.text()).toContain('待办')
+    expect(wrapper.text()).toContain('小私账')
     expect(wrapper.text()).toContain('月度结账')
     expect(wrapper.text()).toContain('报税')
     expect(wrapper.text()).toContain('经营')
@@ -123,8 +133,8 @@ describe('sidebar workspace filtering', () => {
     expect(wrapper.text()).toContain('复盘')
     // 项目利润收进「经营报表」页卡片，不再占导航位
     expect(wrapper.text()).not.toContain('项目利润')
-    // 工作台 3 + 每月 2 + 复盘 1（设置不再占导航位，收进左下角图标）
-    expect(wrapper.findAll('button.nav-item')).toHaveLength(6)
+    // 每天 4（工作台、AI 会计、待办、小私账）+ 每月 2 + 复盘 1（设置不再占导航位，收进左下角图标）
+    expect(wrapper.findAll('button.nav-item')).toHaveLength(7)
 
     expect(wrapper.text()).not.toContain('经营账本')
     expect(wrapper.text()).not.toContain('发票')
@@ -139,9 +149,9 @@ describe('sidebar workspace filtering', () => {
     expect(navButton(wrapper, '设置')).toBeUndefined()
     expect(wrapper.find('.settings-btn').exists()).toBe(true)
 
-    // 点击左下角图标弹出设置菜单：公司信息 / 税费种认定 / 个人设置 必须能进
+    // 点击左下角图标弹出设置菜单：税费种认定 / 个人设置 必须能进（公司信息已由顶部公司管理入口承载）
     await wrapper.find('.settings-btn').trigger('click')
-    expect(wrapper.text()).toContain('公司信息')
+    expect(wrapper.text()).not.toContain('公司信息')
     expect(wrapper.text()).toContain('税费种认定')
     expect(wrapper.text()).toContain('个人设置')
 
@@ -172,7 +182,7 @@ describe('sidebar workspace filtering', () => {
     expect(navButton(wrapper, '设置')).toBeDefined()
     await navButton(wrapper, '设置')!.trigger('click')
     expect(wrapper.text()).toContain('会计科目')
-    expect(wrapper.text()).toContain('期初设置')
+    expect(wrapper.text()).toContain('期初建账')
     expect(wrapper.text()).toContain('备份与归档')
 
     // 已有导航入口，左下角图标不再重复

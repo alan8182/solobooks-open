@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 from uuid import uuid4
 from datetime import date
 from decimal import Decimal
@@ -27,6 +28,7 @@ from models.schemas import (
     BatchPostResponse,
     CompanyMemberCreate,
     CompanyMemberUpdate,
+    CorrectCategoryRequest,
     JournalReverseRequest,
     PeriodReopenRequest,
     StrictRequestModel,
@@ -53,6 +55,7 @@ from services.accounting_core_service import (
 
 
 router = APIRouter(tags=["accounting"], dependencies=[Depends(require_auth)])
+logger = logging.getLogger(__name__)
 
 
 def _request_id(request: Request) -> str:
@@ -244,14 +247,16 @@ async def batch_post_entries_route(
                     reason=str(exc.message),
                 )
             )
-        except Exception as exc:
+        except Exception:
+            # 未知异常可能携带内部细节（SQL/路径），不下发给客户端，完整堆栈进日志
+            logger.exception("batch_post 内部错误 company=%s entry=%s", ctx.company_id, entry_id)
             title = entry.summary if entry is not None else entry_id
             failed_items.append(
                 BatchPostFailedItem(
                     entryId=entry_id,
                     title=title or entry_id,
                     code="UNEXPECTED_ERROR",
-                    reason=str(exc),
+                    reason="处理该凭证时发生内部错误，请稍后重试",
                 )
             )
 
@@ -312,6 +317,29 @@ async def reverse_entry_route(
         response=response,
     )
     return response
+
+
+@router.post("/api/record/entries/{entry_id}/correct-category")
+async def correct_entry_category_route(
+    entry_id: str,
+    body: CorrectCategoryRequest,
+    request: Request,
+    ctx: AuthContext = Depends(require_auth),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """更正已过账凭证的分类/科目：红字冲销 + 按新分类重建并双双过账。"""
+    from services.accounting_core_service import correct_entry_category
+
+    result = await correct_entry_category(
+        session,
+        entry_id,
+        body.category,
+        company_id=ctx.company_id,
+        user_id=ctx.user_id,
+        request_id=_request_id(request),
+        reason=body.reason,
+    )
+    return result
 
 
 @router.get("/api/periods/available")

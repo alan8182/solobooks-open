@@ -129,6 +129,7 @@ describe('ReportPage Dual-View UX (Boss vs Accounting)', () => {
     expect(wrapper.text()).toContain('客户待回款')
     expect(wrapper.text()).toContain('待付支出')
     expect(wrapper.text()).toContain('老板个人垫资')
+    expect(wrapper.text()).toContain('可支撑约 4.7 个月开销')
     expect(wrapper.text()).not.toContain('货币资金')
     expect(wrapper.text()).not.toContain('应收账款')
     expect(wrapper.text()).not.toContain('应付账款')
@@ -141,12 +142,9 @@ describe('ReportPage Dual-View UX (Boss vs Accounting)', () => {
     expect(wrapper.text()).toContain('催款与应付清单')
     expect(wrapper.text()).toContain('项目利润')
     expect(wrapper.text()).toContain('企业健康体检')
-
-    // 老板税务预警卡片
-    expect(wrapper.text()).toContain('增值税额度与预估')
-    expect(wrapper.text()).toContain('企业所得税优惠')
-    expect(wrapper.text()).toContain('税务申报')
     expect(wrapper.text()).toContain('单据合规检查')
+    expect(wrapper.text()).not.toContain('增值税额度与预估')
+    expect(wrapper.text()).not.toContain('企业所得税优惠')
 
     // 老板视图底部应提示切换会计视图
     expect(wrapper.text()).toContain('需要查看法定报表、账簿或做账底稿？')
@@ -190,12 +188,14 @@ describe('ReportPage Dual-View UX (Boss vs Accounting)', () => {
     expect(wrapper.text()).toContain('健康评分')
     expect(wrapper.text()).toContain('同比/环比')
 
-    // 税务辅助与法定报表
-    expect(wrapper.text()).toContain('增值税辅助')
-    expect(wrapper.text()).toContain('企业所得税')
-    expect(wrapper.text()).toContain('归档清单')
+    // 单据合规与法定报表
+    expect(wrapper.text()).toContain('单据合规检查')
+    expect(wrapper.text()).not.toContain('增值税辅助')
+    expect(wrapper.text()).not.toContain('企业所得税')
     expect(wrapper.find('.legal-books').exists()).toBe(true)
     expect(wrapper.text()).toContain('法定财务报表')
+    expect(wrapper.text()).toContain('资产负债表已配平')
+    expect(wrapper.text()).toContain('税局标准月季报与底册导出')
     // 账簿已移出报表中心：五本账统一走侧栏「会计账簿」工作台，不在这里重复发入口
     expect(wrapper.find('.ledger-book-card').exists()).toBe(false)
     expect(wrapper.text()).not.toContain('多栏账')

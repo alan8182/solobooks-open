@@ -43,11 +43,13 @@ class AgentActionApproveRequest(BaseModel):
 
     allowBackfill / backfillReason：单据所属期间已关账时，前端确认补记期间后带上；
     不带则后端维持 PERIOD_CLOSED，不会静默把凭证换到别的月份。
+    stepUpToken：期初余额导入等高敏操作二次验证令牌。
     """
     excludeIndexes: Optional[List[int]] = None
     edits: Optional[Dict[str, Dict[str, Any]]] = None
     allowBackfill: bool = False
     backfillReason: Optional[str] = None
+    stepUpToken: Optional[str] = None
 
 
 def _sse(event: dict) -> str:
@@ -116,6 +118,7 @@ async def approve_action(
         edits=req.edits if req else None,
         allow_backfill=bool(req.allowBackfill) if req else False,
         backfill_reason=req.backfillReason if req else None,
+        step_up_token=req.stepUpToken if req else None,
     )
 
 

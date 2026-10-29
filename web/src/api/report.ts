@@ -8,8 +8,6 @@ import type {
   MonthlyReportResponse,
   ReportDiagnosisResponse,
   HealthScoreResponse,
-  VatAssistResponse,
-  CitAssistResponse,
   ArchiveChecklistResponse,
   BalanceSheetResponse,
   CashFlowResponse,
@@ -47,20 +45,8 @@ export function getReportDiagnosis(
   return apiClient.post('/api/report/diagnosis', { month: period, period, periodType, includeDrafts })
 }
 
-export function getHealthScore(month: string): Promise<HealthScoreResponse> {
-  return apiClient.post('/api/health-score', { month })
-}
-
-export function getVatAssist(
-  period: string,
-  periodType: 'month' | 'quarter' = 'quarter',
-  taxpayerType = 'small_scale',
-): Promise<VatAssistResponse> {
-  return apiClient.post('/api/report/vat-assist', { period, periodType, taxpayerType })
-}
-
-export function getCitAssist(period: string, inputs: Record<string, unknown> = {}): Promise<CitAssistResponse> {
-  return apiClient.post('/api/report/cit-assist', { period, periodType: 'quarter', ...inputs })
+export function getHealthScore(month: string, includeDiagnosis = false): Promise<HealthScoreResponse> {
+  return apiClient.post('/api/health-score', { month, includeDiagnosis })
 }
 
 export function getArchiveChecklist(month: string): Promise<ArchiveChecklistResponse> {
@@ -85,12 +71,27 @@ export interface EquityChangeRow {
   isRetained?: boolean
 }
 
+/** 会计视图：会企04表节次结构 × 小企业四组件，每行为「项目 × 各权益组件金额」 */
+export interface EquityStandardColumn {
+  key: string
+  label: string
+}
+
+export interface EquityStandardRow {
+  key: string
+  label: string
+  level?: number
+  kind?: 'item' | 'section' | 'total'
+  values: Record<string, number>
+}
+
 export interface EquityChangesResponse {
   year: number
   rows: EquityChangeRow[]
   netProfit: number
   totals: { priorYearEnd: number; increase: number; decrease: number; yearEnd: number }
   simplified: boolean
+  standard?: { columns: EquityStandardColumn[]; rows: EquityStandardRow[] }
 }
 
 export function getEquityChanges(year: number): Promise<EquityChangesResponse> {

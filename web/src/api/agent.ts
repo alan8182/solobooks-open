@@ -112,11 +112,13 @@ export interface AgentApproveOptions {
   /** 批量清单中被用户取消勾选的行索引 */
   excludeIndexes?: number[]
   /** 用户修正的字段，按行索引（单笔动作索引用 "0"） */
-  edits?: Record<string, { category?: string; title?: string; payer?: string }>
+  edits?: Record<string, Record<string, unknown>>
   /** 单据所属期间已关账、用户确认补记到后续期间时为 true */
   allowBackfill?: boolean
   /** 补记原因，写进 period_backfills 台账 */
   backfillReason?: string
+  /** 期初余额导入等高敏操作二次验证令牌 */
+  stepUpToken?: string
 }
 
 export async function approveAgentAction(
@@ -128,6 +130,7 @@ export async function approveAgentAction(
     edits: Object.keys(opts.edits || {}).length ? opts.edits : undefined,
     allowBackfill: opts.allowBackfill || undefined,
     backfillReason: opts.backfillReason || undefined,
+    stepUpToken: opts.stepUpToken || undefined,
   })) as unknown as AgentActionDecision
 }
 

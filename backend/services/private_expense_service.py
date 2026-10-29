@@ -97,8 +97,14 @@ async def _ensure_demo_samples(company_id: str) -> None:
 
 
 async def list_expenses(
-    company_id: str, page: int = 1, page_size: int = _PAGE_SIZE_DEFAULT,
+    company_id: str,
+    page: int = 1,
+    page_size: int = _PAGE_SIZE_DEFAULT,
     owner_name: str = "",
+    direction: str = "",
+    invoice_status: str = "",
+    start_date: str = "",
+    end_date: str = "",
 ) -> Dict[str, Any]:
     """分页查询私账记录，按日期倒序。"""
     await _ensure_schema()
@@ -111,6 +117,18 @@ async def list_expenses(
         if owner_name:
             where += " AND owner_name = ?"
             params.append(owner_name)
+        if direction:
+            where += " AND direction = ?"
+            params.append(direction)
+        if invoice_status:
+            where += " AND invoice_status = ?"
+            params.append(invoice_status)
+        if start_date:
+            where += " AND occur_date >= ?"
+            params.append(start_date)
+        if end_date:
+            where += " AND occur_date <= ?"
+            params.append(end_date)
         cursor = await conn.execute(
             f"SELECT * FROM private_expenses WHERE {where} ORDER BY occur_date DESC, created_at DESC LIMIT ? OFFSET ?",
             (*params, page_size, offset),

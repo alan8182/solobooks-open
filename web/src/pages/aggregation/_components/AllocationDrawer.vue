@@ -306,7 +306,7 @@ async function submit(complete: boolean): Promise<void> {
     emit('saved')
     emit('update:show', false)
   } catch (err) {
-    message.error(errorText(err, complete ? '完成归集失败' : '保存归集草稿失败'))
+    message.error(errorText(err))
   } finally {
     saving.value = false
   }
@@ -324,7 +324,7 @@ async function confirmClear(): Promise<void> {
     emit('saved')
     emit('update:show', false)
   } catch (err) {
-    message.error(errorText(err, '清空归集失败'))
+    message.error(errorText(err))
   } finally {
     clearing.value = false
   }

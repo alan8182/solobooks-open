@@ -4,11 +4,12 @@ import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NCard, NButton, NTag, NSpace, useMessage,
-  NSelect, NSpin, NDatePicker, NFormItem
+  NSelect, NSpin, NFormItem
 } from 'naive-ui'
 import { getLedgerAccounts, getLedgerBook } from '@/api/ledger'
 import type { LedgerDetailLine } from '@/api/ledger'
 import { formatMoney, formatDate, getCurrentMonth } from '@/utils/format'
+import { SoloMonthPicker } from '@/components/ui'
 
 interface Counterparty {
   code: string
@@ -170,7 +171,7 @@ onMounted(async () => {
         <NSelect v-model:value="accountCode" :options="accountOptions" style="width: 220px;" filterable />
       </NFormItem>
       <NFormItem label="会计月份" label-placement="left" :show-feedback="false">
-        <NDatePicker v-model:formatted-value="month" type="month" value-format="yyyy-MM" format="yyyy-MM" style="width: 150px;" />
+        <SoloMonthPicker v-model:value="month" style="width: 150px;" />
       </NFormItem>
       <NButton type="primary" @click="query">查询账页</NButton>
     </div>

@@ -197,4 +197,38 @@ async def test_backfill_is_idempotent():
     assert first["created"] == 1
     second = await backfill_invoices(company_id)
     assert second["created"] == 0
+
+
+@pytest.mark.asyncio
+async def test_red_letter_expense_imports_as_reversal():
+    """红冲进项（负金额）导入为冲销凭证：借 2241 / 贷费用，金额取正。"""
+    company_id = "c-inv-reversal"
+    await _setup_company(company_id)
+
+    result = await import_invoices(
+        company_id,
+        "owner-1",
+        [_expense_row(invoice_number="INV-RED", total_amount="-106.00", tax_amount="-6.00")],
+        classify=False,
+    )
+    assert result["imported"] == 1
+    assert result["invoicesWritten"] == 1
+
+    from sqlalchemy import select
+
+    from db.models import JournalLine
+    from db.session import session_scope
+
+    async with session_scope() as session:
+        lines = (
+            await session.execute(
+                select(JournalLine).where(JournalLine.company_id == company_id)
+            )
+        ).scalars().all()
+        debit_lines = [line for line in lines if line.direction == "debit"]
+        credit_lines = [line for line in lines if line.direction == "credit"]
+        assert [line.account_code for line in debit_lines] == ["2241"]
+        assert credit_lines and all(line.account_code != "2241" for line in credit_lines)
+        assert sum(float(line.amount) for line in debit_lines) == pytest.approx(106.0)
+        assert sum(float(line.amount) for line in credit_lines) == pytest.approx(106.0)
     assert (await list_invoices(company_id))["total"] == 1

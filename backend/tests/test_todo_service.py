@@ -81,14 +81,15 @@ def test_owner_transfer_nature_not_exempt_by_small_amount():
     assert "owner_transfer_nature" in _rule_ids(todos)
 
 
-def test_boss_personal_invoice_import_generates_single_todo():
-    """发票导入 + 股东垫付只出一张卡：发票待付款承载生命周期，性质确认不再重复催问。"""
+def test_boss_personal_invoice_import_skips_payment_and_nature_todos():
+    """发票导入 + 股东垫付：垫付去向已确认，不再催付款——核销由公户打款给垫付人时完成，
+    性质确认也不再重复催问（source=invoice_import 本就豁免）。"""
     todos = _derive_entry_todos([
         _entry(id="boss-inv", direction="expense", amount="481.33",
                source="invoice_import", payer="boss_personal", billingStatus="has_invoice"),
     ])
     rules = _rule_ids(todos)
-    assert "invoice_unpaid" in rules
+    assert "invoice_unpaid" not in rules
     assert "owner_transfer_nature" not in rules
 
 
@@ -194,7 +195,7 @@ def test_list_todos_output_carries_key_alias():
     from services import todo_service
 
     async def scenario():
-        async def fake_entries(user_id, company_id):
+        async def fake_entries(user_id, company_id, *, lite=False):
             return [_entry(id="e1", direction="expense", amount="32", billingStatus="no_document")]
 
         orig = todo_service.list_entries

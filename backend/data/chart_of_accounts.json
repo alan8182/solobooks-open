@@ -72,6 +72,12 @@
         "direction": "debit",
         "parentCode": "1221"
       },
+      "122199": {
+        "name": "其他应收款-待收款项",
+        "type": "流动资产",
+        "direction": "debit",
+        "parentCode": "1221"
+      },
       "1403": {
         "name": "原材料",
         "type": "流动资产",
@@ -696,6 +702,18 @@
         "name": "主营业务收入",
         "type": "收入",
         "direction": "credit"
+      },
+      "5001001": {
+        "name": "咨询服务",
+        "type": "收入",
+        "direction": "credit",
+        "parentCode": "5001"
+      },
+      "5001002": {
+        "name": "技术服务",
+        "type": "收入",
+        "direction": "credit",
+        "parentCode": "5001"
       },
       "5051": {
         "name": "其他业务收入",

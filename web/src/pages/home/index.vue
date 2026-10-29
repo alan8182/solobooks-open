@@ -38,9 +38,9 @@ const proLinks = [
 
 const bossActions = [
   {
-    path: '/record/invoice-import',
+    path: '/invoices?import=true',
     label: '上传发票',
-    description: 'Excel 批量导入或票据图片',
+    description: 'Excel 批量导入税局发票',
     icon: 'ri-receipt-line',
   },
   {
@@ -48,6 +48,12 @@ const bossActions = [
     label: '上传流水',
     description: '银行流水、微信支付账单',
     icon: 'ri-bank-line',
+  },
+  {
+    path: '/private-expenses',
+    label: '小私账',
+    description: '老板个人垫付与代收对账',
+    icon: 'ri-wallet-3-line',
   },
   {
     path: '/ledger',
@@ -350,8 +356,20 @@ usePageRefresh(() => Promise.all([reloadTaskInbox(), reloadReadiness(), entrySto
 
 .boss-action-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 12px;
+}
+
+@media (max-width: 960px) {
+  .boss-action-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 520px) {
+  .boss-action-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .boss-action-card {

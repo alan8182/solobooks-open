@@ -45,7 +45,7 @@ async function handleCreateSample(): Promise<void> {
     })
     message.success('已创建示例维度「研发项目」及 2 个归集对象')
   } catch (err) {
-    message.error(errorText(err, '创建示例维度失败，请手动建立维度'))
+    message.error(errorText(err))
   } finally {
     creating.value = false
   }

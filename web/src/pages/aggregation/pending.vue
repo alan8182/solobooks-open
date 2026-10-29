@@ -146,7 +146,7 @@ async function loadMembers(): Promise<void> {
     members.value = await listMembers(dimensionId.value)
   } catch (err) {
     members.value = []
-    message.error(errorText(err, '归集对象加载失败'))
+    message.error(errorText(err))
   }
 }
 
@@ -173,7 +173,7 @@ async function load(): Promise<void> {
   } catch (err) {
     items.value = []
     total.value = 0
-    message.error(errorText(err, '待归集清单加载失败'))
+    message.error(errorText(err))
   } finally {
     loading.value = false
   }

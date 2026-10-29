@@ -2,6 +2,7 @@
 # Licensed under the SoloBooks License v2.0.
 
 """发票导入路由"""
+import asyncio
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from deps.auth import AuthContext, require_auth
@@ -51,7 +52,8 @@ async def parse_invoice_columns(req: ParseColumnsRequest, ctx: AuthContext = Dep
     """LLM column mapping for invoice Excel."""
     prompt = INVOICE_COLUMN_MAPPING_PROMPT.format(columns=", ".join(req.columns))
     fallback = [{"column": c, "mapping": None} for c in req.columns]
-    result = safe_chat_text_json(
+    result = await asyncio.to_thread(
+        safe_chat_text_json,
         "你是一个发票数据导入助手。请返回JSON。",
         prompt,
         fallback=fallback,
@@ -95,5 +97,5 @@ async def classify_entry_invoice(
     }
     
     company_name = await get_real_company_name(ctx.company_id, [row])
-    suggestion = await classify_invoice(row, company_name)
+    suggestion = await classify_invoice(row, company_name, user_id=ctx.user_id, company_id=ctx.company_id)
     return suggestion

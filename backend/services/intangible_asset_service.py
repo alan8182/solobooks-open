@@ -412,6 +412,7 @@ async def _source_entry_values(
         )
     ).scalar_one_or_none()
     acquired_on = entry.occurred_on.isoformat()
+    credit_line = next((l for l in lines if l.direction == "credit"), None)
     return {
         "sourceEntryId": entry_id,
         "existingAssetId": existing,
@@ -422,6 +423,9 @@ async def _source_entry_values(
         "suggestedCategory": _suggest_intangible_category(entry.summary),
         "entryStatus": entry.status,
         "entryType": entry.entry_type,
+        "voucherNo": entry.voucher_no,
+        "summary": entry.summary,
+        "sourceAccount": credit_line.account_name if credit_line else "银行/资金账户",
     }
 
 

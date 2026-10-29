@@ -30,6 +30,14 @@ def _seed_users() -> None:
                 ("u-target", "13900000003", "目标用户", 0, 0),
             ],
         )
+        # 生产登录流程必建成员关系；require_auth 按 ensure_tenant 同口径校验成员
+        # 归属（_headers 默认 company_id=c1），播种需对齐。c-m2 的归属由
+        # _seed_companies 负责。
+        conn.executemany(
+            "INSERT OR REPLACE INTO company_members (company_id, user_id, role, status)"
+            " VALUES ('c1', ?, 'accountant', 'active')",
+            [("u-admin",), ("u-normal",), ("u-target",)],
+        )
         conn.commit()
     finally:
         conn.close()

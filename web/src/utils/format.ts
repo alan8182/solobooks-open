@@ -16,6 +16,14 @@ export function formatMoney(amount: number): string {
 }
 
 /**
+ * 会计视图用：不带货币符号的两位小数金额（负号前缀，配合表头「单位：元」）。
+ * 后端金额经 JSON 可能以字符串到达，这里统一数值化。
+ */
+export function formatAmountPlain(amount: number | string): string {
+  return formatMoney(Number(amount) || 0).replace('¥', '')
+}
+
+/**
  * 金额转人民币大写（凭证合计行用）：19622.55 → 壹万玖仟陆佰贰拾贰圆伍角伍分
  * ponytail: 整数支持到万亿、两位小数（toFixed 四舍五入），凭证合计场景足够
  */

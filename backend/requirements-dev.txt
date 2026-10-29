@@ -1,0 +1,4 @@
+# 测试依赖（运行时安装 requirements.txt 后追加：pip install -r requirements-dev.txt）
+-r requirements.txt
+pytest==8.3.4
+pytest-asyncio==0.24.0

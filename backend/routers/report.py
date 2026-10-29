@@ -2,11 +2,12 @@
 # Licensed under the SoloBooks License v2.0.
 
 """V3 报表路由：月报 + 增值税/CIT/归档/税负/健康评分"""
+import asyncio
 import logging
-from typing import Optional
+from typing import Literal, Optional
 from datetime import date, datetime
 from decimal import Decimal
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,11 +22,13 @@ from models.schemas import (
     CitAssistRequest, CitAssistResponse,
     ArchiveChecklistRequest, ArchiveChecklistResponse, ArchiveItem,
     BalanceSheetRequest, BalanceSheetResponse, BalanceSheetItem,
+    StandardStatementRow, BalanceSheetStandard,
     CashFlowRequest, CashFlowResponse, CashFlowItem,
     EquityChangeRequest,
     IncomeStatementRequest, IncomeStatementResponse, IncomeStatementRow,
     ComparisonRequest, ComparisonResponse, ComparisonItem,
 )
+from core.errors import AccountingError
 from services.llm import chat_text_json, chat_text
 from services.ocr import HEALTH_SCORE_V3_PROMPT
 from services.diagnosis_prompts import CFO_DIAGNOSIS_PROMPT
@@ -41,6 +44,7 @@ from services.tax_filing_export_service import build_statement_data, default_com
 from services.equity_service import get_equity_changes
 from services.vat_filing_service import build_small_scale_vat_assist
 from services.vat_service import VAT_PAYABLE_ACCOUNT
+from services.health_score_service import calculate_health_score
 from services.cit_adjustment_service import build_cit_adjustments
 from services.account_service import get_user_profile
 from services import company_entity_service, headcount_service
@@ -549,7 +553,8 @@ async def monthly_report(
     if req.includeSummary:
         # ponytail: LLM summary only generated when explicitly requested; default returns instantly
         try:
-            result = chat_text_json(
+            result = await asyncio.to_thread(
+                chat_text_json,
                 system_prompt="你是经营助手，生成经营总结。只输出JSON: {\"summary\": \"...\"}",
                 user_message=f"统计周期:{period_type}, 期间:{resolved_period}, 收入:{income}, 支出:{expense}, 净利润:{net_profit}, 分类:{breakdown}",
                 max_tokens=512,
@@ -558,6 +563,8 @@ async def monthly_report(
                 company_id=ctx.company_id,
             )
             summary = result.get("summary", "经营报表已生成")
+        except AccountingError:
+            raise  # 配额超限保持 402
         except Exception:
             summary = "经营报表已生成"
 
@@ -630,7 +637,8 @@ async def report_diagnosis(
     net_profit = income - expense
 
     try:
-        result = chat_text_json(
+        result = await asyncio.to_thread(
+            chat_text_json,
             system_prompt="你是经营助手，生成经营总结。只输出JSON: {\"summary\": \"...\"}",
             user_message=f"统计周期:{period_type}, 期间:{resolved_period}, 收入:{income}, 支出:{expense}, 净利润:{net_profit}, 分类:{breakdown}",
             max_tokens=512,
@@ -639,6 +647,8 @@ async def report_diagnosis(
             company_id=ctx.company_id,
         )
         summary = result.get("summary", "经营报表已生成")
+    except AccountingError:
+        raise  # 配额超限保持 402
     except Exception:
         summary = "经营报表已生成"
 
@@ -654,58 +664,55 @@ async def health_score(
     all_entries = await _authoritative_entries(session, ctx)
     target_month = req.month or max((_entry_month(entry) for entry in all_entries if _entry_month(entry)), default="")
     entries = _filter_month(all_entries, target_month) if target_month else all_entries
-    income = sum((entry.get("amount", 0) for entry in entries if entry.get("direction") == "income"), Decimal("0"))
-    expense = sum((entry.get("amount", 0) for entry in entries if entry.get("direction") == "expense"), Decimal("0"))
 
-    # 计算发票合规率
-    total_expense_cnt = sum(1 for e in entries if e.get("direction") == "expense")
-    with_invoice = sum(1 for e in entries
-                       if e.get("direction") == "expense"
-                       and e.get("billingStatus") in ("has_invoice", "has_receipt"))
-    compliance_rate = round(with_invoice / total_expense_cnt * 100) if total_expense_cnt > 0 else 0
-
-    # #10 改用分类汇总代替截断原始记录，节省 token 且覆盖全量数据
-    category_summary = {}
-    risk_categories = []
-    for e in entries:
-        cat = e.get("category", "其他")
-        direction = e.get("direction", "expense")
-        key = f"{direction}:{cat}"
-        category_summary[key] = category_summary.get(key, 0) + e.get("amount", 0)
-        if sanitize_risk_tags(e.get("riskTags", [])):
-            risk_categories.append(cat)
-
-    prompt = f"""请评估：
-- 月收入:{income}, 支出:{expense}, 净利润:{income - expense}
-- 记录总数:{len(entries)}, 支出笔数:{total_expense_cnt}
-- 发票合规率:{compliance_rate}%
-- 分类金额汇总:{category_summary}
-- 含风险标签的分类:{list(set(risk_categories))}"""
-
+    checks = None
     try:
-        result = chat_text_json(
-        HEALTH_SCORE_V3_PROMPT,
-        prompt,
-        max_tokens=1024,
-        scene="report",
-        user_id=ctx.user_id,
-        company_id=ctx.company_id,
-    )
-        return HealthScoreResponse(
-            totalScore=result.get("totalScore", 70),
-            level=result.get("level", "一般"),
-            dimensions=result.get("dimensions", {}),
-            suggestions=result.get("suggestions", []),
-            taxRiskScore=result.get("taxRiskScore"),
-            taxRiskLevel=result.get("taxRiskLevel"),
-            riskItems=result.get("riskItems"),
-        )
+        from services.accounting_core_service import period_close_checks
+        checks = await period_close_checks(session, ctx.company_id, target_month)
     except Exception:
-        return HealthScoreResponse(
-            totalScore=70, level="一般",
-            dimensions={"账务完整性": 70, "现金流健康": 70, "科目准确性": 70, "发票合规": 70, "税务风险": 70, "成本合理性": 70, "申报及时性": 70},
-            suggestions=["记录更多经营数据后评分会更准确"],
-        )
+        checks = None
+
+    todos = None
+    try:
+        from services.todo_service import list_todos
+        todos = await list_todos(ctx.user_id, ctx.company_id)
+    except Exception:
+        todos = None
+
+    score_result = calculate_health_score(
+        entries=entries,
+        all_entries=all_entries,
+        target_month=target_month,
+        checks=checks,
+        todos=todos,
+    )
+
+    if req.includeDiagnosis:
+        try:
+            prompt = f"""基于以下确定性财务体检结果生成一段简明通俗的 CFO 点评（2-3句话）与改进建议：
+- 月份：{target_month}
+- 健康总分：{score_result['totalScore']} ({score_result['level']})
+- 扣分项与问题：{[p['title'] for p in score_result['penalties']]}
+- 核心指标：{score_result['keyMetrics']}"""
+            llm_res = await asyncio.to_thread(
+                chat_text_json,
+                "你是企业 CFO 经营专家。请输出简明 JSON: {\"overview\": \"...\", \"actionPriorities\": [\"...\"]}",
+                prompt,
+                max_tokens=512,
+                scene="report",
+                user_id=ctx.user_id,
+                company_id=ctx.company_id,
+            )
+            score_result["aiDiagnosis"] = llm_res
+        except AccountingError:
+            raise
+        except Exception:
+            score_result["aiDiagnosis"] = {
+                "overview": score_result["summary"],
+                "actionPriorities": score_result["suggestions"],
+            }
+
+    return HealthScoreResponse(**score_result)
 
 
 @router.post("/report/vat-assist", response_model=VatAssistResponse)
@@ -718,7 +725,15 @@ async def vat_assist(
     period_type = "month" if req.month and not req.period else req.periodType
     period = req.period or req.month or default_completed_period(period_type)
     entries = await _authoritative_entries(session, ctx)
-    return VatAssistResponse(**build_small_scale_vat_assist(entries, period, period_type))
+    from services.vat_service import UnsupportedTaxpayerType, get_vat_config_from_session
+
+    try:
+        config = await get_vat_config_from_session(session, ctx.company_id)
+    except UnsupportedTaxpayerType as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return VatAssistResponse(
+        **build_small_scale_vat_assist(entries, period, period_type, rate_value=config.rate)
+    )
 
 
 @router.post("/report/cit-assist", response_model=CitAssistResponse)
@@ -907,33 +922,57 @@ async def archive_checklist(
     ctx: AuthContext = Depends(require_auth),
     session: AsyncSession = Depends(get_db_session),
 ):
-    """单据归档清单"""
+    """单据归档清单：检查凭证单据的完备度与合规度，辅助档案装订与汇算清缴排查。"""
     items = []
     compliant = 0
     missing = 0
+    compliant_amount = Decimal("0")
+    missing_amount = Decimal("0")
+    total_amount = Decimal("0")
 
     entries = _filter_month(await _authoritative_entries(session, ctx), req.month)
     for e in entries:
         billing = e.get("billingStatus", "no_document")
+        amt = Decimal(str(e.get("amount") or 0))
+        total_amount += abs(amt)
+
         # unknown 和 no_document 都属于待补
-        compliance = "合规" if billing in ("has_invoice", "has_receipt") else "待补"
-        if compliance == "合规":
+        if billing in ("has_invoice", "has_receipt"):
+            compliance = "合规"
+            compliance_status = "compliant"
             compliant += 1
+            compliant_amount += abs(amt)
         else:
+            compliance = "待补"
+            compliance_status = "missing"
             missing += 1
+            missing_amount += abs(amt)
 
         risk = None
         tags = sanitize_risk_tags(e.get("riskTags", []))
         if tags:
             risk = tags[0] if isinstance(tags, list) else str(tags)
+            if compliance_status == "compliant" and risk:
+                compliance_status = "questionable"
+
+        voucher_no = e.get("voucher_no") or e.get("voucherNo") or e.get("voucherRef")
+        attachment_count = 1 if billing in ("has_invoice", "has_receipt") else 0
 
         items.append(ArchiveItem(
-            date=e.get("date") or e.get("time", ""),
+            id=str(e.get("id")) if e.get("id") else None,
+            voucherNo=str(voucher_no) if voucher_no else None,
+            date=e.get("date") or e.get("occurDate") or e.get("time", ""),
             summary=e.get("title", ""),
-            amount=e.get("amount", 0),
+            amount=amt,
+            direction=e.get("direction"),
+            category=e.get("category"),
             docType=billing,
+            invoiceNumber=e.get("invoiceNumber"),
+            invoiceType=e.get("invoiceType"),
             compliance=compliance,
+            complianceStatus=compliance_status,
             riskTag=risk,
+            attachmentCount=attachment_count,
             note=e.get("explanation", ""),
         ))
 
@@ -943,6 +982,9 @@ async def archive_checklist(
         compliantCount=compliant,
         missingCount=missing,
         totalCount=len(items),
+        compliantAmount=compliant_amount,
+        missingAmount=missing_amount,
+        totalAmount=total_amount,
     )
 
 
@@ -1042,25 +1084,36 @@ async def balance_sheet(
     req: BalanceSheetRequest,
     ctx: AuthContext = Depends(require_auth),
 ):
-    """资产负债表：与税务报表共用已过账复式分录及科目余额口径；支持月报/季报。"""
+    """资产负债表：与税务报表共用已过账复式分录及科目余额口径；支持月报/季报。
+
+    同一份数据返回两种视图：boss（非零科目明细）与 standard（会小企01表全量行次，
+    含年初/期末两列）。年初余额取自 balance_opening——有显式期初凭证用期初，
+    否则从历史分录派生（见 opening_balance_service 跨年连续性）。
+    """
     period = _period_label(req.month, req.periodType)
     statement = await build_statement_data(ctx.user_id, ctx.company_id, period, req.periodType)
     balance = statement.balance_current
+    opening = statement.balance_opening
     current_profit = statement.profit_ytd.get("net_profit", Decimal("0"))
     prior_retained = balance.get("retained_earnings", Decimal("0")) - current_profit
 
-    def item(code: str, name: str, amount: Decimal) -> BalanceSheetItem:
-        return BalanceSheetItem(accountCode=code, accountName=name, currentAmount=d2(amount))
+    def item(code: str, name: str, key: str, sign: int = 1) -> BalanceSheetItem:
+        return BalanceSheetItem(
+            accountCode=code,
+            accountName=name,
+            currentAmount=d2(balance.get(key, Decimal("0")) * sign),
+            previousAmount=d2(opening.get(key, Decimal("0")) * sign),
+        )
 
     def nonzero_items(rows: list[tuple[str, str, str, int]]) -> list[BalanceSheetItem]:
         result: list[BalanceSheetItem] = []
         for code, name, key, sign in rows:
             amount = balance.get(key, Decimal("0")) * sign
             if amount:
-                result.append(item(code, name, amount))
+                result.append(item(code, name, key, sign))
         return result
 
-    assets = [item("1002", "货币资金", balance.get("cash", Decimal("0")))]
+    assets = [item("1002", "货币资金", "cash")]
     assets.extend(nonzero_items([
         ("1101", "短期投资", "short_investment", 1),
         ("1121", "应收票据", "notes_receivable", 1),
@@ -1100,12 +1153,140 @@ async def balance_sheet(
         ("3002", "资本公积", "capital_reserve", 1),
         ("3101", "盈余公积", "surplus_reserve", 1),
     ])
-    equity.append(item("3103", "本年利润", current_profit))
-    equity.append(item("3104", "利润分配-未分配利润", prior_retained))
-
     total_assets = d2(balance.get("asset_total", Decimal("0")))
     total_liabilities = d2(balance.get("liability_total", Decimal("0")))
     total_equity = d2(balance.get("equity_total", Decimal("0")))
+
+    # 会计视图恒等口径：未分配利润 = 资产 − 负债 − 显式权益组件（残差），
+    # 期末/年初同式。账套存在未月结/年结月份时 5xxx 余额尚未滚入 3103/3104，
+    # 直接取科目会让报表两侧不平；boss 视图保留科目口径并用 isBalanced 提示，
+    # standard.balanced 记录「科目口径是否天然平衡」供前端展示提示条。
+    current_equity_total = d2(total_assets - total_liabilities)
+    current_retained_std = d2(
+        current_equity_total
+        - balance.get("paid_in_capital", ZERO)
+        - balance.get("capital_reserve", ZERO)
+        - balance.get("surplus_reserve", ZERO)
+    )
+    opening_equity_total = d2(
+        opening.get("asset_total", ZERO) - opening.get("liability_total", ZERO)
+    )
+    opening_retained = d2(
+        opening_equity_total
+        - opening.get("paid_in_capital", ZERO)
+        - opening.get("capital_reserve", ZERO)
+        - opening.get("surplus_reserve", ZERO)
+    )
+    equity.append(BalanceSheetItem(
+        accountCode="3103", accountName="本年利润",
+        currentAmount=d2(current_profit), previousAmount=ZERO,
+    ))
+    equity.append(BalanceSheetItem(
+        accountCode="3104", accountName="利润分配-未分配利润",
+        currentAmount=d2(prior_retained), previousAmount=opening_retained,
+    ))
+
+    def std_row(
+        row_no: int, name: str, key: str | None, *,
+        code: str | None = None, sign: int = 1, level: int = 0,
+        kind: Literal["item", "section", "subtotal", "total"] = "item",
+    ) -> StandardStatementRow:
+        src, src_open = balance, opening
+        if key:
+            return StandardStatementRow(
+                rowNo=row_no, name=name, level=level, kind=kind, accountCode=code,
+                openingAmount=d2(src_open.get(key, Decimal("0")) * sign),
+                currentAmount=d2(src.get(key, Decimal("0")) * sign),
+            )
+        return StandardStatementRow(rowNo=row_no, name=name, level=level, kind=kind)
+
+    std_assets = [
+        StandardStatementRow(name="流动资产：", kind="section"),
+        std_row(1, "货币资金", "cash", code="1002"),
+        std_row(2, "短期投资", "short_investment", code="1101"),
+        std_row(3, "应收票据", "notes_receivable", code="1121"),
+        std_row(4, "应收账款", "accounts_receivable", code="1122"),
+        std_row(5, "预付账款", "prepaid", code="1123"),
+        std_row(6, "应收股利", "dividends_receivable", code="1131"),
+        std_row(7, "应收利息", "interest_receivable", code="1132"),
+        std_row(8, "其他应收款", "other_receivable", code="1221"),
+        std_row(9, "存货", "inventory", code="1405"),
+        std_row(10, "其中：原材料", "raw_material", code="1403", level=1),
+        std_row(11, "在产品", None, level=1),
+        std_row(12, "库存商品", "goods", code="1405", level=1),
+        std_row(13, "周转材料", None, level=1),
+        std_row(14, "其他流动资产", "other_current_asset", code="1901"),
+        std_row(15, "流动资产合计", "current_asset_total", kind="subtotal"),
+        StandardStatementRow(name="非流动资产：", kind="section"),
+        std_row(16, "长期债券投资", "long_bond_investment", code="1501"),
+        std_row(17, "长期股权投资", "long_equity_investment", code="1511"),
+        std_row(18, "固定资产原价", "fixed_asset_cost", code="1601"),
+        std_row(19, "减：累计折旧", "accumulated_depreciation", code="1602", level=1),
+        std_row(20, "固定资产账面价值", "fixed_asset_book_value"),
+        std_row(21, "在建工程", "construction", code="1604"),
+        std_row(22, "工程物资", None),
+        std_row(23, "固定资产清理", None),
+        std_row(24, "生产性生物资产", None),
+        std_row(25, "无形资产", "intangible_asset_book_value", code="1701"),
+        std_row(26, "开发支出", "dev_expense", code="4301002"),
+        std_row(27, "长期待摊费用", "long_prepaid", code="1801"),
+        std_row(28, "其他非流动资产", None),
+        std_row(29, "非流动资产合计", "non_current_asset_total", kind="subtotal"),
+        std_row(30, "资产总计", "asset_total", kind="total"),
+    ]
+
+    std_rights = [
+        StandardStatementRow(name="流动负债：", kind="section"),
+        std_row(31, "短期借款", "short_borrow", code="2001"),
+        std_row(32, "应付票据", "notes_payable", code="2201"),
+        std_row(33, "应付账款", "accounts_payable", code="2202"),
+        std_row(34, "预收账款", "advance_receipt", code="2203"),
+        std_row(35, "应付职工薪酬", "salary_payable", code="2211"),
+        std_row(36, "应交税费", "tax_payable", code="2221"),
+        std_row(37, "应付利息", "interest_payable", code="2231"),
+        std_row(38, "应付利润", "profit_payable", code="2232"),
+        std_row(39, "其他应付款", "other_payable", code="2241"),
+        std_row(40, "其他流动负债", None),
+        std_row(41, "流动负债合计", "current_liability_total", kind="subtotal"),
+        StandardStatementRow(name="非流动负债：", kind="section"),
+        std_row(42, "长期借款", "long_borrow", code="2501"),
+        std_row(43, "长期应付款", "long_payable", code="2701"),
+        std_row(44, "递延收益", "deferred_income", code="2401"),
+        std_row(45, "其他非流动负债", None),
+        std_row(46, "非流动负债合计", "non_current_liability_total", kind="subtotal"),
+        std_row(47, "负债合计", "liability_total", kind="subtotal"),
+        StandardStatementRow(name="所有者权益（或股东权益）：", kind="section"),
+        std_row(48, "实收资本（或股本）", "paid_in_capital", code="3001"),
+        std_row(49, "资本公积", "capital_reserve", code="3002"),
+        std_row(50, "盈余公积", "surplus_reserve", code="3101"),
+        std_row(51, "未分配利润", "retained_earnings"),
+        std_row(52, "所有者权益（或股东权益）合计", "equity_total", kind="subtotal"),
+        std_row(53, "负债和所有者权益（或股东权益）总计", "liability_equity_total", kind="total"),
+    ]
+
+    # 权益三行（未分配利润 / 权益合计 / 右侧总计）双列改用残差口径
+    opening_assets = d2(opening.get("asset_total", Decimal("0")))
+    for row in std_rights:
+        if row.name == "未分配利润":
+            row.openingAmount = opening_retained
+            row.currentAmount = current_retained_std
+        elif row.name == "所有者权益（或股东权益）合计":
+            row.openingAmount = opening_equity_total
+            row.currentAmount = current_equity_total
+        elif row.name == "负债和所有者权益（或股东权益）总计":
+            row.openingAmount = opening_assets
+            row.currentAmount = total_assets
+
+    standard = BalanceSheetStandard(
+        assets=std_assets,
+        rights=std_rights,
+        # 科目口径（3103/3104 直接取数）是否天然平衡：存在未月结/年结月份时为 False，
+        # 此时残差列与 boss 视图的权益合计会有差异，前端据此展示提示条。
+        balanced=(
+            total_assets == d2(balance.get("liability_equity_total", Decimal("0")))
+            and opening_assets == d2(opening.get("liability_equity_total", Decimal("0")))
+        ),
+    )
 
     return BalanceSheetResponse(
         month=req.month,
@@ -1118,6 +1299,7 @@ async def balance_sheet(
         totalLiabilities=total_liabilities,
         totalEquity=total_equity,
         isBalanced=total_assets == total_liabilities + total_equity,
+        standard=standard,
     )
 
 
@@ -1378,7 +1560,12 @@ async def ai_diagnosis(
 {tax_context or '暂无'}"""
 
     try:
-        result = chat_text_json(CFO_DIAGNOSIS_PROMPT, context, max_tokens=1024)
+        # retry_on_parse=True：LLM 偶发带 Markdown 前缀导致 JSON 解析失败时，
+        # 追加约束重试一次，避免用户直接看到"暂时无法生成"兜底文案
+        result = await asyncio.to_thread(
+            chat_text_json, CFO_DIAGNOSIS_PROMPT, context, max_tokens=2048, retry_on_parse=True,
+            scene="report", user_id=ctx.user_id, company_id=ctx.company_id,
+        )
         return {
             "diagnosis": result.get("diagnosis", "数据不足，暂无法生成诊断报告。"),
             "keyMetrics": result.get("keyMetrics", []),
@@ -1386,7 +1573,11 @@ async def ai_diagnosis(
             "disclaimer": result.get("disclaimer", "以上分析仅供经营参考，具体决策以专业财税人员意见为准"),
             "generatedAt": _now_iso(),
         }
+    except AccountingError:
+        raise  # 配额超限保持 402
     except Exception:
+        # 静默兜底可以，但不能无日志——否则"暂时无法生成"永远查不出原因
+        logger.exception("AI CFO 诊断生成失败 month=%s", req.month)
         return {
             "diagnosis": "暂时无法生成 AI 诊断，请稍后再试。",
             "keyMetrics": [],

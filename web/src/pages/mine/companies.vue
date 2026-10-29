@@ -1,7 +1,7 @@
 <!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { computed, ref, onMounted } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { NCard, NButton, NModal, NForm, NFormItem, NInput, NSelect, NTag, NPopover, NTooltip, NDatePicker, useMessage, NSpace, NGrid, NGi } from 'naive-ui'
 import { useAuthStore } from '@/stores/auth'
 import { useCompanyStore } from '@/stores/company'
@@ -14,6 +14,7 @@ import { SoloEmpty } from '@/components/ui'
 
 const message = useMessage()
 const route = useRoute()
+const router = useRouter()
 const authStore = useAuthStore()
 const companyStore = useCompanyStore()
 
@@ -21,6 +22,7 @@ const companies = ref<CompanyInfo[]>([])
 // Create dialog
 function defaultCreateForm() {
   return {
+    onboardingType: 'new' as 'new' | 'migration',
     name: '', type: '有限责任公司', taxpayerType: '小规模纳税人',
     // formatted-value 的「无值」哨兵是 null，空字符串会被当作待解析日期导致弹窗崩溃
     startDate: null as string | null,
@@ -36,6 +38,7 @@ const creating = ref(false)
 const showEdit = ref(false)
 const editingId = ref('')
 const editForm = ref({
+  onboardingType: 'new' as 'new' | 'migration',
   name: '', type: '有限责任公司', taxpayerType: '小规模纳税人',
   startDate: null as string | null,
   taxId: '',
@@ -217,6 +220,7 @@ async function handleCreate() {
 function openEdit(co: CompanyInfo) {
   editingId.value = co.company_id
   editForm.value = {
+    onboardingType: ((co as any).onboardingType === 'migration' ? 'migration' : 'new'),
     name: co.name || '',
     type: co.type || '有限责任公司',
     taxpayerType: co.taxpayerType || '小规模纳税人',
@@ -323,7 +327,12 @@ async function confirmDelete() {
         <h2>主体管理</h2>
         <p class="text-muted">管理您的所有公司及纳税人身份</p>
       </div>
-      <NButton type="primary" @click="showCreate = true">新增主体</NButton>
+      <NSpace>
+        <NButton secondary type="primary" @click="router.push('/copilot?scene=onboarding')">
+          <i class="ri-sparkling-2-line" />&nbsp;AI 引导建账 / 代账转入
+        </NButton>
+        <NButton type="primary" @click="showCreate = true">新增主体</NButton>
+      </NSpace>
     </div>
 
     <NSpace vertical :size="16">
@@ -472,6 +481,17 @@ async function confirmDelete() {
     <NModal v-model:show="showCreate" title="新增主体" preset="card" style="width: 720px; max-width: 92vw;">
       <NForm>
         <NGrid :cols="2" :x-gap="16">
+          <NGi :span="2">
+            <NFormItem label="第一步：选择建账情况">
+              <NSelect
+                v-model:value="createForm.onboardingType"
+                :options="[
+                  { label: '新成立公司 · 从零开始记账（无历史期初余额）', value: 'new' },
+                  { label: '已记账公司 · 从其他代账或财务软件转入（需导入期初余额）', value: 'migration' },
+                ]"
+              />
+            </NFormItem>
+          </NGi>
           <NGi>
             <NFormItem label="公司名称" required>
               <NInput v-model:value="createForm.name" placeholder="请输入公司全称" />

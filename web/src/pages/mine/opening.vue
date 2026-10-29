@@ -1,10 +1,13 @@
 <!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue'
+import { useRoute } from 'vue-router'
+import { accountingErrorText } from '@/utils/errors'
 import {
   NButton, NTag, NSpace, useMessage, NInput, NSpin, NSelect, NModal, NFormItem,
-  NAlert, NInputNumber, NSwitch,
+  NAlert, NInputNumber, NSwitch, NTabs, NTab,
 } from 'naive-ui'
+import LegacyImportTab from './legacy-import.vue'
 import * as XLSX from 'xlsx'
 import apiClient from '@/api/client'
 import { getAuthMe, requestStepUp, sendPhoneCode } from '@/api/auth'
@@ -15,6 +18,7 @@ import {
   exportOpeningTemplate,
   parseOpeningWorkbook,
   type FixedAssetImportItem,
+  type UnmatchedOpeningRow,
 } from '@/utils/openingBalanceImport'
 
 interface BalanceItem {
@@ -53,6 +57,26 @@ const fiscalYear = ref(new Date().getFullYear())
 const startMonth = ref('01')
 const voucherNo = ref<string | null>(null)
 const serverLocked = ref(false)
+
+const route = useRoute()
+const mainTab = ref<'opening' | 'legacy'>((route.query.tab as string) === 'legacy' ? 'legacy' : 'opening')
+
+watch(() => route.query.tab, (tab) => {
+  if (tab === 'legacy') mainTab.value = 'legacy'
+  else if (tab === 'opening') mainTab.value = 'opening'
+})
+
+watch(mainTab, (tab) => {
+  if (tab === 'opening') {
+    checkPendingImportFromSession()
+  }
+})
+
+function onLegacyImported() {
+  mainTab.value = 'opening'
+  checkPendingImportFromSession()
+  load()
+}
 
 // 筛选与视图状态
 const activeTab = ref<ActiveSheetTab>('balance')
@@ -316,6 +340,18 @@ function handleYtdCreditChange(item: BalanceItem, val: number | null) {
 // Excel 导入与解析
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const importModalVisible = ref(false)
+const lastWorkbook = ref<XLSX.WorkBook | null>(null)
+const unmatchedRows = ref<UnmatchedOpeningRow[]>([])
+const mappingOverrides = ref<Record<string, string>>({})
+
+const leafAccountOptions = computed(() => {
+  const all = [...items.value, ...ytdItems.value]
+  return all.map(a => ({
+    label: `${a.account_code} ${a.account_name || ''}`,
+    value: a.account_code,
+  }))
+})
+
 const importSummary = ref<{
   matchedCount: number
   unmatchedCount: number
@@ -341,6 +377,76 @@ function handleDownloadTemplate() {
   message.success('已下载期初科目余额导入模板')
 }
 
+function applyImportResult(parseResult: any) {
+  // 1. 写入资产负债期初明细
+  const balanceMap = new Map(parseResult.items.map((i: any) => [i.account_code, i]))
+  items.value = items.value.map(item => {
+    const parsed: any = balanceMap.get(item.account_code)
+    if (parsed && (parsed.debit_balance > 0 || parsed.credit_balance > 0)) {
+      return {
+        ...item,
+        debit_balance: parsed.debit_balance,
+        credit_balance: parsed.credit_balance,
+        partner_name: parsed.partner_name || item.partner_name || '',
+      }
+    }
+    return item
+  })
+
+  // 2. 写入年中损益本年累计发生额
+  let ytdMatched = 0
+  const ytdMap = new Map(parseResult.ytdItems.map((i: any) => [i.account_code, i]))
+  ytdItems.value = ytdItems.value.map(item => {
+    const parsed: any = ytdMap.get(item.account_code)
+    if (parsed && (parsed.debit_balance > 0 || parsed.credit_balance > 0)) {
+      ytdMatched++
+      return {
+        ...item,
+        debit_balance: parsed.debit_balance,
+        credit_balance: parsed.credit_balance,
+      }
+    }
+    return item
+  })
+
+  // 3. 写入固定资产期初卡片
+  if (parseResult.fixedAssets && parseResult.fixedAssets.length > 0) {
+    fixedAssets.value = parseResult.fixedAssets
+  }
+
+  unmatchedRows.value = parseResult.unmatchedRows || []
+
+  importSummary.value = {
+    matchedCount: parseResult.matchedCount,
+    unmatchedCount: parseResult.unmatchedCount,
+    warnings: parseResult.warnings,
+    totalDebit: parseResult.totalDebit,
+    totalCredit: parseResult.totalCredit,
+    isBalanced: parseResult.isBalanced,
+    ytdMatchedCount: ytdMatched,
+    fixedAssetCount: parseResult.fixedAssets?.length || 0,
+  }
+}
+
+function reapplyMapping() {
+  if (!lastWorkbook.value) return
+  loading.value = true
+  try {
+    const allAccounts = [...balanceItems.value, ...ytdItems.value]
+    const parseResult = parseOpeningWorkbook(lastWorkbook.value, allAccounts, mappingOverrides.value)
+    applyImportResult(parseResult)
+    if (parseResult.isBalanced) {
+      message.success(`映射已更新，成功匹配 ${parseResult.matchedCount} 个科目，借贷双方已平衡`)
+    } else {
+      message.warning(`映射已更新，尚有借贷差额 ¥${Math.abs(parseResult.totalDebit - parseResult.totalCredit).toFixed(2)}，请核对调整`)
+    }
+  } catch (err) {
+    message.error(accountingErrorText(err))
+  } finally {
+    loading.value = false
+  }
+}
+
 async function onFileSelected(e: Event) {
   const target = e.target as HTMLInputElement
   const file = target.files?.[0]
@@ -351,55 +457,11 @@ async function onFileSelected(e: Event) {
   try {
     const data = await file.arrayBuffer()
     const workbook = XLSX.read(data, { type: 'array' })
+    lastWorkbook.value = workbook
+    mappingOverrides.value = {}
     const allAccounts = [...balanceItems.value, ...ytdItems.value]
     const parseResult = parseOpeningWorkbook(workbook, allAccounts)
-
-    // 1. 写入资产负债期初明细
-    const balanceMap = new Map(parseResult.items.map(i => [i.account_code, i]))
-    items.value = items.value.map(item => {
-      const parsed = balanceMap.get(item.account_code)
-      if (parsed && (parsed.debit_balance > 0 || parsed.credit_balance > 0)) {
-        return {
-          ...item,
-          debit_balance: parsed.debit_balance,
-          credit_balance: parsed.credit_balance,
-          partner_name: parsed.partner_name || item.partner_name || '',
-        }
-      }
-      return item
-    })
-
-    // 2. 写入年中损益本年累计发生额
-    let ytdMatched = 0
-    const ytdMap = new Map(parseResult.ytdItems.map(i => [i.account_code, i]))
-    ytdItems.value = ytdItems.value.map(item => {
-      const parsed = ytdMap.get(item.account_code)
-      if (parsed && (parsed.debit_balance > 0 || parsed.credit_balance > 0)) {
-        ytdMatched++
-        return {
-          ...item,
-          debit_balance: parsed.debit_balance,
-          credit_balance: parsed.credit_balance,
-        }
-      }
-      return item
-    })
-
-    // 3. 写入固定资产期初卡片
-    if (parseResult.fixedAssets && parseResult.fixedAssets.length > 0) {
-      fixedAssets.value = parseResult.fixedAssets
-    }
-
-    importSummary.value = {
-      matchedCount: parseResult.matchedCount,
-      unmatchedCount: parseResult.unmatchedCount,
-      warnings: parseResult.warnings,
-      totalDebit: parseResult.totalDebit,
-      totalCredit: parseResult.totalCredit,
-      isBalanced: parseResult.isBalanced,
-      ytdMatchedCount: ytdMatched,
-      fixedAssetCount: parseResult.fixedAssets?.length || 0,
-    }
+    applyImportResult(parseResult)
     importModalVisible.value = true
 
     if (parseResult.isBalanced) {
@@ -408,7 +470,7 @@ async function onFileSelected(e: Event) {
       message.warning(`导入完成，尚有借贷差额 ¥${Math.abs(parseResult.totalDebit - parseResult.totalCredit).toFixed(2)}，请核对调整`)
     }
   } catch (err) {
-    message.error(err instanceof Error ? err.message : 'Excel 解析失败，请检查文件格式')
+    message.error(accountingErrorText(err))
   } finally {
     loading.value = false
   }
@@ -421,6 +483,62 @@ function normalizeRowNumbers(rawList: any[]): BalanceItem[] {
     credit_balance: parseFloat(String(row.credit_balance ?? 0)) || 0,
     partner_name: String(row.partner_name || ''),
   }))
+}
+
+function checkPendingImportFromSession() {
+  try {
+    const raw = sessionStorage.getItem('solobooks:pending_opening_import')
+    if (!raw) return
+    sessionStorage.removeItem('solobooks:pending_opening_import')
+    const parsed = JSON.parse(raw)
+    if (parsed && Array.isArray(parsed.items)) {
+      if (parsed.fiscalYear && typeof parsed.fiscalYear === 'number') {
+        fiscalYear.value = parsed.fiscalYear
+      }
+      if (parsed.startPeriod && typeof parsed.startPeriod === 'string' && parsed.startPeriod.includes('-')) {
+        const parts = parsed.startPeriod.split('-')
+        if (parts[1]) startMonth.value = parts[1].padStart(2, '0')
+      }
+      const balanceMap = new Map(parsed.items.map((i: any) => [String(i.accountCode || i.account_code || ''), i]))
+      items.value = items.value.map(item => {
+        const p: any = balanceMap.get(item.account_code)
+        if (p) {
+          const d = parseFloat(String(p.debitBalance ?? p.debit_balance ?? 0)) || 0
+          const c = parseFloat(String(p.creditBalance ?? p.credit_balance ?? 0)) || 0
+          if (d > 0 || c > 0) {
+            return {
+              ...item,
+              debit_balance: d,
+              credit_balance: c,
+              partner_name: p.partnerName || p.partner_name || item.partner_name || '',
+            }
+          }
+        }
+        return item
+      })
+      if (Array.isArray(parsed.ytdItems)) {
+        const ytdMap = new Map(parsed.ytdItems.map((i: any) => [String(i.accountCode || i.account_code || ''), i]))
+        ytdItems.value = ytdItems.value.map(item => {
+          const p: any = ytdMap.get(item.account_code)
+          if (p) {
+            const d = parseFloat(String(p.debitBalance ?? p.debit_balance ?? 0)) || 0
+            const c = parseFloat(String(p.creditBalance ?? p.credit_balance ?? 0)) || 0
+            if (d > 0 || c > 0) {
+              return {
+                ...item,
+                debit_balance: d,
+                credit_balance: c,
+              }
+            }
+          }
+          return item
+        })
+      }
+      message.success('已载入从旧账导入带入的期初余额，请核对并试算平衡')
+    }
+  } catch (e) {
+    console.error('Failed to load pending opening import', e)
+  }
 }
 
 async function load() {
@@ -474,6 +592,49 @@ async function load() {
       }
     } else {
       loadLocalTaxMemoryFallback(fiscalYear.value)
+    }
+
+    // 若从 AI 会计对话确认卡点击「去期初工作台细调」跳转而来，自动合并 AI 草稿
+    if (!serverLocked.value) {
+      try {
+        const rawDraft = sessionStorage.getItem('solobooks:ai_opening_draft')
+        if (rawDraft) {
+          sessionStorage.removeItem('solobooks:ai_opening_draft')
+          const draft = JSON.parse(rawDraft)
+          if (typeof draft.startPeriod === 'string' && draft.startPeriod.includes('-')) {
+            const p = draft.startPeriod.split('-')
+            if (p[1]) startMonth.value = p[1].padStart(2, '0')
+          }
+          if (Array.isArray(draft.items) && draft.items.length > 0) {
+            const draftMap = new Map(draft.items.map((i: any) => [String(i.account_code), i]))
+            items.value = items.value.map((item) => {
+              const matched: any = draftMap.get(item.account_code)
+              if (!matched) return item
+              return {
+                ...item,
+                debit_balance: parseFloat(String(matched.debit_balance ?? 0)) || 0,
+                credit_balance: parseFloat(String(matched.credit_balance ?? 0)) || 0,
+                partner_name: String(matched.partner_name || item.partner_name || ''),
+              }
+            })
+          }
+          if (Array.isArray(draft.ytdItems) && draft.ytdItems.length > 0) {
+            const ytdMap = new Map(draft.ytdItems.map((i: any) => [String(i.account_code), i]))
+            ytdItems.value = ytdItems.value.map((item) => {
+              const matched: any = ytdMap.get(item.account_code)
+              if (!matched) return item
+              return {
+                ...item,
+                debit_balance: parseFloat(String(matched.debit_balance ?? 0)) || 0,
+                credit_balance: parseFloat(String(matched.credit_balance ?? 0)) || 0,
+              }
+            })
+          }
+          message.info('已带入 AI 会计整理的期初余额草稿，请核对配平后保存')
+        }
+      } catch {
+        /* ignore */
+      }
     }
   } catch {
     message.error('加载期初余额失败')
@@ -626,6 +787,7 @@ onMounted(async () => {
   }
 
   await load()
+  checkPendingImportFromSession()
   try {
     const profile: any = await getAuthMe()
     phone.value = profile?.user?.phone || ''
@@ -637,14 +799,26 @@ onMounted(async () => {
 
 <template>
   <div class="opening-page">
-    <!-- 隐式文件输入 -->
-    <input
-      ref="fileInputRef"
-      type="file"
-      accept=".xlsx,.xls"
-      style="display: none"
-      @change="onFileSelected"
-    />
+    <div class="opening-mode-bar">
+      <NTabs v-model:value="mainTab" type="segment" class="mode-tabs">
+        <NTab name="opening">期初余额试算与建账</NTab>
+        <NTab name="legacy">旧软件账目迁移（用友 / 金蝶 / 柠檬云）</NTab>
+      </NTabs>
+    </div>
+
+    <div v-show="mainTab === 'legacy'" class="legacy-tab-pane">
+      <LegacyImportTab embedded @imported="onLegacyImported" />
+    </div>
+
+    <div v-show="mainTab === 'opening'">
+      <!-- 隐式文件输入 -->
+      <input
+        ref="fileInputRef"
+        type="file"
+        accept=".xlsx,.xls"
+        style="display: none"
+        @change="onFileSelected"
+      />
 
     <!-- 顶部导航与工作台抬头（遵循 layout.css .page-header-left / .page-header-right 规范） -->
     <div class="page-header">
@@ -1242,6 +1416,42 @@ onMounted(async () => {
             <li v-if="importSummary.warnings.length > 5">...其余 {{ importSummary.warnings.length - 5 }} 项已略过</li>
           </ul>
         </div>
+
+        <!-- 未匹配科目在线映射 -->
+        <div v-if="unmatchedRows.length > 0" class="mapping-box">
+          <div class="mapping-box-header">
+            <span class="warning-title">未匹配科目映射（{{ unmatchedRows.length }} 项）：</span>
+            <span class="mapping-tip">可为来源科目指定本账套对应科目并重新计算</span>
+          </div>
+          <div class="mapping-list">
+            <div
+              v-for="row in unmatchedRows"
+              :key="row.originalCode || row.originalName"
+              class="mapping-item"
+            >
+              <div class="mapping-source">
+                <span class="source-code">{{ row.originalCode || '—' }}</span>
+                <span class="source-name">{{ row.originalName || '—' }}</span>
+                <span class="source-amount">({{ row.debit > 0 ? `借 ¥${formatCurrency(row.debit)}` : `贷 ¥${formatCurrency(row.credit)}` }})</span>
+              </div>
+              <i class="ri-arrow-right-line mapping-arrow" />
+              <NSelect
+                v-model:value="mappingOverrides[row.originalCode || row.originalName]"
+                :options="leafAccountOptions"
+                filterable
+                clearable
+                placeholder="指定本账套科目"
+                size="small"
+                style="width: 220px;"
+              />
+            </div>
+          </div>
+          <div class="mapping-actions">
+            <NButton size="small" type="primary" secondary @click="reapplyMapping">
+              按指定映射重新计算
+            </NButton>
+          </div>
+        </div>
       </div>
       <template #footer>
         <NSpace justify="end">
@@ -1288,6 +1498,7 @@ onMounted(async () => {
         </NButton>
       </NSpace>
     </NModal>
+    </div>
   </div>
 </template>
 
@@ -1298,6 +1509,23 @@ onMounted(async () => {
   padding-bottom: 40px;
   width: 100%;
   box-sizing: border-box;
+}
+
+.opening-mode-bar {
+  margin-bottom: 20px;
+  display: flex;
+  justify-content: flex-start;
+}
+.mode-tabs {
+  width: auto;
+  min-width: 360px;
+}
+.legacy-tab-pane {
+  animation: fadeIn 0.15s ease-in-out;
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 /* 顶部导航与主标题栏（对齐全局 layout.css .page-header 规范） */
@@ -1876,5 +2104,69 @@ onMounted(async () => {
   padding-left: 18px;
   color: #636e7c;
   line-height: 1.6;
+}
+
+.mapping-box {
+  margin-top: 8px;
+  padding: 12px;
+  background: #fdfdfd;
+  border: 1px solid #e5e8ec;
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.mapping-box-header {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.mapping-tip {
+  font-size: 11px;
+  color: #8c9ba5;
+}
+.mapping-list {
+  max-height: 200px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-right: 4px;
+}
+.mapping-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+.mapping-source {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.source-code {
+  font-family: monospace;
+  font-weight: 600;
+  color: #1a2233;
+}
+.source-name {
+  color: #4b5563;
+}
+.source-amount {
+  color: #8c9ba5;
+  font-size: 11px;
+}
+.mapping-arrow {
+  color: #9ca3af;
+  font-size: 14px;
+}
+.mapping-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 4px;
 }
 </style>

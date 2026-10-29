@@ -159,8 +159,8 @@ onMounted(load)
           返回报表中心
         </NButton>
         <div class="report-title-section">
-          <h2>辅助核算档案</h2>
-          <p class="report-subtitle">往来单位 / 部门 / 项目：凭证挂上档案后，往来余额、账龄、部门项目费用才能按维度出表</p>
+          <h2>往来单位与客商档案</h2>
+          <p class="report-subtitle">客户 / 供应商 / 部门 / 项目：凭证关联档案后，往来余额、应收账龄、部门项目费用才能按维度出表</p>
         </div>
       </div>
       <div class="report-header-right">
@@ -228,7 +228,7 @@ onMounted(load)
                 <SoloEmpty
                   variant="hint"
                   dense
-                  title="还没有{{ kindLabel }}档案"
+                  :title="`还没有${kindLabel}档案`"
                   description="新增后即可在凭证与导入流程中挂接。"
                 />
               </td>

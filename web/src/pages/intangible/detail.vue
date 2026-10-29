@@ -228,7 +228,7 @@ function handleDelete() {
   withLoading(
     () => deleteIntangibleAsset(assetId.value),
     '已删除'
-  ).then(() => router.push('/intangibles'))
+  ).then(() => router.push({ path: '/assets', query: { tab: 'intangible' } }))
 }
 
 function openDisposal() {
@@ -400,7 +400,7 @@ onMounted(load)
   <div class="detail-page">
     <div class="page-header">
       <div class="header-left">
-        <NButton text class="back-btn" @click="router.push('/intangibles')">
+        <NButton text class="back-btn" @click="router.push({ path: '/assets', query: { tab: 'intangible' } })">
           <template #icon><i class="ri-arrow-left-line" /></template>
           返回台账
         </NButton>

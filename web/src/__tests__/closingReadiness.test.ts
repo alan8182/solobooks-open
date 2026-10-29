@@ -4,7 +4,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { firstActionableReadinessItem, getClosingReadiness, deriveClosingTasks } from '@/utils/closingReadiness'
+import { firstActionableReadinessItem, getClosingReadiness, deriveClosingTasks, summarizeFiveChecks, countOtherPendingReadiness, type ClosingReadinessItem } from '@/utils/closingReadiness'
 
 describe('closing readiness', () => {
   it('turns backend blocking checks into an actionable business task', () => {
@@ -251,5 +251,57 @@ describe('closing notices（跨期与补记提示）', () => {
     expect(getClosingReadiness(checks)).toHaveLength(5)
     expect(deriveClosingTasks(checks)).toHaveLength(0)
     expect(checks.canClose).toBe(true)
+  })
+})
+
+describe('five check summary', () => {
+  const readiness = (code: string, status: ClosingReadinessItem['status']): ClosingReadinessItem => ({
+    code,
+    title: code,
+    status,
+    detail: `${code} detail`,
+    actionLabel: '查看',
+    step: 4,
+  })
+
+  it('keeps the five checks in canonical order and maps their statuses', () => {
+    const summary = summarizeFiveChecks([
+      readiness('REPORT_TO_TAX', 'blocked'),
+      readiness('VOUCHER_TO_SOURCE', 'complete'),
+      readiness('BOOK_TO_ACTUAL', 'needs_review'),
+      readiness('LEDGER_TO_LEDGER', 'complete'),
+      readiness('LEDGER_TO_REPORT', 'complete'),
+    ])
+
+    expect(summary.map(row => row.code)).toEqual([
+      'VOUCHER_TO_SOURCE',
+      'LEDGER_TO_LEDGER',
+      'BOOK_TO_ACTUAL',
+      'LEDGER_TO_REPORT',
+      'REPORT_TO_TAX',
+    ])
+    expect(summary.map(row => row.label)).toEqual(['凭证与来源', '账账核对', '银行流水核对', '账表核对', '申报校验'])
+    expect(summary.map(row => row.status)).toEqual(['complete', 'complete', 'needs_review', 'complete', 'blocked'])
+  })
+
+  it('falls back to incomplete when a check is missing', () => {
+    const [first] = summarizeFiveChecks([])
+
+    expect(first).toEqual({
+      code: 'VOUCHER_TO_SOURCE',
+      label: '凭证与来源',
+      status: 'incomplete',
+      detail: '本期未返回该项核验结果。',
+    })
+  })
+
+  it('counts only non-five readiness items that still need work', () => {
+    expect(countOtherPendingReadiness([
+      readiness('VOUCHER_TO_SOURCE', 'blocked'),
+      readiness('PAYROLL_ACCRUAL', 'blocked'),
+      readiness('FIXED_ASSET_DEPRECIATION', 'incomplete'),
+      readiness('INTANGIBLE_AMORTIZATION', 'complete'),
+      readiness('PERIOD_ORDER', 'not_required'),
+    ])).toBe(2)
   })
 })

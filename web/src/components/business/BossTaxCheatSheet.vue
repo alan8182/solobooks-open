@@ -1,11 +1,10 @@
 <!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { computed } from 'vue'
-import { NButton, NProgress, useMessage } from 'naive-ui'
+import { NButton, useMessage } from 'naive-ui'
 import {
   calculateExemptionGauge,
   formatCopyAmount,
-  generateTaxCopilotInsight,
 } from '@/utils/taxFiling'
 import { copyToClipboard } from '@/utils/clipboard'
 import { formatMoney } from '@/utils/format'
@@ -30,14 +29,10 @@ const message = useMessage()
 const totalSales = computed(() => Number(props.pkg?.vat?.totalSales || 0))
 const periodType = computed(() => props.pkg?.periodType || 'quarter')
 const gauge = computed(() => calculateExemptionGauge(totalSales.value, props.period, periodType.value))
-const insight = computed(() => generateTaxCopilotInsight(props.pkg || {}))
-const blockingIssues = computed<string[]>(() => props.pkg?.summary?.blockingIssues || [])
-const hasBlockers = computed(() => blockingIssues.value.length > 0)
 
 // 预计税额
 const vatPayable = computed(() => Number(props.pkg?.summary?.vatPayable ?? props.pkg?.vat?.totalVatPayable ?? 0))
 const citPayable = computed(() => Number(props.pkg?.summary?.citPayable ?? props.pkg?.cit?.preferentialTax ?? 0))
-const totalTax = computed(() => vatPayable.value + citPayable.value)
 const citRevenue = computed(() => Number(props.pkg?.cit?.revenue || 0))
 const citCost = computed(() => {
   if (props.pkg?.cit?.cost != null) return Number(props.pkg.cit.cost)
@@ -71,19 +66,18 @@ const allDeadlines = computed(() => {
   return list.filter(d => d && d.status && d.status !== 'untracked')
 })
 
-const pendingCount = computed(() =>
-  allDeadlines.value.filter(t => t.status !== 'filed' && t.status !== 'waived').length
+// 本期口径：仅统计近期截止（≤90 天）或已逾期的待办事项。残保金等按年申报、
+// 次年才到期的远期事项单独在清单里展示，不混入「本期申报截止/待办数」。
+const nearTermPending = computed(() =>
+  allDeadlines.value.filter((t: any) => {
+    if (t.status === 'filed' || t.status === 'waived') return false
+    const days = t.daysLeft
+    if (days == null) return true
+    return days <= 90
+  })
 )
 
-// 申报截止日期
-const nearestDueDate = computed(() => {
-  const dates = allDeadlines.value
-    .filter((item: any) => item.status !== 'filed' && item.status !== 'waived')
-    .map((item: any) => item.dueDate)
-    .filter(Boolean)
-    .sort()
-  return dates[0] || '本月 15 日'
-})
+const pendingCount = computed(() => nearTermPending.value.length)
 
 async function copyAmount(val: number, label: string) {
   const text = formatCopyAmount(val)
@@ -98,83 +92,49 @@ async function copyAmount(val: number, label: string) {
 
 <template>
   <div class="boss-tax-sheet-container">
-    <!-- 顶部核心免税结论 Banner -->
-    <section
-      class="tax-hero-banner"
-      :class="hasBlockers ? 'has-blocker' : (gauge.isExempt ? 'exempt' : 'taxable')"
-    >
-      <div class="hero-left">
-        <div class="hero-badge">
-          <i :class="hasBlockers ? 'ri-alert-fill' : (gauge.isExempt ? 'ri-shield-check-fill' : 'ri-information-fill')" />
-          <span>{{ insight.badgeText }}</span>
-        </div>
-        <h1 class="hero-title">
-          {{ gauge.isExempt ? '本期享受小微免税，增值税应缴 ¥0.00' : `本期预计应缴税款 ¥${formatMoney(totalTax)}` }}
-        </h1>
-        <p class="hero-subtitle">
-          {{ gauge.tip }}
-        </p>
-
-        <!-- 申报阻断项提醒（解决“申报受阻”但无原因说明的问题） -->
-        <div v-if="hasBlockers" class="blocker-alert-box">
-          <div class="blocker-alert-head">
-            <i class="ri-error-warning-line" />
-            <span>发现 {{ blockingIssues.length }} 项待确认事项，建议核对后再去电子税局申报：</span>
-            <NButton size="tiny" type="warning" secondary @click="emit('switchMode', 'accounting')">
-              去底稿核对处理
-            </NButton>
-          </div>
-          <ul class="blocker-list">
-            <li v-for="(issue, idx) in blockingIssues" :key="idx">{{ issue }}</li>
-          </ul>
-        </div>
-
-        <!-- 额度进度条 -->
-        <div class="gauge-bar-wrapper">
-          <div class="gauge-labels">
-            <span>已使用免税额度 {{ formatMoney(gauge.totalSales) }}</span>
-            <span>免税上限 {{ formatMoney(gauge.threshold) }}</span>
-          </div>
-          <NProgress
-            type="line"
-            :percentage="gauge.percent"
-            :status="gauge.status === 'danger' ? 'error' : (gauge.status === 'warning' ? 'warning' : 'success')"
-            :show-indicator="false"
-            style="height: 8px"
-          />
-        </div>
-      </div>
-
-      <div class="hero-right">
-        <div class="due-card">
-          <span class="due-label">申报截止日期</span>
-          <strong class="due-date">{{ nearestDueDate }}</strong>
-          <span class="due-status">
-            {{ pendingCount ? `还有 ${pendingCount} 项申报待确认` : '本期申报已办结' }}
-          </span>
-        </div>
-      </div>
-    </section>
-
     <!-- 电子税务局极简小抄 -->
     <section class="cheat-sheet-card">
-      <header class="cheat-sheet-header">
-        <div class="header-titles">
-          <i class="ri-file-copy-2-line header-icon" />
-          <div>
-            <h2>电子税务局「照抄申报卡」</h2>
-            <p>登录电子税务局网页后，按照以下 4 步直接复制金额并确认归档（点击复制均为无逗号纯数字）：</p>
+      <div class="sheet-steps">
+        <!-- 步骤 1：财务报表报送（申报顺序：先报送财报，再增值税、企业所得税） -->
+        <div v-if="finStatementTask" class="step-card" :class="{ 'step-done': finStatementTask.status === 'filed' || finStatementTask.status === 'waived' }">
+          <div class="step-badge">{{ (finStatementTask.status === 'filed' || finStatementTask.status === 'waived') ? '✓' : '1' }}</div>
+          <div class="step-content">
+            <div class="step-head">
+              <h3>{{ finStatementTask.name || '财务报表报送' }}（资产负债表 + 利润表）</h3>
+              <span class="step-tag" :class="{ 'tag-done': finStatementTask.status === 'filed' || finStatementTask.status === 'waived' }">
+                {{ (finStatementTask.status === 'filed' || finStatementTask.status === 'waived') ? '已报送办结' : '必报附表' }}
+              </span>
+            </div>
+            <p class="step-instruction">
+              {{ finStatementTask.guide || '进入电子税局【财务报表报送及更正】➔ 导出下方标准三表 XLS 后直接上传或照抄填报。' }}
+            </p>
+            <div class="task-action-buttons">
+              <NButton
+                size="small"
+                secondary
+                :loading="exporting"
+                @click="emit('exportXls')"
+              >
+                <template #icon><i class="ri-download-2-line" /></template>
+                一键导出标准财务三表 (XLS)
+              </NButton>
+              <NButton
+                v-if="finStatementTask.status !== 'filed' && finStatementTask.status !== 'waived'"
+                type="primary"
+                secondary
+                size="small"
+                @click="emit('markFiled', finStatementTask.deadlineId)"
+              >
+                <template #icon><i class="ri-check-line" /></template>
+                标记「{{ finStatementTask.name }}」已申报办结
+              </NButton>
+            </div>
           </div>
         </div>
-        <NButton secondary size="small" @click="emit('switchMode', 'accounting')">
-          查看完整专业税表底稿
-        </NButton>
-      </header>
 
-      <div class="sheet-steps">
-        <!-- 步骤 1：增值税申报 -->
+        <!-- 步骤 2：增值税申报 -->
         <div class="step-card" :class="{ 'step-done': isVatDone }">
-          <div class="step-badge">{{ isVatDone ? '✓' : '1' }}</div>
+          <div class="step-badge">{{ isVatDone ? '✓' : '2' }}</div>
           <div class="step-content">
             <div class="step-head">
               <h3>增值税及附加税费申报（小规模纳税人）</h3>
@@ -221,9 +181,9 @@ async function copyAmount(val: number, label: string) {
           </div>
         </div>
 
-        <!-- 步骤 2：企业所得税预缴 -->
+        <!-- 步骤 3：企业所得税预缴 -->
         <div class="step-card" :class="{ 'step-done': isCitDone }">
-          <div class="step-badge">{{ isCitDone ? '✓' : '2' }}</div>
+          <div class="step-badge">{{ isCitDone ? '✓' : '3' }}</div>
           <div class="step-content">
             <div class="step-head">
               <h3>企业所得税季度预缴（A200000 查账征收）</h3>
@@ -280,46 +240,9 @@ async function copyAmount(val: number, label: string) {
           </div>
         </div>
 
-        <!-- 步骤 3：财务报表报送 -->
-        <div v-if="finStatementTask" class="step-card" :class="{ 'step-done': finStatementTask.status === 'filed' || finStatementTask.status === 'waived' }">
-          <div class="step-badge">{{ (finStatementTask.status === 'filed' || finStatementTask.status === 'waived') ? '✓' : '3' }}</div>
-          <div class="step-content">
-            <div class="step-head">
-              <h3>{{ finStatementTask.name || '财务报表报送' }}（资产负债表 + 利润表）</h3>
-              <span class="step-tag" :class="{ 'tag-done': finStatementTask.status === 'filed' || finStatementTask.status === 'waived' }">
-                {{ (finStatementTask.status === 'filed' || finStatementTask.status === 'waived') ? '已报送办结' : '必报附表' }}
-              </span>
-            </div>
-            <p class="step-instruction">
-              {{ finStatementTask.guide || '进入电子税局【财务报表报送及更正】➔ 导出下方标准三表 XLS 后直接上传或照抄填报。' }}
-            </p>
-            <div class="task-action-buttons">
-              <NButton
-                size="small"
-                secondary
-                :loading="exporting"
-                @click="emit('exportXls')"
-              >
-                <template #icon><i class="ri-download-2-line" /></template>
-                一键导出标准财务三表 (XLS)
-              </NButton>
-              <NButton
-                v-if="finStatementTask.status !== 'filed' && finStatementTask.status !== 'waived'"
-                type="primary"
-                secondary
-                size="small"
-                @click="emit('markFiled', finStatementTask.deadlineId)"
-              >
-                <template #icon><i class="ri-check-line" /></template>
-                标记「{{ finStatementTask.name }}」已申报办结
-              </NButton>
-            </div>
-          </div>
-        </div>
-
         <!-- 步骤 4：其他必报事项确认（印花税 / 个税扣缴 / 工商年报） -->
         <div class="step-card">
-          <div class="step-badge">{{ finStatementTask ? '4' : '3' }}</div>
+          <div class="step-badge">4</div>
           <div class="step-content">
             <div class="step-head">
               <h3>其他税种及必报事项确认</h3>
@@ -368,6 +291,12 @@ async function copyAmount(val: number, label: string) {
           </div>
         </div>
       </div>
+
+      <div class="cheat-sheet-footer">
+        <NButton text size="small" @click="emit('switchMode', 'accounting')">
+          查看完整专业税表底稿 →
+        </NButton>
+      </div>
     </section>
   </div>
 </template>
@@ -379,156 +308,6 @@ async function copyAmount(val: number, label: string) {
   gap: 20px;
 }
 
-/* 顶部定心丸 Banner */
-.tax-hero-banner {
-  border-radius: var(--solo-radius-xl, 12px);
-  padding: 24px;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 24px;
-  border: 1px solid var(--solo-border, #dde3ea);
-  background: var(--solo-bg-card, #ffffff);
-}
-
-.tax-hero-banner.exempt {
-  background: linear-gradient(135deg, #f0faf5 0%, #ffffff 70%);
-  border-color: #bfe7d5;
-}
-
-.tax-hero-banner.taxable {
-  background: linear-gradient(135deg, #f5f8ff 0%, #ffffff 70%);
-  border-color: #cadcff;
-}
-
-.tax-hero-banner.has-blocker {
-  background: linear-gradient(135deg, #fffaf0 0%, #ffffff 75%);
-  border-color: #f3d29c;
-}
-
-.hero-left {
-  flex: 1;
-  max-width: 680px;
-}
-
-.hero-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 10px;
-  border-radius: 999px;
-  font-size: 12px;
-  font-weight: 600;
-  margin-bottom: 8px;
-}
-
-.tax-hero-banner.exempt .hero-badge {
-  background: var(--solo-income-soft, #eaf7f1);
-  color: var(--solo-income, #0f7354);
-}
-
-.tax-hero-banner.taxable .hero-badge {
-  background: var(--solo-primary-soft, #edf3ff);
-  color: var(--solo-primary, #1747b0);
-}
-
-.tax-hero-banner.has-blocker .hero-badge {
-  background: #fef3c7;
-  color: #b45309;
-}
-
-.blocker-alert-box {
-  background: #fffbeb;
-  border: 1px solid #fde68a;
-  border-radius: 8px;
-  padding: 10px 14px;
-  margin-bottom: 14px;
-  color: #92400e;
-  font-size: 12.5px;
-}
-
-.blocker-alert-head {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-weight: 600;
-  margin-bottom: 6px;
-}
-
-.blocker-alert-head span {
-  flex: 1;
-}
-
-.blocker-list {
-  margin: 0;
-  padding-left: 18px;
-  line-height: 1.5;
-}
-
-.hero-title {
-  margin: 0 0 6px;
-  font-size: 24px;
-  font-weight: 700;
-  color: var(--solo-text-primary, #182230);
-  letter-spacing: -0.3px;
-}
-
-.hero-subtitle {
-  margin: 0 0 16px;
-  font-size: 13.5px;
-  color: var(--solo-text-secondary, #586474);
-  line-height: 1.5;
-}
-
-.gauge-bar-wrapper {
-  background: #ffffff;
-  padding: 12px 14px;
-  border-radius: 8px;
-  border: 1px solid var(--solo-border-light, #edf0f4);
-}
-
-.gauge-labels {
-  display: flex;
-  justify-content: space-between;
-  font-size: 11.5px;
-  color: var(--solo-text-muted, #636e7c);
-  margin-bottom: 6px;
-}
-
-.hero-right {
-  flex-shrink: 0;
-}
-
-.due-card {
-  background: #ffffff;
-  border: 1px solid var(--solo-border-light, #edf0f4);
-  border-radius: 12px;
-  padding: 18px 24px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  text-align: center;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.03);
-}
-
-.due-label {
-  font-size: 12px;
-  color: var(--solo-text-secondary, #586474);
-  margin-bottom: 4px;
-}
-
-.due-date {
-  font-size: 20px;
-  font-weight: 700;
-  color: var(--solo-primary, #1747b0);
-  margin-bottom: 4px;
-}
-
-.due-status {
-  font-size: 11.5px;
-  color: var(--solo-text-muted, #636e7c);
-}
-
 /* 小抄卡片 */
 .cheat-sheet-card {
   background: var(--solo-bg-card, #ffffff);
@@ -537,24 +316,12 @@ async function copyAmount(val: number, label: string) {
   padding: 24px;
 }
 
-.cheat-sheet-header {
+.cheat-sheet-footer {
   display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 24px;
-  padding-bottom: 16px;
-  border-bottom: 1px solid var(--solo-border-light, #edf0f4);
-}
-
-.header-titles {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-.header-icon {
-  font-size: 26px;
-  color: var(--solo-primary, #1747b0);
+  justify-content: flex-end;
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--solo-border-light, #edf0f4);
 }
 
 .header-titles h2 {
@@ -762,12 +529,5 @@ async function copyAmount(val: number, label: string) {
   color: var(--solo-income, #0f7354);
   font-size: 13px;
   font-weight: 600;
-}
-
-@media (max-width: 800px) {
-  .tax-hero-banner {
-    flex-direction: column;
-    align-items: stretch;
-  }
 }
 </style>

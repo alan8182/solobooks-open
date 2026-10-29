@@ -53,10 +53,23 @@ async def list_private_expenses(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
     owner_name: str = Query(""),
+    direction: str = Query(""),
+    invoice_status: str = Query(""),
+    start_date: str = Query(""),
+    end_date: str = Query(""),
     ctx: AuthContext = Depends(require_auth),
 ):
     """分页获取私账列表。"""
-    return await list_expenses(ctx.company_id, page=page, page_size=page_size, owner_name=owner_name)
+    return await list_expenses(
+        ctx.company_id,
+        page=page,
+        page_size=page_size,
+        owner_name=owner_name,
+        direction=direction,
+        invoice_status=invoice_status,
+        start_date=start_date,
+        end_date=end_date,
+    )
 
 
 @router.get("/summary")

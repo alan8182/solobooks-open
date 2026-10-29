@@ -24,49 +24,40 @@ import {
   NTag,
   NTooltip,
   useMessage,
-  useDialog,
 } from 'naive-ui'
 import { formatMoney } from '@/utils/format'
 import {
   amountClassForDirection,
-  buildSuggestedMatchPair,
-  getStatementMatchedEntryIds,
-  getMatchedEntryIdSets,
   invoiceDisplayAmount,
-  isReconciledEntry,
   isNonBankSettledEntry,
   formatDispositionTag,
   formatDispositionExplanation,
 } from '@/utils/closingWizard'
-import { sortEntriesByDateDescending } from '@/utils/entrySort'
-import { getEntryNaturePresentation } from '@/utils/entryNature'
 import { useEntryStore } from '@/stores/entry'
 import { useDeleteConfirm } from '@/composables/useDeleteConfirm'
 import apiClient from '@/api/client'
-import { getAIDiagnosis, getIncomeStatement } from '@/api/report'
-import { importInvoices } from '@/api/invoice'
-import { getRdExpenseTypes, getRdProjects } from '@/api/rd'
-import type { RdExpenseTypeOption, RdProject } from '@/api/types'
-import { parseWechatBill, importWechatBill, fetchWechatBillRecords } from '@/api/wechat-bill'
-import { useBackfillConfirm, isBackfillCancelled } from '@/composables/backfillConfirm'
-import { summarizeWechatImportFailures, type WechatImportFailureGroup } from '@/utils/wechatImport'
+import { useBackfillConfirm } from '@/composables/backfillConfirm'
 import { useAuthStore } from '@/stores/auth'
-import { getClosingReadiness, canBatchPostDrafts, deriveClosingTasks, type ClosingNotice, type ClosingNoticeRecord, type ClosingReadinessItem, type ClosingTaskAction } from '@/utils/closingReadiness'
-import { postEntry, getPostingOptions, batchPostEntries, getFilingObligations, reopenPeriod, type FilingObligation, type FilingObligations } from '@/api/accounting'
-import { updateEntry } from '@/api/record'
-import { requestStepUp, sendPhoneCode } from '@/api/auth'
-import { normalizeVoucherLines, generateVoucherLines, loadAccountMapping, accountForCategory, type VoucherLine } from '@/utils/accounting'
+import { getClosingReadiness, canBatchPostDrafts, deriveClosingTasks, summarizeFiveChecks, countOtherPendingReadiness, type ClosingNotice, type ClosingNoticeRecord, type ClosingReadinessItem, type ClosingTaskAction } from '@/utils/closingReadiness'
+import { getFilingObligations, type FilingObligation, type FilingObligations } from '@/api/accounting'
+import { loadAccountMapping } from '@/utils/accounting'
 import ClosingAgentPanel from '@/components/business/ClosingAgentPanel.vue'
+import ReopenPeriodDialog from './ReopenPeriodDialog.vue'
+import AskAiPanel from './AskAiPanel.vue'
+import { usePayrollFlow } from './composables/usePayrollFlow'
+import { useClosingImports } from './composables/useClosingImports'
+import { useClosingFlow } from './composables/useClosingFlow'
+import { useBatchPost } from './composables/useBatchPost'
+import { useReconciliationWorkspace } from './composables/useReconciliationWorkspace'
 import FileDropzone from '@/components/business/FileDropzone.vue'
-import * as XLSX from 'xlsx'
+import { SoloDrawer, SoloEmpty } from '@/components/ui'
 
-import { SoloEmpty } from '@/components/ui'
-import { reportErrorToast } from '@/utils/errorPresenter'
-import { offerRescue } from '@/composables/useRescue'
+// 「重新上传/重新导入」按钮复用拖拽区的文件选择器
+const wechatDropzone = ref<InstanceType<typeof FileDropzone> | null>(null)
+const invoiceDropzone = ref<InstanceType<typeof FileDropzone> | null>(null)
 
 const router = useRouter()
 const message = useMessage()
-const dialog = useDialog()
 const entryStore = useEntryStore()
 const authStore = useAuthStore()
 const { confirmDelete } = useDeleteConfirm()
@@ -136,59 +127,6 @@ const isQuarterEndMonth = computed(() => {
 })
 
 // Real Unmatched Data lists
-const rawStatements = ref<any[]>([])
-const bankStatements = ref<any[]>([])
-const invoicesList = ref<any[]>([])
-const bankUploadResult = ref<{ imported: number; errors: number; rows: any[] } | null>(null)
-
-// WeChat bill state
-const wechatBillRows = ref<any[]>([])
-const wechatBillSummary = ref<Record<string, any>>({})
-const wechatBillImported = ref(false)
-const wechatBillImporting = ref(false)
-const wechatImportMode = ref<'summary' | 'detail'>('summary')
-// 导入失败明细（按原因聚合）：失败不再只靠一闪而过的 message，内嵌面板可读、可操作
-const wechatBillFailures = ref<WechatImportFailureGroup[]>([])
-
-// 「重新上传/重新导入」按钮复用拖拽区的文件选择器
-const wechatDropzone = ref<InstanceType<typeof FileDropzone> | null>(null)
-const invoiceDropzone = ref<InstanceType<typeof FileDropzone> | null>(null)
-// 发票表的专业列（类型/入账模式/冲销）默认收起，老板只需要日期/名称/金额/状态
-const showInvoiceDetails = ref(false)
-const wechatBillRecords = ref<any[]>([])
-const wechatBillRecordsSummary = ref<Record<string, any>>({})
-
-// Step 3: Payroll data
-const payrollAccrued = ref(false)
-const payrollPaid = ref(false)
-const payrollPendingReview = ref(false)
-const payrollSsPaid = ref(false)
-const payrollHfPaid = ref(false)
-const payrollTaxPaid = ref(false)
-const employees = ref<any[]>([])
-const salarySheet = ref<any>(null)
-const showSalaryTable = ref(false)
-const payrollPaymentSuggestions = ref<any[]>([])
-const applyingSalaryStatementId = ref('')
-
-// Step 4: Matching workspace states
-const selectedInvoiceIds = ref<string[]>([])
-const selectedBank = ref<string | null>(null)
-const matchedPairs = ref<any[]>([])
-const aiSuggestions = ref<any[]>([])
-const reconciliationHealth = ref<any | null>(null)
-const reconciliationHealthLoading = ref(false)
-
-// Step 5: Closing states
-const closed = ref(false)
-const closingLoading = ref(false)
-const monthlyIncome = ref(0)
-const monthlyExpense = ref(0)
-const netProfit = ref(0)
-const cfoDiagnosis = ref<any>(null)
-// 本次结账自动生成的期末损益结转凭证号（完成页持久展示，不只靠瞬时 toast）
-const closingVoucherRefs = ref<string[]>([])
-
 // ponytail: explicit detection of zero-transaction periods to prevent false "ready to close" reports
 const confirmZeroActivity = ref(false)
 
@@ -215,20 +153,242 @@ const isZeroRecordMonth = computed(() =>
   monthStatements.value.length === 0 &&
   monthInvoices.value.length === 0
 )
-// 工资按权责发生制：所属月必须计提；发放可延到次月，凭银行流水核销，
-// 社保/个税挂账同样作为负债结转，均不阻断本月结账。
-const payrollHasSocial = computed(() =>
-  employees.value.some((emp) => safeFloat(emp.social) > 0 || safeFloat(emp.personalSocial) > 0)
-)
-const payrollHasTax = computed(() =>
-  employees.value.some((emp) => safeFloat(emp.personalTax) > 0)
-)
-const hasBlockingPayroll = computed(() =>
-  employees.value.length > 0 && (!payrollAccrued.value || payrollPendingReview.value)
-)
+// 拖拽上传的校验失败提示（统一入口）
+function onFileError(msg: string) {
+  message.error(msg)
+}
+
+// 启用日期拦截是「账套配置问题」而非数据问题，一键直达编辑弹窗修正
+function gotoAdjustStartDate() {
+  const companyId = authStore.currentCompanyId
+  router.push({ path: '/mine/companies', query: companyId ? { edit: companyId } : {} })
+}
+
+function apiErrorMessage(err: any, fallback: string) {
+  const detail = (err as { response?: { data?: { detail?: unknown } } } | null)?.response?.data?.detail
+  if (typeof detail === 'string' && detail.trim()) return detail
+  if (detail && typeof detail === 'object' && 'message' in detail) {
+    const msg = (detail as { message?: unknown }).message
+    if (typeof msg === 'string' && msg.trim()) return msg
+  }
+  const raw = err as { message?: unknown } | null
+  if (typeof raw?.message === 'string' && raw.message.trim()) return raw.message
+  return fallback
+}
+
+// 工资 6 连发流程（状态/请求/口径已拆入 composables/usePayrollFlow）
+const {
+  payrollAccrued,
+  payrollPaid,
+  payrollPendingReview,
+  payrollSsPaid,
+  payrollHfPaid,
+  payrollTaxPaid,
+  employees,
+  showSalaryTable,
+  payrollPaymentSuggestions,
+  applyingSalaryStatementId,
+  payrollHasSocial,
+  payrollHasTax,
+  hasBlockingPayroll,
+  totalNetSalary,
+  totalCompanyCost,
+  loadSalarySheet,
+  loadPayrollPaymentSuggestions,
+  handleApplySalaryPayment,
+  handleAccruePayroll,
+  handlePayPayroll,
+  handlePaySocial,
+  handlePayHousingFund,
+  handlePayTax,
+} = usePayrollFlow({
+  month: targetMonth,
+  loading,
+  entryStore,
+  reloadAll: loadAllData,
+})
+
+// 三类导入流程（微信/发票/银行，状态与请求已拆入 composables/useClosingImports）
+const {
+  wechatBillRows,
+  wechatBillSummary,
+  wechatBillImported,
+  wechatBillImporting,
+  wechatImportMode,
+  wechatBillFailures,
+  wechatBillRecords,
+  wechatBillRecordsSummary,
+  loadWechatBillRecords,
+  processWechatBillFile,
+  removeWechatRow,
+  confirmWechatBillImport,
+  processInvoiceFile,
+  handleDeleteInvoice,
+  toggleArchiveMode,
+  bankUploadResult,
+  processBankFile,
+} = useClosingImports({
+  month: targetMonth,
+  loading,
+  entryStore,
+  reloadAll: loadAllData,
+})
+
+// 批量过账域（状态/请求已拆入 composables/useBatchPost）
+const {
+  showVoucherModal,
+  voucherModalLoading,
+  voucherPostingLoading,
+  batchPostingLoading,
+  batchPostConfirmVisible,
+  batchPostWalkthrough,
+  batchPostWalkthroughTotal,
+  currentVoucherEntry,
+  batchPostEntries,
+  openVoucherModal,
+  handleModalPostEntry,
+  openBatchPostConfirm,
+  startWalkthrough,
+  startWalkthroughFromConfirm,
+  confirmBatchPost,
+  modalVoucherLines,
+  modalDebitTotal,
+  modalCreditTotal,
+} = useBatchPost({
+  month: targetMonth,
+  entryPeriod,
+  entryStore,
+  reloadAll: loadAllData,
+  errorMessage: apiErrorMessage,
+})
+
+// 对账工作台（AI 建议/配对/批量确认/分类编辑/处置/速记）已整体拆入
+// composables/useReconciliationWorkspace.ts，按名解构保持模板兼容。
+const {
+  rawStatements,
+  bankStatements,
+  invoicesList,
+  showInvoiceDetails,
+  selectedInvoiceIds,
+  selectedBank,
+  matchedPairs,
+  filterUnmatchedData,
+  loadAiSuggestions,
+  loadReconciliationHealth,
+  deletePair,
+  safeFloat,
+  isItemAutoMatched,
+  unmatchedInvoices,
+  buildPersistedMatchedPairs,
+  allUnmatchedEntries,
+  unmatchedStatements,
+  historicalUnmatchedStatements,
+  reconciliationStats,
+  reconciliationHealthSummary,
+  hasBlockingReconciliationRisk,
+  getAiSuggestion,
+  hasExistingEntrySuggestion,
+  isFallbackSuggestion,
+  pairCategoryPreview,
+  CATEGORY_OPTIONS,
+  refreshCategoryOptions,
+  categoryValueNatureLabel,
+  filterCategory,
+  renderCategoryOption,
+  rdProjectOptions,
+  rdExpenseTypeOptions,
+  loadRdOptions,
+  isRdCategoryValue,
+  showManualDialog,
+  manualTarget,
+  manualForm,
+  manualSubmitting,
+  manualAiLoading,
+  manualSuggestionMeta,
+  showPairCategoryDialog,
+  pairCategoryTarget,
+  pairCategoryForm,
+  pairCategorySubmitting,
+  showEditVoucherDialog,
+  editVoucherForm,
+  editVoucherSaving,
+  cleanStatementTitle,
+  suggestionAccountPreview,
+  rowCategoryChoice,
+  ambiguityGroupOf,
+  effectiveSuggestion,
+  altAccountText,
+  askAiVisible,
+  askAiStmt,
+  askAiPrompt,
+  askAiCandidateLines,
+  openAskAi,
+  handleAskAiAccept,
+  openManualClassify,
+  openPairCategoryDialog,
+  handlePairCategorySave,
+  openEditVoucher,
+  saveEditVoucher,
+  refreshManualAiSuggestion,
+  handleManualClassify,
+  highConfidenceStatements,
+  statementTierFilter,
+  selectedStatementIds,
+  rememberRuleOnConfirm,
+  isSelectableForBatch,
+  isNeedsAttentionStatement,
+  suggestionBadgeLabel,
+  selectableBatchStatements,
+  attentionStatements,
+  filteredUnmatchedStatements,
+  toggleStatementSelection,
+  allSelectableChecked,
+  someSelectableChecked,
+  toggleSelectAllStatements,
+  batchTargetStatements,
+  batchConfirming,
+  handleBatchConfirmRules,
+  quickSubmittingId,
+  handleAcceptSuggested,
+  handleQuickSelectCategory,
+  findMatchingInvoiceForStatement,
+  findStatementCandidateForEntry,
+  statementCandidateText,
+  handleEntryPaid,
+  confirmEntryDisposition,
+  resetEntryDisposition,
+  employeePayerOptions,
+  pendingEntryList,
+  entryIsOutflow,
+  confirmedExceptionEntries,
+  bossLedgerSummary,
+  pendingInvoiceList,
+  unpaidInvoiceCount,
+  handleMatchInvoiceDirect,
+  bossExpenseOptions,
+  bossIncomeOptions,
+} = useReconciliationWorkspace({
+  month: targetMonth,
+  currentStep,
+  entryPeriod,
+  entryStore,
+  backfillConfirm,
+  openVoucherModal,
+  scrollIntoBank,
+  employees,
+  currentVoucherEntry,
+  reloadAll: loadAllData,
+  apiErrorMessage,
+})
 
 const readinessItems = computed(() => getClosingReadiness(periodCloseChecks.value))
 const closingTasks = computed(() => deriveClosingTasks(periodCloseChecks.value))
+
+// 五项核对常显条：把结账检查里最核心的五项从折叠明细提到顶部，
+// 关账前一眼看到「账证 / 账账 / 账实 / 账表 / 申报」是否都通过。
+// 其余准备项（折旧、摊销、工资、关账顺序）仍在下方清单里逐项展开。
+const fiveCheckItems = computed(() => summarizeFiveChecks(readinessItems.value))
+const otherReadinessPending = computed(() => countOtherPendingReadiness(readinessItems.value))
 
 // 提示项：跨期未处理单据 / 本期补记。不阻断结账，只要求用户知情。
 const closingNotices = computed<ClosingNotice[]>(() => periodCloseChecks.value?.notices ?? [])
@@ -251,6 +411,80 @@ function goFilingPackage(item?: FilingObligation) {
   const period = item?.period || filingInfo.value?.quarter
   if (!period) return
   router.push({ path: '/tax-filing', query: { period } })
+}
+
+// 往来款项明细穿透抽屉 (方案 B: 结账上下文穿透 + 外部业务台账直达)
+type BossLedgerDetailType = 'customer_owes' | 'supplier_owes' | 'boss_and_emp' | null
+const activeBossLedgerType = ref<BossLedgerDetailType>(null)
+const showBossLedgerDrawer = ref(false)
+
+function openBossLedgerDetail(type: 'customer_owes' | 'supplier_owes' | 'boss_and_emp') {
+  activeBossLedgerType.value = type
+  showBossLedgerDrawer.value = true
+}
+
+const currentBossLedgerDetail = computed(() => {
+  if (!activeBossLedgerType.value) return null
+  if (activeBossLedgerType.value === 'customer_owes') {
+    const list = confirmedExceptionEntries.value.filter(
+      (e) => e.paymentStatus === 'unpaid' && e.direction === 'income',
+    )
+    return {
+      type: 'customer_owes' as const,
+      title: '客户欠款明细（应收账款）',
+      amount: bossLedgerSummary.value.customerOwes,
+      count: bossLedgerSummary.value.customerCount,
+      bossOnly: 0,
+      empOnly: 0,
+      tip: '本月销项发票或应收业务中，客户尚未完成公户支付的款项。等公户收到回款流水时，系统将自动对账核销。',
+      targetRoute: '/invoices',
+      targetQuery: { direction: 'income', month: targetMonth.value },
+      targetLabel: '前往发票台账（销项） ↗',
+      entries: list,
+    }
+  }
+  if (activeBossLedgerType.value === 'supplier_owes') {
+    const list = confirmedExceptionEntries.value.filter(
+      (e) => e.paymentStatus === 'unpaid' && e.direction === 'expense',
+    )
+    return {
+      type: 'supplier_owes' as const,
+      title: '待付供应商款明细（应付挂账）',
+      amount: bossLedgerSummary.value.companyOwesSupplier,
+      count: bossLedgerSummary.value.supplierCount,
+      bossOnly: 0,
+      empOnly: 0,
+      tip: '本月进项发票或应付业务中，公司尚未付款挂账的款项。后续从公司银行公户付款打款时，系统将自动核销。',
+      targetRoute: '/invoices',
+      targetQuery: { direction: 'expense', month: targetMonth.value },
+      targetLabel: '前往发票台账（进项） ↗',
+      entries: list,
+    }
+  }
+  if (activeBossLedgerType.value === 'boss_and_emp') {
+    const list = confirmedExceptionEntries.value.filter(
+      (e) => e.direction === 'expense' && (e.payer === 'boss_personal' || String(e.payer || '').startsWith('employee_personal')),
+    )
+    return {
+      type: 'boss_and_emp' as const,
+      title: '公司欠老板/员工垫付款明细',
+      amount: bossLedgerSummary.value.companyOwesBossAndEmp,
+      count: list.length,
+      bossOnly: bossLedgerSummary.value.bossOnly,
+      empOnly: bossLedgerSummary.value.empOnly,
+      tip: '属于公司真实经营支出，但实际由老板或员工个人先行垫付。公户资金充裕时，可随时通过公对私转账归还个人，属于往来款返还不涉及个税。',
+      targetRoute: '/private-expenses',
+      targetQuery: undefined,
+      targetLabel: '前往老板私账登记还款 ↗',
+      entries: list,
+    }
+  }
+  return null
+})
+
+function handleGoToTarget(routePath: string, query?: Record<string, string>) {
+  showBossLedgerDrawer.value = false
+  router.push({ path: routePath, query })
 }
 
 function noticeTitle(notice: ClosingNotice): string {
@@ -330,6 +564,14 @@ function runTaskAction(action: ClosingTaskAction) {
     }
     return
   }
+  if (action.kind === 'walkthrough') {
+    startWalkthrough()
+    return
+  }
+  if (action.kind === 'balance-detail') {
+    showBankBalanceDetail.value = true
+    return
+  }
   if (action.kind === 'vouchers') {
     const voucherCheck = periodCloseChecks.value?.checks?.find((c: any) => c.code === 'VOUCHER_TO_SOURCE')
     const firstEntryId = voucherCheck?.records?.[0]?.entryId
@@ -370,15 +612,48 @@ function handleReadinessAction(item: ClosingReadinessItem) {
   else currentStep.value = normalizeStep(item.step)
 }
 const closeDraftCount = computed(() => Number(periodCloseChecks.value?.checks?.find((check: any) => check.code === 'VOUCHER_TO_SOURCE')?.autoPostAtCloseCount || 0))
+const showBankBalanceDetail = ref(false)
+const bankBalanceRecon = computed(() => {
+  const check = periodCloseChecks.value?.checks?.find((c: any) => c.code === 'BOOK_TO_ACTUAL')
+  return check?.balanceReconciliation || null
+})
 const canBatchPostAndClose = computed(() => canBatchPostDrafts(periodCloseChecks.value))
+
+// 结账域（状态/请求已拆入 composables/useClosingFlow；阻断判定由各域传入）
+const {
+  closed,
+  closingLoading,
+  monthlyIncome,
+  monthlyExpense,
+  netProfit,
+  cfoDiagnosis,
+  diagnosisLoading,
+  closingVoucherRefs,
+  vatExemptAmount,
+  vatExemptVoucherRefs,
+  fetchClosedMetrics,
+  generateDiagnosis,
+  runClosing,
+  downloadReport,
+} = useClosingFlow({
+  month: targetMonth,
+  currentStep,
+  periodCloseChecks,
+  hasBlockingPayroll,
+  isZeroRecordMonth,
+  confirmZeroActivity,
+  loadReconciliationHealth,
+  hasBlockingReconciliationRisk: () => hasBlockingReconciliationRisk.value,
+  entryStore,
+})
+
 const closingReady = computed(() => {
-  if (!periodCloseChecks.value?.canClose && !canBatchPostAndClose.value) return false
+  if (!periodCloseChecks.value?.canClose && !canBatchPostDrafts(periodCloseChecks.value)) return false
   if (hasBlockingPayroll.value) return false
   if (isZeroRecordMonth.value && !confirmZeroActivity.value) return false
   return true
 })
 
-let suggestionsController: AbortController | null = null
 
 // Load all data on mount
 onMounted(async () => {
@@ -387,14 +662,6 @@ onMounted(async () => {
 })
 
 async function loadAllData() {
-  if (suggestionsController) {
-    try {
-      suggestionsController.abort()
-    } catch {
-      // ignore
-    }
-  }
-
   loading.value = true
   confirmZeroActivity.value = false
   try {
@@ -454,7 +721,7 @@ async function loadAllData() {
   loadWechatBillRecords()
   
   if (closed.value) {
-    fetchClosedDiagnosis()
+    fetchClosedMetrics()
   }
   loadAiSuggestions()
 }
@@ -481,2216 +748,19 @@ function readinessStatusIcon(status: string) {
   }[status] || 'ri-time-line'
 }
 
-function filterUnmatchedData() {
-  // Unmatched bank statements
-  // ponytail: 空日期的流水不过滤，否则银行流水导入后因日期解析失败消失
-  bankStatements.value = rawStatements.value.filter(
-    (s) => !s.matched_entry_id && (
-      !s.transaction_date ||
-      s.transaction_date === '' ||
-      s.transaction_date.substring(0, 7) <= targetMonth.value
-    )
-  )
-
-  // All invoices for current month (with linked/confirmed status split)
-  const { linkedEntryIds, confirmedEntryIds } = getMatchedEntryIdSets(rawStatements.value, entryStore.activeEntries)
-  invoicesList.value = entryStore.activeEntries.filter((e) => {
-    const isInvoice = (e as any).source === 'invoice_import' || !!(e as any).invoiceNumber
-    const isInMonth = entryPeriod(e) === targetMonth.value
-    return isInvoice && isInMonth
-  }).map(e => ({
-    id: e.id,
-    title: e.title,
-    date: e.occurDate,
-    amount: e.amount,
-    direction: e.direction,
-    category: (e as any).category || '',
-    billingStatus: (e as any).billingStatus,
-    paymentStatus: (e as any).paymentStatus || '',
-    voucherStatus: (e as any).voucherStatus || '',
-    voucherRef: (e as any).voucherRef || (e as any).voucher_no || '',
-    payer: (e as any).payer || 'company_account',
-    is_archive_only: (e as any).is_archive_only || (e as any).isArchiveOnly || false,
-    status: confirmedEntryIds.has(e.id) ? 'matched' : linkedEntryIds.has(e.id) ? 'pending_confirmation' : 'unmatched'
-  }))
-}
-
 function goLedgerDetail(entryId: string) {
   router.push({ path: `/ledger/${entryId}`, query: { from: `/closing-wizard?month=${targetMonth}&step=1` } })
 }
 
-async function handleDeleteInvoice(id: string) {
-  loading.value = true
-  try {
-    await entryStore.removeEntry(id)
-    message.success('已成功删除该发票，不予入账')
-    await loadAllData()
-  } catch (err) {
-    const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail
-    const reason = typeof detail === 'string' ? detail : (detail as { message?: string } | undefined)?.message
-    message.error(reason || '删除发票失败')
-  } finally {
-    loading.value = false
-  }
-}
-
-async function toggleArchiveMode(id: string, isArchive: boolean) {
-  loading.value = true
-  try {
-    await apiClient.patch(`/api/record/entries/${id}`, {
-      is_archive_only: isArchive,
-      isArchiveOnly: isArchive
-    })
-    message.success(isArchive ? '已将该发票设为“仅归档不记账”，不再影响科目余额' : '已将该发票设为“参与记账”')
-    await loadAllData()
-  } catch (err) {
-    message.error('切换记账模式失败')
-  } finally {
-    loading.value = false
-  }
-}
-
-// 拖拽上传的校验失败提示（统一入口）
-function onFileError(msg: string) {
-  message.error(msg)
-}
-
-// Parse WeChat bill CSV (preview only, not yet imported)
-async function processWechatBillFile(file: File) {
-  loading.value = true
-  try {
-    const res = await parseWechatBill(file)
-    if (!res.valid || res.valid.length === 0) {
-      message.warning('未解析到有效的微信支付交易记录，请检查文件格式')
-      return
-    }
-    wechatBillRows.value = res.valid
-    wechatBillSummary.value = res.summary || {}
-    wechatBillImported.value = false
-    wechatBillFailures.value = []
-    message.success(`已解析 ${res.valid.length} 条交易记录，请确认后点击导入`)
-  } catch (e) {
-    message.error('微信账单文件解析失败，请确认为微信商户后台导出的 CSV 格式')
-  } finally {
-    loading.value = false
-  }
-}
-
-// Remove a single row from wechat bill preview
-function removeWechatRow(index: number) {
-  wechatBillRows.value.splice(index, 1)
-}
-
-// Confirm import of previewed wechat bill rows
-async function confirmWechatBillImport() {
-  const isSummaryMode = wechatImportMode.value === 'summary'
-  const importableRows = wechatBillRows.value.filter((row) => !row.is_duplicate)
-  if (wechatBillImporting.value) return
-  if (!isSummaryMode && importableRows.length === 0) return
-
-  // 计算发生日期：取账单最晚一条日期或目标月份最后一天
-  let latestDate = ''
-  for (const r of wechatBillRows.value) {
-    if (r.date && (!latestDate || r.date > latestDate)) latestDate = r.date
-  }
-  const occurDate = latestDate || (targetMonth.value ? `${targetMonth.value}-28` : '')
-
-  loading.value = true
-  wechatBillImporting.value = true
-  try {
-    const res: any = await backfillConfirm.withBackfill((allowBackfill, backfillReason) =>
-      importWechatBill(isSummaryMode ? [] : importableRows, {
-        allowBackfill,
-        backfillReason,
-        importMode: wechatImportMode.value,
-        summary: wechatBillSummary.value,
-        occurDate,
-      }),
-    )
-    wechatBillFailures.value = summarizeWechatImportFailures(res.results || [])
-    wechatBillImported.value = true
-    wechatBillRows.value = []
-    let msg = isSummaryMode
-      ? `微信账单月度汇总完成：已生成 1 张月度综合凭证。`
-      : `微信账单导入完成：${res.imported} 条交易已入账。`
-    if (res.ignored_duplicates > 0) {
-      msg += `（已过滤 ${res.ignored_duplicates} 条已存在账目）`
-    }
-    if (res.failed > 0) {
-      msg += `，${res.failed} 条失败（原因见下方提示）`
-    }
-    if (res.imported > 0) {
-      message.success(msg)
-    } else {
-      message.warning(msg)
-    }
-    await loadAllData()
-  } catch (e) {
-    if (!isBackfillCancelled(e)) message.error('导入失败，请重试')
-  } finally {
-    wechatBillImporting.value = false
-    loading.value = false
-  }
-}
-
-// 启用日期拦截是「账套配置问题」而非数据问题，一键直达编辑弹窗修正
-function gotoAdjustStartDate() {
-  const companyId = authStore.currentCompanyId
-  router.push({ path: '/mine/companies', query: companyId ? { edit: companyId } : {} })
-}
-
-// Load previously imported wechat bill records for the target month
-async function loadWechatBillRecords() {
-  try {
-    const res: any = await fetchWechatBillRecords(targetMonth.value)
-    wechatBillRecords.value = Array.isArray(res.items) ? res.items : []
-    wechatBillRecordsSummary.value = res.summary || {}
-  } catch {
-    wechatBillRecords.value = []
-    wechatBillRecordsSummary.value = {}
-  }
-}
-
-// Parse and upload invoices Excel/CSV
-async function processInvoiceFile(file: File) {
-  loading.value = true
-  
-  const reader = new FileReader()
-  reader.onload = async (ev) => {
-    try {
-      const data = new Uint8Array(ev.target?.result as ArrayBuffer)
-      const workbook = XLSX.read(data, { type: 'array' })
-      const sheet = workbook.Sheets[workbook.SheetNames[0]]
-      const json = XLSX.utils.sheet_to_json(sheet, { defval: '' })
-      if (json.length === 0) {
-        message.warning('Excel 文件为空')
-        return
-      }
-      
-      const columns = Object.keys(json[0] as any)
-      const isTaxBureauFormat = columns.includes('数电发票号码') || columns.includes('销方名称') || columns.includes('购买方名称')
-      
-      let mapped: any[] = []
-      if (isTaxBureauFormat) {
-        mapped = json.map((row: any) => {
-          const invoiceNum = String(row['数电发票号码'] || row['发票号码'] || row['发票代码'] || '').trim()
-          
-          const isNegative = String(row['是否正数发票'] || '').trim() === '否' || String(row['发票状态'] || '').trim() === '红冲'
-          
-          let amountVal = safeFloat(row['金额'] || row['不含税金额'] || 0)
-          let totalAmountVal = safeFloat(row['价税合计'] || row['含税金额'] || row['总金额'] || 0)
-          let taxAmountVal = safeFloat(row['税额'] || 0)
-          
-          if (isNegative) {
-            amountVal = -Math.abs(amountVal)
-            totalAmountVal = -Math.abs(totalAmountVal)
-            taxAmountVal = -Math.abs(taxAmountVal)
-          }
-          
-          return {
-            invoice_number: invoiceNum,
-            invoice_code: String(row['发票代码'] || '').trim(),
-            invoice_date: String(row['开票日期'] || row['开票时间'] || row['发票日期'] || '').trim(),
-            seller_name: String(row['销方名称'] || '').trim(),
-            buyer_name: String(row['购买方名称'] || '').trim(),
-            seller_tax_id: String(row['销方识别号'] || '').trim(),
-            buyer_tax_id: String(row['购方识别号'] || '').trim(),
-            total_amount: totalAmountVal,
-            amount: amountVal || (totalAmountVal - taxAmountVal),
-            tax_amount: taxAmountVal || (totalAmountVal - amountVal),
-            tax_rate: String(row['税率'] || '').trim(),
-            item_name: String(row['货物或应税劳务名称'] || '').trim(),
-            specification: String(row['规格型号'] || '').trim(),
-            unit: String(row['单位'] || '').trim(),
-            quantity: row['数量'] ? safeFloat(row['数量']) : null,
-            unit_price: row['单价'] ? safeFloat(row['单价']) : null,
-            invoice_source: String(row['发票来源'] || '').trim(),
-            invoice_type: String(row['发票票种'] || '').trim(),
-            invoice_status: String(row['发票状态'] || '').trim(),
-            drawer: String(row['开票人'] || '').trim(),
-            remark: String(row['备注'] || '').trim()
-          }
-        })
-      } else {
-        // Fallback to fuzzy regex mapping
-        const map: Record<string, string> = {}
-        for (const col of columns) {
-          const lc = col.toLowerCase()
-          if (/发票号码|发票代码|invoice.*no|invoice.*num|发票编号/.test(lc)) map[col] = 'invoice_number'
-          else if (/开票日期|发票日期|date|开票时间/.test(lc)) map[col] = 'invoice_date'
-          else if (/销售方|卖方|seller|供应商|供货方/.test(lc)) map[col] = 'seller_name'
-          else if (/购买方|买方|buyer|客户/.test(lc)) map[col] = 'buyer_name'
-          else if (/价税合计|总金额|total.*amount|含税金额|合计/.test(lc)) map[col] = 'total_amount'
-          else if (/金额|amount|不含税/.test(lc) && !/税额/.test(lc)) map[col] = 'amount'
-          else if (/税额|tax/.test(lc)) map[col] = 'tax_amount'
-          else if (/名称|货物|item|商品/.test(lc)) map[col] = 'item_name'
-        }
-        
-        mapped = json.map((row: any) => {
-          const out: Record<string, any> = {}
-          for (const [col, field] of Object.entries(map)) {
-            if (field) out[field] = row[col]
-          }
-          
-          const isNegative = Object.entries(row).some(([k, v]) => {
-            const key = String(k).trim()
-            const val = String(v).trim()
-            return (key === '是否正数发票' && val === '否') || (key === '发票状态' && val === '红冲')
-          })
-          
-          if (isNegative) {
-            if (out.amount !== undefined) out.amount = -Math.abs(safeFloat(out.amount))
-            if (out.total_amount !== undefined) out.total_amount = -Math.abs(safeFloat(out.total_amount))
-            if (out.tax_amount !== undefined) out.tax_amount = -Math.abs(safeFloat(out.tax_amount))
-          }
-          
-          return out
-        })
-      }
-      
-      const parseRes: any = await apiClient.post('/api/invoice/parse', { rows: mapped })
-      if (parseRes.valid.length === 0) {
-        message.error('未在文件中解析到有效发票行')
-        return
-      }
-      
-      const rows = parseRes.valid.map((r: any) => ({
-        ...r,
-        direction: r.direction || 'expense',
-        // 类别必须与方向同侧：销项票（income）兜底为主营业务收入，
-        // 否则后端生成的挂账凭证会被收支校验拒绝导致整批导入失败
-        category: r.category || (r.direction === 'income' ? '主营业务收入' : '其他支出')
-      }))
-      
-      const importRes: any = await importInvoices(rows, false)
-      let msg = `成功导入 ${importRes.imported} 张新发票！请在对账步骤查看候选建议并手动确认。`
-      if (importRes.ignored_duplicates > 0) {
-        msg += `（系统已自动过滤 ${importRes.ignored_duplicates} 张已存在的发票记录）`
-      }
-      message.success(msg)
-      await loadAllData()
-    } catch (err) {
-      message.error('发票文件导入解析失败')
-    } finally {
-      loading.value = false
-    }
-  }
-  reader.readAsArrayBuffer(file)
-}
-
-// Convert various date formats (including XLSX serial numbers) to YYYY-MM-DD
-function formatBankDate(val: any): string {
-  if (val === null || val === undefined || val === '') return ''
-  // XLSX numeric serial date (e.g. 45800)
-  if (typeof val === 'number') {
-    const d = XLSX.SSF.parse_date_code(val)
-    if (d) {
-      return `${d.y}-${String(d.m).padStart(2, '0')}-${String(d.d).padStart(2, '0')}`
-    }
-  }
-  const s = String(val).trim()
-  // Already YYYY-MM-DD
-  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10)
-  // YYYY/MM/DD or YYYYMMDD
-  const m1 = s.match(/^(\d{4})[/](\d{1,2})[/](\d{1,2})/)
-  if (m1) return `${m1[1]}-${m1[2].padStart(2, '0')}-${m1[3].padStart(2, '0')}`
-  const m2 = s.match(/^(\d{4})(\d{2})(\d{2})/)
-  if (m2) return `${m2[1]}-${m2[2]}-${m2[3]}`
-  return s.slice(0, 10) || ''
-}
-
-function parseBankExcel(sheet: any): any[] {
-  // Parse sheet into 2D array of raw rows
-  const rawRows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' }) as any[][]
-  
-  let headerIndex = -1
-  for (let i = 0; i < rawRows.length; i++) {
-    const row = rawRows[i]
-    if (!row) continue
-    
-    let score = 0
-    for (const cell of row) {
-      const val = String(cell || '').trim()
-      if (/交易日|交易日期|日期|时间|date|time/i.test(val)) score++
-      else if (/交易金额|发生额|金额|借贷发生额|amount/i.test(val)) score++
-      else if (/交易摘要|摘要|描述|用途|description|desc|remark/i.test(val)) score++
-      else if (/账户余额|余额|balance/i.test(val)) score++
-    }
-    
-    if (score >= 3) {
-      headerIndex = i
-      break
-    }
-  }
-  
-  if (headerIndex === -1) {
-    // Fallback if no structured header found
-    return XLSX.utils.sheet_to_json(sheet, { defval: '' })
-  }
-  
-  const headers = rawRows[headerIndex].map(h => String(h || '').trim())
-  
-  // Find date column indices to filter out header/footer rows without date
-  const dateColIndices: number[] = []
-  for (let j = 0; j < headers.length; j++) {
-    const h = headers[j].toLowerCase()
-    if (/交易日|记账日|入账日|起息日|日期|时间|date|time/i.test(h)) {
-      dateColIndices.push(j)
-    }
-  }
-
-  const json: any[] = []
-  
-  for (let i = headerIndex + 1; i < rawRows.length; i++) {
-    const row = rawRows[i]
-    if (!row || row.length === 0) continue
-    
-    // Skip empty or summary rows
-    const firstCell = String(row[0] || '').trim()
-    const hasSummaryText = row.some(cell => /累计|合计|总计|总记录数/.test(String(cell || '').trim()))
-    if (/累计|合计|总计|总记录数/.test(firstCell) || hasSummaryText) continue
-    
-    // If a date column is defined but this row has no date, it is likely a footer or summary row
-    if (dateColIndices.length > 0) {
-      const hasDate = dateColIndices.some(idx => String(row[idx] || '').trim() !== '')
-      if (!hasDate) continue
-    }
-    
-    const obj: Record<string, any> = {}
-    let hasValue = false
-    for (let j = 0; j < headers.length; j++) {
-      const header = headers[j]
-      if (header) {
-        obj[header] = row[j] !== undefined ? row[j] : ''
-        if (obj[header] !== '') hasValue = true
-      }
-    }
-    if (hasValue) {
-      json.push(obj)
-    }
-  }
-  
-  return json
-}
-
-// Parse and upload bank statements CSV/Excel
-async function processBankFile(file: File) {
-  loading.value = true
-  
-  const reader = new FileReader()
-  reader.onload = async (ev) => {
-    try {
-      const data = new Uint8Array(ev.target?.result as ArrayBuffer)
-      const workbook = XLSX.read(data, { type: 'array' })
-      const sheet = workbook.Sheets[workbook.SheetNames[0]]
-      const json = parseBankExcel(sheet)
-      if (json.length === 0) {
-        message.warning('流水文件为空')
-        return
-      }
-      
-      const columns = Object.keys(json[0] as any)
-      const map: Record<string, string> = {}
-      let typeCol = ''
-      let counterpartyCol = ''
-      let summaryCol = ''
-      let commentCol = ''
-      
-      let incomeCol = ''
-      let expenseCol = ''
-
-      // 只选一个日期列：优先 交易日期/记账日期/入账日期；纯时间列（如 交易时间）不是日期源，
-      // 否则多列同时映射时起息日期会覆盖交易日期，时间值还会导致后端日期解析失败
-      const isTimeOnlyCol = (col: string) => {
-        const lc = col.toLowerCase()
-        return /时间|time/i.test(lc) && !/日期|交易日/i.test(lc)
-      }
-      const dateCandidates = columns.filter((col) => {
-        const lc = col.toLowerCase()
-        return !/对方/.test(lc) && !isTimeOnlyCol(col) && /日期|交易日|date/i.test(lc)
-      })
-      const dateCol = dateCandidates.find((col) => /交易日期|记账日期|入账日期|交易日/.test(col)) || dateCandidates[0] || ''
-
-      for (const col of columns) {
-        const lc = col.toLowerCase()
-        if (col === dateCol) {
-          map[col] = 'transaction_date'
-        } else if (/账户余额|余额|balance/i.test(lc)) {
-          map[col] = 'balance'
-        } else if (/金额|发生额|amount/i.test(lc) && /支出|借方|支取|付款/.test(lc) && !/商户支出/.test(lc)) {
-          // 必须同时是金额类表头：付款人名称/名义付款人名称 等对手方列含“付款”，
-          // 若不限定金额列会把它们误判为支出金额列，导致交易金额列无法映射、金额全为 0
-          expenseCol = col
-        } else if (/金额|发生额|amount/i.test(lc) && /收入|贷方|存入|收款/.test(lc) && !/商户收入/.test(lc)) {
-          incomeCol = col
-        }
-        
-        // Find supplementary columns for creating an enriched description
-        if (/交易类型|业务名称|业务类型|类型|type/i.test(col)) typeCol = col
-        else if (/对手方|对方户名|对方名称|对方账号名称|收\(付\)方名称|收付方名称|对方开户名|对手方开户名|对手方银行户名|交易对手/i.test(col)) counterpartyCol = col
-        else if (/交易摘要|摘要|描述|description|desc|remark/i.test(col)) summaryCol = col
-        else if (/附言|用途|备注|附加信息|备注信息|附加备注|comment|purpose/i.test(col)) commentCol = col
-      }
-
-      // If we didn't find separate income/expense columns, search for a single amount column
-      if (!incomeCol && !expenseCol) {
-        for (const col of columns) {
-          const lc = col.toLowerCase()
-          if (/交易发生额|发生额|金额|amount/i.test(lc)) {
-            map[col] = 'amount'
-            break
-          }
-        }
-      }
-      
-      const mapped = json.map((row: any) => {
-        const out: Record<string, any> = {
-          transaction_date: '',
-          description: '',
-          amount: 0,
-          balance: 0
-        }
-        
-        for (const [col, field] of Object.entries(map)) {
-          if (field) {
-            if (field === 'amount' || field === 'balance') {
-              out[field] = safeFloat(row[col])
-            } else if (field === 'transaction_date') {
-              out[field] = formatBankDate(row[col])
-            } else {
-              out[field] = String(row[col] || '').trim()
-            }
-          }
-        }
-        
-        // Compute amount if separate columns exist
-        if (incomeCol || expenseCol) {
-          const incVal = incomeCol ? safeFloat(row[incomeCol]) : 0
-          const expVal = expenseCol ? safeFloat(row[expenseCol]) : 0
-          out.amount = incVal - expVal
-        }
-        
-        // Construct description: [Type] Summary | Comments (Counterparty)
-        const typeName = typeCol ? String(row[typeCol] || '').trim() : ''
-        const summaryText = summaryCol ? String(row[summaryCol] || '').trim() : ''
-        const commentText = commentCol ? String(row[commentCol] || '').trim() : ''
-        const counterpartyName = counterpartyCol ? String(row[counterpartyCol] || '').trim() : ''
-        
-        const descParts: string[] = []
-        if (typeName) descParts.push(`[${typeName}]`)
-        
-        const textParts: string[] = []
-        if (summaryText) textParts.push(summaryText)
-        if (commentText && commentText !== summaryText) textParts.push(`附言: ${commentText}`)
-        
-        if (textParts.length > 0) {
-          descParts.push(textParts.join(' | '))
-        }
-        
-        if (counterpartyName) descParts.push(`(对方: ${counterpartyName})`)
-        
-        out.description = descParts.join(' ') || '-'
-        return out
-      })
-      
-      const importRes: any = await apiClient.post('/api/bank/import-json', {
-        rows: mapped,
-        statement_id: `bs-upload-${Date.now()}`
-      })
-      
-      bankUploadResult.value = {
-        imported: importRes.imported,
-        errors: importRes.errors,
-        rows: mapped
-      }
-      
-      message.success(`成功导入 ${importRes.imported} 条银行流水！请在对账步骤手动确认匹配或分类。`)
-      await loadAllData()
-    } catch (err) {
-      message.error('银行流水文件解析导入失败')
-    } finally {
-      loading.value = false
-    }
-  }
-  reader.readAsArrayBuffer(file)
-}
-
-// Fetch Salary sheet
-async function loadSalarySheet() {
-  try {
-    // GET /api/salary/sheets/{month} 直接返回工资表对象（扁平结构，无 sheet 包装层）
-    const res: any = await apiClient.get(`/api/salary/sheets/${targetMonth.value}`)
-    salarySheet.value = res
-    employees.value = (res.records || []).map((r: any) => ({
-      name: r.employee_name,
-      dept: r.department,
-      base: r.base_salary,
-      bonus: r.bonus,
-      social: r.company_social_security,
-      personalSocial: r.personal_social_security,
-      personalTax: r.personal_tax,
-      net: r.net_salary,
-      cost: r.total_cost
-    }))
-
-    if (res && res.id) {
-      // accrued/paid：计提凭证已入账；pending_review：计提凭证待审核（maker_checker）
-      payrollAccrued.value = res.status === 'accrued' || res.status === 'paid'
-      payrollPendingReview.value = res.status === 'pending_review'
-      payrollPaid.value = res.status === 'paid'
-      payrollSsPaid.value = ['posted', 'not_required'].includes(res.ssPaymentStatus)
-      payrollHfPaid.value = ['posted', 'not_required'].includes(res.hfPaymentStatus)
-      payrollTaxPaid.value = ['posted', 'not_required'].includes(res.taxPaymentStatus)
-    }
-  } catch (err: any) {
-    console.error('[loadSalarySheet] Error occurred:', err)
-    employees.value = []
-    payrollAccrued.value = false
-    payrollPaid.value = false
-    payrollPendingReview.value = false
-      payrollSsPaid.value = false
-      payrollHfPaid.value = false
-      payrollTaxPaid.value = false
-  }
-}
-
-async function loadPayrollPaymentSuggestions() {
-  try {
-    const res: any = await apiClient.get('/api/salary/payments/suggestions')
-    payrollPaymentSuggestions.value = res.suggestions || []
-  } catch {
-    payrollPaymentSuggestions.value = []
-  }
-}
-
-async function handleApplySalaryPayment(item: any) {
-  applyingSalaryStatementId.value = item.statement.id
-  try {
-    const result: any = await apiClient.post('/api/salary/payments/apply', {
-      month: item.month,
-      statementId: item.statement.id,
-    })
-    message.success(
-      result.linked
-        ? `${item.month} 工资已按 ${item.statement.date} 流水发放并核销`
-        : `工资已发放，但流水核销失败：${result.linkError || '请到银行流水页手工关联'}`,
-    )
-    await entryStore.fetchEntries()
-    await loadAllData()
-  } catch (err: any) {
-    const detail = err.response?.data?.detail
-    message.error(typeof detail === 'string' ? detail : detail?.message || '工资流水核销失败')
-  } finally {
-    applyingSalaryStatementId.value = ''
-  }
-}
-
-async function handleAccruePayroll() {
-  loading.value = true
-  try {
-    await apiClient.post(`/api/salary/sheets/${targetMonth.value}/accrue`)
-    await entryStore.fetchEntries()
-    message.success(`${targetMonth.value} 工资计提成功，已生成记账凭证！`)
-    await loadAllData()
-  } catch (err: any) {
-    message.error(err.response?.data?.detail || '工资计提失败')
-  } finally {
-    loading.value = false
-  }
-}
-
-async function handlePayPayroll() {
-  loading.value = true
-  try {
-    await apiClient.post(`/api/salary/sheets/${targetMonth.value}/pay`)
-    await entryStore.fetchEntries()
-    message.success(`${targetMonth.value} 工资发放确认成功，已生成付款凭证！`)
-    await loadAllData()
-  } catch (err: any) {
-    message.error(err.response?.data?.detail || '工资发放失败')
-  } finally {
-    loading.value = false
-  }
-}
-
-async function handlePaySocial() {
-  loading.value = true
-  try {
-    await apiClient.post(`/api/salary/sheets/${targetMonth.value}/pay-social`)
-    await entryStore.fetchEntries()
-    message.success(`${targetMonth.value} 社保缴纳成功，已生成付款凭证！`)
-    await loadAllData()
-  } catch (err: any) {
-    message.error(err.response?.data?.detail || '社保缴纳失败')
-  } finally {
-    loading.value = false
-  }
-}
-
-async function handlePayHousingFund() {
-  loading.value = true
-  try {
-    await apiClient.post(`/api/salary/sheets/${targetMonth.value}/pay-housing-fund`)
-    await entryStore.fetchEntries()
-    message.success(`${targetMonth.value} 公积金缴纳成功，已生成付款凭证！`)
-    await loadAllData()
-  } catch (err: any) {
-    message.error(err.response?.data?.detail || '公积金缴纳失败')
-  } finally {
-    loading.value = false
-  }
-}
-
-async function handlePayTax() {
-  loading.value = true
-  try {
-    await apiClient.post(`/api/salary/sheets/${targetMonth.value}/pay-tax`)
-    await entryStore.fetchEntries()
-    message.success(`${targetMonth.value} 个人所得税缴纳成功，已生成付款凭证！`)
-    await loadAllData()
-  } catch (err: any) {
-    message.error(err.response?.data?.detail || '个税缴纳失败')
-  } finally {
-    loading.value = false
-  }
-}
-
-// Fetch AI matching suggestions
-async function loadAiSuggestions() {
-  if (suggestionsController) {
-    try {
-      suggestionsController.abort()
-    } catch {
-      // ignore
-    }
-  }
-  suggestionsController = new AbortController()
-
-  try {
-    const res: any = await apiClient.post('/api/bank/ai-suggest', {}, { 
-      timeout: 60000,
-      signal: suggestionsController.signal
-    })
-    const visibleStatementIds = new Set(bankStatements.value.map((s: any) => s.id))
-    aiSuggestions.value = (res.suggestions || []).filter((s: any) => visibleStatementIds.has(s.statementId))
-    
-    const suggestionPairs = aiSuggestions.value
-      .map((suggestion: any) => buildSuggestedMatchPair(suggestion, entryStore.activeEntries))
-      .filter(Boolean)
-
-    matchedPairs.value = [...buildPersistedMatchedPairs(), ...suggestionPairs]
-  } catch (err: any) {
-    if (err.name === 'CanceledError' || err.code === 'ERR_CANCELED') {
-      return
-    }
-    matchedPairs.value = buildPersistedMatchedPairs()
-  }
-}
-
-
-function emptyReconciliationHealth() {
-  return {
-    broken_links: [],
-    amount_mismatches: [],
-    direction_mismatches: [],
-    duplicate_entry_matches: [],
-    pending_confirmations: [],
-    summary: { highRiskCount: 0, warningCount: 0 },
-  }
-}
-
-async function loadReconciliationHealth() {
-  reconciliationHealthLoading.value = true
-  try {
-    reconciliationHealth.value = await apiClient.get('/api/bank/reconciliation-health', {
-      params: { month: targetMonth.value },
-    })
-  } catch {
-    reconciliationHealth.value = emptyReconciliationHealth()
-  } finally {
-    reconciliationHealthLoading.value = false
-  }
-}
-// Split / delete a pair
-async function deletePair(id: string) {
-  const pair = matchedPairs.value.find(p => p.id === id)
-  if (pair) {
-    if (pair.status !== 'confirmed' && !pair.persisted) {
-      matchedPairs.value = matchedPairs.value.filter(p => p.id !== id)
-      message.info('已忽略该 AI 匹配建议')
-      return
-    }
-    try {
-      await apiClient.post('/api/bank/confirm-suggestion', {
-        statement_id: pair.statementId,
-        type: 'match',
-        matched_entry_id: '',
-        matched_entry_ids: [],
-      })
-      message.info('对账关联已取消')
-      await loadAllData()
-    } catch (err) {
-      message.error(apiErrorMessage(err, '取消对账失败'))
-    }
-  }
-}
-
-function isDirectionCompatible(direction: string, statementAmount: number) {
-  if (statementAmount > 0) return direction === 'income' || direction === 'owner_transfer'
-  if (statementAmount < 0) return direction === 'expense' || direction === 'owner_transfer'
-  return true
-}
-
-function apiErrorMessage(err: any, fallback: string) {
-  if (err?.code === 'ECONNABORTED') {
-    return `${fallback}：请求超时，请刷新确认是否已经入账或对账。`
-  }
-  const detail = err?.response?.data?.detail || err?.response?.data?.message || err?.message
-  if (detail && typeof detail === 'object') {
-    const messageText = detail.message || detail.detail || '请求未通过校验'
-    const numbers = [
-      detail.statementAmount !== undefined ? `流水 ${formatMoney(detail.statementAmount)}` : '',
-      detail.entryBankEffect !== undefined ? `账目银行影响 ${formatMoney(detail.entryBankEffect)}` : '',
-      detail.difference !== undefined ? `差额 ${formatMoney(detail.difference)}` : '',
-    ].filter(Boolean).join('，')
-    return numbers ? `${fallback}：${messageText}（${numbers}）` : `${fallback}：${messageText}`
-  }
-  return detail ? `${fallback}：${detail}` : fallback
-}
-
-// Fetch diagnostic metrics and report when closed
-async function fetchClosedDiagnosis() {
-  try {
-    const [statement, diagnosis] = await Promise.all([
-      getIncomeStatement(targetMonth.value, 'summary'),
-      getAIDiagnosis(targetMonth.value),
-    ])
-    const value = (key: string) => Number(statement.rows.find(row => row.key === key)?.values?.current || 0)
-    monthlyIncome.value = value('operating_revenue') + value('nonoperating_income') + value('investment_income')
-    netProfit.value = Number(statement.totals?.netProfit?.current || 0)
-    monthlyExpense.value = monthlyIncome.value - netProfit.value
-    cfoDiagnosis.value = diagnosis
-  } catch (err) {
-    // ignore
-  }
-}
-
-// Perform Month-end Closing and lock period
-async function runClosing() {
-  if (hasBlockingPayroll.value) {
-    currentStep.value = 2
-    message.warning('本月在职员工工资尚未完成计提，请先计提后再结账（发放可延至次月）。')
-    return
-  }
-  if (isZeroRecordMonth.value && !confirmZeroActivity.value) {
-    message.warning('本月尚未录入任何账目记录。若确认本月无经营业务，请先勾选确认零申报。')
-    return
-  }
-
-  closingLoading.value = true
-  try {
-    await loadReconciliationHealth()
-    if (hasBlockingReconciliationRisk.value) {
-      currentStep.value = 2
-      message.warning('仍有高风险流水认领问题，请先处理后再结账。')
-      return
-    }
-
-    const checks: any = await apiClient.get(`/api/periods/${targetMonth.value}/close-checks`)
-    periodCloseChecks.value = checks
-    if (!checks.canClose && !canBatchPostAndClose.value) {
-      const blocking = getClosingReadiness(checks).filter(item => item.status === 'blocked')
-      currentStep.value = 3
-      message.warning(`还不能结账：${blocking.map(item => item.title).join('、')}`)
-      return
-    }
-
-    const result: any = await apiClient.post(
-      `/api/periods/${targetMonth.value}/close`,
-      {},
-      { headers: { 'Idempotency-Key': `close-${targetMonth.value}` } },
-    )
-    closed.value = result.status === 'closed' || result.periodStatus === 'closed'
-    periodCloseChecks.value = result
-    currentStep.value = 3
-    await entryStore.fetchEntries()
-    await fetchClosedDiagnosis()
-    const postedCount = Number(result.autoPostedCount || 0)
-    const closingRefs: string[] = Array.isArray(result.closingVoucherRefs) ? result.closingVoucherRefs.filter(Boolean) : []
-    closingVoucherRefs.value = closingRefs
-    const closingSuffix = closingRefs.length ? `（已自动生成期末损益结转凭证：${closingRefs.join('、')}）` : ''
-    message.success(postedCount
-      ? `🎉 已批量过账 ${postedCount} 张凭证并完成 ${targetMonth.value} 结账${closingSuffix}。`
-      : `🎉 ${targetMonth.value} 结账成功！本期账册已锁定${closingSuffix}。`)
-  } catch (err: any) {
-    const detail = err?.response?.data?.detail
-    if (detail?.code === 'CLOSE_CHECK_FAILED' && detail.context?.checks) {
-      periodCloseChecks.value = { ...periodCloseChecks.value, checks: detail.context.checks, canClose: false }
-      message.error('本月核验仍有阻断项；本次自动过账已一并回滚，请按检查结果处理后重试。')
-    } else if (detail?.code === 'REVIEW_REQUIRED') {
-      // 救援层能定位到具体是哪张待复核，比这里一句笼统的话有用
-      if (!offerRescue(err)) {
-        message.error('本月有凭证需要其他复核人审批，本次过账和结账均未完成。')
-      }
-    } else {
-      reportErrorToast(message, err, '结账失败，请检查阻断项')
-    }
-  } finally {
-    closingLoading.value = false
-  }
-}
-function downloadReport() {
-  message.success('月度财务报销报告及凭证归档包 PDF 生成成功，正在下载...')
-}
-
-// ── 反结账：解锁本期账册并自动红冲期末损益结转凭证（后端 reopen_period） ──
+// ── 反结账：状态与请求已拆入 ReopenPeriodDialog.vue，成功后由 handleReopened 刷新 ──
 const reopenVisible = ref(false)
-const reopenReason = ref('')
-const reopenPhone = ref('')
-const reopenCode = ref('')
-const reopenBizId = ref('')
-const reopenSending = ref(false)
-const reopenSubmitting = ref(false)
 
-async function sendReopenCode() {
-  if (!reopenPhone.value) {
-    message.warning('请输入账号绑定的手机号')
-    return
-  }
-  reopenSending.value = true
-  try {
-    const result = await sendPhoneCode({ phone: reopenPhone.value })
-    reopenBizId.value = (result as any).biz_id || ''
-    message.success('验证码已发送')
-  } catch {
-    message.error('验证码发送失败')
-  } finally {
-    reopenSending.value = false
-  }
+async function handleReopened() {
+  closingVoucherRefs.value = []
+  closed.value = false
+  await entryStore.fetchEntries()
+  periodCloseChecks.value = await apiClient.get(`/api/periods/${targetMonth.value}/close-checks`)
 }
-
-async function submitReopen() {
-  if (!reopenReason.value.trim()) {
-    message.warning('请填写反结账原因（将留痕）')
-    return
-  }
-  if (!reopenPhone.value || !reopenCode.value) {
-    message.warning('请输入手机号和短信验证码完成安全验证')
-    return
-  }
-  reopenSubmitting.value = true
-  try {
-    const stepUp = await requestStepUp({
-      action: 'reopen_period',
-      phone: reopenPhone.value,
-      code: reopenCode.value,
-      bizId: reopenBizId.value || undefined,
-    })
-    await reopenPeriod(targetMonth.value, reopenReason.value.trim(), stepUp.stepUpToken)
-    reopenVisible.value = false
-    closingVoucherRefs.value = []
-    closed.value = false
-    await entryStore.fetchEntries()
-    periodCloseChecks.value = await apiClient.get(`/api/periods/${targetMonth.value}/close-checks`)
-    message.success(`${targetMonth.value} 已反结账：本期期末损益结转凭证已自动红冲，账册解锁，可补记后重新结账。`)
-  } catch (err: any) {
-    const detail = err?.response?.data?.detail
-    message.error(typeof detail === 'string' ? detail : detail?.message || '反结账失败')
-  } finally {
-    reopenSubmitting.value = false
-  }
-}
-
-function safeFloat(val: any): number {
-  if (val === null || val === undefined || val === '') return 0
-  if (typeof val === 'number') return val
-  const cleaned = String(val).replace(/,/g, '').trim()
-  const parsed = parseFloat(cleaned)
-  return isNaN(parsed) ? 0 : parsed
-}
-
-function isItemAutoMatched(row: any) {
-  const amount = safeFloat(row.amount)
-  const desc = String(row.description || '').trim()
-  const date = String(row.transaction_date || '').trim()
-  
-  const found = rawStatements.value.find(s => 
-    Math.abs(s.amount) === Math.abs(amount) && 
-    s.description === desc &&
-    String(s.transaction_date || '').startsWith(date)
-  )
-  const matchedEntryIds = getStatementMatchedEntryIds(found)
-  if (matchedEntryIds.length === 0) return false
-  return matchedEntryIds.every((entryId) => isReconciledEntry(
-    entryStore.activeEntries.find((entry) => entry.id === entryId) as any,
-  ))
-}
-
-const unmatchedInvoices = computed(() => {
-  try {
-    return invoicesList.value
-  } catch (err) {
-    console.error('unmatchedInvoices computed error:', err)
-    return []
-  }
-})
-
-function getEntryMonth(entry: any) {
-  return entry.date ? String(entry.date).substring(0, 7) : ''
-}
-
-function getStatementMonth(statement: any) {
-  return statement.transaction_date ? String(statement.transaction_date).substring(0, 7) : ''
-}
-
-function isStatementInTargetMonth(statement: any) {
-  const month = getStatementMonth(statement)
-  return month === targetMonth.value
-}
-
-function buildPersistedMatchedPairs() {
-  try {
-    const entriesById = new Map(entryStore.activeEntries.map((entry) => [entry.id, entry]))
-    const pairs: any[] = []
-
-    for (const statement of rawStatements.value) {
-      const matchedEntryIds = getStatementMatchedEntryIds(statement)
-      if (matchedEntryIds.length === 0 || !isStatementInTargetMonth(statement)) continue
-
-      const entries = matchedEntryIds
-        .map((entryId) => entriesById.get(entryId))
-        .filter(Boolean) as any[]
-      if (entries.length === 0) continue
-
-      const confirmed = entries.length === matchedEntryIds.length && entries.every((item) => isReconciledEntry(item))
-      const pairEntries = entries.map((item) => ({
-        id: item.id,
-        title: item.title || '未命名条目',
-        amount: item.amount,
-        direction: item.direction,
-        billingStatus: item.billingStatus,
-        category: item.category || '',
-        accountCode: item.accountCode || '',
-        accountName: item.accountName || '',
-        voucherLines: item.voucherLines,
-        voucherStatus: item.voucherStatus,
-        source: item.source,
-        reconciliationType: item.reconciliationType,
-      }))
-      pairs.push({
-        id: statement.id,
-        statementId: statement.id,
-        matchedEntryId: matchedEntryIds[0],
-        matchedEntryIds,
-        entries: pairEntries,
-        settlement: entries.find((item) => item.reconciliationType === 'wechat_settlement'),
-        invoice: pairEntries[0],
-        bank: {
-          id: statement.id,
-          title: statement.description || '未命名流水',
-          amount: statement.amount,
-        },
-        confidence: confirmed ? '已确认' : '待确认',
-        reason: confirmed
-          ? (pairEntries.length > 1 ? `${pairEntries.length} 笔账目合并对账` : '已确认对账')
-          : '已有流水关联，等待人工确认',
-        persisted: true,
-        status: confirmed ? 'confirmed' : 'pending',
-      })
-    }
-
-    return pairs
-  } catch (err) {
-    console.error('buildPersistedMatchedPairs error:', err)
-    return []
-  }
-}
-
-const allUnmatchedEntries = computed(() => {
-  try {
-    const matchedIds = new Set(rawStatements.value.flatMap((statement) => getStatementMatchedEntryIds(statement)))
-    // 冲销红字凭证（entryType=reversal）不参与对账；被红字冲销的原凭证同样
-    // 与红字完全抵消、无剩余资金影响，一并退出对账候选（与待办去噪同口径）
-    const reversalIds = new Set(entryStore.activeEntries
-      .filter((e) => (e as any).entryType === 'reversal' || (e as any).entry_type === 'reversal')
-      .map((e) => String((e as any).reversalOf || '').trim())
-      .filter(Boolean))
-    return sortEntriesByDateDescending(entryStore.activeEntries.filter((e) => {
-      const month = e.occurDate ? e.occurDate.substring(0, 7) : ''
-      const isBeforeOrInMonth = month ? month <= targetMonth.value : false
-      const isNotMatched = !matchedIds.has(e.id)
-      const isNotArchiveOnly = !((e as any).is_archive_only || (e as any).isArchiveOnly)
-      const isNotReconciled = e.billingStatus !== 'reconciled' && (e as any).billing_status !== 'reconciled'
-      // ponytail: 非公户结算（垫付、未付款挂账、预存扣款、平台未提现等）无需且无法匹配公户银行流水
-      const isNonBank = isNonBankSettledEntry(e as any)
-      const isReversal = (e as any).entryType === 'reversal' || (e as any).entry_type === 'reversal'
-      const isReversedOriginal = reversalIds.has(String(e.id))
-      return isBeforeOrInMonth && isNotMatched && isNotArchiveOnly && isNotReconciled && !isNonBank && !isReversal && !isReversedOriginal
-    }).map(e => ({
-      id: e.id,
-      title: e.title,
-      date: e.occurDate,
-      month: e.occurDate ? e.occurDate.substring(0, 7) : '',
-      amount: e.amount,
-      direction: e.direction,
-      category: (e as any).category || '',
-      source: (e as any).source || 'manual',
-      paymentStatus: (e as any).paymentStatus || '',
-      invoiceNumber: (e as any).invoiceNumber || '',
-      voucherLines: (e as any).voucherLines || null,
-      payer: (e as any).payer || 'company_account',
-      voucherStatus: (e as any).voucherStatus || '',
-      is_archive_only: (e as any).is_archive_only || (e as any).isArchiveOnly || false,
-      status: 'unmatched'
-    })))
-  } catch (err) {
-    console.error('allUnmatchedEntries computed error:', err)
-    return []
-  }
-})
-
-// ── In-place Voucher Inspection & Posting Modal (ponytail: zero-redirect inspection) ──
-const showVoucherModal = ref(false)
-const voucherModalLoading = ref(false)
-const voucherPostingLoading = ref(false)
-const batchPostingLoading = ref(false)
-const currentVoucherEntry = ref<any>(null)
-const currentVoucherPostingOptions = ref<any>(null)
-
-async function openVoucherModal(entryId: string) {
-  if (!entryId) return
-  showVoucherModal.value = true
-  voucherModalLoading.value = true
-  currentVoucherEntry.value = null
-  currentVoucherPostingOptions.value = null
-  try {
-    let found = entryStore.activeEntries.find((e: any) => e.id === entryId)
-    if (!found) {
-      await entryStore.fetchEntries()
-      found = entryStore.activeEntries.find((e: any) => e.id === entryId)
-    }
-    currentVoucherEntry.value = found || null
-    if (found) {
-      try {
-        currentVoucherPostingOptions.value = await getPostingOptions(found.id)
-      } catch {
-        currentVoucherPostingOptions.value = null
-      }
-    }
-  } finally {
-    voucherModalLoading.value = false
-  }
-}
-
-async function handleModalPostEntry() {
-  if (!currentVoucherEntry.value || voucherPostingLoading.value) return
-  voucherPostingLoading.value = true
-  try {
-    const res = await postEntry(currentVoucherEntry.value.id)
-    message.success(`凭证过账成功！凭证号：${res.entry?.voucherRef || ''}`)
-    currentVoucherEntry.value = res.entry
-    await Promise.all([
-      entryStore.fetchEntries(),
-      loadAllData(),
-    ])
-  } catch (err: any) {
-    message.error(apiErrorMessage(err, '过账失败'))
-  } finally {
-    voucherPostingLoading.value = false
-  }
-}
-
-async function handleBatchPostMonth() {
-  batchPostingLoading.value = true
-  try {
-    const res = await batchPostEntries({ month: targetMonth.value })
-    if (res.postedCount > 0) {
-      message.success(`已成功批量过账 ${res.postedCount} 张凭证！`)
-    } else {
-      message.info('本月暂无符合条件的待过账草稿凭证')
-    }
-    if (res.failedCount > 0) {
-      message.warning(`有 ${res.failedCount} 张凭证过账未通过，请查看明细`)
-    }
-    await Promise.all([
-      entryStore.fetchEntries(),
-      loadAllData(),
-    ])
-  } catch (err: any) {
-    message.error(apiErrorMessage(err, '批量过账失败'))
-  } finally {
-    batchPostingLoading.value = false
-  }
-}
-
-const modalVoucherLines = computed<VoucherLine[]>(() => {
-  if (!currentVoucherEntry.value) return []
-  const stored = normalizeVoucherLines(currentVoucherEntry.value.voucherLines)
-  if (stored.length > 0) return stored
-  return generateVoucherLines({
-    type: currentVoucherEntry.value.direction as 'income' | 'expense' | 'owner_transfer',
-    amount: currentVoucherEntry.value.amount,
-    category: currentVoucherEntry.value.category || '',
-    payer: currentVoucherEntry.value.payer || 'company_account',
-  })
-})
-
-const modalDebitTotal = computed(() =>
-  modalVoucherLines.value.filter((l) => l.side === 'debit').reduce((s, l) => s + l.amount, 0)
-)
-const modalCreditTotal = computed(() =>
-  modalVoucherLines.value.filter((l) => l.side === 'credit').reduce((s, l) => s + l.amount, 0)
-)
-const unmatchedEntries = computed(() => {
-  try {
-    return allUnmatchedEntries.value.filter(e => getEntryMonth(e) === targetMonth.value)
-  } catch (err) {
-    console.error('unmatchedEntries computed error:', err)
-    return []
-  }
-})
-const unmatchedStatements = computed(() => {
-  try {
-    return bankStatements.value.filter(s => {
-      const month = getStatementMonth(s)
-      return !month || month === targetMonth.value
-    })
-  } catch (err) {
-    console.error('unmatchedStatements computed error:', err)
-    return []
-  }
-})
-const historicalUnmatchedStatements = computed(() => {
-  try {
-    return bankStatements.value.filter(s => {
-      const month = getStatementMonth(s)
-      return month && month < targetMonth.value
-    })
-  } catch (err) {
-    console.error('historicalUnmatchedStatements computed error:', err)
-    return []
-  }
-})
-const totalNetSalary = computed(() => {
-  try {
-    return employees.value.reduce((sum, e) => sum + e.net, 0)
-  } catch (err) {
-    return 0
-  }
-})
-const totalCompanyCost = computed(() => {
-  try {
-    return employees.value.reduce((sum, e) => sum + e.cost, 0)
-  } catch (err) {
-    return 0
-  }
-})
-
-// Reconciliation completeness metrics
-const reconciliationStats = computed(() => {
-  try {
-    const entriesById = new Map(entryStore.activeEntries.map((entry) => [entry.id, entry]))
-    const isConfirmedStatement = (statement: any) => {
-      const matchedEntryIds = getStatementMatchedEntryIds(statement)
-      if (matchedEntryIds.length === 0) return false
-      return matchedEntryIds.every((entryId) => isReconciledEntry(entriesById.get(entryId) as any))
-    }
-
-    // ponytail: 仅统计本月目标月份流水，避免历史未匹配流水拉低本月统计造成虚假告警
-    const targetMonthStatements = rawStatements.value.filter((s: any) => {
-      const m = s.transaction_date ? s.transaction_date.substring(0, 7) : ''
-      return !m || m === targetMonth.value
-    })
-
-    const total = targetMonthStatements.length
-    const matched = targetMonthStatements.filter(isConfirmedStatement).length
-    const unmatched = total - matched
-    const rate = total > 0 ? Math.round((matched / total) * 100) : (targetMonthStatements.length === 0 ? 100 : 0)
-
-    const unmatchedItems = targetMonthStatements.filter(s => !isConfirmedStatement(s))
-    const unmatchedIncome = unmatchedItems.filter(s => s.amount > 0)
-    const unmatchedExpense = unmatchedItems.filter(s => s.amount < 0)
-
-    return { total, matched, unmatched, rate, unmatchedIncome, unmatchedExpense }
-  } catch (err) {
-    console.error('reconciliationStats computed error:', err)
-    return { total: 0, matched: 0, unmatched: 0, rate: 0, unmatchedIncome: [], unmatchedExpense: [] }
-  }
-})
-
-
-
-const reconciliationHealthSummary = computed(() => {
-  try {
-    return reconciliationHealth.value?.summary || { highRiskCount: 0, warningCount: 0 }
-  } catch {
-    return { highRiskCount: 0, warningCount: 0 }
-  }
-})
-const hasBlockingReconciliationRisk = computed(() => {
-  try {
-    return reconciliationHealthSummary.value.highRiskCount > 0
-  } catch {
-    return false
-  }
-})
-// Get AI suggestion for a statement
-function getAiSuggestion(stmtId: string) {
-  return aiSuggestions.value.find(s => s.statementId === stmtId)
-}
-
-/** 账上已有对应凭证：此时该做的是核对并确认配对，不是再记一笔。 */
-function hasExistingEntrySuggestion(stmt: any) {
-  const sug = getAiSuggestion(stmt.id)
-  return sug?.type === 'match' || sug?.type === 'existing'
-}
-
-/** 低置信 / 兜底草稿不是 AI 的判断，不能按「建议分类」展示。 */
-function isFallbackSuggestion(stmt: any) {
-  const sug = getAiSuggestion(stmt.id)
-  if (!sug || sug.type !== 'new') return false
-  return Number(sug.confidence || 0) < 0.5
-}
-
-function findEntryById(id: string) {
-  return entryStore.activeEntries.find((entry: any) => entry.id === id)
-}
-
-function pairCategoryPreview(pair: any) {
-  if (pair.entries?.length > 1) {
-    const categories = [...new Set(pair.entries.map((entry: any) => entry.category).filter(Boolean))]
-    return categories.length > 0 ? `${pair.entries.length} 笔 · ${categories.join('、')}` : `${pair.entries.length} 笔账目`
-  }
-  const category = pair.invoice?.category || '未选择分类'
-  const account = [pair.invoice?.accountCode, pair.invoice?.accountName].filter(Boolean).join(' ')
-  return account ? `${category} · ${account}` : category
-}
-
-// ─── Manual Classify Dialog ──────────────────────────────────────────────────
-
-const CATEGORY_OPTIONS_RAW = [
-  { label: '── 收入 ──', value: '__header_income__', disabled: true },
-  { label: '主营业务收入', value: 'income|主营业务收入|5001|主营业务收入' },
-  { label: '其他业务收入', value: 'income|其他业务收入|5051|其他业务收入' },
-  { label: '营业外收入', value: 'income|营业外收入|5301|营业外收入' },
-  { label: '利息收入', value: 'income|利息收入|5603005|财务费用-利息收入' },
-  { label: '── 员工成本 ──', value: '__header_salary__', disabled: true },
-  // 工资/社保流水走工资模块核销（应付职工薪酬），不直接记费用；与后端 account_mapper 对齐
-  { label: '工资发放', value: 'expense|工资发放|221101|应付职工薪酬-工资' },
-  { label: '社保公积金', value: 'expense|社保公积金|221102|应付职工薪酬-单位社保' },
-  { label: '── 费用支出 ──', value: '__header_expense__', disabled: true },
-  { label: '差旅费', value: 'expense|差旅费|5602006|管理费用-差旅费' },
-  { label: '办公费', value: 'expense|办公费|5602004|管理费用-办公费' },
-  { label: '业务招待费', value: 'expense|业务招待费|5602002|管理费用-业务招待费' },
-  { label: '研发支出-费用化支出', value: 'expense|研发支出-费用化支出|4301|研发支出-费用化支出' },
-  { label: '信息技术服务费', value: 'expense|信息技术服务费|5602015|管理费用-信息技术服务费' },
-  { label: '租金物业', value: 'expense|租金物业|5602013|管理费用-租赁费' },
-  { label: '银行及金融手续费', value: 'expense|银行及金融手续费|5603002|财务费用-手续费' },
-  { label: '其他支出', value: 'expense|其他支出|5602999|管理费用-其他' },
-  { label: '── 采购与往来 ──', value: '__header_purchase__', disabled: true },
-  { label: '原材料采购', value: 'expense|原材料采购|1403|原材料' },
-  { label: '商品采购', value: 'expense|商品采购|1405|库存商品' },
-  { label: '供应商付款', value: 'expense|供应商付款|2202|应付账款' },
-  { label: '预付账款', value: 'expense|预付账款|1123|预付账款' },
-  // 1221 已容器化：往来款一律落末级子科目（员工往来 122103）
-  { label: '其他应收款', value: 'expense|其他应收款|122103|其他应收款-员工往来' },
-  { label: '其他应付款', value: 'expense|其他应付款|2241|其他应付款-其他' },
-  { label: '往来款-支（暂付款）', value: 'expense|往来款|122103|其他应收款-员工往来' },
-  { label: '往来款-收（暂收款）', value: 'income|往来款|2241|其他应付款-其他' },
-  // 2221 是容器：税费缴纳落应交增值税末级（小规模纳税人专用）
-  { label: '税费缴纳', value: 'expense|税费缴纳|2221026|应交增值税（小规模纳税人专用）' },
-  { label: '── 资本 ──', value: '__header_capital__', disabled: true },
-  { label: '股东投入', value: 'owner_transfer|股东投入|3001|实收资本' },
-  { label: '资本公积', value: 'owner_transfer|资本公积|3002|资本公积' },
-  { label: '── 往来 ──', value: '__header_owner__', disabled: true },
-  { label: '股东垫付', value: 'owner_transfer|股东垫付|2241|其他应付款-股东' },
-  { label: '员工垫付报销', value: 'owner_transfer|员工垫付报销|2241|其他应付款-员工' },
-]
-
-// 下拉选项：accountCode/accountName 权威值从后端 /account-mapping 加载后刷新，
-// 硬编码仅兜底；分组/顺序/往来款收支拆分是前端 UI 编排，保留在此。
-const CATEGORY_OPTIONS = ref(CATEGORY_OPTIONS_RAW)
-
-function refreshCategoryOptions() {
-  CATEGORY_OPTIONS.value = CATEGORY_OPTIONS_RAW.map((opt: any) => {
-    if (opt.disabled || !opt.value || opt.value.startsWith('__')) return opt
-    const [direction, category] = opt.value.split('|')
-    // 往来款收/支是前端特化，后端映射只给单一 code，跳过以免覆盖收=2241 的语义
-    if (category === '往来款') return opt
-    const acct = accountForCategory(category)
-    if (!acct) return opt
-    return { ...opt, value: `${direction}|${category}|${acct.code}|${acct.name}` }
-  })
-}
-
-function categoryValueNatureLabel(value: string) {
-  const [direction = '', category = ''] = value.split('|')
-  return getEntryNaturePresentation(direction, category).detailLabel
-}
-
-const rdProjects = ref<RdProject[]>([])
-const rdExpenseTypes = ref<RdExpenseTypeOption[]>([])
-const rdProjectOptions = computed(() => rdProjects.value
-  .filter(project => ['active', 'completed'].includes(project.status))
-  .map(project => ({ label: `${project.code} · ${project.name}`, value: project.id })))
-const rdExpenseTypeOptions = computed(() => rdExpenseTypes.value
-  .map(item => ({ label: item.label, value: item.value })))
-
-async function loadRdOptions() {
-  try {
-    const [projects, types] = await Promise.all([getRdProjects(true), getRdExpenseTypes()])
-    rdProjects.value = projects
-    rdExpenseTypes.value = types.items
-  } catch {
-    message.warning('研发项目选项加载失败，研发分类暂不能确认')
-  }
-}
-
-function isRdCategoryValue(value: string) {
-  return value.split('|')[1] === '研发支出-费用化支出'
-}
-
-function rdDetailFromEntry(entry: any) {
-  const lines = [
-    ...(entry?.voucherLines?.debit || []),
-    ...(entry?.voucherLines?.credit || []),
-  ]
-  return lines.find((line: any) => line.rdDetail)?.rdDetail || null
-}
-
-const showManualDialog = ref(false)
-const manualTarget = ref<any>(null)
-const manualForm = ref({
-  title: '',
-  categoryValue: '',
-  businessContext: '',
-  remark: '',
-  rdProjectId: '',
-  rdExpenseType: '',
-  rdAllocationBasis: '',
-  suggestedSubAccount: null as null | { parentCode: string; name: string },
-  useSuggestedSubAccount: true,
-})
-const manualSubmitting = ref(false)
-const manualAiLoading = ref(false)
-const manualSuggestionMeta = ref<{ confidence?: number; reason?: string }>({})
-const showPairCategoryDialog = ref(false)
-const pairCategoryTarget = ref<any>(null)
-const pairCategoryForm = ref({
-  title: '',
-  categoryValue: '',
-  rdProjectId: '',
-  rdExpenseType: '',
-  rdAllocationBasis: '',
-})
-const pairCategorySubmitting = ref(false)
-
-function defaultCategoryValue(stmt: any) {
-  return stmt.amount >= 0
-    ? 'income|主营业务收入|5001|主营业务收入'
-    : 'expense|其他支出|5602999|管理费用-其他'
-}
-
-function cleanStatementTitle(stmt: any) {
-  const desc = String(stmt.description || '')
-  return desc.replace(/^\[.*?\]\s*/, '').replace(/^\(对方:\s*/, '').replace(/\)$/, '').trim() || desc || '银行流水记账'
-}
-
-function categoryValueFromSuggestion(stmt: any, suggested: any) {
-  if (!suggested) return defaultCategoryValue(stmt)
-  const direction = suggested.direction || (stmt.amount >= 0 ? 'income' : 'expense')
-  const exact = `${direction}|${suggested.category}|${suggested.accountCode}|${suggested.accountName}`
-  if (CATEGORY_OPTIONS.value.some((opt: any) => !opt.disabled && opt.value === exact)) return exact
-  const byCategory = CATEGORY_OPTIONS.value.find((opt: any) => !opt.disabled && String(opt.value).includes(`|${suggested.category}|`))
-  return byCategory?.value || defaultCategoryValue(stmt)
-}
-
-function categoryValueFromEntry(entry: any, stmt: any) {
-  if (!entry) return defaultCategoryValue(stmt)
-  const exact = `${entry.direction}|${entry.category}|${entry.accountCode}|${entry.accountName}`
-  if (CATEGORY_OPTIONS.value.some((opt: any) => !opt.disabled && opt.value === exact)) return exact
-  const byCategory = CATEGORY_OPTIONS.value.find((opt: any) => !opt.disabled && String(opt.value).includes(`|${entry.category}|`))
-  return byCategory?.value || defaultCategoryValue(stmt)
-}
-
-function openManualClassify(stmt: any, suggestedEntry: any = null) {
-  const suggestion = getAiSuggestion(stmt.id)
-  if (suggestion?.type === 'match' || suggestion?.type === 'existing') {
-    selectExistingReconciliation(stmt, suggestion.matchedEntryIds || [suggestion.matchedEntryId].filter(Boolean))
-    return
-  }
-  manualTarget.value = stmt
-  manualSuggestionMeta.value = suggestedEntry
-    ? { confidence: suggestedEntry.confidence, reason: suggestedEntry.reason }
-    : {}
-  const sub = suggestedEntry?.suggestedSubAccount
-  manualForm.value = {
-    title: suggestedEntry?.title || cleanStatementTitle(stmt),
-    categoryValue: categoryValueFromSuggestion(stmt, suggestedEntry),
-    businessContext: '',
-    remark: '',
-    rdProjectId: '',
-    rdExpenseType: '',
-    rdAllocationBasis: '',
-    suggestedSubAccount: (sub?.parentCode && sub?.name)
-      ? { parentCode: String(sub.parentCode), name: String(sub.name) }
-      : null,
-    useSuggestedSubAccount: !!(sub?.parentCode && sub?.name),
-  }
-  showManualDialog.value = true
-}
-
-function selectExistingReconciliation(stmt: any, entryIds: string[]) {
-  selectedBank.value = stmt.id
-  selectedInvoiceIds.value = entryIds.every((id) => allUnmatchedEntries.value.some((entry) => entry.id === id)) ? entryIds : []
-  message.warning('已有账目，请核对左侧收入与手续费后确认合并对账，勿重复记账。')
-}
-
-function openPairCategoryDialog(pair: any) {
-  if (pair.entries?.length > 1) {
-    message.info('合并对账请分别在经营账本中修改各笔分类')
-    return
-  }
-  const entry = findEntryById(pair.matchedEntryId) || pair.invoice
-  const rdDetail = rdDetailFromEntry(entry)
-  pairCategoryTarget.value = pair
-  pairCategoryForm.value = {
-    title: entry?.title || pair.invoice?.title || '',
-    categoryValue: categoryValueFromEntry(entry, pair.bank),
-    rdProjectId: rdDetail?.projectId || '',
-    rdExpenseType: rdDetail?.expenseType || '',
-    rdAllocationBasis: rdDetail?.allocationBasis || '',
-  }
-  showPairCategoryDialog.value = true
-}
-
-async function handlePairCategorySave() {
-  const pair = pairCategoryTarget.value
-  if (!pair || !pairCategoryForm.value.title.trim() || !pairCategoryForm.value.categoryValue || pairCategoryForm.value.categoryValue.startsWith('__')) {
-    message.warning('请填写标题并选择科目分类')
-    return
-  }
-
-  const [direction, category, accountCode, accountName] = pairCategoryForm.value.categoryValue.split('|')
-  if (category === '研发支出-费用化支出' && !(
-    pairCategoryForm.value.rdProjectId && pairCategoryForm.value.rdExpenseType
-  )) {
-    message.warning('研发费用必须选择研发项目和费用类别')
-    return
-  }
-  pairCategorySubmitting.value = true
-  try {
-    await apiClient.patch(`/api/record/entries/${pair.matchedEntryId}`, {
-      title: pairCategoryForm.value.title.trim(),
-      direction,
-      category,
-      accountCode,
-      accountName,
-      ...(category === '研发支出-费用化支出' ? {
-        rdProjectId: pairCategoryForm.value.rdProjectId,
-        rdExpenseType: pairCategoryForm.value.rdExpenseType,
-        rdOriginalAmount: Math.abs(Number(pair.bank?.amount || pair.invoice?.amount || 0)),
-        rdAllocationMethod: 'direct',
-        rdAllocationBasis: pairCategoryForm.value.rdAllocationBasis || undefined,
-      } : {}),
-    })
-    pair.invoice = {
-      ...pair.invoice,
-      title: pairCategoryForm.value.title.trim(),
-      direction,
-      category,
-      accountCode,
-      accountName,
-    }
-    await entryStore.fetchEntries()
-    showPairCategoryDialog.value = false
-    message.success(`已更新分类：${category}`)
-  } catch (err: any) {
-    message.error(apiErrorMessage(err, '分类更新失败'))
-  } finally {
-    pairCategorySubmitting.value = false
-  }
-}
-
-async function refreshManualAiSuggestion() {
-  if (!manualTarget.value) return
-  manualAiLoading.value = true
-  try {
-    const res: any = await apiClient.post('/api/bank/classify-statement', {
-      statement_id: manualTarget.value.id,
-      business_context: manualForm.value.businessContext.trim(),
-    }, { timeout: 60000 })
-    if (!res?.suggestedEntry) {
-      message.warning('暂未生成新的 AI 分类建议')
-      return
-    }
-    const suggested = res.suggestedEntry
-    manualSuggestionMeta.value = { confidence: suggested.confidence, reason: suggested.reason }
-    const sub = suggested?.suggestedSubAccount
-    manualForm.value = {
-      ...manualForm.value,
-      title: suggested.title || manualForm.value.title,
-      categoryValue: categoryValueFromSuggestion(manualTarget.value, suggested),
-      suggestedSubAccount: (sub?.parentCode && sub?.name)
-        ? { parentCode: String(sub.parentCode), name: String(sub.name) }
-        : manualForm.value.suggestedSubAccount,
-      useSuggestedSubAccount: !!(sub?.parentCode && sub?.name) || manualForm.value.useSuggestedSubAccount,
-    }
-    message.success('已根据业务说明更新 AI 分类草稿')
-  } catch (err: any) {
-    message.error(`AI 分类建议更新失败: ${err.message || err}`)
-  } finally {
-    manualAiLoading.value = false
-  }
-}
-
-async function handleManualClassify() {
-  if (!manualTarget.value || !manualForm.value.categoryValue || !manualForm.value.title.trim()) {
-    message.warning('请填写记账标题并选择分类')
-    return
-  }
-
-  const [direction, category, suggestedCode, suggestedName] = manualForm.value.categoryValue.split('|')
-  let accountCode = suggestedCode
-  let accountName = suggestedName
-  if (category === '研发支出-费用化支出' && !(
-    manualForm.value.rdProjectId && manualForm.value.rdExpenseType
-  )) {
-    message.warning('研发费用必须选择研发项目和费用类别')
-    return
-  }
-  const stmt = manualTarget.value
-
-  const finalDirection = direction === 'owner_transfer'
-    ? 'owner_transfer'
-    : (stmt.amount >= 0 ? 'income' : 'expense')
-  const businessContext = manualForm.value.businessContext.trim()
-  const remark = [
-    businessContext ? `业务说明：${businessContext}` : '',
-    manualForm.value.remark.trim(),
-  ].filter(Boolean).join('\n')
-
-  // 若 AI 建议新建二级科目且用户确认，先落地科目，再用新 code 记账；失败则回落原映射科目
-  if (manualForm.value.useSuggestedSubAccount && manualForm.value.suggestedSubAccount) {
-    try {
-      const created: any = await apiClient.post('/api/ledger/accounts/ensure-sub', {
-        parent_code: manualForm.value.suggestedSubAccount.parentCode,
-        name: manualForm.value.suggestedSubAccount.name,
-      })
-      if (created?.code && created?.name) {
-        accountCode = created.code
-        accountName = created.name
-      }
-    } catch {
-      // 建科失败不阻断记账
-    }
-  }
-
-  manualSubmitting.value = true
-  try {
-    const confirmRes: any = await backfillConfirm.withBackfill((allowBackfill, backfillReason) =>
-      apiClient.post('/api/bank/confirm-suggestion', {
-      statement_id: stmt.id,
-      type: 'new',
-      allowBackfill,
-      backfillReason,
-      new_entry: {
-        title: manualForm.value.title.trim(),
-        amount: Math.abs(stmt.amount),
-        direction: finalDirection,
-        category,
-        accountCode,
-        accountName,
-        occurDate: stmt.transaction_date ? stmt.transaction_date.slice(0, 10) : new Date().toISOString().slice(0, 10),
-        remark,
-        ...(category === '研发支出-费用化支出' ? {
-          rdProjectId: manualForm.value.rdProjectId,
-          rdExpenseType: manualForm.value.rdExpenseType,
-          rdOriginalAmount: Math.abs(stmt.amount),
-          rdAllocationMethod: 'direct',
-          rdAllocationBasis: manualForm.value.rdAllocationBasis || undefined,
-        } : {}),
-      }
-    }, { timeout: 60000 }),
-    )
-    if (confirmRes?.status === 'already_matched') {
-      message.success('该流水已完成对账，已刷新列表。')
-    } else {
-      message.success(`已确认记账并完成对账：「${manualForm.value.title.trim()}」→ ${category}`)
-    }
-    
-    // ponytail: 接口成功后立即关闭弹窗和置灰，用非阻塞 loadAllData 刷新后台以防止 Vue 重渲染挂起阻塞 UI 响应
-    showManualDialog.value = false
-    manualSubmitting.value = false
-    loadAllData()
-  } catch (err: any) {
-    if (isBackfillCancelled(err)) {
-      manualSubmitting.value = false
-      return
-    }
-    const detail = err?.response?.data?.detail
-    if (detail?.code === 'EXISTING_WECHAT_ENTRIES') {
-      showManualDialog.value = false
-      const groups = detail.candidateEntryGroups || []
-      selectExistingReconciliation(stmt, groups.length === 1 ? groups[0] : [])
-    } else {
-      message.error(apiErrorMessage(err, '记账提交失败'))
-    }
-    manualSubmitting.value = false
-  }
-}
-
-const highConfidenceStatements = computed(() => {
-  return unmatchedStatements.value.filter((stmt: any) => {
-    const sug = getAiSuggestion(stmt.id)
-    return sug && sug.confidence >= 0.95
-  })
-})
-
-const statementTierFilter = ref<'all' | 'ready' | 'attention'>('all')
-const selectedStatementIds = ref<string[]>([])
-const rememberRuleOnConfirm = ref(true)
-
-function isSelectableForBatch(stmt: any): boolean {
-  const sug = getAiSuggestion(stmt.id)
-  if (!sug) return false
-  if (isFallbackSuggestion(stmt)) return false
-  if (sug.type === 'new' && sug.suggestedEntry?.category === '研发支出-费用化支出') return false
-  return Number(sug.confidence || 0) >= 0.5
-}
-
-function isNeedsAttentionStatement(stmt: any): boolean {
-  if (findMatchingInvoiceForStatement(stmt)) return false
-  const sug = getAiSuggestion(stmt.id)
-  if (!sug) return true
-  return isFallbackSuggestion(stmt)
-}
-
-function suggestionBadgeLabel(stmt: any): string {
-  if (isFallbackSuggestion(stmt)) return '待人工指定'
-  const sug = getAiSuggestion(stmt.id)
-  if (!sug) return '待指定'
-  if (sug.rule === 'company_memory_rule') return '记忆规则 98%'
-  if (sug.rule) return '系统规则 100%'
-  const conf = Number(sug.confidence || 0)
-  if (conf >= 0.95) return '高置信度'
-  return '推荐依据'
-}
-
-const selectableBatchStatements = computed(() =>
-  unmatchedStatements.value.filter((stmt: any) => isSelectableForBatch(stmt))
-)
-
-const attentionStatements = computed(() =>
-  unmatchedStatements.value.filter((stmt: any) => isNeedsAttentionStatement(stmt))
-)
-
-const filteredUnmatchedStatements = computed(() => {
-  if (statementTierFilter.value === 'ready') {
-    return unmatchedStatements.value.filter((stmt: any) => !isNeedsAttentionStatement(stmt))
-  }
-  if (statementTierFilter.value === 'attention') {
-    return attentionStatements.value
-  }
-  return unmatchedStatements.value
-})
-
-watch(
-  [unmatchedStatements, aiSuggestions],
-  () => {
-    const validSelectable = new Set(selectableBatchStatements.value.map((s: any) => s.id))
-    const defaultHighConf = highConfidenceStatements.value
-      .filter((s: any) => validSelectable.has(s.id))
-      .map((s: any) => s.id)
-    const kept = selectedStatementIds.value.filter((id) => validSelectable.has(id))
-    selectedStatementIds.value = kept.length > 0 ? kept : defaultHighConf
-  },
-  { immediate: true }
-)
-
-function toggleStatementSelection(stmtId: string, checked: boolean) {
-  if (checked) {
-    if (!selectedStatementIds.value.includes(stmtId)) {
-      selectedStatementIds.value = [...selectedStatementIds.value, stmtId]
-    }
-  } else {
-    selectedStatementIds.value = selectedStatementIds.value.filter((id) => id !== stmtId)
-  }
-}
-
-const allSelectableChecked = computed(
-  () =>
-    selectableBatchStatements.value.length > 0 &&
-    selectableBatchStatements.value.every((stmt: any) => selectedStatementIds.value.includes(stmt.id))
-)
-
-const someSelectableChecked = computed(
-  () =>
-    !allSelectableChecked.value &&
-    selectableBatchStatements.value.some((stmt: any) => selectedStatementIds.value.includes(stmt.id))
-)
-
-function toggleSelectAllStatements(checked: boolean) {
-  selectedStatementIds.value = checked
-    ? selectableBatchStatements.value.map((stmt: any) => stmt.id)
-    : []
-}
-
-const batchTargetStatements = computed(() => {
-  const selectedSet = new Set(selectedStatementIds.value)
-  const picked = unmatchedStatements.value.filter(
-    (stmt: any) => selectedSet.has(stmt.id) && isSelectableForBatch(stmt)
-  )
-  return picked.length > 0 ? picked : highConfidenceStatements.value
-})
-
-/** 按建议确认单笔流水（match 关联已有记录 / new 新建入账）。批量与单条共用同一路径。 */
-async function confirmSuggested(
-  stmt: any,
-  sug: any,
-  opts: { skipDuplicateCheck?: boolean; rememberRule?: boolean } = {}
-) {
-  if (sug.type === 'match') {
-    const matchIds = sug.matchedEntryIds || [sug.matchedEntryId].filter(Boolean)
-    return await backfillConfirm.withBackfill((allowBackfill, backfillReason) =>
-      apiClient.post('/api/bank/confirm-suggestion', {
-        statement_id: stmt.id,
-        type: 'match',
-        matched_entry_ids: matchIds,
-        allowBackfill,
-        backfillReason,
-      })
-    )
-  }
-  const suggestedEntry = sug.suggestedEntry || {}
-  return await backfillConfirm.withBackfill((allowBackfill, backfillReason) =>
-    apiClient.post('/api/bank/confirm-suggestion', {
-      statement_id: stmt.id,
-      type: 'new',
-      new_entry: {
-        title: suggestedEntry.title || cleanStatementTitle(stmt),
-        category: suggestedEntry.category || (stmt.amount > 0 ? '其他业务收入' : '其他支出'),
-        amount: Math.abs(stmt.amount),
-        direction: stmt.amount > 0 ? 'income' : 'expense',
-        occurDate: stmt.transaction_date ? stmt.transaction_date.slice(0, 10) : '',
-        paymentDate: stmt.transaction_date ? stmt.transaction_date.slice(0, 10) : '',
-        billingStatus: 'reconciled',
-        source: 'bank_import',
-        payer: 'company_account',
-        rdProjectId: suggestedEntry.rdProjectId,
-        rdExpenseType: suggestedEntry.rdExpenseType,
-      },
-      allowBackfill,
-      backfillReason,
-      ...(opts.skipDuplicateCheck ? { skipDuplicateCheck: true } : {}),
-      ...(opts.rememberRule ? { rememberRule: true } : {}),
-    })
-  )
-}
-
-const batchConfirming = ref(false)
-async function handleBatchConfirmRules() {
-  const items = batchTargetStatements.value
-    .map((stmt: any) => ({ stmt, sug: getAiSuggestion(stmt.id) }))
-    .filter((item: any) => item.sug)
-  if (items.length === 0) return
-  batchConfirming.value = true
-  let confirmed = 0
-  let cancelled = false
-  try {
-    // 串行执行：跨期补记弹窗共用同一个 resolver，并发会互相覆盖
-    for (const { stmt, sug } of items) {
-      try {
-        await confirmSuggested(stmt, sug)
-        confirmed += 1
-      } catch (err: any) {
-        if (isBackfillCancelled(err)) {
-          cancelled = true
-          break
-        }
-        console.error('批量确认失败:', stmt.id, err)
-      }
-    }
-    selectedStatementIds.value = []
-    await loadAllData()
-    const failed = items.length - confirmed
-    if (cancelled) message.info(`已确认 ${confirmed} 笔，其余已取消`)
-    else if (failed > 0) message.warning(`已确认 ${confirmed} 笔，${failed} 笔未能自动确认，请手动处理`)
-    else message.success(`已确认 ${confirmed} 笔流水`)
-  } finally {
-    batchConfirming.value = false
-  }
-}
-
-const quickSubmittingId = ref<string | null>(null)
-
-/**
- * 新建入账时账上已有等额凭证（后端 EXISTING_ENTRY_MATCH）：
- * 直接给出"配对"选项，而不是再记一笔。返回 true 表示已接管错误提示。
- */
-function promptExistingEntryMatch(stmt: any, err: any, retryAsNew?: () => Promise<void>): boolean {
-  const detail = err?.response?.data?.detail
-  if (!detail || detail.code !== 'EXISTING_ENTRY_MATCH') return false
-  const entryIds: string[] = (detail.candidateEntryIds || []).map(String)
-  if (!entryIds.length) return false
-  const first = (detail.entries || [])[0] || {}
-  dialog.warning({
-    title: '发现一笔相同金额的已有凭证',
-    content: `账上已有「${first.title || stmt.description}」${first.date ? `（${first.date}）` : ''}，金额相同。直接配对即可，避免同一笔钱记两次；确实属于两笔独立付款时再单独记账。`,
-    positiveText: '直接配对',
-    negativeText: '确认是两笔，仍要记账',
-    onPositiveClick: async () => {
-      try {
-        await backfillConfirm.withBackfill((allowBackfill, backfillReason) =>
-          apiClient.post('/api/bank/confirm-suggestion', {
-            statement_id: stmt.id,
-            type: 'match',
-            matched_entry_ids: entryIds,
-            allowBackfill,
-            backfillReason,
-          })
-        )
-        message.success(`已配对，未重复记账：「${stmt.description}」`)
-        await loadAllData()
-      } catch (pairErr: any) {
-        if (!isBackfillCancelled(pairErr)) message.error(apiErrorMessage(pairErr, '配对失败'))
-      }
-    },
-    onNegativeClick: async () => {
-      if (!retryAsNew) {
-        openVoucherModal(entryIds[0])
-        return
-      }
-      try {
-        await retryAsNew()
-        message.success(`已按独立的一笔记账：「${stmt.description}」`)
-        await loadAllData()
-      } catch (retryErr: any) {
-        if (!isBackfillCancelled(retryErr)) message.error(apiErrorMessage(retryErr, '入账失败'))
-      }
-    },
-  })
-  return true
-}
-
-async function handleAcceptSuggested(stmt: any) {
-  const sug = getAiSuggestion(stmt.id)
-  if (!sug) return
-  quickSubmittingId.value = stmt.id
-  const shouldRemember = Boolean(rememberRuleOnConfirm.value && sug.type === 'new' && !isFallbackSuggestion(stmt))
-  try {
-    const res: any = await confirmSuggested(stmt, sug, { rememberRule: shouldRemember })
-    const suggestedEntry = sug.suggestedEntry || {}
-    if (sug.type === 'match') {
-      message.success(`已完成对账：「${stmt.description}」`)
-    } else if (res?.savedRulePattern) {
-      message.success(`已确认入账并对账：「${stmt.description}」→ ${suggestedEntry.category}（已沉淀规则：后续「${res.savedRulePattern}」自动归入此科目）`)
-    } else {
-      message.success(`已确认入账并对账：「${stmt.description}」→ ${suggestedEntry.category}`)
-    }
-    await loadAllData()
-  } catch (err: any) {
-    if (isBackfillCancelled(err)) return
-    if (promptExistingEntryMatch(stmt, err, () => confirmSuggested(stmt, sug, { skipDuplicateCheck: true, rememberRule: shouldRemember }).then(() => undefined))) return
-    message.error(apiErrorMessage(err, '入账失败'))
-  } finally {
-    quickSubmittingId.value = null
-  }
-}
-
-async function handleQuickSelectCategory(stmt: any, category: string) {
-  if (!category) return
-  if (category === '研发支出-费用化支出') {
-    openManualClassify(stmt, { category: '研发支出-费用化支出' })
-    return
-  }
-  quickSubmittingId.value = stmt.id
-  const submitNewEntry = (allowBackfill: boolean, backfillReason?: string, skipDuplicateCheck = false) =>
-    apiClient.post('/api/bank/confirm-suggestion', {
-      statement_id: stmt.id,
-      type: 'new',
-      new_entry: {
-        title: cleanStatementTitle(stmt),
-        category: category,
-        amount: Math.abs(stmt.amount),
-        direction: stmt.amount > 0 ? 'income' : 'expense',
-        occurDate: stmt.transaction_date ? stmt.transaction_date.slice(0, 10) : '',
-        paymentDate: stmt.transaction_date ? stmt.transaction_date.slice(0, 10) : '',
-        billingStatus: 'reconciled',
-        source: 'bank_import',
-        payer: 'company_account',
-      },
-      allowBackfill,
-      backfillReason,
-      ...(skipDuplicateCheck ? { skipDuplicateCheck: true } : {}),
-      ...(rememberRuleOnConfirm.value ? { rememberRule: true } : {}),
-    })
-  try {
-    const res: any = await backfillConfirm.withBackfill((allowBackfill, backfillReason) =>
-      submitNewEntry(allowBackfill, backfillReason)
-    )
-    if (res?.savedRulePattern) {
-      message.success(`已入账：「${stmt.description}」→ ${category}（已沉淀规则：后续「${res.savedRulePattern}」自动归入此科目）`)
-    } else {
-      message.success(`已入账：「${stmt.description}」→ ${category}`)
-    }
-    await loadAllData()
-  } catch (err: any) {
-    if (isBackfillCancelled(err)) return
-    if (promptExistingEntryMatch(stmt, err, () => submitNewEntry(false, undefined, true).then(() => undefined))) return
-    message.error(apiErrorMessage(err, '入账失败'))
-  } finally {
-    quickSubmittingId.value = null
-  }
-}
-
-function findMatchingInvoiceForStatement(stmt: any) {
-  const stmtAmount = Math.abs(stmt.amount)
-  return unmatchedEntries.value.find((entry: any) => {
-    const entryAmount = Math.abs(Number(entry.amount) || 0)
-    return Math.abs(stmtAmount - entryAmount) < 0.01 && isDirectionCompatible(entry.direction, stmt.amount)
-  })
-}
-
-// ── 待确认账目（发票/手工账）：老板只需要回答"付款了吗" ─────────────────
-
-/** 给一笔账目找最可能的银行流水：方向一致、日期 ±10 天、金额最接近。 */
-function findStatementCandidateForEntry(entry: any) {
-  const entryAmount = Math.abs(Number(entry.amount) || 0)
-  const entryDate = String(entry.date || entry.occurDate || '').slice(0, 10)
-  const wantsIncome = entry.direction === 'income'
-  let best: { statement: any; diff: number } | null = null
-  for (const stmt of unmatchedStatements.value) {
-    const stmtAmount = Number(stmt.amount) || 0
-    if ((stmtAmount > 0) !== wantsIncome) continue
-    const stmtDate = String(stmt.transaction_date || '').slice(0, 10)
-    if (entryDate && stmtDate) {
-      const dayDiff = Math.abs(new Date(entryDate).getTime() - new Date(stmtDate).getTime()) / 86400000
-      if (dayDiff > 10) continue
-    }
-    const diff = Math.abs(Math.abs(stmtAmount) - entryAmount)
-    if (!best || diff < best.diff) best = { statement: stmt, diff }
-  }
-  return best
-}
-
-function statementCandidateText(candidate: { statement: any; diff: number } | null) {
-  if (!candidate) return ''
-  const stmt = candidate.statement
-  const relation = candidate.diff < 0.01 ? '金额一致' : `差 ${formatMoney(candidate.diff)}`
-  return `疑似对应 ${String(stmt.transaction_date).slice(0, 10)} ${stmt.description}（${relation}）`
-}
-
-/** 账目已付款：带用户去核对对应流水；找不到流水时提示补导。 */
-function handleEntryPaid(entry: any) {
-  const candidate = findStatementCandidateForEntry(entry)
-  currentStep.value = 2
-  if (!candidate) {
-    message.warning('本月没找到对应流水。如果这笔是现金或个人账户支付，可以标记「还没付款」或直接忽略。')
-    return
-  }
-  selectedBank.value = candidate.statement.id
-  nextTick(() => scrollIntoBank(candidate.statement.id))
-  message.info(statementCandidateText(candidate))
-}
-
-/** 确认单据去向（未付款/老板垫付/员工垫付/预存扣除/老板代收/平台未提现/冲前期预收等；若已过账则后台自动冲销重记） */
-async function confirmEntryDisposition(entry: any, choice: { payer?: string; paymentStatus?: 'unpaid'; label: string }) {
-  try {
-    const { label, ...payload } = choice
-    await updateEntry(entry.id, { ...payload, autoReverseRepost: true })
-    message.success(`已确认：${label}`)
-    await loadAllData()
-  } catch (err: any) {
-    message.error(apiErrorMessage(err, '确认失败'))
-  }
-}
-
-/** 撤销去向确认：单据重新回到待确认列表 */
-async function resetEntryDisposition(entry: any) {
-  try {
-    await updateEntry(entry.id, { paymentStatus: null, payer: 'company_account', autoReverseRepost: true })
-    message.success('已恢复为待确认状态')
-    await loadAllData()
-  } catch (err: any) {
-    message.error(apiErrorMessage(err, '恢复失败'))
-  }
-}
-
-/** 标记未付款：草稿会改为挂账科目（应付/应收），不再出现在待确认列表。 */
-async function markEntryUnpaid(entry: any) {
-  const label = entry.direction === 'income' ? '客户未付款' : '还没付款'
-  return confirmEntryDisposition(entry, { paymentStatus: 'unpaid', label })
-}
-
-const employeePayerOptions = computed(() => {
-  const options = (employees.value || []).map((emp: any) => ({
-    label: `员工垫付：${emp.name}`,
-    key: `employee_personal:${emp.name}`
-  }))
-  options.push({
-    label: '其他员工垫付',
-    key: 'employee_personal'
-  })
-  return options
-})
-
-const SYSTEM_MANUAL_CATEGORIES = new Set([
-  '人力成本',
-  '工资发放',
-  '社保公积金',
-  '个人所得税',
-  '银行及金融手续费',
-  '银行手续费',
-  '利息收入',
-  '股东投入',
-  '老板投入',
-  '资本公积',
-  '股东取现',
-  '老板取现',
-  '股东垫付报销',
-  '员工垫付报销',
-])
-
-const pendingEntryList = computed(() =>
-  unmatchedEntries.value.filter((entry: any) => {
-    const isInvoice = entry.source === 'invoice_import' || !!entry.invoiceNumber
-    if (isInvoice) return true
-    if (entry.direction === 'owner_transfer') return false
-    const cat = String(entry.category || '').trim()
-    const title = String(entry.title || '').trim()
-    if (SYSTEM_MANUAL_CATEGORIES.has(cat)) return false
-    if (/工资|社保|公积金|手续费|注册资本|股东投入/.test(title)) return false
-    return true
-  })
-)
-
-/** 资金流出：支出，或负数的资本往来（股东取现等）；股东投入按流入显示 */
-const entryIsOutflow = (entry: any) =>
-  entry.direction === 'expense' || (entry.direction !== 'income' && Number(entry.amount) < 0)
-
-const confirmedExceptionEntries = computed(() => {
-  try {
-    return entryStore.activeEntries.filter((e) => {
-      const month = e.occurDate ? e.occurDate.substring(0, 7) : ''
-      const isCurrentMonth = month === targetMonth.value
-      const isNotArchiveOnly = !((e as any).is_archive_only || (e as any).isArchiveOnly)
-      return isCurrentMonth && isNotArchiveOnly && isNonBankSettledEntry(e as any)
-    }).map((e) => ({
-      id: e.id,
-      title: e.title,
-      date: e.occurDate,
-      amount: e.amount,
-      direction: e.direction,
-      category: (e as any).category || '',
-      source: (e as any).source || 'manual',
-      payer: (e as any).payer || 'company_account',
-      paymentStatus: (e as any).paymentStatus || '',
-    }))
-  } catch (err) {
-    console.error('confirmedExceptionEntries computed error:', err)
-    return []
-  }
-})
-
-/** 老板往来小账本汇总：让老板一眼看懂确认后的应收、应付、可免税报销垫付款 */
-const bossLedgerSummary = computed(() => {
-  let customerOwes = 0
-  let customerCount = 0
-  let companyOwesSupplier = 0
-  let supplierCount = 0
-  let companyOwesBossAndEmp = 0
-  let bossOnly = 0
-  let empOnly = 0
-
-  for (const item of confirmedExceptionEntries.value) {
-    const amt = Math.abs(Number(item.amount) || 0)
-    const payer = String(item.payer || '')
-    const status = String(item.paymentStatus || '')
-    if (status === 'unpaid') {
-      if (item.direction === 'income') {
-        customerOwes += amt
-        customerCount += 1
-      } else if (item.direction === 'expense') {
-        companyOwesSupplier += amt
-        supplierCount += 1
-      }
-    } else if (item.direction === 'expense') {
-      if (payer === 'boss_personal') {
-        companyOwesBossAndEmp += amt
-        bossOnly += amt
-      } else if (payer.startsWith('employee_personal')) {
-        companyOwesBossAndEmp += amt
-        empOnly += amt
-      }
-    }
-  }
-  return {
-    customerOwes,
-    customerCount,
-    companyOwesSupplier,
-    supplierCount,
-    companyOwesBossAndEmp,
-    bossOnly,
-    empOnly,
-    hasAny: customerOwes > 0 || companyOwesSupplier > 0 || companyOwesBossAndEmp > 0
-  }
-})
-
-const pendingInvoiceList = computed(() =>
-  pendingEntryList.value.filter((entry: any) => entry.source === 'invoice_import' || !!entry.invoiceNumber)
-)
-
-const unpaidInvoiceCount = computed(() =>
-  invoicesList.value.filter((inv: any) => isNonBankSettledEntry(inv)).length
-)
-
-async function handleMatchInvoiceDirect(stmt: any, invoice: any) {
-  quickSubmittingId.value = stmt.id
-  try {
-    await backfillConfirm.withBackfill((allowBackfill, backfillReason) =>
-      apiClient.post('/api/bank/confirm-suggestion', {
-        statement_id: stmt.id,
-        type: 'match',
-        matched_entry_ids: [invoice.id],
-        allowBackfill,
-        backfillReason,
-      })
-    )
-    message.success(`已关联发票并完成核对：「${invoice.title}」`)
-    await loadAllData()
-  } catch (err: any) {
-    if (isBackfillCancelled(err)) return
-    message.error(apiErrorMessage(err, '发票关联失败'))
-  } finally {
-    quickSubmittingId.value = null
-  }
-}
-
-const bossExpenseOptions = [
-  { label: '办公耗材 / 打印杂费', value: '办公费' },
-  { label: '信息服务 / 云服务器 / 软件', value: '信息技术服务费' },
-  { label: '请客吃饭 / 商务招待', value: '业务招待费' },
-  { label: '打车交通 / 差旅住宿', value: '差旅费' },
-  { label: '研发项目支出（需选项目）', value: '研发支出-费用化支出' },
-  { label: '采购款 / 原材料', value: '原材料采购' },
-  { label: '房租 / 物业 / 水电通讯', value: '租金物业' },
-  { label: '员工报销款 / 往来备用金', value: '其他应收款' },
-  { label: '还老板垫付款 / 股东往来', value: '股东垫付报销' },
-  { label: '税费缴纳（增值税/个税等）', value: '税费缴纳' },
-  { label: '银行手续费 / 转账费', value: '银行及金融手续费' },
-  { label: '其他日常支出', value: '其他支出' },
-]
-
-const bossIncomeOptions = [
-  { label: '微信支付结算（提现到账）', value: '微信支付结算' },
-  { label: '支付宝结算（提现到账）', value: '支付宝结算' },
-  { label: '主营业务收入（货款/服务费）', value: '主营业务收入' },
-  { label: '银行存款结息（利息收入）', value: '利息收入' },
-  { label: '实名认证打款 / 营业外收入', value: '营业外收入' },
-  { label: '股东投资款注入', value: '股东投入' },
-  { label: '其他业务收入', value: '其他业务收入' },
-]
 
 function nextStep() {
   if (currentStep.value === 2 && hasBlockingPayroll.value) {
@@ -2848,7 +918,6 @@ usePageRefresh(loadAllData)
                   <th style="text-align: right;">发票金额</th>
                   <th v-if="showInvoiceDetails" style="text-align: center; width: 130px;">入账模式</th>
                   <th style="text-align: center; width: 120px;">状态</th>
-                  <th style="text-align: center; width: 190px;">下一步</th>
                   <th v-if="showInvoiceDetails" style="text-align: center; width: 80px;">冲销 / 删除</th>
                 </tr>
               </thead>
@@ -2885,19 +954,6 @@ usePageRefresh(loadAllData)
                     <NTag v-else-if="inv.status === 'matched'" size="small" type="success" :bordered="false">已和公户对上</NTag>
                     <NTag v-else-if="inv.status === 'pending_confirmation'" size="small" type="info" :bordered="false">待确认</NTag>
                     <NTag v-else size="small" type="warning">还没和公户对上</NTag>
-                  </td>
-                  <td style="text-align: center;">
-                    <template v-if="!inv.is_archive_only && inv.status !== 'matched' && !isNonBankSettledEntry(inv)">
-                      <NButton size="tiny" type="primary" secondary @click="handleEntryPaid(inv)">已付款</NButton>
-                      <NButton size="tiny" text style="margin-left: 6px;" @click="markEntryUnpaid(inv)">未付款</NButton>
-                    </template>
-                    <NButton
-                      v-else-if="isNonBankSettledEntry(inv)"
-                      size="tiny"
-                      text
-                      @click="resetEntryDisposition(inv)"
-                    >重新确认</NButton>
-                    <span v-else class="invoice-no-action">—</span>
                   </td>
                   <td v-if="showInvoiceDetails" style="text-align: center;">
                     <NButton
@@ -3168,8 +1224,9 @@ usePageRefresh(loadAllData)
                 本次文件解析与导入成功
               </span>
               <span style="font-size: 12px; color: var(--solo-text-muted);">
-                已导入: <span style="color: var(--solo-income); font-weight: bold;">{{ bankUploadResult.imported }}</span> 条 | 
-                失败: <span style="color: var(--solo-expense); font-weight: bold;">{{ bankUploadResult.errors }}</span> 条
+                已导入: <span style="color: var(--solo-income); font-weight: bold;">{{ bankUploadResult.imported }}</span> 条 |
+                失败: <span style="color: var(--solo-expense); font-weight: bold;">{{ bankUploadResult.errors }}</span> 条<template v-if="bankUploadResult.skipped > 0"> |
+                跳过: <span style="color: #A05C10; font-weight: bold;">{{ bankUploadResult.skipped }}</span> 条（无有效交易日期）</template>
               </span>
             </div>
             
@@ -3225,7 +1282,13 @@ usePageRefresh(loadAllData)
                     <td>{{ stmt.description }}</td>
                     <td class="amount-cell" :class="stmt.amount >= 0 ? 'income' : 'expense'">{{ formatMoney(stmt.amount) }}</td>
                     <td style="text-align: center;">
-                      <NTag size="small" type="warning">待匹配</NTag>
+                      <NTooltip v-if="getAiSuggestion(stmt.id)?.type === 'match'" trigger="hover">
+                        <template #trigger>
+                          <NTag size="small" type="success" :bordered="false">已找到对应账目</NTag>
+                        </template>
+                        {{ getAiSuggestion(stmt.id)?.reason || '系统已匹配待确认账目，去下一步认领即可' }}
+                      </NTooltip>
+                      <NTag v-else size="small" type="warning">待匹配</NTag>
                     </td>
                   </tr>
                 </tbody>
@@ -3447,39 +1510,69 @@ usePageRefresh(loadAllData)
         </div>
 
         <!-- 老板往来小账本汇总：让老板一眼看懂确认后的应收、应付、可免税报销垫付款 -->
-        <div v-if="bossLedgerSummary.hasAny" class="boss-ledger-summary-bar" style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 18px;">
-          <div style="background: var(--solo-card-bg, #fff); border: 1px solid var(--solo-border, #e5e7eb); border-radius: 10px; padding: 12px 16px;">
-            <div style="font-size: 12px; color: var(--solo-text-muted); display: flex; align-items: center; gap: 4px;">
-              <i class="ri-hand-coin-line" style="color: var(--solo-income);"></i> 客户还欠公司（应收账款）
+        <div v-if="bossLedgerSummary.hasAny" class="boss-ledger-summary-bar">
+          <!-- 卡片 1: 客户还欠公司（应收账款） -->
+          <div
+            class="boss-ledger-card"
+            :class="{ clickable: bossLedgerSummary.customerOwes > 0 || bossLedgerSummary.customerCount > 0 }"
+            @click="(bossLedgerSummary.customerOwes > 0 || bossLedgerSummary.customerCount > 0) && openBossLedgerDetail('customer_owes')"
+          >
+            <div class="boss-ledger-card-header">
+              <span class="boss-ledger-card-title">
+                <i class="ri-hand-coin-line" style="color: var(--solo-income);"></i> 客户还欠公司（应收账款）
+              </span>
+              <span v-if="bossLedgerSummary.customerOwes > 0 || bossLedgerSummary.customerCount > 0" class="boss-ledger-card-link">
+                查看明细 <i class="ri-arrow-right-s-line"></i>
+              </span>
             </div>
-            <div style="font-size: 18px; font-weight: 700; color: var(--solo-text-primary); margin-top: 4px;">
+            <div class="boss-ledger-card-amount">
               {{ formatMoney(bossLedgerSummary.customerOwes) }}
             </div>
-            <div style="font-size: 11px; color: var(--solo-text-muted); margin-top: 2px;">
+            <div class="boss-ledger-card-meta">
               {{ bossLedgerSummary.customerCount > 0 ? `${bossLedgerSummary.customerCount} 张销项票待客户打款，回款时自动核销` : '本月无客户欠款' }}
             </div>
           </div>
 
-          <div style="background: var(--solo-card-bg, #fff); border: 1px solid var(--solo-border, #e5e7eb); border-radius: 10px; padding: 12px 16px;">
-            <div style="font-size: 12px; color: var(--solo-text-muted); display: flex; align-items: center; gap: 4px;">
-              <i class="ri-bill-line" style="color: #d97706;"></i> 公司还欠供应商（应付挂账）
+          <!-- 卡片 2: 公司还欠供应商（应付挂账） -->
+          <div
+            class="boss-ledger-card"
+            :class="{ clickable: bossLedgerSummary.companyOwesSupplier > 0 || bossLedgerSummary.supplierCount > 0 }"
+            @click="(bossLedgerSummary.companyOwesSupplier > 0 || bossLedgerSummary.supplierCount > 0) && openBossLedgerDetail('supplier_owes')"
+          >
+            <div class="boss-ledger-card-header">
+              <span class="boss-ledger-card-title">
+                <i class="ri-bill-line" style="color: #d97706;"></i> 公司还欠供应商（应付挂账）
+              </span>
+              <span v-if="bossLedgerSummary.companyOwesSupplier > 0 || bossLedgerSummary.supplierCount > 0" class="boss-ledger-card-link">
+                查看明细 <i class="ri-arrow-right-s-line"></i>
+              </span>
             </div>
-            <div style="font-size: 18px; font-weight: 700; color: var(--solo-text-primary); margin-top: 4px;">
+            <div class="boss-ledger-card-amount">
               {{ formatMoney(bossLedgerSummary.companyOwesSupplier) }}
             </div>
-            <div style="font-size: 11px; color: var(--solo-text-muted); margin-top: 2px;">
+            <div class="boss-ledger-card-meta">
               {{ bossLedgerSummary.supplierCount > 0 ? `${bossLedgerSummary.supplierCount} 张进项票未付款，后续公户打款时核销` : '本月无待付供应商款' }}
             </div>
           </div>
 
-          <div style="background: var(--solo-card-bg, #fff); border: 1px solid var(--solo-border, #e5e7eb); border-radius: 10px; padding: 12px 16px;">
-            <div style="font-size: 12px; color: var(--solo-text-muted); display: flex; align-items: center; gap: 4px;">
-              <i class="ri-user-heart-line" style="color: var(--solo-primary);"></i> 公司欠老板/员工（可免税报销提取）
+          <!-- 卡片 3: 公司欠老板/员工（可免税报销提取） -->
+          <div
+            class="boss-ledger-card"
+            :class="{ clickable: bossLedgerSummary.companyOwesBossAndEmp > 0 }"
+            @click="bossLedgerSummary.companyOwesBossAndEmp > 0 && openBossLedgerDetail('boss_and_emp')"
+          >
+            <div class="boss-ledger-card-header">
+              <span class="boss-ledger-card-title">
+                <i class="ri-user-heart-line" style="color: var(--solo-primary);"></i> 公司欠老板/员工（可免税报销提取）
+              </span>
+              <span v-if="bossLedgerSummary.companyOwesBossAndEmp > 0" class="boss-ledger-card-link">
+                查看明细 <i class="ri-arrow-right-s-line"></i>
+              </span>
             </div>
-            <div style="font-size: 18px; font-weight: 700; color: var(--solo-primary); margin-top: 4px;">
+            <div class="boss-ledger-card-amount" style="color: var(--solo-primary);">
               {{ formatMoney(bossLedgerSummary.companyOwesBossAndEmp) }}
             </div>
-            <div style="font-size: 11px; color: var(--solo-text-muted); margin-top: 2px;">
+            <div class="boss-ledger-card-meta">
               <template v-if="bossLedgerSummary.companyOwesBossAndEmp > 0">
                 老板垫付 {{ formatMoney(bossLedgerSummary.bossOnly) }} · 员工垫付 {{ formatMoney(bossLedgerSummary.empOnly) }}（公户有钱可随时转回私卡）
               </template>
@@ -3707,8 +1800,9 @@ usePageRefresh(loadAllData)
               </div>
             </div>
 
-            <!-- 方案与核算依据区 -->
-            <div class="reconcile-cell-plan">
+            <!-- 第二行：方案与核算依据 + 操作调整 -->
+            <div class="reconcile-row-detail">
+              <div class="reconcile-cell-plan">
               <!-- Case 1: 匹配记账单据 -->
               <div v-if="getAiSuggestion(stmt.id)?.type === 'match'" class="plan-badge match">
                 <i class="ri-link-m" style="font-size: 14px; color: var(--solo-primary);"></i>
@@ -3741,8 +1835,12 @@ usePageRefresh(loadAllData)
                 :class="isFallbackSuggestion(stmt) ? 'fallback' : 'standard'"
               >
                 <span class="plan-label">{{ isFallbackSuggestion(stmt) ? '系统兜底分类：' : '建议分类：' }}</span>
-                <strong class="plan-category">{{ getAiSuggestion(stmt.id)?.suggestedEntry?.category }}</strong>
-                
+                <strong class="plan-category">{{ effectiveSuggestion(stmt)?.suggestedEntry?.category }}</strong>
+                <span v-if="suggestionAccountPreview(stmt)" class="plan-account-preview">
+                  <i class="ri-arrow-right-line" style="font-size: 11px;"></i>
+                  {{ suggestionAccountPreview(stmt)!.name }} {{ suggestionAccountPreview(stmt)!.code }}
+                </span>
+
                 <NTooltip trigger="hover" placement="top" :style="{ maxWidth: '360px' }">
                   <template #trigger>
                     <span
@@ -3780,64 +1878,96 @@ usePageRefresh(loadAllData)
                 <i class="ri-question-line" style="font-size: 13px;"></i>
                 <span class="plan-label">待指定核算科目</span>
               </div>
-            </div>
 
-            <!-- 操作与调整区 -->
-            <div class="reconcile-cell-action">
-              <!-- 快捷选择科目 -->
-              <template v-if="!hasExistingEntrySuggestion(stmt)">
-                <NSelect
+              <!-- 模糊分类候选：正确科目取决于账外事实，展开候选由用户点选；问 AI 仅分析不代操作。
+                   必须放在 Case 链之后——中间插入 v-if 会截断 v-if/v-else 链，让「待指定核算科目」误显 -->
+              <div v-if="ambiguityGroupOf(stmt).length" class="plan-alternatives">
+                <button
+                  v-for="altCat in ambiguityGroupOf(stmt)"
+                  :key="altCat"
+                  type="button"
+                  class="plan-alt-chip"
+                  :class="{ selected: effectiveSuggestion(stmt)?.suggestedEntry?.category === altCat }"
+                  @click="rowCategoryChoice[stmt.id] = altCat"
+                >
+                  {{ altCat }}<span v-if="altAccountText(stmt, altCat)" class="plan-alt-account">{{ altAccountText(stmt, altCat) }}</span>
+                </button>
+                <button type="button" class="plan-ask-ai" @click="openAskAi(stmt)">
+                  <i class="ri-chat-sm-2-line" style="font-size: 12px;"></i> 问 AI
+                </button>
+              </div>
+              </div>
+
+              <!-- 操作与调整区 -->
+              <div class="reconcile-cell-action">
+                <!-- 快捷选择科目 -->
+                <template v-if="!hasExistingEntrySuggestion(stmt)">
+                  <NSelect
+                    size="small"
+                    class="reconcile-category-select"
+                    placeholder="换分类..."
+                    :options="stmt.amount >= 0 ? bossIncomeOptions : bossExpenseOptions"
+                    :disabled="quickSubmittingId === stmt.id"
+                    @update:value="(val: string) => handleQuickSelectCategory(stmt, val)"
+                  />
+                </template>
+
+                <!-- 主确认按钮 -->
+                <NButton
+                  v-if="getAiSuggestion(stmt.id)?.type === 'match'"
                   size="small"
-                  class="reconcile-category-select"
-                  placeholder="调整科目..."
-                  :options="stmt.amount >= 0 ? bossIncomeOptions : bossExpenseOptions"
-                  :disabled="quickSubmittingId === stmt.id"
-                  @update:value="(val: string) => handleQuickSelectCategory(stmt, val)"
-                />
-              </template>
+                  type="primary"
+                  secondary
+                  :loading="quickSubmittingId === stmt.id"
+                  @click="handleAcceptSuggested(stmt)"
+                >
+                  确认配对
+                </NButton>
+                <NButton
+                  v-else-if="findMatchingInvoiceForStatement(stmt)"
+                  size="small"
+                  type="primary"
+                  secondary
+                  :loading="quickSubmittingId === stmt.id"
+                  @click="handleMatchInvoiceDirect(stmt, findMatchingInvoiceForStatement(stmt)!)"
+                >
+                  关联发票
+                </NButton>
+                <NButton
+                  v-else-if="getAiSuggestion(stmt.id)?.suggestedEntry?.category"
+                  size="small"
+                  type="primary"
+                  :loading="quickSubmittingId === stmt.id"
+                  @click="handleAcceptSuggested(stmt)"
+                >
+                  <template #icon><i class="ri-check-line" /></template>
+                  {{ isFallbackSuggestion(stmt) ? '按此入账' : '认可入账' }}
+                </NButton>
 
-              <!-- 主确认按钮 -->
-              <NButton
-                v-if="getAiSuggestion(stmt.id)?.type === 'match'"
-                size="small"
-                type="primary"
-                secondary
-                :loading="quickSubmittingId === stmt.id"
-                @click="handleAcceptSuggested(stmt)"
-              >
-                确认配对
-              </NButton>
-              <NButton
-                v-else-if="findMatchingInvoiceForStatement(stmt)"
-                size="small"
-                type="primary"
-                secondary
-                :loading="quickSubmittingId === stmt.id"
-                @click="handleMatchInvoiceDirect(stmt, findMatchingInvoiceForStatement(stmt)!)"
-              >
-                关联发票
-              </NButton>
-              <NButton
-                v-else-if="getAiSuggestion(stmt.id)?.suggestedEntry?.category"
-                size="small"
-                type="primary"
-                :loading="quickSubmittingId === stmt.id"
-                @click="handleAcceptSuggested(stmt)"
-              >
-                <template #icon><i class="ri-check-line" /></template>
-                {{ isFallbackSuggestion(stmt) ? '按此入账' : '认可入账' }}
-              </NButton>
+                <!-- 详细记账：完整表单（改标题/研发明细/二级科目），非配对场景的次级入口 -->
+                <NButton
+                  v-if="!hasExistingEntrySuggestion(stmt)"
+                  size="small"
+                  quaternary
+                  class="reconcile-detail-btn"
+                  @click="openManualClassify(stmt, getAiSuggestion(stmt.id)?.suggestedEntry)"
+                >
+                  <template #icon><i class="ri-edit-line" /></template>
+                  详细记账
+                </NButton>
 
-              <!-- 次级操作/手动核算 -->
-              <NButton
-                size="small"
-                quaternary
-                class="reconcile-detail-btn"
-                @click="openManualClassify(stmt, getAiSuggestion(stmt.id)?.suggestedEntry)"
-              >
-                <template #icon><i :class="hasExistingEntrySuggestion(stmt) ? 'ri-link-m' : 'ri-edit-line'" /></template>
-                {{ hasExistingEntrySuggestion(stmt) ? '核对已有账目' : '核算明细' }}
-              </NButton>
+                <!-- 已有账目待配对：唯一入口（此时下拉已隐藏） -->
+                <NButton
+                  v-if="hasExistingEntrySuggestion(stmt)"
+                  size="small"
+                  quaternary
+                  class="reconcile-detail-btn"
+                  @click="openManualClassify(stmt, getAiSuggestion(stmt.id)?.suggestedEntry)"
+                >
+                  <template #icon><i class="ri-link-m" /></template>
+                  核对已有账目
+                </NButton>
+              </div>
             </div>
           </div>
         </div>
@@ -3858,21 +1988,23 @@ usePageRefresh(loadAllData)
                       {{ stmt.amount >= 0 ? '+' : '' }}{{ formatMoney(stmt.amount) }}
                     </div>
                   </div>
-                  <div class="reconcile-cell-plan">
-                    <span class="plan-label" style="font-size: 12px; color: var(--solo-text-muted);">往期未结流水，确认补记期间后入账</span>
-                  </div>
-                  <div class="reconcile-cell-action">
-                    <NSelect
-                      size="small"
-                      class="reconcile-category-select"
-                      placeholder="补记归类入账..."
-                      :options="stmt.amount >= 0 ? bossIncomeOptions : bossExpenseOptions"
-                      @update:value="(val: string) => handleQuickSelectCategory(stmt, val)"
-                    />
-                    <NButton size="small" quaternary class="reconcile-detail-btn" @click="openManualClassify(stmt)">
-                      <template #icon><i class="ri-edit-line" /></template>
-                      详情记账
-                    </NButton>
+                  <div class="reconcile-row-detail">
+                    <div class="reconcile-cell-plan">
+                      <span class="plan-label" style="font-size: 12px; color: var(--solo-text-muted);">往期未结流水，确认补记期间后入账</span>
+                    </div>
+                    <div class="reconcile-cell-action">
+                      <NSelect
+                        size="small"
+                        class="reconcile-category-select"
+                        placeholder="补记归类入账..."
+                        :options="stmt.amount >= 0 ? bossIncomeOptions : bossExpenseOptions"
+                        @update:value="(val: string) => handleQuickSelectCategory(stmt, val)"
+                      />
+                      <NButton size="small" quaternary class="reconcile-detail-btn" @click="openManualClassify(stmt)">
+                        <template #icon><i class="ri-edit-line" /></template>
+                        详情记账
+                      </NButton>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -3932,6 +2064,30 @@ usePageRefresh(loadAllData)
               </div>
             </div>
 
+            <!-- 五项核对常显条：关账前先看这五项，细节仍可在下方折叠清单展开 -->
+            <div class="five-check-strip" role="group" aria-label="五项核对">
+              <div class="five-check-strip-head">
+                <span>五项核对</span>
+                <small v-if="!isZeroRecordMonth && otherReadinessPending > 0">另有 {{ otherReadinessPending }} 项准备项待处理</small>
+                <small v-else>{{ isZeroRecordMonth ? '本月无业务记录' : '结账前自动核验' }}</small>
+              </div>
+              <div class="five-check-chips">
+                <div
+                  v-for="item in fiveCheckItems"
+                  :key="item.code"
+                  class="five-check-chip"
+                  :class="item.status"
+                  :title="item.detail"
+                >
+                  <span class="five-check-chip-icon"><i :class="readinessStatusIcon(item.status)" /></span>
+                  <span class="five-check-chip-copy">
+                    <strong>{{ item.label }}</strong>
+                    <small>{{ isZeroRecordMonth ? '本月无记录' : readinessStatusLabel(item.status) }}</small>
+                  </span>
+                </div>
+              </div>
+            </div>
+
             <!-- 零业务/未记账提示横幅 -->
             <div v-if="isZeroRecordMonth" class="zero-record-card mb-4">
               <div class="zero-record-head">
@@ -3985,10 +2141,10 @@ usePageRefresh(loadAllData)
                     type="primary"
                     secondary
                     :loading="batchPostingLoading"
-                    @click="handleBatchPostMonth"
+                    @click="openBatchPostConfirm"
                   >
                     <template #icon><i class="ri-check-double-line" /></template>
-                    批量过账本月凭证
+                    去批量过账
                   </NButton>
                   <NButton
                     v-for="action in task.actions"
@@ -4061,9 +2217,9 @@ usePageRefresh(loadAllData)
               </NAlert>
             </div>
 
-            <!-- 五项核验详细状态（原检查框架，折叠保留） -->
+            <!-- 全部核验明细（五项已在顶部常显，这里补充折旧、摊销、工资、关账顺序等准备项） -->
             <NCollapse class="readiness-detail-collapse mb-4">
-              <NCollapseItem title="展开专业核验明细（凭证与来源 / 账账核对 / 银行流水核对 / 账表核对 / 申报校验）" name="checks">
+              <NCollapseItem title="展开全部核验明细（含折旧、摊销、工资、关账顺序）" name="checks">
             <div class="readiness-list" aria-label="结账准备清单">
               <div
                 v-for="item in readinessItems"
@@ -4150,6 +2306,14 @@ usePageRefresh(loadAllData)
             <p v-if="closingVoucherRefs.length" class="ceremony-vouchers">
               本次自动生成期末损益结转凭证：{{ closingVoucherRefs.join('、') }}（已纳入凭证归档）
             </p>
+            <div v-if="vatExemptAmount > 0" class="ceremony-vat-exempt mb-2">
+              <i class="ri-shield-star-line" />
+              <span>
+                <strong>小微免税达成：</strong>
+                本季度销售额符合免税政策，已自动为您减免增值税 <strong>{{ formatMoney(vatExemptAmount) }}</strong> 并结转至营业外收入。
+                <span v-if="vatExemptVoucherRefs.length">（免税凭证号：{{ vatExemptVoucherRefs.join('、') }}）</span>
+              </span>
+            </div>
             <p class="ceremony-book-hint">
               <i class="ri-book-2-line"></i>
               本期账簿已可导出：<a class="book-link" @click="router.push(`/ledger/book?month=${targetMonth}`)">电子账簿（余额表、明细账、日记账、总账）</a>
@@ -4178,20 +2342,37 @@ usePageRefresh(loadAllData)
           </div>
         </NCard>
 
-        <!-- AI Virtual CFO Comment -->
+        <!-- AI Virtual CFO Comment：按需手动生成（每次点击是一次 LLM 调用） -->
         <NCard :bordered="false" class="report-card mb-4 cfo-diagnosis-card" style="padding: 16px 20px;">
           <h3 class="report-section-title" style="margin: 0 0 12px; color: var(--solo-primary);">
             <i class="ri-robot-2-line"></i> AI CFO 月度深度诊断点评
           </h3>
-          <div style="font-size: 13.5px; line-height: 1.8; color: var(--solo-text-primary); margin: 0; text-align: justify; white-space: pre-wrap;">
-            {{ cfoDiagnosis?.diagnosis || '暂未生成诊断点评。' }}
+          <div v-if="!cfoDiagnosis" style="display: flex; align-items: center; gap: 10px; font-size: 13.5px; color: var(--solo-text-secondary);">
+            <template v-if="diagnosisLoading">
+              <NSpin size="small" />
+              <span>正在生成 AI 诊断（约需十几秒）…</span>
+            </template>
+            <template v-else>
+              <NButton type="primary" secondary size="small" @click="generateDiagnosis">✨ 生成 AI 诊断</NButton>
+              <span>按需生成，点击后调用 AI 分析本月经营数据</span>
+            </template>
           </div>
-          <div v-if="cfoDiagnosis?.urgentActions?.length" style="margin-top: 16px;">
-            <div style="font-size: 13px; font-weight: bold; color: var(--solo-expense); margin-bottom: 8px;">⚠️ 紧急关注事项：</div>
-            <ul style="margin: 0; padding-left: 20px; font-size: 13px; color: var(--solo-text-primary); line-height: 1.6;">
-              <li v-for="(act, idx) in cfoDiagnosis.urgentActions" :key="idx">{{ act }}</li>
-            </ul>
-          </div>
+          <template v-else>
+            <div style="font-size: 13.5px; line-height: 1.8; color: var(--solo-text-primary); margin: 0; text-align: justify; white-space: pre-wrap;">
+              {{ cfoDiagnosis?.diagnosis || '暂未生成诊断点评。' }}
+            </div>
+            <div v-if="cfoDiagnosis?.urgentActions?.length" style="margin-top: 16px;">
+              <div style="font-size: 13px; font-weight: bold; color: var(--solo-expense); margin-bottom: 8px;">⚠️ 紧急关注事项：</div>
+              <ul style="margin: 0; padding-left: 20px; font-size: 13px; color: var(--solo-text-primary); line-height: 1.6;">
+                <li v-for="(act, idx) in cfoDiagnosis.urgentActions" :key="idx">{{ act }}</li>
+              </ul>
+            </div>
+            <div style="margin-top: 12px;">
+              <NButton text size="tiny" :disabled="diagnosisLoading" @click="generateDiagnosis">
+                {{ diagnosisLoading ? '重新生成中…' : '↻ 重新生成' }}
+              </NButton>
+            </div>
+          </template>
         </NCard>
 
         <!-- 季末结账接力：直达税务申报作业包 -->
@@ -4245,54 +2426,8 @@ usePageRefresh(loadAllData)
         </NButton>
       </div>
     </div>
-    <!-- ── Reopen Period Dialog ──────────────────────────────────── -->
-    <NModal
-      v-model:show="reopenVisible"
-      :mask-closable="true"
-      style="width: 480px; max-width: 96vw;"
-      :auto-focus="false"
-    >
-      <div class="manual-dialog reopen-dialog">
-        <div class="manual-dialog-header">
-          <div class="manual-dialog-icon reopen-icon"><i class="ri-lock-unlock-line"></i></div>
-          <div>
-            <div class="manual-dialog-title">反结账 {{ targetMonth }}</div>
-            <div class="manual-dialog-subtitle">解锁本期账册，补记或更正后需重新结账</div>
-          </div>
-        </div>
-
-        <div class="reopen-warning">
-          <i class="ri-error-warning-line"></i>
-          <span>反结账将自动红冲本期的期末损益结转凭证并解锁账册；如后续月份已关账，需先反结账最新月份。反结账原因将留痕。</span>
-        </div>
-
-        <div class="reopen-field">
-          <label>反结账原因（必填）</label>
-          <NInput
-            v-model:value="reopenReason"
-            type="textarea"
-            :autosize="{ minRows: 2, maxRows: 4 }"
-            placeholder="例如：补记遗漏的银行手续费"
-          />
-        </div>
-
-        <div class="reopen-field">
-          <label>安全验证（仅账套所有者可反结账）</label>
-          <div class="reopen-verify">
-            <NInput v-model:value="reopenPhone" placeholder="绑定手机号" />
-            <NInput v-model:value="reopenCode" placeholder="短信验证码" />
-            <NButton size="small" :loading="reopenSending" @click="sendReopenCode">发送验证码</NButton>
-          </div>
-        </div>
-
-        <div class="reopen-actions">
-          <NButton size="small" @click="reopenVisible = false">取消</NButton>
-          <NButton size="small" type="warning" :loading="reopenSubmitting" @click="submitReopen">
-            确认反结账
-          </NButton>
-        </div>
-      </div>
-    </NModal>
+    <!-- ── Reopen Period Dialog（已拆入 ReopenPeriodDialog.vue） ────── -->
+    <ReopenPeriodDialog v-model:show="reopenVisible" :month="targetMonth" @reopened="handleReopened" />
 
     <!-- ── Manual Classify Dialog ─────────────────────────────────── -->
     <NModal
@@ -4493,8 +2628,12 @@ usePageRefresh(loadAllData)
             <NSelect
               v-model:value="pairCategoryForm.categoryValue"
               :options="CATEGORY_OPTIONS"
-              placeholder="请选择科目分类"
+              placeholder="输入关键字搜索分类 / 科目名 / 代码"
+              filterable
+              :filter="filterCategory"
+              :render-option="renderCategoryOption"
               :render-label="(opt: any) => opt.disabled ? opt.label : `${opt.label}`"
+              :virtual-scroll="false"
             />
             <div v-if="pairCategoryForm.categoryValue && !pairCategoryForm.categoryValue.startsWith('__')" class="manual-account-preview">
               <span>科目代码：<b>{{ pairCategoryForm.categoryValue.split('|')[2] }}</b></span>
@@ -4546,6 +2685,134 @@ usePageRefresh(loadAllData)
       </div>
     </NModal>
 
+    <!-- 修改草稿凭证：过账前发现分类/标题不对可就地改 -->
+    <NModal
+      v-model:show="showEditVoucherDialog"
+      :mask-closable="true"
+      style="width: 460px; max-width: 96vw;"
+      :auto-focus="false"
+    >
+      <div class="manual-dialog">
+        <div class="manual-dialog-header">
+          <div class="manual-dialog-icon"><i class="ri-edit-line"></i></div>
+          <div>
+            <div class="manual-dialog-title">修改凭证</div>
+            <div class="manual-dialog-subtitle">{{ currentVoucherEntry?.voucherRef || currentVoucherEntry?.title || '凭证' }}</div>
+          </div>
+        </div>
+
+        <div class="manual-form">
+          <div class="manual-form-item">
+            <label class="manual-form-label">账目标题 <span style="color: var(--solo-expense);">*</span></label>
+            <NInput v-model:value="editVoucherForm.title" placeholder="请输入账目标题" maxlength="50" show-count />
+          </div>
+          <div class="manual-form-item">
+            <label class="manual-form-label">账目分类 <span style="color: var(--solo-expense);">*</span></label>
+            <NSelect
+              v-model:value="editVoucherForm.categoryValue"
+              :options="CATEGORY_OPTIONS"
+              placeholder="请选择科目分类"
+              :render-label="(opt: any) => opt.disabled ? opt.label : `${opt.label}`"
+            />
+            <div v-if="editVoucherForm.categoryValue && !editVoucherForm.categoryValue.startsWith('__')" class="manual-account-preview">
+              <span>科目代码：<b>{{ editVoucherForm.categoryValue.split('|')[2] }}</b></span>
+              <span style="margin-left: 12px;">科目名称：<b>{{ editVoucherForm.categoryValue.split('|')[3] }}</b></span>
+            </div>
+          </div>
+          <div v-if="isRdCategoryValue(editVoucherForm.categoryValue)" class="manual-form-item">
+            <label class="manual-form-label">研发归集 <span style="color: var(--solo-expense);">*</span></label>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+              <NSelect v-model:value="editVoucherForm.rdProjectId" :options="rdProjectOptions" placeholder="选择研发项目" filterable />
+              <NSelect v-model:value="editVoucherForm.rdExpenseType" :options="rdExpenseTypeOptions" placeholder="选择费用类别" />
+            </div>
+            <NInput v-model:value="editVoucherForm.rdAllocationBasis" style="margin-top: 10px;" placeholder="分摊依据（直接归集可选）" maxlength="200" />
+          </div>
+        </div>
+
+        <div class="manual-dialog-actions">
+          <NButton @click="showEditVoucherDialog = false">取消</NButton>
+          <NButton
+            type="primary"
+            :loading="editVoucherSaving"
+            :disabled="!editVoucherForm.title.trim() || !editVoucherForm.categoryValue || editVoucherForm.categoryValue.startsWith('__') || (isRdCategoryValue(editVoucherForm.categoryValue) && (!editVoucherForm.rdProjectId || !editVoucherForm.rdExpenseType))"
+            @click="saveEditVoucher"
+          >
+            <template #icon><i class="ri-check-line" /></template>
+            保存修改
+          </NButton>
+        </div>
+      </div>
+    </NModal>
+
+    <!-- 行内问 AI（已拆入 AskAiPanel.vue）：上下文由父页组装，结论落地走 handleAskAiAccept -->
+    <AskAiPanel
+      v-model:show="askAiVisible"
+      :stmt="askAiStmt"
+      :stmt-title="askAiStmt ? cleanStatementTitle(askAiStmt) : ''"
+      :prompt="askAiPrompt"
+      :candidate-lines="askAiCandidateLines"
+      :fallback-category="askAiStmt ? (effectiveSuggestion(askAiStmt)?.suggestedEntry?.category || '') : ''"
+      :confirming="!!askAiStmt && quickSubmittingId === askAiStmt.id"
+      @accept="handleAskAiAccept"
+    />
+
+    <!-- 批量过账确认：列凭证明细 + 说明后果 + 取消/确认 -->
+    <NModal v-model:show="batchPostConfirmVisible" style="width: 540px; max-width: 96vw;">
+      <div class="batch-post-confirm">
+        <div class="batch-post-confirm-header">
+          <i class="ri-check-double-line"></i>
+          <h3>确认过账 {{ batchPostEntries.length }} 张凭证</h3>
+        </div>
+        <div class="batch-post-confirm-tip">
+          过账 = 把这 {{ batchPostEntries.length }} 张草稿正式记入账簿。之后它们才会参与报表、无形资产摊销、固定资产折旧和银行配对；过账后不能单张撤销，要改只能整月反结账。
+        </div>
+        <div class="batch-post-confirm-list">
+          <div v-for="e in batchPostEntries" :key="e.id" class="batch-post-confirm-row">
+            <div class="batch-post-confirm-main">
+              <span class="batch-post-confirm-title">{{ e.title }}</span>
+              <span class="batch-post-confirm-cat">{{ e.category }}<em v-if="e.accountName"> · {{ e.accountName }}</em></span>
+            </div>
+            <span class="batch-post-confirm-amt" :class="e.direction === 'income' ? 'income' : 'expense'">
+              {{ e.direction === 'income' ? '+' : '-' }}{{ formatMoney(e.amount) }}
+            </span>
+          </div>
+        </div>
+        <div class="batch-post-confirm-footer">
+          <NButton size="small" quaternary @click="startWalkthroughFromConfirm">
+            <template #icon><i class="ri-list-check-2"></i></template>
+            逐笔过账
+          </NButton>
+          <div style="flex: 1;"></div>
+          <NButton size="small" @click="batchPostConfirmVisible = false">取消</NButton>
+          <NButton size="small" type="primary" :loading="batchPostingLoading" @click="confirmBatchPost">
+            确认过账 {{ batchPostEntries.length }} 张
+          </NButton>
+        </div>
+      </div>
+    </NModal>
+
+    <!-- 银行余额核对明细：让「查看核对明细」真正展示差额 -->
+    <NModal v-model:show="showBankBalanceDetail" preset="card" title="银行余额核对明细" style="max-width: 540px;">
+      <div v-if="bankBalanceRecon && bankBalanceRecon.has_data">
+        <div class="bank-balance-line"><span>期初余额</span><b>{{ bankBalanceRecon.opening_balance }}</b></div>
+        <div class="bank-balance-line"><span>＋ 流入（收到的钱）</span><b>{{ bankBalanceRecon.income_total }}</b></div>
+        <div class="bank-balance-line"><span>－ 流出（花掉的钱）</span><b>{{ bankBalanceRecon.expense_total }}</b></div>
+        <div class="bank-balance-line"><span>＝ 应该有的期末余额</span><b>{{ bankBalanceRecon.calculated_closing_balance }}</b></div>
+        <div class="bank-balance-line"><span>银行流水上的期末余额</span><b>{{ bankBalanceRecon.bank_closing_balance }}</b></div>
+        <div v-if="Number(bankBalanceRecon.flow_difference) !== 0" class="bank-balance-warn">
+          ⚠ 差了 {{ bankBalanceRecon.flow_difference }}——流水可能漏导了几笔，或某笔的金额/余额列、期初余额填错了。
+        </div>
+        <div class="bank-balance-line" style="margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--solo-border-light);">
+          <span>账面上记录的银行存款</span><b>{{ bankBalanceRecon.book_bank_balance }}</b>
+        </div>
+        <div class="bank-balance-line"><span>银行实际期末余额</span><b>{{ bankBalanceRecon.bank_closing_balance }}</b></div>
+        <div v-if="Number(bankBalanceRecon.book_difference) !== 0" class="bank-balance-warn">
+          ⚠ 差了 {{ bankBalanceRecon.book_difference }}——账面和银行对不上；凭证还没过账会少算，过账后一般会平。
+        </div>
+      </div>
+      <div v-else>暂无流水余额数据。</div>
+    </NModal>
+
     <!-- ── In-place Voucher Details Modal (ponytail: zero-redirect inspection) ── -->
     <NModal
       v-model:show="showVoucherModal"
@@ -4569,6 +2836,12 @@ usePageRefresh(loadAllData)
             </div>
             <div class="manual-dialog-subtitle">{{ currentVoucherEntry?.title || '凭证分录与来源检查' }}</div>
           </div>
+        </div>
+
+        <div v-if="batchPostWalkthrough" class="walkthrough-progress">
+          <i class="ri-guide-line"></i>
+          逐笔过账中 · 第 {{ batchPostWalkthroughTotal - batchPostEntries.length + 1 }} / {{ batchPostWalkthroughTotal }} 笔
+          <span class="walkthrough-progress-hint">过账后自动进入下一笔</span>
         </div>
 
         <NSpin :show="voucherModalLoading">
@@ -4660,6 +2933,14 @@ usePageRefresh(loadAllData)
               <NButton size="small" @click="showVoucherModal = false">关闭</NButton>
               <NButton
                 v-if="currentVoucherEntry && currentVoucherEntry.voucherStatus !== 'posted'"
+                size="small"
+                @click="openEditVoucher"
+              >
+                <template #icon><i class="ri-edit-line" /></template>
+                修改
+              </NButton>
+              <NButton
+                v-if="currentVoucherEntry && currentVoucherEntry.voucherStatus !== 'posted'"
                 type="primary"
                 size="small"
                 :loading="voucherPostingLoading"
@@ -4712,6 +2993,106 @@ usePageRefresh(loadAllData)
         </div>
       </template>
     </NModal>
+
+    <!-- 往来款项明细穿透抽屉 (方案 B: 结账上下文穿透 + 外部业务台账直达) -->
+    <SoloDrawer
+      v-model:show="showBossLedgerDrawer"
+      :title="currentBossLedgerDetail?.title || '款项明细'"
+      :width="600"
+    >
+      <div v-if="currentBossLedgerDetail" class="boss-ledger-drawer-content">
+        <!-- 统计与说明 Banner -->
+        <div class="boss-ledger-drawer-banner">
+          <div class="boss-ledger-drawer-amount-row">
+            <div>
+              <div class="drawer-amount-label">本月汇总金额</div>
+              <div class="drawer-amount-value" :style="{ color: currentBossLedgerDetail.type === 'boss_and_emp' ? 'var(--solo-primary)' : 'var(--solo-text-primary)' }">
+                {{ formatMoney(currentBossLedgerDetail.amount) }}
+              </div>
+            </div>
+            <NTag size="medium" :bordered="false" type="info">
+              共 {{ currentBossLedgerDetail.entries.length }} 笔单据
+            </NTag>
+          </div>
+
+          <div v-if="currentBossLedgerDetail.type === 'boss_and_emp' && currentBossLedgerDetail.amount > 0" class="drawer-breakdown-row">
+            <span>老板垫付：<strong>{{ formatMoney(currentBossLedgerDetail.bossOnly) }}</strong></span>
+            <span class="breakdown-divider">·</span>
+            <span>员工垫付：<strong>{{ formatMoney(currentBossLedgerDetail.empOnly) }}</strong></span>
+          </div>
+
+          <div class="drawer-tip-box">
+            <i class="ri-information-line"></i>
+            <span>{{ currentBossLedgerDetail.tip }}</span>
+          </div>
+        </div>
+
+        <!-- 单据列表 -->
+        <div class="boss-ledger-drawer-list-header">
+          <span>包含单据明细</span>
+          <span style="font-size: 12px; color: var(--solo-text-muted);">可点击凭证查看借贷科目或重新指定去向</span>
+        </div>
+
+        <div v-if="currentBossLedgerDetail.entries.length === 0" style="padding: 30px 0;">
+          <SoloEmpty description="暂无相关款项单据" />
+        </div>
+
+        <div v-else class="boss-ledger-drawer-entries">
+          <div
+            v-for="entry in currentBossLedgerDetail.entries"
+            :key="entry.id"
+            class="drawer-entry-card"
+          >
+            <div class="drawer-entry-main">
+              <div class="drawer-entry-header-line">
+                <NTag size="small" :bordered="false" :type="entry.direction === 'income' ? 'success' : 'warning'">
+                  {{ entry.source === 'invoice_import' || entry.invoiceNumber ? (entry.direction === 'income' ? '销项发票' : '进项发票') : (entry.direction === 'income' ? '日常收入' : '日常支出') }}
+                </NTag>
+                <span class="drawer-entry-date">{{ entry.date }}</span>
+                <strong class="drawer-entry-title" :title="entry.title">{{ entry.title }}</strong>
+                <NTag size="small" type="success" :bordered="false" style="margin-left: 4px;">
+                  {{ formatDispositionTag(entry) }}
+                </NTag>
+              </div>
+              <div class="drawer-entry-meta-line">
+                <span class="drawer-entry-category">{{ entry.category || '日常经营' }}</span>
+                <span class="drawer-entry-explanation">
+                  · {{ formatDispositionExplanation(entry) }}
+                </span>
+              </div>
+            </div>
+            <div class="drawer-entry-side">
+              <div class="drawer-entry-amount" :class="entryIsOutflow(entry) ? 'expense' : 'income'">
+                {{ entryIsOutflow(entry) ? '-' : '+' }}{{ formatMoney(Math.abs(Number(entry.amount) || 0)) }}
+              </div>
+              <div class="drawer-entry-actions">
+                <NButton size="tiny" secondary type="primary" @click="openVoucherModal(entry.id)">
+                  查看凭证
+                </NButton>
+                <NButton size="tiny" text @click="resetEntryDisposition(entry)">
+                  重新选择
+                </NButton>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <template #footer>
+        <div style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
+          <NButton
+            v-if="currentBossLedgerDetail?.targetRoute"
+            type="primary"
+            secondary
+            @click="handleGoToTarget(currentBossLedgerDetail.targetRoute, currentBossLedgerDetail.targetQuery)"
+          >
+            {{ currentBossLedgerDetail.targetLabel }}
+          </NButton>
+          <div v-else></div>
+          <NButton @click="showBossLedgerDrawer = false">关闭</NButton>
+        </div>
+      </template>
+    </SoloDrawer>
   </div>
 </template>
 
@@ -4822,58 +3203,13 @@ usePageRefresh(loadAllData)
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.18);
 }
 
-/* Reopen Period Dialog + completion voucher note */
-.reopen-icon {
-  background: rgba(240, 153, 123, 0.12);
-  color: #d85a30;
-}
+/* completion voucher note */
 
-.reopen-warning {
-  display: flex;
-  gap: 8px;
-  align-items: flex-start;
-  background: rgba(230, 162, 60, 0.08);
-  border: 1px solid rgba(230, 162, 60, 0.25);
-  border-radius: 8px;
-  padding: 10px 12px;
-  font-size: 12.5px;
-  line-height: 1.6;
-  color: var(--solo-text-secondary, #586474);
-  margin-bottom: 16px;
-}
 
-.reopen-warning i {
-  color: #ba7517;
-  font-size: 15px;
-  flex-shrink: 0;
-  margin-top: 2px;
-}
 
-.reopen-field {
-  margin-bottom: 14px;
-}
 
-.reopen-field > label {
-  display: block;
-  font-size: 12.5px;
-  font-weight: 500;
-  color: var(--solo-text-primary);
-  margin-bottom: 6px;
-}
 
-.reopen-verify {
-  display: grid;
-  grid-template-columns: 1fr 1fr auto;
-  gap: 8px;
-  align-items: center;
-}
 
-.reopen-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-  margin-top: 18px;
-}
 
 .reopen-entry {
   display: flex;
@@ -4892,6 +3228,21 @@ usePageRefresh(loadAllData)
   margin: 8px 0 0;
   font-size: 12.5px;
   color: var(--solo-text-secondary);
+}
+.ceremony-vat-exempt {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-radius: 8px;
+  background: rgba(15, 115, 84, 0.08);
+  border: 1px solid rgba(15, 115, 84, 0.2);
+  color: var(--solo-income, #0f7354);
+  font-size: 13px;
+  margin-top: 8px;
+}
+.ceremony-vat-exempt strong {
+  font-weight: 600;
 }
 /* F4：结账完成页引导到电子账簿（账簿的读者是会计/税务，给入口不给老板视图） */
 .ceremony-book-hint {
@@ -5222,6 +3573,128 @@ usePageRefresh(loadAllData)
   margin: 6px 0 0;
   color: var(--solo-text-secondary);
   font-size: 14px;
+}
+
+.five-check-strip {
+  margin: 0 0 20px;
+}
+
+.five-check-strip-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.five-check-strip-head span {
+  color: var(--solo-text-primary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.five-check-strip-head small {
+  color: var(--solo-text-muted);
+  font-size: 12px;
+}
+
+.five-check-chips {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.five-check-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--solo-border);
+  border-radius: 10px;
+  background: var(--solo-bg-soft);
+  transition: background-color 180ms ease, border-color 180ms ease;
+}
+
+.five-check-chip-icon {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--solo-bg-card);
+  color: var(--solo-text-muted);
+  font-size: 14px;
+}
+
+.five-check-chip-copy {
+  min-width: 0;
+}
+
+.five-check-chip-copy strong,
+.five-check-chip-copy small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.five-check-chip-copy strong {
+  color: var(--solo-text-primary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.five-check-chip-copy small {
+  margin-top: 1px;
+  color: var(--solo-text-secondary);
+  font-size: 12px;
+}
+
+.five-check-chip.complete {
+  background: var(--solo-income-soft);
+}
+
+.five-check-chip.complete .five-check-chip-icon {
+  color: var(--solo-income);
+}
+
+.five-check-chip.complete .five-check-chip-copy small {
+  color: var(--solo-income);
+}
+
+.five-check-chip.blocked,
+.five-check-chip.needs_review {
+  background: var(--solo-warning-soft);
+}
+
+.five-check-chip.blocked .five-check-chip-icon,
+.five-check-chip.needs_review .five-check-chip-icon {
+  color: var(--solo-warning);
+}
+
+.five-check-chip.blocked .five-check-chip-copy small,
+.five-check-chip.needs_review .five-check-chip-copy small {
+  color: var(--solo-warning);
+}
+
+@media (max-width: 900px) {
+  .five-check-chips {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 520px) {
+  .five-check-chips {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .five-check-chip {
+    transition: none;
+  }
 }
 
 .readiness-list {
@@ -5565,15 +4038,25 @@ usePageRefresh(loadAllData)
 
 /* 商业化紧凑型对账行 (Compact Reconcile Row) */
 .reconcile-row {
+  /* 两行布局：第一行事实（勾选/摘要/金额），第二行决策（建议分类+操作） */
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
   padding: 8px 14px;
   background: var(--solo-bg-card);
   border: 1px solid var(--solo-border-light);
   border-radius: 8px;
   transition: all 0.2s ease;
+}
+
+.reconcile-row-detail {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  /* 与第一行摘要文本对齐（跳过勾选框宽度） */
+  padding-left: 30px;
 }
 
 .reconcile-row:hover {
@@ -5629,8 +4112,7 @@ usePageRefresh(loadAllData)
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  flex: 1.2;
-  min-width: 320px;
+  min-width: 0;
 }
 
 .fact-lead {
@@ -5669,8 +4151,10 @@ usePageRefresh(loadAllData)
 .reconcile-cell-plan {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  row-gap: 4px;
   flex: 1;
-  min-width: 220px;
+  min-width: 0;
 }
 
 .plan-badge {
@@ -5717,6 +4201,221 @@ usePageRefresh(loadAllData)
   font-weight: 600;
   color: var(--solo-text-primary);
   font-size: 12px;
+}
+
+.plan-account-preview {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  color: var(--solo-text-muted);
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+.plan-alternatives {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.plan-alt-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--solo-border-light);
+  background: #fff;
+  color: var(--solo-text-secondary);
+  font-size: 11px;
+  line-height: 18px;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+
+.plan-alt-chip:hover {
+  border-color: var(--solo-primary);
+  color: var(--solo-primary);
+}
+
+.plan-alt-chip.selected {
+  border-color: var(--solo-primary);
+  color: var(--solo-primary);
+  background: rgba(23, 71, 176, 0.06);
+  font-weight: 600;
+}
+
+.plan-alt-account {
+  color: var(--solo-text-muted);
+  font-size: 10px;
+  font-weight: 400;
+}
+
+.plan-ask-ai {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  border: 1px dashed var(--solo-border-light);
+  background: transparent;
+  color: var(--solo-text-muted);
+  font-size: 11px;
+  line-height: 18px;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.plan-ask-ai:hover {
+  border-color: var(--solo-primary);
+  color: var(--solo-primary);
+}
+
+
+.batch-post-confirm {
+  /* 裸 NModal 不带卡片样式，必须自带底色，否则页面内容透出 */
+  background: var(--solo-bg-card);
+  border-radius: 12px;
+  padding: 16px 20px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.18);
+}
+
+.batch-post-confirm-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.batch-post-confirm-header i {
+  color: var(--solo-primary);
+  font-size: 18px;
+}
+
+.batch-post-confirm-header h3 {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--solo-text-primary);
+  margin: 0;
+}
+
+.batch-post-confirm-tip {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--solo-text-secondary);
+  background: var(--solo-info-bg);
+  border: 1px solid rgba(23, 71, 176, 0.16);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+}
+
+.batch-post-confirm-list {
+  max-height: 260px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.batch-post-confirm-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 10px;
+  border: 1px solid var(--solo-border-light);
+  border-radius: 8px;
+}
+
+.batch-post-confirm-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.batch-post-confirm-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--solo-text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.batch-post-confirm-cat {
+  font-size: 11px;
+  color: var(--solo-text-secondary);
+}
+
+.batch-post-confirm-cat em {
+  font-style: normal;
+}
+
+.batch-post-confirm-amt {
+  font-size: 13px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.batch-post-confirm-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.walkthrough-progress {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  background: var(--solo-info-bg);
+  border: 1px solid rgba(23, 71, 176, 0.18);
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--solo-primary);
+  font-weight: 500;
+  margin-bottom: 10px;
+}
+
+.walkthrough-progress-hint {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--solo-text-secondary);
+}
+
+.bank-balance-line {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 0;
+  font-size: 13px;
+}
+
+.bank-balance-line span {
+  color: var(--solo-text-secondary);
+}
+
+.bank-balance-line b {
+  font-weight: 600;
+  color: var(--solo-text-primary);
+  font-family: monospace;
+}
+
+.bank-balance-warn {
+  margin-top: 8px;
+  padding: 8px 10px;
+  background: rgba(250, 173, 20, 0.08);
+  border: 1px solid rgba(250, 173, 20, 0.3);
+  border-radius: 8px;
+  font-size: 12px;
+  color: #b45309;
+  line-height: 1.5;
 }
 
 .plan-evidence-pill {
@@ -5907,5 +4606,242 @@ usePageRefresh(loadAllData)
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 老板往来小账本汇总卡片交互 (方案 B) */
+.boss-ledger-summary-bar {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.boss-ledger-card {
+  background: var(--solo-card-bg, #fff);
+  border: 1px solid var(--solo-border, #e5e7eb);
+  border-radius: 10px;
+  padding: 12px 16px;
+  transition: all 0.2s ease;
+  position: relative;
+}
+
+.boss-ledger-card.clickable {
+  cursor: pointer;
+}
+
+.boss-ledger-card.clickable:hover {
+  border-color: var(--solo-primary, #1677ff);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.06);
+  transform: translateY(-1px);
+}
+
+.boss-ledger-card-header {
+  font-size: 12px;
+  color: var(--solo-text-muted);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+}
+
+.boss-ledger-card-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.boss-ledger-card-link {
+  font-size: 12px;
+  color: var(--solo-primary, #1677ff);
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-weight: 500;
+  opacity: 0.85;
+}
+
+.boss-ledger-card.clickable:hover .boss-ledger-card-link {
+  opacity: 1;
+}
+
+.boss-ledger-card-amount {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--solo-text-primary);
+  margin-top: 4px;
+}
+
+.boss-ledger-card-meta {
+  font-size: 11px;
+  color: var(--solo-text-muted);
+  margin-top: 2px;
+  line-height: 1.4;
+}
+
+/* 往来账本抽屉样式 */
+.boss-ledger-drawer-content {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.boss-ledger-drawer-banner {
+  background: var(--solo-bg-subtle, #f9fafb);
+  border: 1px solid var(--solo-border, #e5e7eb);
+  border-radius: 8px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.boss-ledger-drawer-amount-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.drawer-amount-label {
+  font-size: 12px;
+  color: var(--solo-text-muted);
+}
+
+.drawer-amount-value {
+  font-size: 22px;
+  font-weight: 700;
+  margin-top: 2px;
+}
+
+.drawer-breakdown-row {
+  font-size: 13px;
+  color: var(--solo-text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: rgba(0, 0, 0, 0.03);
+  border-radius: 6px;
+}
+
+.breakdown-divider {
+  color: var(--solo-text-muted);
+}
+
+.drawer-tip-box {
+  font-size: 12px;
+  color: var(--solo-text-muted);
+  line-height: 1.5;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.drawer-tip-box i {
+  font-size: 14px;
+  color: var(--solo-primary);
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+
+.boss-ledger-drawer-list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--solo-text-primary);
+  padding: 0 2px;
+}
+
+.boss-ledger-drawer-entries {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.drawer-entry-card {
+  background: var(--solo-card-bg, #fff);
+  border: 1px solid var(--solo-border, #e5e7eb);
+  border-radius: 8px;
+  padding: 12px 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  transition: border-color 0.15s ease;
+}
+
+.drawer-entry-card:hover {
+  border-color: var(--solo-border-hover, #cbd5e1);
+}
+
+.drawer-entry-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.drawer-entry-header-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.drawer-entry-date {
+  font-size: 12px;
+  color: var(--solo-text-muted);
+}
+
+.drawer-entry-title {
+  font-size: 13px;
+  color: var(--solo-text-primary);
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.drawer-entry-meta-line {
+  font-size: 12px;
+  color: var(--solo-text-muted);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.drawer-entry-explanation {
+  color: var(--solo-primary);
+  font-weight: 500;
+}
+
+.drawer-entry-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.drawer-entry-amount {
+  font-size: 15px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.drawer-entry-amount.income {
+  color: var(--solo-income, #16a34a);
+}
+
+.drawer-entry-amount.expense {
+  color: var(--solo-text-primary, #111827);
+}
+
+.drawer-entry-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 </style>

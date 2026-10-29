@@ -39,11 +39,17 @@ export function accountingErrorText(err: unknown, fallback = '操作失败'): st
   const detail = accountingErrorDetail(err)
   const message = detail?.message?.trim()
   if (message) return message
+  // HTTPException 风格的纯文本 detail（detail 为字符串）同样要透出后端的话，
+  // 否则用户只能看到 "Request failed with status code 400" 这类 axios 包装文案
+  const plainDetail = (err as { response?: { data?: { detail?: unknown } } } | null)?.response
+    ?.data?.detail
+  if (typeof plainDetail === 'string' && plainDetail.trim()) return plainDetail.trim()
   // 非结构化错误（网络中断、axios 包装层）也要给出可辨认的话，而不是空的
   const raw = err as { message?: unknown; response?: { status?: number } } | null
   if (raw?.response?.status) {
     const status = raw.response.status
     if (status === 401) return '登录已过期，请重新登录'
+    if (status === 402) return 'AI 额度已用完，请升级套餐或等待下期恢复'
     if (status === 403) return '没有权限执行这个操作'
     if (status >= 500) return '服务暂时不可用，请稍后重试'
   }

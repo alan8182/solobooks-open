@@ -1,14 +1,11 @@
 <!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
-import { computed, h, onMounted, ref } from 'vue'
+import { computed, h, onMounted, ref, watch } from 'vue'
 import {
-  NButton,
   NCard,
-  NDataTable,
   NDatePicker,
   NPopconfirm,
   NSelect,
-  NTag,
   useMessage,
   type DataTableColumns,
 } from 'naive-ui'
@@ -19,8 +16,13 @@ import {
   type CleanupStatsItem,
   type CleanupTable,
 } from '@/api/admin'
+import { useAdminStore } from '@/stores/admin'
+import { formatAdminNumber } from '@/composables/useAdminTable'
+import { SoloTable, SoloButton, SoloStatusBadge } from '@/components/ui'
 
 const message = useMessage()
+const adminStore = useAdminStore()
+
 const loading = ref(false)
 const cleaning = ref(false)
 const lastResult = ref<CleanupResult | null>(null)
@@ -42,9 +44,25 @@ function beforeStr(ts: number): string {
 }
 
 const statsColumns: DataTableColumns<CleanupStatsItem> = [
-  { title: '表', key: 'table', minWidth: 220, render: (row) => h('span', { style: 'font-family:monospace;font-size:12.5px' }, row.table) },
-  { title: '总行数', key: 'total', width: 110, align: 'right', render: (row) => row.total.toLocaleString('zh-CN') },
-  { title: '最早记录（UTC）', key: 'oldest', minWidth: 190, render: (row) => (row.oldest ? row.oldest.replace('T', ' ').slice(0, 19) : '—') },
+  {
+    title: '数据库物理表',
+    key: 'table',
+    minWidth: 220,
+    render: (row) => h('span', { class: 'table-name-mono' }, row.table),
+  },
+  {
+    title: '存量数据总行数',
+    key: 'total',
+    width: 140,
+    align: 'right',
+    render: (row) => formatAdminNumber(row.total),
+  },
+  {
+    title: '最早记录时间（UTC）',
+    key: 'oldest',
+    minWidth: 200,
+    render: (row) => (row.oldest ? row.oldest.replace('T', ' ').slice(0, 19) : '—'),
+  },
 ]
 
 async function loadStats() {
@@ -52,20 +70,23 @@ async function loadStats() {
   try {
     stats.value = (await fetchCleanupStats()).items
   } catch (err: any) {
-    message.error(err?.response?.data?.detail || '统计加载失败')
+    message.error(err?.response?.data?.detail || '数据统计加载失败')
   } finally {
     loading.value = false
   }
 }
 
-const preview = computed(() => (lastResult.value?.dryRun && lastResult.value.table === table.value ? lastResult.value : null))
+const preview = computed(() =>
+  lastResult.value?.dryRun && lastResult.value.table === table.value ? lastResult.value : null,
+)
 
 async function doPreview() {
   cleaning.value = true
   try {
     lastResult.value = await runCleanup({ table: table.value, before: beforeStr(beforeTs.value), dryRun: true })
+    message.info(`预估将清理 ${lastResult.value.deleted} 条记录`)
   } catch (err: any) {
-    message.error(err?.response?.data?.detail || '预览失败')
+    message.error(err?.response?.data?.detail || '预演失败')
   } finally {
     cleaning.value = false
   }
@@ -76,7 +97,7 @@ async function doApply() {
   try {
     const result = await runCleanup({ table: table.value, before: beforeStr(beforeTs.value), dryRun: false })
     lastResult.value = result
-    message.success(`已删除 ${result.deleted} 行（留痕已记录）`)
+    message.success(`成功执行清理：已安全物理删除 ${result.deleted} 行（留痕已写入审计表）`)
     await loadStats()
   } catch (err: any) {
     message.error(err?.response?.data?.detail || '清理失败')
@@ -85,58 +106,88 @@ async function doApply() {
   }
 }
 
+watch(
+  () => adminStore.refreshSignal,
+  () => {
+    void loadStats()
+  },
+)
+
 onMounted(loadStats)
 </script>
 
 <template>
   <div class="admin-data-ops">
-    <NCard title="数据规模" :bordered="false">
-      <NDataTable
+    <NCard title="表数据规模" :bordered="false" class="stats-card">
+      <template #header-extra>
+        <SoloButton size="small" variant="secondary" @click="loadStats">
+          <template #icon><i class="ri-refresh-line" /></template>
+          刷新规模
+        </SoloButton>
+      </template>
+      <SoloTable
         :columns="statsColumns"
         :data="stats"
         :loading="loading"
         :bordered="false"
         size="small"
         :pagination="false"
+        empty-title="暂无表统计信息"
       />
     </NCard>
 
-    <NCard title="按时间清理" :bordered="false">
-      <template #header-extra>
-        <NTag size="small" round :bordered="false">删除 UTC 日期零点之前的记录</NTag>
-      </template>
+    <NCard title="归档清理作业" :bordered="false" class="ops-card">
       <div class="cleanup-form">
-        <NSelect v-model:value="table" :options="TABLES" size="small" style="width: 320px" />
-        <div class="date-item">
-          <span class="date-label">清理截至</span>
-          <NDatePicker v-model:value="beforeTs" type="date" size="small" :is-date-disabled="(ts: number) => ts > Date.now()" />
+        <div class="form-row">
+          <label class="form-label">目标清理表</label>
+          <NSelect v-model:value="table" :options="TABLES" style="width: 320px" size="small" />
         </div>
-        <NButton size="small" :loading="cleaning" @click="doPreview">预览将删除的行数</NButton>
-        <NPopconfirm
-          :disabled="!preview || preview.matched === 0"
-          @positive-click="doApply"
-        >
-          <template #trigger>
-            <NButton size="small" type="error" :disabled="!preview || preview.matched === 0" :loading="cleaning">
-              执行清理
-            </NButton>
-          </template>
-          确认删除 {{ preview?.matched }} 行？此操作不可恢复（将写入操作留痕）。
-        </NPopconfirm>
+
+        <div class="form-row">
+          <label class="form-label">清理截至时间</label>
+          <NDatePicker v-model:value="beforeTs" type="date" size="small" style="width: 200px" />
+          <span class="form-hint">早于该日期的记录将被清理</span>
+        </div>
+
+        <div class="form-actions">
+          <SoloButton
+            size="small"
+            variant="secondary"
+            :loading="cleaning"
+            @click="doPreview"
+          >
+            <template #icon><i class="ri-eye-line" /></template>
+            预演扫描 (Dry Run)
+          </SoloButton>
+
+          <NPopconfirm :on-positive-click="doApply">
+            <template #trigger>
+              <SoloButton
+                size="small"
+                variant="danger"
+                :loading="cleaning"
+              >
+                <template #icon><i class="ri-delete-bin-line" /></template>
+                执行物理清理
+              </SoloButton>
+            </template>
+            确认对 {{ table }} 执行物理删除（早于 {{ beforeStr(beforeTs) }}）？该操作不可撤销！
+          </NPopconfirm>
+        </div>
+
+        <!-- 预演结果反馈 -->
+        <div v-if="preview" class="preview-box">
+          <div class="preview-header">
+            <SoloStatusBadge tone="brand">
+              预演成功 · 模拟结果
+            </SoloStatusBadge>
+            <span class="preview-time">扫描目标：{{ preview.table }}</span>
+          </div>
+          <p class="preview-desc">
+            若立即执行，系统将清理 <strong>{{ formatAdminNumber(preview.deleted) }}</strong> 行历史数据（早于 {{ preview.before }}）。
+          </p>
+        </div>
       </div>
-      <p v-if="lastResult" class="cleanup-result" :class="{ preview: lastResult.dryRun }">
-        <i class="ri-information-line" />
-        <template v-if="lastResult.dryRun">
-          预览：{{ lastResult.table }} 在 {{ lastResult.before }} 之前有 {{ lastResult.matched }} 行将被删除。
-        </template>
-        <template v-else>
-          已清理：{{ lastResult.table }} 删除 {{ lastResult.deleted }} 行（{{ lastResult.before }} 之前）。
-        </template>
-      </p>
-      <p class="ops-note">
-        <i class="ri-shield-check-line" />
-        清理仅作用于统计/审计类表，业务账套数据不受影响；所有清理操作均写入操作日志。
-      </p>
     </NCard>
   </div>
 </template>
@@ -148,47 +199,75 @@ onMounted(loadStats)
   gap: 16px;
 }
 
+.table-name-mono {
+  font-family: monospace;
+  font-size: 13px;
+  color: var(--solo-text-primary);
+}
+
 .cleanup-form {
   display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
+  flex-direction: column;
+  gap: 18px;
+  max-width: 680px;
+  padding: 8px 0;
 }
 
-.date-item {
+.form-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 14px;
 }
 
-.date-label {
+.form-label {
+  width: 90px;
+  flex-shrink: 0;
   font-size: 13px;
   color: var(--solo-text-secondary);
 }
 
-.cleanup-result {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin: 14px 0 0;
-  padding: 10px 12px;
-  border-radius: var(--solo-radius-sm);
-  background: var(--solo-income-bg);
-  color: var(--solo-income);
-  font-size: 13px;
-}
-
-.cleanup-result.preview {
-  background: var(--solo-info-bg);
-  color: var(--solo-info);
-}
-
-.ops-note {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin: 12px 0 0;
+.form-hint {
   font-size: 12.5px;
   color: var(--solo-text-muted);
+}
+
+.form-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 6px;
+}
+
+.preview-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 16px;
+  background: var(--solo-bg-blue-soft, #edf3ff);
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius, 8px);
+}
+
+.preview-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.preview-time {
+  font-size: 12px;
+  color: var(--solo-text-muted);
+  font-family: monospace;
+}
+
+.preview-desc {
+  margin: 0;
+  font-size: 13px;
+  color: var(--solo-text-primary);
+}
+
+.preview-desc strong {
+  color: var(--solo-primary);
+  font-size: 15px;
 }
 </style>

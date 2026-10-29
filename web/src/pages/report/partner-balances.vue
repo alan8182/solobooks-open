@@ -2,10 +2,12 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NButton, NCard, NDatePicker, NFormItem, NSelect, NSpin, useMessage } from 'naive-ui'
+import { NButton, NCard, NFormItem, NSelect, NSpin, useMessage } from 'naive-ui'
 import apiClient from '@/api/client'
 import * as XLSX from 'xlsx'
 import { formatMoney, getCurrentMonth } from '@/utils/format'
+import { saveWorkbook } from '@/utils/export'
+import { SoloMonthPicker } from '@/components/ui'
 
 interface PartnerBalanceRow {
   partnerId: string
@@ -104,7 +106,7 @@ function exportExcel() {
   worksheet['!cols'] = [{ wch: 28 }, { wch: 10 }, { wch: 16 }, { wch: 16 }, { wch: 16 }, { wch: 10 }, { wch: 16 }]
   const workbook = XLSX.utils.book_new()
   XLSX.utils.book_append_sheet(workbook, worksheet, '核算项目余额表')
-  XLSX.writeFile(workbook, `核算项目余额表_${accountCode.value}_${month.value}.xlsx`)
+  saveWorkbook(workbook, `核算项目余额表_${accountCode.value}_${month.value}.xlsx`)
   message.success('已导出')
 }
 
@@ -145,9 +147,19 @@ onMounted(load)
         <NSelect v-model:value="accountCode" :options="accountOptions" style="width: 180px;" />
       </NFormItem>
       <NFormItem label="会计月份" label-placement="left" :show-feedback="false">
-        <NDatePicker v-model:formatted-value="month" type="month" value-format="yyyy-MM" format="yyyy-MM" style="width: 150px;" />
+        <SoloMonthPicker v-model:value="month" style="width: 150px;" />
       </NFormItem>
       <NButton type="primary" @click="load">查询</NButton>
+      <div class="filter-actions">
+        <NButton secondary @click="exportExcel">
+          <template #icon><i class="ri-download-2-line" /></template>
+          导出 Excel
+        </NButton>
+        <NButton secondary @click="printPage">
+          <template #icon><i class="ri-printer-line" /></template>
+          打印
+        </NButton>
+      </div>
     </div>
 
     <!-- 打印抬头 -->
@@ -229,6 +241,12 @@ onMounted(load)
   border-radius: 8px;
 }
 .filter-bar :deep(.n-form-item) { margin-bottom: 0; width: auto; flex: 0 0 auto; }
+.filter-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
 .report-table-wrapper { overflow-x: auto; }
 .amount-cell { text-align: right; font-variant-numeric: tabular-nums; }
 .balance { font-weight: 700; color: var(--solo-primary); }

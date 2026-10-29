@@ -117,7 +117,7 @@ function confirmArchiveDimension(row: AggregationDimension): void {
         store.invalidate()
         await store.loadDimensions(true)
       } catch (err) {
-        message.error(errorText(err, '归档维度失败'))
+        message.error(errorText(err))
       }
     },
   })
@@ -173,7 +173,7 @@ async function submitDimension(): Promise<void> {
     await store.loadDimensions(true)
     store.setCurrentDimension(created.id)
   } catch (err) {
-    message.error(errorText(err, '创建维度失败'))
+    message.error(errorText(err))
   } finally {
     dimensionSubmitting.value = false
   }
@@ -243,7 +243,7 @@ async function loadMembers(): Promise<void> {
   try {
     members.value = await listMembers(dimensionId, false)
   } catch (err) {
-    message.error(errorText(err, '加载归集对象失败'))
+    message.error(errorText(err))
   } finally {
     membersLoading.value = false
   }
@@ -337,7 +337,7 @@ async function submitMember(): Promise<void> {
     showMemberModal.value = false
     await loadMembers()
   } catch (err) {
-    message.error(errorText(err, editingMemberId.value ? '更新归集对象失败' : '创建归集对象失败'))
+    message.error(errorText(err))
   } finally {
     memberSubmitting.value = false
   }
@@ -355,7 +355,7 @@ function confirmArchiveMember(row: AggregationMember): void {
         message.success(`归集对象「${row.name}」已归档`)
         await loadMembers()
       } catch (err) {
-        message.error(errorText(err, '归档归集对象失败'))
+        message.error(errorText(err))
       }
     },
   })
@@ -371,7 +371,7 @@ onMounted(async () => {
     await store.bootstrap()
     await loadMembers()
   } catch (err) {
-    message.error(errorText(err, '加载归集维度失败'))
+    message.error(errorText(err))
   }
 })
 </script>

@@ -381,6 +381,7 @@ async def query_advance_balances(company_id: str, month: str) -> dict[str, Any]:
                 "reimbursed": ZERO,
                 "count": 0,
                 "lastDate": "",
+                "entries": [],
             },
         )
         # 2241 是负债：贷方=垫付增加，借方=报销冲销
@@ -394,6 +395,21 @@ async def query_advance_balances(company_id: str, month: str) -> dict[str, Any]:
         occurred = entry.occurred_on.isoformat() if entry.occurred_on else ""
         if occurred > bucket["lastDate"]:
             bucket["lastDate"] = occurred
+
+        bucket["entries"].append(
+            {
+                "id": entry.id,
+                "sourceId": entry.source_transaction_id,
+                "voucherNo": entry.voucher_no or "",
+                "date": occurred,
+                "period": entry.period_start.strftime("%Y-%m"),
+                "summary": entry.summary or "",
+                "category": metadata.get("category") or "",
+                "amount": money_text(amount),
+                "direction": "advance" if line.direction == "credit" else "reimbursement",
+                "isCurrentMonth": start <= entry.period_start <= end,
+            }
+        )
 
     items: list[dict[str, Any]] = []
     for bucket in buckets.values():
@@ -409,6 +425,11 @@ async def query_advance_balances(company_id: str, month: str) -> dict[str, Any]:
                 "closing": money_text(closing),
                 "count": bucket["count"],
                 "lastDate": bucket["lastDate"],
+                "entries": sorted(
+                    bucket["entries"],
+                    key=lambda e: (e["date"] or "", e["id"] or ""),
+                    reverse=True,
+                ),
             }
         )
         total["opening"] += bucket["opening"]

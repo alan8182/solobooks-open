@@ -267,6 +267,11 @@ class JournalReverseRequest(BaseModel):
     reversalDate: Optional[str] = None
 
 
+class CorrectCategoryRequest(BaseModel):
+    category: str
+    reason: str = ""
+
+
 class BatchPostRequest(BaseModel):
     entryIds: Optional[List[str]] = None
     month: Optional[str] = None
@@ -462,15 +467,47 @@ class MonthlyReportResponse(BaseModel):
 
 class HealthScoreRequest(StrictRequestModel):
     month: Optional[str] = None
+    includeDiagnosis: Optional[bool] = False
+
+
+class DimensionDetail(BaseModel):
+    code: str
+    name: str
+    score: int
+    weight: int
+    rawScore: Optional[int] = None
+    status: str
+    highlight: str
+    tips: Optional[str] = None
+
+
+class HealthPenaltyItem(BaseModel):
+    id: str
+    dimensionCode: str
+    title: str
+    description: str
+    deduction: int
+    severity: Literal["high", "medium", "low"]
+    targetRoute: Optional[str] = None
+    actionLabel: Optional[str] = None
+
 
 class HealthScoreResponse(BaseModel):
+    month: Optional[str] = None
     totalScore: int
     level: str
+    levelCode: Optional[str] = None
+    levelLabel: Optional[str] = None
+    summary: Optional[str] = None
     dimensions: dict
+    dimensionDetails: Optional[List[DimensionDetail]] = None
+    penalties: Optional[List[HealthPenaltyItem]] = None
     suggestions: List[str]
+    keyMetrics: Optional[List[dict]] = None
     taxRiskScore: Optional[int] = None
     taxRiskLevel: Optional[str] = None
     riskItems: Optional[List[str]] = None
+    aiDiagnosis: Optional[dict] = None
 
 
 class VatAssistRequest(StrictRequestModel):
@@ -600,12 +637,20 @@ class ArchiveChecklistRequest(StrictRequestModel):
     month: str
 
 class ArchiveItem(BaseModel):
+    id: Optional[str] = None
+    voucherNo: Optional[str] = None
     date: str
     summary: str
     amount: Decimal
+    direction: Optional[str] = None
+    category: Optional[str] = None
     docType: str
+    invoiceNumber: Optional[str] = None
+    invoiceType: Optional[str] = None
     compliance: str
+    complianceStatus: Optional[str] = None
     riskTag: Optional[str] = None
+    attachmentCount: int = 0
     note: Optional[str] = None
 
 class ArchiveChecklistResponse(BaseModel):
@@ -614,6 +659,9 @@ class ArchiveChecklistResponse(BaseModel):
     compliantCount: int
     missingCount: int
     totalCount: int
+    compliantAmount: Decimal = Decimal("0")
+    missingAmount: Decimal = Decimal("0")
+    totalAmount: Decimal = Decimal("0")
 
 
 # ── 凭证（后台）──
@@ -665,6 +713,22 @@ class BalanceSheetItem(BaseModel):
     currentAmount: Decimal
     previousAmount: Decimal = Decimal("0")
 
+class StandardStatementRow(BaseModel):
+    """会计视图（准则格式）单行：年初/期末两列金额；kind 区分节标题/小计/总计行。"""
+    rowNo: int = 0
+    name: str
+    openingAmount: Decimal = Decimal("0.00")
+    currentAmount: Decimal = Decimal("0.00")
+    level: int = 0
+    kind: Literal["item", "section", "subtotal", "total"] = "item"
+    accountCode: Optional[str] = None
+
+class BalanceSheetStandard(BaseModel):
+    """会小企01表格式：左资产、右负债和所有者权益，两列期间均为年初+期末。"""
+    assets: List[StandardStatementRow]
+    rights: List[StandardStatementRow]
+    balanced: bool = True
+
 class BalanceSheetResponse(BaseModel):
     month: str
     periodType: str = "month"
@@ -676,6 +740,7 @@ class BalanceSheetResponse(BaseModel):
     totalLiabilities: Decimal
     totalEquity: Decimal
     isBalanced: bool
+    standard: Optional[BalanceSheetStandard] = None
 
 # ── 现金流量表 ──
 
@@ -855,6 +920,9 @@ class FixedAssetEntryPrefillResponse(BaseModel):
     availableForUseDate: str
     originalValue: Decimal
     suggestedCategory: str
+    voucherNo: Optional[str] = None
+    summary: Optional[str] = None
+    sourceAccount: Optional[str] = None
 
 
 class FixedAssetDepreciationDuePeriod(BaseModel):
@@ -1293,6 +1361,9 @@ class IntangibleAssetEntryPrefillResponse(BaseModel):
     availableForUseDate: str
     originalValue: Decimal
     suggestedCategory: str
+    voucherNo: Optional[str] = None
+    summary: Optional[str] = None
+    sourceAccount: Optional[str] = None
 
 
 class IntangibleAmortizationDuePeriod(BaseModel):

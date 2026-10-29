@@ -2,13 +2,13 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NButton, NDatePicker, useMessage } from 'naive-ui'
+import { NButton, useMessage } from 'naive-ui'
 import { useEntryStore } from '@/stores/entry'
 import { useAuthStore } from '@/stores/auth'
 import { getRdProjects } from '@/api/rd'
 import { getCurrentMonth } from '@/utils/format'
 import VoucherSheet from '@/components/business/VoucherSheet.vue'
-import { SoloEmpty } from '@/components/ui'
+import { SoloEmpty, SoloMonthPicker } from '@/components/ui'
 
 const route = useRoute()
 const router = useRouter()
@@ -80,7 +80,7 @@ onMounted(load)
       <NButton text @click="router.back()">← 返回</NButton>
       <div class="toolbar-center">
         <span class="toolbar-label">按期间连续打印</span>
-        <NDatePicker v-model:formatted-value="month" type="month" value-format="yyyy-MM" format="yyyy-MM" style="width: 140px;" />
+        <SoloMonthPicker v-model:value="month" style="width: 140px;" />
         <NButton size="small" @click="reloadByMonth">重载</NButton>
         <span class="count-hint">共 {{ entries.length }} 张凭证 · 合计 {{ totalAmount.toFixed(2) }}</span>
       </div>

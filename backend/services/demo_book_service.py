@@ -282,17 +282,6 @@ def build_demo_book(
                 match=False,
                 desc="员工垫付-市内交通",
             )
-        add(
-            year_month,
-            28,
-            f"{month} 月员工工资发放",
-            18000,
-            "expense",
-            "人力成本",
-            billing="no_invoice",
-            desc="招行对公 | 代发工资",
-        )
-
     last_year, last_month = window[-1]
     # 最后一个月：发票已收到、尚未付款 → 「待付款」演示；两笔已到账未记账 → 「待处理流水」演示
     # 日期不能落到未来：流水不可能来自明天，所以当月末两笔按「今天」封顶。
@@ -352,20 +341,27 @@ async def _seed_owner_payroll(
         accrue_salary_sheet,
         create_employee,
         get_or_create_salary_sheet,
+        list_employees,
         pay_payroll_liability,
         pay_salary_sheet,
         update_salary_records,
     )
 
     amounts = demo_owner_payroll_amounts()
-    employee = await create_employee(
-        company_id,
-        DEMO_OWNER_NAME,
-        DEMO_OWNER_DEPARTMENT,
-        DEMO_OWNER_SALARY,
-        DEMO_OWNER_SS_BASE,
-        is_owner=True,
+    # 老板员工只建一次：本函数按月循环调用，重复 INSERT 会造出多个同名「陈默」
+    employee = next(
+        (emp for emp in await list_employees(company_id) if emp["name"] == DEMO_OWNER_NAME),
+        None,
     )
+    if employee is None:
+        employee = await create_employee(
+            company_id,
+            DEMO_OWNER_NAME,
+            DEMO_OWNER_DEPARTMENT,
+            DEMO_OWNER_SALARY,
+            DEMO_OWNER_SS_BASE,
+            is_owner=True,
+        )
     sheet = await get_or_create_salary_sheet(company_id, month)
     record = sheet["records"][0]
     await update_salary_records(
@@ -1186,44 +1182,46 @@ async def create_demo_company(user_id: str, *, months: int = 3) -> dict[str, Any
         )
 
     payroll_vouchers = 0
-    payroll_month = _month_sequence(date.today(), max(1, min(months, MAX_MONTHS)))[-1]
-    payroll_month_text = f"{payroll_month[0]}-{payroll_month[1]:02d}"
     try:
-        owner_payroll = await _seed_owner_payroll(company_id, user_id, payroll_month_text)
-        salary_desc = f"招行对公 | 代发工资（{DEMO_OWNER_NAME}）"
-        social_desc = f"招行对公 | 社保扣款（{DEMO_OWNER_NAME}）"
-        housing_desc = f"招行对公 | 公积金扣款（{DEMO_OWNER_NAME}）"
-        statements.extend(
-            [
-                {
-                    "transaction_date": owner_payroll["salaryDate"],
-                    "description": salary_desc,
-                    "amount": -float(owner_payroll["salaryAmount"]),
-                    "balance": 0.0,
-                },
-                {
-                    "transaction_date": owner_payroll["socialDate"],
-                    "description": social_desc,
-                    "amount": -float(owner_payroll["socialAmount"]),
-                    "balance": 0.0,
-                },
-                {
-                    "transaction_date": owner_payroll["housingDate"],
-                    "description": housing_desc,
-                    "amount": -float(owner_payroll["housingAmount"]),
-                    "balance": 0.0,
-                },
-            ]
-        )
-        pairs.extend(
-            [
-                (owner_payroll["salaryDate"], salary_desc, owner_payroll["salaryVoucherId"]),
-                (owner_payroll["socialDate"], social_desc, owner_payroll["socialVoucherId"]),
-                (owner_payroll["housingDate"], housing_desc, owner_payroll["housingVoucherId"]),
-            ]
-        )
+        for payroll_year, payroll_month_no in _month_sequence(
+            date.today(), max(1, min(months, MAX_MONTHS))
+        ):
+            payroll_month_text = f"{payroll_year}-{payroll_month_no:02d}"
+            owner_payroll = await _seed_owner_payroll(company_id, user_id, payroll_month_text)
+            salary_desc = f"招行对公 | 代发工资（{DEMO_OWNER_NAME}）"
+            social_desc = f"招行对公 | 社保扣款（{DEMO_OWNER_NAME}）"
+            housing_desc = f"招行对公 | 公积金扣款（{DEMO_OWNER_NAME}）"
+            statements.extend(
+                [
+                    {
+                        "transaction_date": owner_payroll["salaryDate"],
+                        "description": salary_desc,
+                        "amount": -float(owner_payroll["salaryAmount"]),
+                        "balance": 0.0,
+                    },
+                    {
+                        "transaction_date": owner_payroll["socialDate"],
+                        "description": social_desc,
+                        "amount": -float(owner_payroll["socialAmount"]),
+                        "balance": 0.0,
+                    },
+                    {
+                        "transaction_date": owner_payroll["housingDate"],
+                        "description": housing_desc,
+                        "amount": -float(owner_payroll["housingAmount"]),
+                        "balance": 0.0,
+                    },
+                ]
+            )
+            pairs.extend(
+                [
+                    (owner_payroll["salaryDate"], salary_desc, owner_payroll["salaryVoucherId"]),
+                    (owner_payroll["socialDate"], social_desc, owner_payroll["socialVoucherId"]),
+                    (owner_payroll["housingDate"], housing_desc, owner_payroll["housingVoucherId"]),
+                ]
+            )
+            payroll_vouchers += int(owner_payroll["voucherCount"])
         _apply_running_balance(statements)
-        payroll_vouchers = int(owner_payroll["voucherCount"])
     except Exception:  # noqa: BLE001 - 工资样本是增强项，失败不该让整本演示账失败
         logger.warning("演示账套：老板工资/社保/公积金生成跳过（company=%s）", company_id, exc_info=True)
 

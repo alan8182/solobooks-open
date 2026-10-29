@@ -145,7 +145,9 @@ def test_demo_seeds_owner_payroll_with_hangzhou_rates(client, auth_headers):
     statements = client.get("/api/bank/statements", headers=auth_headers)
     assert statements.status_code == 200, statements.text
     payroll_statements = [
-        item for item in statements.json()["items"] if DEMO_OWNER_NAME in item["description"]
+        item for item in statements.json()["items"]
+        if DEMO_OWNER_NAME in item["description"]
+        and item["transaction_date"].startswith(month)
     ]
     assert len(payroll_statements) == 3
     assert all(item["matched_entry_ids"] for item in payroll_statements)

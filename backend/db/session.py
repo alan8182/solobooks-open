@@ -37,6 +37,30 @@ def get_engine() -> AsyncEngine:
     return create_async_engine(url, **kwargs)
 
 
+_sync_engine_instance = None
+
+
+def get_sync_engine():
+    """线程池/同步上下文用的独立同步引擎（psycopg/sqlite），避免污染全局异步连接池。
+
+    同步 URL 由异步 URL 重写而来（asyncpg→psycopg、aiosqlite→sqlite）；
+    配额计数、用量埋点等 fire-and-forget 写路径共用此引擎。
+    """
+    global _sync_engine_instance
+    if _sync_engine_instance is None:
+        from sqlalchemy import create_engine
+
+        url = database_url()
+        if url.startswith("postgresql+asyncpg://"):
+            url = "postgresql+psycopg://" + url[len("postgresql+asyncpg://"):]
+        elif url.startswith("sqlite+aiosqlite://"):
+            # 前缀等长替换：sqlite+aiosqlite:// → sqlite://（多拼一个斜杠会把
+            # 空主机名解析成空端口，int('') 崩；此 bug 曾被埋点静默吞错掩盖）
+            url = "sqlite" + url[len("sqlite+aiosqlite"):]
+        _sync_engine_instance = create_engine(url, pool_pre_ping=True)
+    return _sync_engine_instance
+
+
 @lru_cache(maxsize=1)
 def get_session_factory() -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(get_engine(), expire_on_commit=False, autoflush=False)

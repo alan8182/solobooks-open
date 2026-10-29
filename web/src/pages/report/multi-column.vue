@@ -2,11 +2,12 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NButton, NCard, NDatePicker, NFormItem, NSelect, NSpin, useMessage } from 'naive-ui'
+import { NButton, NCard, NFormItem, NSelect, NSpin, useMessage } from 'naive-ui'
 import apiClient from '@/api/client'
 import { getMultiColumnLedger } from '@/api/ledger'
 import type { MultiColumnResponse } from '@/api/ledger'
 import { formatDate, formatMoney, getCurrentMonth } from '@/utils/format'
+import { SoloMonthPicker } from '@/components/ui'
 
 const route = useRoute()
 const router = useRouter()
@@ -89,7 +90,7 @@ onMounted(() => {
         <NSelect v-model:value="accountCode" :options="accountOptions" style="width: 240px;" filterable />
       </NFormItem>
       <NFormItem label="会计月份" label-placement="left" :show-feedback="false">
-        <NDatePicker v-model:formatted-value="month" type="month" value-format="yyyy-MM" format="yyyy-MM" style="width: 150px;" />
+        <SoloMonthPicker v-model:value="month" style="width: 150px;" />
       </NFormItem>
       <NButton type="primary" @click="query">查询账页</NButton>
     </div>

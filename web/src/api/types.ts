@@ -6,6 +6,8 @@
 // API transport uses fixed-point strings. The response interceptor converts
 // them to numbers for display-only view models; authoritative calculations
 // remain on the server.
+import type { VoucherLinesLike } from '@/utils/fundsChannel'
+
 export type Money = number
 export type MoneyInput = string | number
 
@@ -269,7 +271,7 @@ export interface Entry {
   sourceType?: string
   voucherStatus?: string
   voucherRef?: string
-  voucherLines?: unknown
+  voucherLines?: VoucherLinesLike | null
   /** 分录已被会计人工调整（服务端 metadata 透出），改分类前需确认覆盖 */
   voucherManuallyAdjusted?: boolean
   voucherAdjustment?: {
@@ -280,6 +282,10 @@ export interface Entry {
   }
   /** 凭证类型：closing = 期末损益结转（系统自动生成）；opening = 期初；reversal = 红字冲销 */
   entryType?: string
+  /** 转销合并的原分录 id 列表（微信收付款多笔合并一凭证时由服务端透出） */
+  originalEntryIds?: string[]
+  /** 关联的银行流水 id（对账确认后由服务端透出） */
+  linkedStatementId?: string
   /** 期末损益结转凭证标记：结账自动生成，反结账时自动红冲 */
   isClosingTransfer?: boolean
   /** 记账期间（YYYY-MM）。补记时可能与该凭证的业务日期所属月不同；法定报表按此口径 */
@@ -378,14 +384,53 @@ export interface ReportDiagnosisResponse {
   summary: string
 }
 
+export interface DimensionDetail {
+  code: string
+  name: string
+  score: number
+  weight: number
+  rawScore?: number
+  status: 'pass' | 'warning' | 'danger'
+  highlight: string
+  tips?: string
+}
+
+export interface HealthPenaltyItem {
+  id: string
+  dimensionCode: string
+  title: string
+  description: string
+  deduction: number
+  severity: 'high' | 'medium' | 'low'
+  targetRoute?: string
+  actionLabel?: string
+}
+
+export interface KeyMetricItem {
+  label: string
+  value: string
+  status: 'pass' | 'warning' | 'danger'
+}
+
 export interface HealthScoreResponse {
+  month?: string
   totalScore: number
   level: string
+  levelCode?: 'excellent' | 'good' | 'fair' | 'poor'
+  levelLabel?: string
+  summary?: string
   dimensions: Record<string, number>
+  dimensionDetails?: DimensionDetail[]
+  penalties?: HealthPenaltyItem[]
   suggestions: string[]
+  keyMetrics?: KeyMetricItem[]
   taxRiskScore?: number
   taxRiskLevel?: string
   riskItems?: string[]
+  aiDiagnosis?: {
+    overview?: string
+    actionPriorities?: string[]
+  }
 }
 
 export interface VatAssistResponse {
@@ -478,15 +523,26 @@ export interface ArchiveChecklistResponse {
   compliantCount: number
   missingCount: number
   totalCount: number
+  compliantAmount?: Money
+  missingAmount?: Money
+  totalAmount?: Money
 }
 
 export interface ArchiveItem {
+  id?: string
+  voucherNo?: string
   date: string
   summary: string
   amount: Money
+  direction?: string
+  category?: string
   docType: string
+  invoiceNumber?: string
+  invoiceType?: string
   compliance: string
+  complianceStatus?: 'compliant' | 'missing' | 'questionable' | string
   riskTag?: string
+  attachmentCount?: number
   note?: string
 }
 
@@ -496,6 +552,26 @@ export interface BalanceSheetItem {
   accountName: string
   currentAmount: Money
   previousAmount?: Money
+}
+
+/** 会计视图（准则格式）单行：kind 区分节标题/小计/总计行 */
+export type StandardRowKind = 'item' | 'section' | 'subtotal' | 'total'
+
+export interface StandardStatementRow {
+  rowNo: number
+  name: string
+  openingAmount: Money
+  currentAmount: Money
+  level?: number
+  kind?: StandardRowKind
+  accountCode?: string | null
+}
+
+/** 会小企01表格式：左资产、右负债和所有者权益；balanced=false 表示账套存在未结账月份 */
+export interface BalanceSheetStandard {
+  assets: StandardStatementRow[]
+  rights: StandardStatementRow[]
+  balanced: boolean
 }
 
 export interface BalanceSheetResponse {
@@ -509,6 +585,7 @@ export interface BalanceSheetResponse {
   totalLiabilities: Money
   totalEquity: Money
   isBalanced: boolean
+  standard?: BalanceSheetStandard
 }
 
 // ===== Cash Flow Types =====
@@ -695,6 +772,9 @@ export interface FixedAssetEntryPrefill {
   availableForUseDate: string
   originalValue: number
   suggestedCategory: string
+  voucherNo?: string
+  summary?: string
+  sourceAccount?: string
 }
 
 export interface FixedAssetDepreciationDuePeriod {
@@ -1155,6 +1235,9 @@ export interface IntangibleAssetEntryPrefill {
   availableForUseDate: string
   originalValue: number
   suggestedCategory: string
+  voucherNo?: string
+  summary?: string
+  sourceAccount?: string
 }
 
 export interface IntangibleAmortizationDuePeriod {

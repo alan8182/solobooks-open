@@ -3,7 +3,8 @@
  * Licensed under the SoloBooks License v2.0.
  */
 
-import axios from 'axios'
+import axios, { type AxiosRequestConfig } from 'axios'
+import { createDiscreteApi } from 'naive-ui'
 
 // 金额字段以字符串形式传输（Decimal 序列化），响应拦截器按此正则把命中字段的数值字符串转为 Number。
 // 不变量：凡是前端要做数值运算（求和/比较）的响应字段，命名必须命中此正则；绕过 apiClient 的裸 fetch 不做转换。
@@ -89,6 +90,24 @@ export function shouldClearSession(status: number | undefined, body: unknown): b
   return true
 }
 
+/**
+ * 402 = AI 用量超出当前套餐额度（core/plans.py 额度未设限时后端不会返回 402）。
+ * 这里用 naive-ui 离散 API 全局弹一次提示——调用方各自的错误处理仍会照常执行，
+ * 对没有接 reportErrorToast 的调用点（如工具型页面）这是唯一可见出口。
+ */
+let quotaMessageApi: ReturnType<typeof createDiscreteApi>['message'] | null = null
+let quotaToastAt = 0
+
+function notifyQuotaExceeded(): void {
+  const now = Date.now()
+  if (now - quotaToastAt < 3000) return // 批量调用（如导入逐行分类）只弹一次
+  quotaToastAt = now
+  if (!quotaMessageApi) {
+    quotaMessageApi = createDiscreteApi(['message']).message
+  }
+  quotaMessageApi.error('AI 额度已用完，请升级套餐或等待下期恢复', { duration: 5000 })
+}
+
 apiClient.interceptors.response.use(
   (response) => normalizeMoneyForDisplay(response.data),
   async (error) => {
@@ -96,6 +115,9 @@ apiClient.interceptors.response.use(
       localStorage.removeItem('auth_token')
       localStorage.removeItem('auth_state')
       window.location.href = '/login'
+    }
+    if (error.response?.status === 402) {
+      notifyQuotaExceeded()
     }
     // 文件下载类请求（responseType: 'blob'）失败时响应体是 Blob，
     // 还原成 JSON 让调用方的 err.response.data.detail 能取到具体原因。
@@ -111,4 +133,19 @@ apiClient.interceptors.response.use(
   },
 )
 
-export default apiClient
+// 拦截器已把响应解包为 data 本体（见 normalizeMoneyForDisplay）。
+// axios 自带泛型 get<T> 的返回类型是 Promise<AxiosResponse<T>>，与运行时相反：
+// 调用方按 AxiosResponse 解构 data 会拿到 undefined 且编译不报错（最隐蔽的 any 泄漏）。
+// 这里用 axios 官方的第二泛型参数把返回类型钉成 data 本体；默认 any 保持
+// api 层「裸调用 + 显式 : Promise<T> 标注」的既有写法可编译，泛型调用获得真类型。
+const raw = apiClient
+export default {
+  get: <T = any, R = T>(url: string, config?: AxiosRequestConfig) => raw.get<T, R>(url, config),
+  post: <T = any, R = T>(url: string, data?: unknown, config?: AxiosRequestConfig) =>
+    raw.post<T, R>(url, data, config),
+  put: <T = any, R = T>(url: string, data?: unknown, config?: AxiosRequestConfig) =>
+    raw.put<T, R>(url, data, config),
+  patch: <T = any, R = T>(url: string, data?: unknown, config?: AxiosRequestConfig) =>
+    raw.patch<T, R>(url, data, config),
+  delete: <T = any, R = T>(url: string, config?: AxiosRequestConfig) => raw.delete<T, R>(url, config),
+}

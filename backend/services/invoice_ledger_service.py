@@ -31,6 +31,7 @@ from db.session import session_scope
 from services.database import get_conn
 
 INVOICE_DIRECTIONS = ("income", "expense")
+INVOICE_STATUSES = {"normal", "red", "reversed"}
 _BACKFILL_FLAG = "invoice_backfill_done"
 logger = logging.getLogger(__name__)
 
@@ -101,7 +102,9 @@ def invoice_fields_from_entry(payload: dict[str, Any], *, direction: str | None 
         "invoice_number": _text(payload.get("invoiceNumber") or payload.get("invoice_number"), 64),
         "invoice_code": _text(payload.get("invoice_code"), 64),
         "invoice_type": _text(payload.get("invoice_type") or payload.get("invoiceType"), 64),
-        "invoice_status": _text(payload.get("invoice_status"), 32) or "normal",
+        # 台账状态是系统枚举（ck_invoice_status）；Excel 带来的"正常/红冲"等原值
+        # 只在命中枚举时透传，否则一律落 normal，红字口径由金额符号表达
+        "invoice_status": _text(payload.get("invoice_status"), 32) if _text(payload.get("invoice_status"), 32) in INVOICE_STATUSES else "normal",
         "invoice_date": invoice_date,
         "buyer_name": buyer,
         "buyer_tax_id": _text(payload.get("buyer_tax_id") or payload.get("buyerTaxId"), 64),
@@ -350,6 +353,7 @@ async def list_invoices(
     direction: str | None = None,
     keyword: str | None = None,
     status: str | None = None,
+    posting: str | None = None,
     page: int = 1,
     page_size: int = 20,
 ) -> dict[str, Any]:
@@ -364,6 +368,19 @@ async def list_invoices(
         conditions.append(Invoice.direction == direction)
     if status:
         conditions.append(Invoice.invoice_status == status)
+    if posting == "pending":
+        # 待过账：凭证还是草稿/待复核，或台账行尚未关联到凭证
+        sub = select(JournalEntry.id).where(
+            JournalEntry.company_id == company_id,
+            JournalEntry.status.in_(("draft", "pending_review")),
+        )
+        conditions.append(or_(Invoice.entry_id.is_(None), Invoice.entry_id.in_(sub)))
+    elif posting == "posted":
+        sub = select(JournalEntry.id).where(
+            JournalEntry.company_id == company_id,
+            JournalEntry.status == "posted",
+        )
+        conditions.append(Invoice.entry_id.in_(sub))
     keyword = (keyword or "").strip()
     if keyword:
         like = f"%{keyword}%"

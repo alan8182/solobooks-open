@@ -56,6 +56,19 @@ export function reverseEntry(
   )
 }
 
+/** 更正已过账凭证的分类/科目：红字冲销 + 按新分类重建并双双过账。 */
+export function correctEntryCategory(
+  entryId: string,
+  category: string,
+  reason: string,
+): Promise<{ reversalId: string; correctedId: string }> {
+  return apiClient.post(
+    `/api/record/entries/${entryId}/correct-category`,
+    { category, reason },
+    { headers: headers() },
+  )
+}
+
 /** 人工调整分录的一行（会计纠错用）。 */
 export interface VoucherLineAdjustment {
   direction: 'debit' | 'credit'

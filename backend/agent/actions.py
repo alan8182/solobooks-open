@@ -71,7 +71,14 @@ async def create_action(
     evidence: Optional[Dict[str, Any]] = None,
     conversation_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    if action_type not in ("propose_voucher", "propose_vouchers", "propose_match", "propose_accrual"):
+    if action_type not in (
+        "propose_voucher",
+        "propose_vouchers",
+        "propose_match",
+        "propose_accrual",
+        "propose_company_setup",
+        "propose_opening_balance",
+    ):
         raise ValueError(f"unsupported action_type: {action_type}")
     if action_type == "propose_vouchers" and not _batch_items(payload):
         raise ValueError("propose_vouchers payload items is empty")
@@ -84,6 +91,10 @@ async def create_action(
         "asset_closure",
     ):
         raise ValueError("propose_accrual.kind 必须是 depreciation、amortization 或 salary")
+    if action_type == "propose_company_setup" and not str(payload.get("name") or "").strip():
+        raise ValueError("propose_company_setup 需要公司名称 name")
+    if action_type == "propose_opening_balance" and not payload.get("items"):
+        raise ValueError("propose_opening_balance 需要期初科目列表 items")
     async with session_scope() as session:
         row = AgentAction(
             id=new_id(),
@@ -147,6 +158,7 @@ async def approve_action(
     edits: Optional[Dict[str, Dict[str, Any]]] = None,
     allow_backfill: bool = False,
     backfill_reason: Optional[str] = None,
+    step_up_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """人工确认动作。
 
@@ -253,6 +265,114 @@ async def approve_action(
                 from services.accounting_core_service import _json_safe
 
                 result = {"accrual": {"kind": kind, "month": month, "summary": _json_safe(summary)}}
+        elif row.action_type == "propose_company_setup":
+            from services.account_service import (
+                create_company,
+                get_company,
+                set_user_current_company,
+                update_company,
+            )
+            from services.accounting_core_service import ensure_tenant
+            from services.jwt_service import create_access_token
+
+            merged = {**(row.payload or {}), **dict(edit_map.get(0) or {})}
+            name = str(merged.get("name") or "").strip()
+            if not name:
+                raise HTTPException(status_code=422, detail="请填写公司名称")
+            tax_id = str(merged.get("taxId") or "").strip().upper()
+            if tax_id and len(tax_id) != 18:
+                raise HTTPException(status_code=422, detail="统一社会信用代码需为 18 位")
+            onboarding_type = str(merged.get("onboardingType") or "new").strip()
+            if onboarding_type not in ("new", "migration"):
+                onboarding_type = "new"
+            company_fields = {
+                "type": str(merged.get("type") or "有限责任公司").strip(),
+                "taxpayerType": str(merged.get("taxpayerType") or "小规模纳税人").strip(),
+                "startDate": str(merged.get("startDate") or "").strip(),
+                "taxId": tax_id,
+                "industry": str(merged.get("industry") or "").strip(),
+                "vatFilingCycle": str(merged.get("vatFilingCycle") or "quarter").strip(),
+                "onboardingType": onboarding_type,
+            }
+            current_co = await get_company(company_id) or {}
+            if current_co.get("isDemo"):
+                created_co = await create_company(user_id, name, company_fields)
+                new_cid = created_co["company_id"]
+                await set_user_current_company(user_id, new_cid)
+                await ensure_tenant(session, new_cid, user_id)
+                # 同一会话中若已起草期初余额等后续待确认动作，一并迁移到新正式账套
+                await session.execute(
+                    AgentAction.__table__.update()
+                    .where(
+                        AgentAction.user_id == user_id,
+                        AgentAction.company_id == company_id,
+                        AgentAction.status == "pending",
+                        AgentAction.id != row.id,
+                    )
+                    .values(company_id=new_cid)
+                )
+                token = create_access_token({"sub": user_id, "company_id": new_cid})
+                result = {
+                    "company": created_co,
+                    "companyId": new_cid,
+                    "accessToken": token,
+                    "switchedFromDemo": True,
+                    "onboardingType": onboarding_type,
+                }
+            else:
+                try:
+                    updated_co = await update_company(
+                        user_id, company_id, {"name": name, **company_fields}
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                await ensure_tenant(session, company_id, user_id)
+                result = {
+                    "company": updated_co,
+                    "companyId": company_id,
+                    "switchedFromDemo": False,
+                    "onboardingType": onboarding_type,
+                }
+            row.payload = {**merged, "name": name, **company_fields}
+        elif row.action_type == "propose_opening_balance":
+            from services.account_service import get_company
+            from services.accounting_core_service import _json_safe, ensure_tenant
+            from services.opening_balance_service import save_opening_balances
+
+            current_co = await get_company(company_id) or {}
+            if current_co.get("isDemo"):
+                raise HTTPException(
+                    status_code=409,
+                    detail="当前仍为演示账套，请先确认上方「主体建账信息卡片」创建正式账套后，再导入期初余额",
+                )
+            merged = {**(row.payload or {}), **dict(edit_map.get(0) or {})}
+            start_period = str(merged.get("startPeriod") or "").strip()
+            fiscal_year = int(
+                merged.get("fiscalYear")
+                or (start_period[:4] if len(start_period) >= 4 else datetime.now().year)
+            )
+            items = list(merged.get("items") or [])
+            ytd_items = list(merged.get("ytdItems") or [])
+            tax_memory = dict(merged.get("taxMemory") or {})
+            await ensure_tenant(session, company_id, user_id)
+            saved = await save_opening_balances(
+                company_id,
+                fiscal_year,
+                items,
+                user_id=user_id,
+                step_up_token=step_up_token,
+                request_id=f"agent-action-{row.id}",
+                start_period=start_period or None,
+                ytd_items=ytd_items or None,
+                tax_memory=tax_memory or None,
+                session=session,
+            )
+            row.payload = merged
+            result = {
+                "opening": _json_safe(saved),
+                "fiscalYear": fiscal_year,
+                "startPeriod": start_period,
+            }
         else:  # pragma: no cover — create_action 已限制类型
             raise HTTPException(status_code=422, detail=f"不支持的动作类型：{row.action_type}")
 

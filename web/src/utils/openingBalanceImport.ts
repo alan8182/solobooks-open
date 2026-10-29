@@ -8,6 +8,7 @@
  * ponytail: 纯前端无依赖解析函数，基于 SheetJS，支持科目别名、客商核算及年中损益累计识别
  */
 import * as XLSX from 'xlsx'
+import { saveWorkbook } from '@/utils/export'
 
 export interface MatchedOpeningItem {
   account_code: string
@@ -32,6 +33,13 @@ export interface FixedAssetImportItem {
   salvage_rate?: number
 }
 
+export interface UnmatchedOpeningRow {
+  originalCode: string
+  originalName: string
+  debit: number
+  credit: number
+}
+
 export interface ParseOpeningResult {
   items: MatchedOpeningItem[]
   ytdItems: MatchedOpeningItem[]
@@ -43,6 +51,8 @@ export interface ParseOpeningResult {
   matchedCount: number
   unmatchedCount: number
   warnings: string[]
+  unmatchedRows?: UnmatchedOpeningRow[]
+  rawRows?: Record<string, unknown>[]
 }
 
 const EXPENSE_ASSET_CODES = new Set([
@@ -88,6 +98,7 @@ function parseNumber(val: unknown): number {
 export function parseOpeningRows(
   rows: Record<string, unknown>[],
   allAccounts: { account_code: string; account_name?: string }[],
+  mapping?: Record<string, string>,
 ): ParseOpeningResult {
   if (!rows || rows.length === 0) {
     return {
@@ -160,6 +171,7 @@ export function parseOpeningRows(
 
   let matchedCount = 0
   let unmatchedCount = 0
+  const unmatchedRows: UnmatchedOpeningRow[] = []
 
   for (const row of rows) {
     const rawCode = codeKey ? String(row[codeKey] ?? '').trim() : ''
@@ -220,15 +232,19 @@ export function parseOpeningRows(
       continue
     }
 
-    // 匹配系统科目（精准 -> 清洗 -> 前缀 -> 中文名称）
-    const cleanCode = rawCode.replace(/[.\-_]/g, '')
-    const prefixCode = rawCode.includes('.') ? rawCode.split('.')[0] : rawCode.includes('-') ? rawCode.split('-')[0] : ''
-    let target = codeMap.get(rawCode) || codeMap.get(cleanCode)
-    if (!target && prefixCode) {
-      target = codeMap.get(prefixCode)
-    }
-    if (!target && rawName) {
-      target = nameMap.get(rawName)
+    // 匹配系统科目（映射优先 -> 精准 -> 清洗 -> 前缀 -> 中文名称）
+    const mappedCode = mapping?.[rawCode] || mapping?.[rawName]
+    let target = mappedCode ? codeMap.get(mappedCode) : undefined
+    if (!target) {
+      const cleanCode = rawCode.replace(/[.\-_]/g, '')
+      const prefixCode = rawCode.includes('.') ? rawCode.split('.')[0] : rawCode.includes('-') ? rawCode.split('-')[0] : ''
+      target = codeMap.get(rawCode) || codeMap.get(cleanCode)
+      if (!target && prefixCode) {
+        target = codeMap.get(prefixCode)
+      }
+      if (!target && rawName) {
+        target = nameMap.get(rawName)
+      }
     }
 
     if (target) {
@@ -245,6 +261,12 @@ export function parseOpeningRows(
     } else {
       unmatchedCount++
       warnings.push(`未匹配到系统科目：[${rawCode || '-'}] ${rawName || '-'} (借: ${debit}, 贷: ${credit})`)
+      unmatchedRows.push({
+        originalCode: rawCode,
+        originalName: rawName,
+        debit,
+        credit,
+      })
     }
   }
 
@@ -269,6 +291,8 @@ export function parseOpeningRows(
     matchedCount,
     unmatchedCount,
     warnings,
+    unmatchedRows,
+    rawRows: rows,
   }
 }
 
@@ -340,10 +364,11 @@ export function parseFixedAssetRows(rows: Record<string, unknown>[]): FixedAsset
 export function parseOpeningWorkbook(
   workbook: XLSX.WorkBook,
   allAccounts: { account_code: string; account_name?: string }[],
+  mapping?: Record<string, string>,
 ): ParseOpeningResult {
   const sheetNames = workbook.SheetNames
   if (!sheetNames || sheetNames.length === 0) {
-    return parseOpeningRows([], allAccounts)
+    return parseOpeningRows([], allAccounts, mapping)
   }
 
   // 1. 定位各个 Sheet
@@ -353,12 +378,12 @@ export function parseOpeningWorkbook(
 
   // 解析资产负债 Sheet
   const balanceRows = XLSX.utils.sheet_to_json(workbook.Sheets[balanceSheetName], { defval: '' }) as Record<string, unknown>[]
-  const baseResult = parseOpeningRows(balanceRows, allAccounts)
+  const baseResult = parseOpeningRows(balanceRows, allAccounts, mapping)
 
   // 如果有独立的损益 Sheet，合并损益科目数据
   if (ytdSheetName && ytdSheetName !== balanceSheetName) {
     const ytdRows = XLSX.utils.sheet_to_json(workbook.Sheets[ytdSheetName], { defval: '' }) as Record<string, unknown>[]
-    const ytdParsed = parseOpeningRows(ytdRows, allAccounts)
+    const ytdParsed = parseOpeningRows(ytdRows, allAccounts, mapping)
     if (ytdParsed.ytdItems && ytdParsed.ytdItems.length > 0) {
       const existingYtdMap = new Map(baseResult.ytdItems.map(y => [y.account_code, y]))
       for (const yi of ytdParsed.ytdItems) {
@@ -440,5 +465,5 @@ export function exportOpeningTemplate(
   ws3['!cols'] = [{ wch: 22 }, { wch: 16 }, { wch: 16 }, { wch: 16 }, { wch: 18 }, { wch: 14 }, { wch: 16 }, { wch: 45 }]
   XLSX.utils.book_append_sheet(wb, ws3, '固定资产期初卡片')
 
-  XLSX.writeFile(wb, `梭罗记账_期初建账导入模板_${pName}.xlsx`)
+  saveWorkbook(wb, `梭罗记账_期初建账导入模板_${pName}.xlsx`)
 }

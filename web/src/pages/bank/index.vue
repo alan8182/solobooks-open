@@ -1,18 +1,24 @@
 <!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { computed, ref, h, onMounted, watch } from 'vue'
+import { accountingErrorText } from '@/utils/errors'
 import { useRouter } from 'vue-router'
 import {
   NCard, NButton, NTag, NSpace, useMessage, NSpin,
-  NInput, NModal, NForm, NFormItem, NDataTable, NSelect, NDatePicker, useDialog,
+  NInput, NModal, NDataTable, NSelect, NDatePicker, useDialog,
 } from 'naive-ui'
 import apiClient from '@/api/client'
 import { getRdExpenseTypes, getRdProjects } from '@/api/rd'
 import type { RdExpenseTypeOption, RdProject } from '@/api/types'
 import { useDeleteConfirm } from '@/composables/useDeleteConfirm'
 import { usePageRefresh } from '@/composables/usePageRefresh'
-import { buildBankStatementDescription } from '@/utils/bankStatementDescription'
-import * as XLSX from 'xlsx'
+import {
+  buildBankRows,
+  detectBankColumnMapping,
+  parseBankWorkbookData,
+  bankColumnDescriptionRole,
+  extractStatementCounterparty,
+} from '@/utils/bankImport'
 import { SoloDrawer, SoloEmpty, SoloStatusBadge } from '@/components/ui'
 
 const router = useRouter()
@@ -25,9 +31,6 @@ const statements = ref<any[]>([])
 const diffReport = ref<any>(null)
 const month = ref(new Date().toISOString().slice(0, 7))
 const showUnmatched = ref(false)
-const showImportModal = ref(false)
-const importCsv = ref('')
-const importBatchId = ref('')
 const matching = ref(false)
 const searchKeyword = ref('')
 const dateRange = ref<[number, number] | null>(null)
@@ -103,7 +106,8 @@ const filteredStatements = computed(() => {
     if (matchStatus.value === 'unmatched' && row.matched_entry_id) return false
     if (!keyword) return true
 
-    return [rowDate, row.description, row.amount, row.balance]
+    const counterparty = row.counterparty || extractStatementCounterparty(row.description)
+    return [rowDate, row.description, counterparty, row.amount, row.balance]
       .some(value => String(value ?? '').toLowerCase().includes(keyword))
   })
 })
@@ -184,6 +188,15 @@ const statementColumns = [
     title: '日期', key: 'transaction_date', width: 110,
     sorter: (a: any, b: any) => String(a.transaction_date || '').localeCompare(String(b.transaction_date || '')),
     defaultSortOrder: 'descend' as const,
+  },
+  {
+    title: '对方户名', key: 'counterparty', width: 160,
+    render: (row: any) => {
+      const party = row.counterparty || extractStatementCounterparty(row.description)
+      return party
+        ? h('span', { class: 'statement-counterparty', style: 'font-weight: 500;' }, party)
+        : h('span', { style: 'color: var(--solo-text-muted);' }, '-')
+    },
   },
   { title: '摘要', key: 'description' },
   {
@@ -283,30 +296,6 @@ function confirmEffectRepair(issue: any) {
       }
     },
   })
-}
-
-async function handleImport() {
-  if (!importCsv.value.trim()) {
-    message.warning('请输入 CSV 内容')
-    return
-  }
-  try {
-    const result: any = await apiClient.post('/api/bank/import', {
-      csv_content: importCsv.value,
-      statement_id: importBatchId.value,
-    })
-    if (result.skipped > 0) {
-      message.success(`导入成功：${result.imported} 条 (已自动过滤 ${result.skipped} 条重复流水)`)
-    } else {
-      message.success(`导入成功：${result.imported} 条`)
-    }
-    showImportModal.value = false
-    importCsv.value = ''
-    importBatchId.value = ''
-    await loadStatements()
-  } catch {
-    message.error('导入失败')
-  }
 }
 
 async function handleMatch() {
@@ -419,102 +408,12 @@ function getConfidenceLabel(conf: number): string {
 function triggerFilePicker() {
   const input = document.createElement('input')
   input.type = 'file'
-  input.accept = '.xlsx,.xls'
+  input.accept = '.xlsx,.xls,.csv'
   input.style.display = 'none'
   input.addEventListener('change', handleFileUpload)
   document.body.appendChild(input)
   input.click()
   document.body.removeChild(input)
-}
-
-// Convert various date formats (including XLSX serial numbers) to YYYY-MM-DD
-function formatBankDate(val: any): string {
-  if (val === null || val === undefined || val === '') return ''
-  if (typeof val === 'number') {
-    const d = XLSX.SSF.parse_date_code(val)
-    if (d) return `${d.y}-${String(d.m).padStart(2, '0')}-${String(d.d).padStart(2, '0')}`
-  }
-  const s = String(val).trim()
-  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10)
-  const m1 = s.match(/^(\d{4})[/](\d{1,2})[/](\d{1,2})/)
-  if (m1) return `${m1[1]}-${m1[2].padStart(2, '0')}-${m1[3].padStart(2, '0')}`
-  const m2 = s.match(/^(\d{4})(\d{2})(\d{2})/)
-  if (m2) return `${m2[1]}-${m2[2]}-${m2[3]}`
-  return s.slice(0, 10) || ''
-}
-
-function parseBankExcel(sheet: any): any[] {
-  // Parse sheet into 2D array of raw rows
-  const rawRows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' }) as any[][]
-  
-  let headerIndex = -1
-  for (let i = 0; i < rawRows.length; i++) {
-    const row = rawRows[i]
-    if (!row) continue
-    
-    let score = 0
-    for (const cell of row) {
-      const val = String(cell || '').trim()
-      if (/交易日|交易日期|日期|时间|date|time/i.test(val)) score++
-      else if (/交易金额|发生额|金额|借贷发生额|amount/i.test(val)) score++
-      else if (/交易摘要|摘要|描述|用途|description|desc|remark/i.test(val)) score++
-      else if (/账户余额|余额|balance/i.test(val)) score++
-    }
-    
-    if (score >= 3) {
-      headerIndex = i
-      break
-    }
-  }
-  
-  if (headerIndex === -1) {
-    // Fallback if no structured header found
-    return XLSX.utils.sheet_to_json(sheet, { defval: '' })
-  }
-  
-  const headers = rawRows[headerIndex].map(h => String(h || '').trim())
-  
-  // Find date column indices to filter out header/footer rows without date
-  const dateColIndices: number[] = []
-  for (let j = 0; j < headers.length; j++) {
-    const h = headers[j].toLowerCase()
-    if (/交易日|记账日|入账日|起息日|日期|时间|date|time/i.test(h)) {
-      dateColIndices.push(j)
-    }
-  }
-
-  const json: any[] = []
-  
-  for (let i = headerIndex + 1; i < rawRows.length; i++) {
-    const row = rawRows[i]
-    if (!row || row.length === 0) continue
-    
-    // Skip empty or summary rows
-    const firstCell = String(row[0] || '').trim()
-    const hasSummaryText = row.some(cell => /累计|合计|总计|总记录数/.test(String(cell || '').trim()))
-    if (/累计|合计|总计|总记录数/.test(firstCell) || hasSummaryText) continue
-    
-    // If a date column is defined but this row has no date, it is likely a footer or summary row
-    if (dateColIndices.length > 0) {
-      const hasDate = dateColIndices.some(idx => String(row[idx] || '').trim() !== '')
-      if (!hasDate) continue
-    }
-    
-    const obj: Record<string, any> = {}
-    let hasValue = false
-    for (let j = 0; j < headers.length; j++) {
-      const header = headers[j]
-      if (header) {
-        obj[header] = row[j] !== undefined ? row[j] : ''
-        if (obj[header] !== '') hasValue = true
-      }
-    }
-    if (hasValue) {
-      json.push(obj)
-    }
-  }
-  
-  return json
 }
 
 function handleFileUpload(e: Event) {
@@ -526,140 +425,41 @@ function handleFileUpload(e: Event) {
   reader.onload = (ev) => {
     try {
       const data = new Uint8Array(ev.target?.result as ArrayBuffer)
-      const workbook = XLSX.read(data, { type: 'array' })
-      const sheet = workbook.Sheets[workbook.SheetNames[0]]
-      const json = parseBankExcel(sheet)
+      const json = parseBankWorkbookData(data)
       if (json.length === 0) {
-        message.warning('Excel 文件为空')
+        message.warning('流水文件为空')
         return
       }
       excelColumns.value = Object.keys(json[0] as any)
       excelRows.value = json as any[]
-      // Auto-detect mapping
-      const map: Record<string, string> = {}
-      for (const col of excelColumns.value) {
-        const lc = col.toLowerCase()
-        if (/交易日期|记账日期|入账日期|交易日|起息日期|日期|date/i.test(lc) || (/交易时间|时间/.test(lc) && !/对方/.test(lc))) map[col] = 'transaction_date'
-        else if (/附言|用途|备注|附加信息|备注信息|附加备注|comment|purpose/.test(lc)) map[col] = ''
-        else if (/摘要|描述|说明|description|desc/.test(lc)) map[col] = 'description'
-        else if (/余额|balance/.test(lc)) map[col] = 'balance'
-        else if (/收入金额|存入金额|收入|借/.test(lc)) map[col] = 'income_amount'
-        else if (/支出金额|支取金额|支出|贷/.test(lc)) map[col] = 'expense_amount'
-        else if (/金额|amount|交易额|发生额/.test(lc)) map[col] = 'amount'
-        else map[col] = ''
-      }
-      columnMapping.value = map
+      columnMapping.value = detectBankColumnMapping(excelColumns.value)
       excelStep.value = 'preview'
     } catch {
-      message.error('解析 Excel 文件失败')
+      message.error('解析文件失败')
     }
   }
   reader.readAsArrayBuffer(file)
   input.value = '' // reset
 }
 
-function parseMoney(val: any): number {
-  if (val === undefined || val === null || val === '') return 0
-  if (typeof val === 'number') return val
-  const cleaned = String(val).replace(/,/g, '').trim()
-  const num = parseFloat(cleaned)
-  return isNaN(num) ? 0 : num
-}
-
 async function handleExcelImport() {
-  const mapped = excelRows.value.map(row => {
-    const out: any = {
-      transaction_date: '',
-      description: '',
-      amount: 0,
-      balance: 0
-    }
-    let singleAmount = 0
-    let incomeAmount = 0
-    let expenseAmount = 0
-    let hasSingleAmount = false
-    let hasIncomeAmount = false
-    let hasExpenseAmount = false
-
-    for (const [col, field] of Object.entries(columnMapping.value)) {
-      if (!field) continue
-      const val = (row as any)[col]
-      if (field === 'transaction_date') {
-        out.transaction_date = formatBankDate(val)
-      } else if (field === 'description') {
-        const strVal = String(val).trim()
-        if (strVal) {
-          out.description = out.description 
-            ? `${out.description} | ${strVal}`
-            : strVal
-        }
-      } else if (field === 'balance') {
-        out.balance = parseMoney(val)
-      } else if (field === 'amount') {
-        singleAmount = parseMoney(val)
-        hasSingleAmount = true
-      } else if (field === 'income_amount') {
-        incomeAmount = parseMoney(val)
-        hasIncomeAmount = true
-      } else if (field === 'expense_amount') {
-        expenseAmount = parseMoney(val)
-        hasExpenseAmount = true
-      }
-    }
-
-    // Determine the final amount
-    if (hasIncomeAmount || hasExpenseAmount) {
-      if (incomeAmount > 0) {
-        out.amount = Math.abs(incomeAmount)
-      } else if (expenseAmount > 0) {
-        out.amount = -Math.abs(expenseAmount)
-      } else {
-        out.amount = 0
-      }
-    } else if (hasSingleAmount) {
-      out.amount = singleAmount
-    }
-
-    // Find supplementary columns in raw row for creating an enriched description
-    let typeName = ''
-    let counterpartyName = ''
-    let rawSummaryText = ''
-    let commentText = ''
-    
-    for (const [col, val] of Object.entries(row as any)) {
-      const colName = String(col).trim()
-      const strVal = String(val || '').trim()
-      if (/交易类型|业务名称|业务类型|类型|type/i.test(colName)) {
-        typeName = strVal
-      } else if (/对手方|对方户名|对方名称|对方账号名称|收\(付\)方名称|收付方名称|对方开户名|对手方开户名|对手方银行户名|交易对手/i.test(colName)) {
-        counterpartyName = strVal
-      } else if (/交易摘要|摘要|描述|description|desc|remark/i.test(colName)) {
-        rawSummaryText = strVal
-      } else if (/附言|用途|备注|附加信息|备注信息|附加备注|comment|purpose/i.test(colName)) {
-        commentText = strVal
-      }
-    }
-    
-    out.description = buildBankStatementDescription({
-      typeName,
-      summaryText: rawSummaryText || out.description,
-      commentText,
-      counterpartyName,
-    })
-    return out
-  })
+  const { rows: importable, skippedInvalidDate } = buildBankRows(excelRows.value, columnMapping.value)
+  if (importable.length === 0) {
+    message.error('未在文件中解析到带有效交易日期的流水行')
+    return
+  }
 
   excelImporting.value = true
   try {
     const result: any = await apiClient.post('/api/bank/import-json', {
-      rows: mapped,
+      rows: importable,
       statement_id: excelFileName.value,
     })
-    if (result.skipped > 0) {
-      message.success(`导入成功：${result.imported} 条 (已自动过滤 ${result.skipped} 条重复流水)`)
-    } else {
-      message.success(`导入成功：${result.imported} 条`)
-    }
+    const parts = [`导入成功：${result.imported} 条`]
+    if (result.skipped > 0) parts.push(`自动过滤 ${result.skipped} 条重复流水`)
+    if (skippedInvalidDate > 0) parts.push(`跳过 ${skippedInvalidDate} 条无有效日期`)
+    if (result.errors > 0) parts.push(`${result.errors} 条导入失败`)
+    message.success(parts.join('，'))
     showExcelImport.value = false
     excelStep.value = 'upload'
     excelRows.value = []
@@ -679,7 +479,7 @@ async function handleDeleteStatement(id: string) {
     checkedRowKeys.value = checkedRowKeys.value.filter(key => key !== id)
     await loadStatements()
   } catch (err) {
-    message.error('删除流水失败，请重试')
+    message.error(accountingErrorText(err, '删除流水失败，请重试'))
   } finally {
     loading.value = false
   }
@@ -703,7 +503,7 @@ async function handleBatchDeleteStatements(ids: string[]) {
     checkedRowKeys.value = []
     await loadStatements()
   } catch (err) {
-    message.error('批量删除失败，请重试')
+    message.error(accountingErrorText(err, '批量删除失败，请重试'))
   } finally {
     batchDeleting.value = false
     loading.value = false
@@ -736,8 +536,7 @@ usePageRefresh(loadStatements)
       <div class="header-right">
         <NSpace>
           <NButton size="small" :loading="matching" @click="handleMatch">生成匹配候选</NButton>
-          <NButton size="small" @click="showImportModal = true">导入 CSV</NButton>
-          <NButton size="small" @click="openExcelImport">导入 Excel</NButton>
+          <NButton size="small" @click="openExcelImport">导入文件</NButton>
         </NSpace>
       </div>
     </div>
@@ -814,10 +613,7 @@ usePageRefresh(loadStatements)
         >
           <template #action>
             <div class="empty-actions">
-              <NButton type="primary" size="small" @click="showImportModal = true">
-                导入 CSV
-              </NButton>
-              <NButton size="small" @click="openExcelImport">导入 Excel</NButton>
+              <NButton type="primary" size="small" @click="openExcelImport">导入文件</NButton>
             </div>
           </template>
         </SoloEmpty>
@@ -960,7 +756,7 @@ usePageRefresh(loadStatements)
           :bordered="false"
           :single-line="true"
           :pagination="tablePagination"
-          :scroll-x="820"
+          :scroll-x="980"
           size="small"
           @update:page="tablePage = $event"
           @update:page-size="tablePageSize = $event; tablePage = 1"
@@ -976,7 +772,7 @@ usePageRefresh(loadStatements)
               "
             >
               <template v-if="statements.length === 0" #action>
-                <NButton size="small" @click="showImportModal = true">导入</NButton>
+                <NButton size="small" @click="openExcelImport">导入</NButton>
               </template>
             </SoloEmpty>
           </template>
@@ -1061,32 +857,11 @@ usePageRefresh(loadStatements)
       </NSpin>
     </SoloDrawer>
 
-    <NModal v-model:show="showImportModal" title="导入银行流水" preset="card" style="width: 520px;">
-      <NForm>
-        <NFormItem label="批次编号（可选）">
-          <NInput v-model:value="importBatchId" placeholder="如 2026-06" />
-        </NFormItem>
-        <NFormItem label="CSV 内容">
-          <NInput
-            v-model:value="importCsv"
-            type="textarea"
-            :rows="8"
-            placeholder="date,description,amount,balance&#10;2026-06-01,转账收入,10000,50000&#10;2026-06-02,采购付款,-5000,45000"
-          />
-        </NFormItem>
-      </NForm>
-      <template #footer>
-        <NSpace justify="end">
-          <NButton @click="showImportModal = false">取消</NButton>
-          <NButton type="primary" @click="handleImport">导入</NButton>
-        </NSpace>
-      </template>
-    </NModal>
-    <!-- Excel Import Modal -->
-    <NModal v-model:show="showExcelImport" title="导入银行流水 Excel" preset="card" style="width: 700px;">
+    <!-- Import Modal（CSV/Excel 统一走前端解析，CSV 弹窗已移除） -->
+    <NModal v-model:show="showExcelImport" title="导入银行流水文件" preset="card" style="width: 700px;">
       <template v-if="excelStep === 'upload'">
         <div class="upload-area">
-          <p>选择银行流水 Excel 文件（.xlsx / .xls）</p>
+          <p>选择银行流水文件（.xlsx / .xls / .csv）</p>
           <NButton type="primary" @click="triggerFilePicker">选择文件</NButton>
         </div>
       </template>
@@ -1095,17 +870,33 @@ usePageRefresh(loadStatements)
         <p class="excel-info">文件：{{ excelFileName }} · 共 {{ excelRows.length }} 行</p>
 
         <h4 class="section-title">列映射</h4>
+        <p class="mapping-hint">附言、对手方户名等辅助列无需映射，导入时会自动并入交易描述，供收支识别参考。</p>
         <div class="mapping-grid">
           <div v-for="col in excelColumns" :key="col" class="mapping-row">
             <span class="mapping-col">{{ col }}</span>
             <span class="mapping-arrow">→</span>
+            <!-- 描述增强列（附言/对手方户名等）不参与映射，自动并入描述；显示角色让用户所见即所得 -->
+            <NTag
+              v-if="columnMapping[col] === '' && bankColumnDescriptionRole(col)"
+              size="small"
+              type="info"
+              :bordered="false"
+              class="mapping-auto-tag"
+            >
+              自动并入描述 · {{ bankColumnDescriptionRole(col) }}
+            </NTag>
             <NSelect
+              v-else
               :value="columnMapping[col]"
               @update:value="(v: string) => columnMapping[col] = v"
               :options="[
                 { label: '忽略', value: '' },
                 { label: '日期', value: 'transaction_date' },
                 { label: '摘要/描述', value: 'description' },
+                { label: '对方户名', value: 'counterparty_name' },
+                { label: '收款人户名', value: 'payee_name' },
+                { label: '付款人户名', value: 'payer_name' },
+                { label: '附言/备注', value: 'comment' },
                 { label: '金额(收支单列)', value: 'amount' },
                 { label: '存入(收入)金额', value: 'income_amount' },
                 { label: '支取(支出)金额', value: 'expense_amount' },
@@ -1393,6 +1184,16 @@ usePageRefresh(loadStatements)
   margin: 0 0 12px;
   font-size: 14px;
   font-weight: 600;
+}
+.mapping-hint {
+  margin: -6px 0 10px;
+  font-size: 12px;
+  color: var(--solo-text-muted);
+}
+.mapping-auto-tag {
+  width: 160px;
+  justify-content: center;
+  font-size: 12px;
 }
 .diff-table {
   width: 100%;

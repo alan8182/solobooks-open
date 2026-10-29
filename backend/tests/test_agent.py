@@ -425,3 +425,47 @@ async def test_workspace_view_is_injected_into_agent_prompt(monkeypatch):
     assert "会计视图" in accounting_prompt
     assert "科目编码" in accounting_prompt
 
+
+@pytest.mark.asyncio
+async def test_propose_company_setup_and_opening_balance_tools():
+    """验证 AI 会计对话内的主体建账与期初余额导入工具（含差额自动配平与容器中文字段映射）。"""
+    from agent.tools import ToolContext, execute_tool
+
+    await _ensure_schema()
+    ctx = ToolContext(user_id="owner-onboard", company_id="c-onboard-1")
+
+    setup_res = await execute_tool(
+        "propose_company_setup",
+        {
+            "onboarding_type": "migration",
+            "name": "杭州迁入测试科技有限公司",
+            "tax_id": "91330100MA27XXXXXX",
+            "start_date": "2026-10-01",
+            "industry": "软件和信息技术服务业",
+        },
+        ctx,
+    )
+    assert setup_res["status"] == "pending"
+    assert setup_res["onboardingType"] == "migration"
+
+    opening_res = await execute_tool(
+        "propose_opening_balance",
+        {
+            "start_period": "2026-10",
+            "items": [
+                {"account_name": "银行存款", "debit_balance": 120000},
+                {"account_name": "固定资产", "debit_balance": 30000},
+                {"account_name": "累计折旧", "debit_balance": 5000},  # 自动纠正到贷方
+                {"account_name": "实收资本", "credit_balance": 100000},
+            ],
+            "auto_plug_difference": True,
+        },
+        ctx,
+    )
+    assert opening_res["status"] == "pending"
+    assert opening_res["balanced"] is True
+    assert opening_res["totalDebit"] == "150000.00"
+    assert opening_res["totalCredit"] == "150000.00"
+    assert opening_res["autoPlugged"]["accountCode"] == "3104006"
+    assert opening_res["autoPlugged"]["amount"] == 45000.0
+

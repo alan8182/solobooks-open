@@ -65,6 +65,7 @@ export function getInvoices(params: {
   direction?: string
   keyword?: string
   status?: string
+  posting?: string
   page?: number
   page_size?: number
 }): Promise<InvoiceListResponse> {

@@ -102,7 +102,8 @@ async def test_save_entry_repairs_stale_known_category_voucher_lines(temp_entry_
     )
 
     assert saved["voucherLines"]["debit"][0]["accountCode"] == "5602004"
-    assert saved["voucherLines"]["debit"][0]["accountName"] == "办公费"
+    # 科目名落库为完整路径（父级-末级），底账与报表口径一致
+    assert saved["voucherLines"]["debit"][0]["accountName"] == "管理费用-办公费"
     assert saved["voucherLines"]["credit"][0]["accountCode"] == "1002"
 @pytest.mark.asyncio
 async def test_update_entry_persists_direction_and_recomputes_voucher_lines(temp_entry_db):

@@ -12,12 +12,12 @@ import {
 } from '@/api/asset'
 import { getRdProjects } from '@/api/rd'
 import { formatMoney } from '@/utils/format'
-import { residualRateFromValue, residualValueFromRate } from '@/utils/fixedAssetResidual'
+import { depreciationPlan, residualRateFromValue, residualValueFromRate } from '@/utils/fixedAssetResidual'
 import type {
-  DepreciationCatchUpResult,
   FixedAssetCategory,
   FixedAssetCreateRequest,
   FixedAssetDepreciationDuePeriod,
+  FixedAssetEntryPrefill,
   FixedAssetFromEntryResponse,
 } from '@/api/types'
 
@@ -30,13 +30,12 @@ const categories = ref<FixedAssetCategory[]>([])
 const rdProjects = ref<{ id: string; code: string; name: string; status: string }[]>([])
 const rdProjectOptions = ref<{ label: string; value: string }[]>([])
 const sourceEntryId = computed(() => typeof route.query.sourceEntryId === 'string' ? route.query.sourceEntryId : '')
+const sourcePrefill = ref<FixedAssetEntryPrefill | null>(null)
+const showAdvanced = ref(false)
 const createdAssetId = ref('')
 const duePeriods = ref<FixedAssetDepreciationDuePeriod[]>([])
 const dueTotalAmount = ref(0)
 const showDueModal = ref(false)
-const showCatchUpPreview = ref(false)
-const catchUpPreview = ref<DepreciationCatchUpResult | null>(null)
-const previewingCatchUp = ref(false)
 const runningCatchUp = ref(false)
 
 // formatted-value 的「无值」哨兵是 null，空字符串会被当作待解析日期导致页面崩溃
@@ -122,29 +121,27 @@ watch(() => form.value.originalValue, (original) => {
   }
 })
 
-function addMonths(period: string, months: number): string {
-  const y = Number(period.slice(0, 4))
-  const m = Number(period.slice(5, 7))
-  const total = y * 12 + (m - 1) + months
-  return `${String(Math.floor(total / 12)).padStart(4, '0')}-${String((total % 12) + 1).padStart(2, '0')}`
-}
-
 const calc = computed(() => {
-  const original = form.value.originalValue || 0
-  const residual = form.value.residualValue || 0
-  const base = Math.max(0, original - residual)
-  const isOneTime = form.value.depreciationMethod === 'one_time'
-  const months = isOneTime ? 1 : (form.value.usefulLifeMonths || 0)
-  const start = form.value.availableForUseDate || form.value.acquisitionDate || ''
-  const startPeriod = start ? start.slice(0, 7) : ''
-  const firstDepPeriod = startPeriod ? addMonths(startPeriod, 1) : '—'
+  const plan = depreciationPlan({
+    originalValue: form.value.originalValue || 0,
+    residualValue: form.value.residualValue || 0,
+    usefulLifeMonths: form.value.usefulLifeMonths || 0,
+    oneTime: form.value.depreciationMethod === 'one_time',
+    availableForUseDate: form.value.availableForUseDate || form.value.acquisitionDate || null,
+  })
   return {
-    base,
-    monthly: months > 0 ? base / months : 0,
+    base: plan.base,
+    monthly: plan.monthly,
+    usePeriod: plan.usePeriod || '—',
     // 次月起提
-    startPeriod: firstDepPeriod,
-    endPeriod: start && months > 0 ? addMonths(firstDepPeriod, months - 1) : '—',
+    startPeriod: plan.startPeriod || '—',
+    endPeriod: plan.endPeriod || '—',
   }
+})
+
+const canOneTimeDeduct = computed(() => {
+  const original = form.value.originalValue || 0
+  return original > 0 && original <= 5000000 && !!currentCategory.value?.oneTimeAllowed
 })
 
 async function loadSourcePrefill() {
@@ -156,6 +153,7 @@ async function loadSourcePrefill() {
       await router.replace(`/assets/${prefill.existingAssetId}`)
       return
     }
+    sourcePrefill.value = prefill
     form.value.name = prefill.name
     form.value.category = prefill.suggestedCategory || 'other'
     form.value.acquisitionDate = prefill.acquisitionDate
@@ -180,29 +178,11 @@ function handleCreated(result: FixedAssetFromEntryResponse) {
     showDueModal.value = true
     return
   }
-  message.success('固定资产卡片已建立')
+  message.success('固定资产卡片已成功建立')
   router.push(`/assets/${result.asset.id}`)
 }
 
-async function previewCatchUp() {
-  if (!createdAssetId.value) return
-  previewingCatchUp.value = true
-  try {
-    catchUpPreview.value = await runFixedAssetDepreciationCatchUp({
-      throughPeriod: currentPeriod(),
-      assetIds: [createdAssetId.value],
-      dryRun: true,
-    })
-    showDueModal.value = false
-    showCatchUpPreview.value = true
-  } catch (err: any) {
-    message.error(err?.response?.data?.detail?.message || err?.response?.data?.detail || '预览折旧失败')
-  } finally {
-    previewingCatchUp.value = false
-  }
-}
-
-async function confirmCatchUp() {
+async function directCatchUp() {
   if (!createdAssetId.value) return
   runningCatchUp.value = true
   try {
@@ -216,7 +196,7 @@ async function confirmCatchUp() {
         ? `已补提 ${result.processedCount} 期折旧，其中 ${pending} 张凭证待复核`
         : `已补提 ${result.processedCount} 期折旧`,
     )
-    showCatchUpPreview.value = false
+    showDueModal.value = false
     router.push(`/assets/${createdAssetId.value}`)
   } catch (err: any) {
     message.error(err?.response?.data?.detail?.message || err?.response?.data?.detail || '补提折旧失败')
@@ -341,255 +321,309 @@ async function handleSubmit() {
       </div>
     </div>
 
-    <NCard :bordered="false" class="form-card">
-      <NForm label-placement="top" class="fixed-asset-form">
-        <NGrid :cols="2" :x-gap="20">
-          <NGridItem :span="2">
-            <NFormItem label="资产名称">
-              <NInput v-model:value="form.name" placeholder="如：XX 台式电脑、XX 乘用车、XX 办公家具" />
-            </NFormItem>
-          </NGridItem>
+    <div v-if="sourceEntryId" class="source-anchor">
+      <div class="anchor-head">
+        <div class="anchor-badge">来源交易核对</div>
+        <span class="anchor-note">原支出交易已入账，本次仅确立折旧摊销规则，不会重复生成资金凭证。</span>
+      </div>
+      <div class="anchor-facts">
+        <div class="fact-item">
+          <span class="fact-label">记账摘要</span>
+          <strong class="fact-val">{{ sourcePrefill?.summary || sourcePrefill?.name || form.name || '—' }}</strong>
+        </div>
+        <div class="fact-item">
+          <span class="fact-label">交易日期</span>
+          <strong class="fact-val tabular">{{ sourcePrefill?.acquisitionDate || form.acquisitionDate || '—' }}</strong>
+        </div>
+        <div class="fact-item">
+          <span class="fact-label">支出账户</span>
+          <strong class="fact-val">{{ sourcePrefill?.sourceAccount || '公司账户（外购取得）' }}</strong>
+        </div>
+        <div class="fact-item">
+          <span class="fact-label">原账目凭证号</span>
+          <strong class="fact-val tabular">{{ sourcePrefill?.voucherNo || sourceEntryId.slice(0, 8) }}</strong>
+        </div>
+        <div class="fact-item fact-amount">
+          <span class="fact-label">价税合计金额</span>
+          <strong class="fact-val tabular amount-highlight">{{ formatMoney(sourcePrefill?.originalValue ?? form.originalValue ?? 0) }}</strong>
+        </div>
+      </div>
+    </div>
 
-          <NGridItem :span="1">
-            <NFormItem label="资产类别">
-              <NSelect v-model:value="form.category" :options="categoryOptions" @update:value="handleCategoryChange" />
-              <template #feedback>
-                <span class="form-tip">{{ lifeTip }}</span>
-              </template>
-            </NFormItem>
-          </NGridItem>
+    <div class="workspace-grid">
+      <NCard :bordered="false" class="form-card">
+        <NForm label-placement="top" class="fixed-asset-form">
+          <div class="section-heading">1. 核心方案配置</div>
+          <NGrid :cols="2" :x-gap="20">
+            <NGridItem :span="2">
+              <NFormItem label="资产名称">
+                <NInput v-model:value="form.name" placeholder="如：XX 台式电脑、XX 乘用车、XX 办公家具" />
+              </NFormItem>
+            </NGridItem>
 
-          <NGridItem :span="1">
-            <NFormItem label="取得方式">
-              <NSelect v-model:value="form.acquisitionType" :options="acquisitionTypeOptions" :disabled="!!sourceEntryId" />
-            </NFormItem>
-          </NGridItem>
+            <NGridItem :span="sourceEntryId ? 2 : 1">
+              <NFormItem label="资产类别">
+                <NSelect v-model:value="form.category" :options="categoryOptions" @update:value="handleCategoryChange" />
+                <template #feedback>
+                  <span class="form-tip">{{ lifeTip }}</span>
+                </template>
+              </NFormItem>
+            </NGridItem>
 
-          <NGridItem :span="1">
-            <NFormItem label="取得日期">
-              <NDatePicker
-                v-model:formatted-value="form.acquisitionDate"
-                value-format="yyyy-MM-dd"
-                type="date"
-                style="width: 100%;"
-                placeholder="购置日/竣工日/投入使用日"
-                @update:formatted-value="handleAcquisitionDateChange"
-              />
-            </NFormItem>
-          </NGridItem>
+            <NGridItem v-if="!sourceEntryId" :span="1">
+              <NFormItem label="取得方式">
+                <NSelect v-model:value="form.acquisitionType" :options="acquisitionTypeOptions" />
+              </NFormItem>
+            </NGridItem>
 
-          <NGridItem :span="1">
-            <NFormItem label="可供使用日期（次月起计提）">
-              <NDatePicker
-                v-model:formatted-value="form.availableForUseDate"
-                value-format="yyyy-MM-dd"
-                type="date"
-                style="width: 100%;"
-                placeholder="默认与取得日期一致"
-              />
-              <template #feedback>
-                <span class="form-tip">固定资产自<b>可供使用次月</b>起计提折旧。</span>
-              </template>
-            </NFormItem>
-          </NGridItem>
+            <NGridItem v-if="!sourceEntryId" :span="1">
+              <NFormItem label="取得日期">
+                <NDatePicker
+                  v-model:formatted-value="form.acquisitionDate"
+                  value-format="yyyy-MM-dd"
+                  type="date"
+                  style="width: 100%;"
+                  placeholder="购置日/竣工日/投入使用日"
+                  @update:formatted-value="handleAcquisitionDateChange"
+                />
+              </NFormItem>
+            </NGridItem>
 
-          <NGridItem :span="1">
-            <NFormItem label="资产原值（元）">
-              <NInputNumber v-model:value="form.originalValue" :min="0.01" :step="1000" style="width: 100%;" placeholder="0.00" />
-              <template #feedback>
-                <span class="form-tip">小规模纳税人不抵扣进项税额，按价税合计金额填入。</span>
-              </template>
-            </NFormItem>
-          </NGridItem>
+            <NGridItem :span="1">
+              <NFormItem label="可供使用日期（次月起计提）">
+                <NDatePicker
+                  v-model:formatted-value="form.availableForUseDate"
+                  value-format="yyyy-MM-dd"
+                  type="date"
+                  style="width: 100%;"
+                  placeholder="默认与取得日期一致"
+                />
+                <template #feedback>
+                  <span class="form-tip">固定资产自<b>可供使用次月</b>起计提折旧。</span>
+                </template>
+              </NFormItem>
+            </NGridItem>
 
-          <NGridItem v-if="form.acquisitionType === 'purchase' && !sourceEntryId" :span="1">
-            <NFormItem label="支付方式">
-              <NSelect v-model:value="form.paymentMethod" :options="paymentMethodOptions" />
-            </NFormItem>
-          </NGridItem>
+            <NGridItem v-if="!sourceEntryId" :span="1">
+              <NFormItem label="资产原值（元）">
+                <NInputNumber v-model:value="form.originalValue" :min="0.01" :step="1000" style="width: 100%;" placeholder="0.00" />
+                <template #feedback>
+                  <span class="form-tip">小规模纳税人不抵扣进项税额，按价税合计金额填入。</span>
+                </template>
+              </NFormItem>
+            </NGridItem>
 
-          <NGridItem :span="1">
-            <NFormItem label="折旧方法">
-              <NSelect
-                :value="form.depreciationMethod"
-                :options="[
-                  { label: '年限平均法（直线法）', value: 'straight_line' },
-                  { label: '一次性折旧（≤500 万设备器具）', value: 'one_time', disabled: !currentCategory?.oneTimeAllowed },
-                ]"
-                @update:value="handleDepreciationMethodChange"
-              />
-              <template #feedback>
-                <span class="form-tip">一次性折旧：单位价值不超过 500 万元的设备、器具可一次性计入当期成本费用（残值须为零）。</span>
-              </template>
-            </NFormItem>
-          </NGridItem>
+            <NGridItem v-if="form.acquisitionType === 'purchase' && !sourceEntryId" :span="1">
+              <NFormItem label="支付方式">
+                <NSelect v-model:value="form.paymentMethod" :options="paymentMethodOptions" />
+              </NFormItem>
+            </NGridItem>
 
-          <NGridItem v-if="form.depreciationMethod === 'straight_line'" :span="1">
-            <NFormItem label="折旧年限（月）">
-              <NInputNumber
-                v-model:value="form.usefulLifeMonths"
-                :min="currentCategory?.lifeMinMonths ?? 12"
-                :max="currentCategory?.lifeMaxMonths ?? 600"
-                style="width: 100%;"
-              />
-            </NFormItem>
-          </NGridItem>
+            <NGridItem :span="1">
+              <NFormItem label="折旧方法">
+                <NSelect
+                  :value="form.depreciationMethod"
+                  :options="[
+                    { label: '年限平均法（直线法）', value: 'straight_line' },
+                    { label: '一次性折旧（≤500 万设备器具）', value: 'one_time', disabled: !currentCategory?.oneTimeAllowed },
+                  ]"
+                  @update:value="handleDepreciationMethodChange"
+                />
+                <template #feedback>
+                  <span class="form-tip">一次性折旧：单位价值不超过 500 万元的设备、器具可一次性计入当期成本费用（残值须为零）。</span>
+                </template>
+              </NFormItem>
+            </NGridItem>
 
-          <NGridItem v-if="form.depreciationMethod === 'straight_line'" :span="1">
-            <NFormItem label="预计净残值率（%，选填）">
-              <NInputNumber
-                :value="form.residualRate"
-                :min="0"
-                :max="100"
-                :step="0.5"
-                :precision="2"
-                style="width: 100%;"
-                placeholder="常用 5%"
-                @update:value="syncResidualFromRate"
-              />
-              <template #feedback>
-                <span class="form-tip">与净残值金额自动换算；常用 5%，默认 0%。</span>
-              </template>
-            </NFormItem>
-          </NGridItem>
+            <NGridItem v-if="form.depreciationMethod === 'straight_line'" :span="1">
+              <NFormItem label="折旧年限（月）">
+                <NInputNumber
+                  v-model:value="form.usefulLifeMonths"
+                  :min="currentCategory?.lifeMinMonths ?? 12"
+                  :max="currentCategory?.lifeMaxMonths ?? 600"
+                  style="width: 100%;"
+                />
+              </NFormItem>
+            </NGridItem>
 
-          <NGridItem v-if="form.depreciationMethod === 'straight_line'" :span="1">
-            <NFormItem label="预计净残值（元，选填）">
-              <NInputNumber
-                :value="form.residualValue"
-                :min="0"
-                :step="100"
-                :precision="2"
-                style="width: 100%;"
-                placeholder="默认为 0"
-                @update:value="syncResidualFromAmount"
-              />
-              <template #feedback>
-                <span class="form-tip">修改比例或金额，另一项自动更新。</span>
-              </template>
-            </NFormItem>
-          </NGridItem>
+            <NGridItem v-if="form.depreciationMethod === 'straight_line'" :span="1">
+              <NFormItem>
+                <template #label>
+                  <div class="label-with-pills">
+                    <span>预计净残值率（%）</span>
+                    <div class="rate-pills">
+                      <button type="button" class="rate-pill" :class="{ active: (form.residualRate || 0) === 0 }" @click="syncResidualFromRate(0)">0% 无残值</button>
+                      <button type="button" class="rate-pill" :class="{ active: form.residualRate === 5 }" @click="syncResidualFromRate(5)">5% 常用残值</button>
+                    </div>
+                  </div>
+                </template>
+                <NInputNumber
+                  :value="form.residualRate"
+                  :min="0"
+                  :max="100"
+                  :step="0.5"
+                  :precision="2"
+                  style="width: 100%;"
+                  placeholder="常用 5%"
+                  @update:value="syncResidualFromRate"
+                />
+                <template #feedback>
+                  <span class="form-tip">与净残值金额自动换算；常用 5%，默认 0%。</span>
+                </template>
+              </NFormItem>
+            </NGridItem>
 
-          <NGridItem :span="1">
-            <NFormItem label="存放地点">
-              <NInput v-model:value="form.location" placeholder="选填，如：办公室 A302" />
-            </NFormItem>
-          </NGridItem>
+            <NGridItem v-if="form.depreciationMethod === 'straight_line'" :span="1">
+              <NFormItem label="预计净残值（元，选填）">
+                <NInputNumber
+                  :value="form.residualValue"
+                  :min="0"
+                  :step="100"
+                  :precision="2"
+                  style="width: 100%;"
+                  placeholder="默认为 0"
+                  @update:value="syncResidualFromAmount"
+                />
+                <template #feedback>
+                  <span class="form-tip">修改比例或金额，另一项自动更新。</span>
+                </template>
+              </NFormItem>
+            </NGridItem>
+          </NGrid>
 
-          <NGridItem :span="1">
-            <NFormItem label="保管人">
-              <NInput v-model:value="form.custodian" placeholder="选填" />
-            </NFormItem>
-          </NGridItem>
+          <div class="advanced-section">
+            <button type="button" class="advanced-toggle" @click="showAdvanced = !showAdvanced">
+              <span>2. 辅助与归集信息（存放地点 / 保管人 / 研发加计扣除分摊）</span>
+              <span class="toggle-hint">{{ showAdvanced ? '收起' : '展开选填项' }}</span>
+            </button>
 
-          <NGridItem :span="2">
-            <div class="rd-allocation-box">
-              <div class="calc-title">研发使用归集（选填）</div>
+            <div v-if="showAdvanced" class="advanced-body">
               <NGrid :cols="2" :x-gap="16">
                 <NGridItem>
-                  <NFormItem label="研发项目">
-                    <NSelect v-model:value="form.rdProjectId" :options="rdProjectOptions" clearable filterable placeholder="未用于研发可不选" />
+                  <NFormItem label="存放地点">
+                    <NInput v-model:value="form.location" placeholder="选填，如：办公室 A302" />
                   </NFormItem>
                 </NGridItem>
                 <NGridItem>
-                  <NFormItem label="研发使用比例（0-1）">
-                    <NInputNumber v-model:value="form.rdUseRate" :min="0" :max="1" :step="0.1" style="width:100%" placeholder="例如 0.6 表示60%" />
-                  </NFormItem>
-                </NGridItem>
-                <NGridItem :span="2">
-                  <NFormItem label="分摊依据">
-                    <NInput v-model:value="form.rdAllocationBasis" placeholder="例如：设备使用日志，研发使用时长占60%" />
+                  <NFormItem label="保管人">
+                    <NInput v-model:value="form.custodian" placeholder="选填" />
                   </NFormItem>
                 </NGridItem>
               </NGrid>
-            </div>
-          </NGridItem>
 
-          <NGridItem :span="1">
-            <div class="calculation-preview-box">
-              <div class="calc-title">预估折旧测算</div>
-              <div class="calc-row">
-                <span class="calc-label">应折旧总额:</span>
-                <span class="calc-val">{{ formatMoney(calc.base) }}</span>
-              </div>
-              <div class="calc-row">
-                <span class="calc-label">{{ form.depreciationMethod === 'one_time' ? '一次性计提额:' : '预计月折旧额:' }}</span>
-                <span class="calc-val highlighted-val">{{ formatMoney(calc.monthly) }}</span>
-              </div>
-              <div class="calc-row">
-                <span class="calc-label">首期计提:</span>
-                <span class="calc-val">{{ calc.startPeriod }}</span>
-              </div>
-              <div class="calc-row">
-                <span class="calc-label">计提完毕:</span>
-                <span class="calc-val">{{ calc.endPeriod }}</span>
+              <div class="rd-allocation-box">
+                <div class="calc-title">研发使用归集（选填）</div>
+                <NGrid :cols="2" :x-gap="16">
+                  <NGridItem>
+                    <NFormItem label="研发项目">
+                      <NSelect v-model:value="form.rdProjectId" :options="rdProjectOptions" clearable filterable placeholder="未用于研发可不选" />
+                    </NFormItem>
+                  </NGridItem>
+                  <NGridItem>
+                    <NFormItem label="研发使用比例（0-1）">
+                      <NInputNumber v-model:value="form.rdUseRate" :min="0" :max="1" :step="0.1" style="width:100%" placeholder="例如 0.6 表示60%" />
+                    </NFormItem>
+                  </NGridItem>
+                  <NGridItem :span="2">
+                    <NFormItem label="分摊依据">
+                      <NInput v-model:value="form.rdAllocationBasis" placeholder="例如：设备使用日志，研发使用时长占60%" />
+                    </NFormItem>
+                  </NGridItem>
+                </NGrid>
               </div>
             </div>
-          </NGridItem>
-        </NGrid>
-      </NForm>
+          </div>
+        </NForm>
 
-      <div class="form-footer">
-        <NSpace justify="end" size="medium">
-          <NButton @click="router.push('/assets')">取消</NButton>
-          <NButton type="primary" :loading="submitting" @click="handleSubmit">
-            {{ sourceEntryId ? '建立资产卡片' : '保存草稿' }}
-          </NButton>
-        </NSpace>
-      </div>
-    </NCard>
+        <div class="form-footer">
+          <NSpace justify="end" size="medium">
+            <NButton @click="router.push('/assets')">取消</NButton>
+            <NButton type="primary" :loading="submitting" @click="handleSubmit">
+              {{ sourceEntryId ? '确认建立折旧方案' : '保存草稿' }}
+            </NButton>
+          </NSpace>
+        </div>
+      </NCard>
+
+      <aside class="preview-sidebar">
+        <div class="depreciation-preview-board">
+          <div class="preview-metric">
+            <span class="metric-label">{{ form.depreciationMethod === 'one_time' ? '预计一次性计提额' : '预计月折旧额' }}</span>
+            <div class="metric-value tabular">
+              {{ formatMoney(calc.monthly) }}
+              <span v-if="form.depreciationMethod !== 'one_time'" class="metric-unit">/月</span>
+            </div>
+            <div class="metric-sub tabular">
+              应折旧总额 {{ formatMoney(calc.base) }}（原值 {{ formatMoney(form.originalValue || 0) }} - 净残值 {{ formatMoney(form.residualValue || 0) }}）
+            </div>
+          </div>
+
+          <div class="preview-block">
+            <div class="block-title">计提时间轴</div>
+            <div class="timeline-list">
+              <div class="timeline-row">
+                <span class="calc-label">可供使用月份</span>
+                <span class="calc-val tabular">{{ calc.usePeriod }}</span>
+              </div>
+              <div class="timeline-row">
+                <span class="calc-label">首期计提（次月）</span>
+                <span class="calc-val tabular">{{ calc.startPeriod }}</span>
+              </div>
+              <div class="timeline-row">
+                <span class="calc-label">预计计提完毕</span>
+                <span class="calc-val tabular">{{ calc.endPeriod }}</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="preview-block compliance-box">
+            <div class="block-title">财税合规与税优提示</div>
+            <p class="compliance-text">
+              {{ lifeTip || '固定资产自可供使用次月起按月计提折旧，处置当月停止计提。' }}
+            </p>
+            <div v-if="canOneTimeDeduct" class="tax-perk-tip">
+              <span>当前资产金额不超过 500 万元且类别符合，可适用一次性税前扣除政策，享受所得税延缓优惠。</span>
+              <button
+                v-if="form.depreciationMethod !== 'one_time'"
+                type="button"
+                class="perk-switch-btn"
+                @click="handleDepreciationMethodChange('one_time')"
+              >
+                切换为一次性折旧
+              </button>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </div>
 
     <NModal
       v-model:show="showDueModal"
-      title="固定资产已建档"
+      title="跨期历史折旧一键补提"
       preset="card"
       :closable="false"
       :mask-closable="false"
       style="width: 520px; border-radius: var(--solo-radius-lg);"
     >
-      <p style="margin: 0 0 10px; color: var(--solo-text-secondary);">
-        还有历史折旧未计提，共 {{ duePeriods.length }} 期，合计 {{ formatMoney(dueTotalAmount) }}。
+      <p style="margin: 0 0 12px; color: var(--solo-text-secondary);">
+        固定资产卡片已建立。检测到共有 <b>{{ duePeriods.length }}</b> 期历史月份需补提折旧，确认后将直接生成各月折旧凭证：
       </p>
       <div
         v-for="item in duePeriods"
         :key="item.period"
-        style="display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px dashed var(--solo-border-light);"
+        class="catchup-row"
       >
-        <span>{{ item.period }} · {{ item.count }} 项资产</span>
-        <strong>{{ formatMoney(item.amount) }}</strong>
+        <span class="tabular">{{ item.period }} 折旧凭证</span>
+        <strong class="tabular">{{ formatMoney(item.amount) }}</strong>
+      </div>
+      <div class="catchup-total">
+        <span>补提合计</span>
+        <strong class="tabular">{{ formatMoney(dueTotalAmount) }}</strong>
       </div>
       <template #footer>
         <NSpace justify="end">
-          <NButton @click="deferCatchUp">稍后处理</NButton>
-          <NButton type="primary" :loading="previewingCatchUp" @click="previewCatchUp">立即补提</NButton>
-        </NSpace>
-      </template>
-    </NModal>
-
-    <NModal
-      v-model:show="showCatchUpPreview"
-      title="补提折旧预览"
-      preset="card"
-      style="width: 520px; border-radius: var(--solo-radius-lg);"
-    >
-      <div v-if="catchUpPreview">
-        <div
-          v-for="item in catchUpPreview.periods"
-          :key="item.period"
-          style="display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px dashed var(--solo-border-light);"
-        >
-          <span>{{ item.period }} · {{ item.processedCount }} 项</span>
-          <strong>{{ formatMoney(item.totalAmount) }}</strong>
-        </div>
-        <div style="display: flex; justify-content: space-between; padding-top: 12px;">
-          <span>合计</span>
-          <strong>{{ formatMoney(catchUpPreview.totalAmount) }}</strong>
-        </div>
-      </div>
-      <template #footer>
-        <NSpace justify="end">
-          <NButton @click="showCatchUpPreview = false">取消</NButton>
-          <NButton type="primary" :loading="runningCatchUp" @click="confirmCatchUp">确认补提</NButton>
+          <NButton @click="deferCatchUp">稍后在月结向导中处理</NButton>
+          <NButton type="primary" :loading="runningCatchUp" @click="directCatchUp">一键补提折旧入账</NButton>
         </NSpace>
       </template>
     </NModal>
@@ -598,11 +632,14 @@ async function handleSubmit() {
 
 <style scoped>
 .create-page {
-  max-width: 640px;
+  max-width: 1080px;
   margin: 0 auto;
   padding: 16px 0 48px 0;
 }
-.page-header { margin-bottom: 24px; }
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+.page-header { margin-bottom: 20px; }
 .back-btn {
   font-weight: 500;
   color: var(--solo-text-secondary);
@@ -623,21 +660,149 @@ async function handleSubmit() {
   line-height: 1.4;
 }
 .subtitle b { color: var(--solo-primary); font-weight: 600; }
+
+.source-anchor {
+  background: var(--solo-bg-blue-soft);
+  border: 1px solid var(--solo-border);
+  border-left: 3px solid var(--solo-primary);
+  border-radius: var(--solo-radius-lg);
+  padding: 14px 18px;
+  margin-bottom: 20px;
+}
+.anchor-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.anchor-badge {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--solo-primary);
+  background: var(--solo-bg-card);
+  border: 1px solid var(--solo-border);
+  padding: 2px 8px;
+  border-radius: var(--solo-radius-sm, 4px);
+}
+.anchor-note {
+  font-size: 12.5px;
+  color: var(--solo-text-secondary);
+}
+.anchor-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--solo-border);
+}
+.fact-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.fact-label {
+  font-size: 11.5px;
+  color: var(--solo-text-muted);
+}
+.fact-val {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--solo-text-primary);
+}
+.amount-highlight {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--solo-primary);
+}
+
+.workspace-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.85fr) minmax(300px, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+@media (max-width: 900px) {
+  .workspace-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 .form-card {
   background: var(--solo-bg-card);
-  backdrop-filter: blur(12px);
-  border: 1px solid var(--solo-border-glass);
+  border: 1px solid var(--solo-border);
   border-radius: var(--solo-radius-lg);
-  box-shadow: var(--solo-shadow-lg);
+  box-shadow: var(--solo-shadow-sm);
   padding: 8px;
 }
-.fixed-asset-form { margin-top: 8px; }
-.rd-allocation-box {
-  margin: 4px 0 16px;
-  padding: 16px;
-  border: 1px solid rgba(99, 102, 241, 0.14);
+.section-heading {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--solo-text-primary);
+  margin-bottom: 14px;
+}
+.fixed-asset-form { margin-top: 4px; }
+
+.label-with-pills {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  gap: 8px;
+}
+.rate-pills {
+  display: inline-flex;
+  gap: 6px;
+}
+.rate-pill {
+  padding: 2px 8px;
+  font-size: 11.5px;
+  border-radius: 4px;
+  border: 1px solid var(--solo-border);
+  background: var(--solo-bg-soft);
+  color: var(--solo-text-secondary);
+  cursor: pointer;
+}
+.rate-pill.active {
+  background: var(--solo-bg-blue-soft);
+  border-color: var(--solo-primary);
+  color: var(--solo-primary);
+  font-weight: 600;
+}
+
+.advanced-section {
+  margin-top: 8px;
+  border-top: 1px dashed var(--solo-border-light);
+  padding-top: 12px;
+}
+.advanced-toggle {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  background: var(--solo-bg-soft);
+  border: 1px solid var(--solo-border);
   border-radius: var(--solo-radius);
-  background: rgba(99, 102, 241, 0.035);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--solo-text-primary);
+  cursor: pointer;
+}
+.toggle-hint {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--solo-primary);
+}
+.advanced-body {
+  margin-top: 14px;
+}
+.rd-allocation-box {
+  margin: 4px 0 8px;
+  padding: 14px;
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius);
+  background: var(--solo-bg-soft);
 }
 .form-tip {
   font-size: 11px;
@@ -646,24 +811,64 @@ async function handleSubmit() {
   display: block;
 }
 .form-tip b { color: var(--solo-primary); font-weight: 600; }
-.calculation-preview-box {
-  background: rgba(99, 102, 241, 0.03);
-  border: 1px solid rgba(99, 102, 241, 0.08);
-  border-radius: var(--solo-radius);
-  padding: 12px 16px;
-  height: calc(100% - 24px);
+
+.preview-sidebar {
+  position: sticky;
+  top: 20px;
+}
+.depreciation-preview-board {
+  background: var(--solo-bg-card);
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius-lg);
+  box-shadow: var(--solo-shadow-sm);
+  padding: 18px;
   display: flex;
   flex-direction: column;
-  justify-content: center;
+  gap: 16px;
+}
+.preview-metric {
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--solo-border-light);
+}
+.metric-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--solo-text-secondary);
+}
+.metric-value {
+  margin-top: 4px;
+  font-size: 26px;
+  font-weight: 800;
+  color: var(--solo-income);
+  line-height: 1.2;
+}
+.metric-unit {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--solo-text-secondary);
+  margin-left: 2px;
+}
+.metric-sub {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--solo-text-muted);
+}
+.preview-block {
+  display: flex;
+  flex-direction: column;
   gap: 8px;
 }
-.calc-title {
+.block-title, .calc-title {
   font-size: 12px;
   font-weight: 700;
   color: var(--solo-primary);
-  margin-bottom: 2px;
 }
-.calc-row {
+.timeline-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.timeline-row {
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -673,12 +878,54 @@ async function handleSubmit() {
 .calc-val {
   font-weight: 600;
   color: var(--solo-text-primary);
-  font-family: 'Outfit', 'Inter', sans-serif;
 }
-.highlighted-val {
+.compliance-box {
+  background: var(--solo-bg-blue-soft);
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius);
+  padding: 12px;
+}
+.compliance-text {
+  margin: 0;
+  font-size: 12px;
+  color: var(--solo-text-secondary);
+  line-height: 1.45;
+}
+.tax-perk-tip {
+  margin-top: 6px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--solo-border);
+  font-size: 12px;
   color: var(--solo-income);
-  font-size: 14.5px;
-  font-weight: 800;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.perk-switch-btn {
+  align-self: flex-start;
+  padding: 3px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--solo-primary);
+  background: var(--solo-bg-card);
+  border: 1px solid var(--solo-primary);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.catchup-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 0;
+  border-bottom: 1px dashed var(--solo-border-light);
+  font-size: 13px;
+}
+.catchup-total {
+  display: flex;
+  justify-content: space-between;
+  padding-top: 12px;
+  font-size: 14px;
+  color: var(--solo-text-primary);
 }
 .form-footer {
   margin-top: 24px;

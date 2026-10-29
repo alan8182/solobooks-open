@@ -2,16 +2,108 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { NCard, NButton, NModal, NForm, NFormItem, NInput, NTag, useMessage } from 'naive-ui'
+import {
+  NCard,
+  NButton,
+  NModal,
+  NForm,
+  NFormItem,
+  NInput,
+  NTag,
+  NRadioGroup,
+  NRadioButton,
+  NProgress,
+  NSpin,
+  useMessage,
+} from 'naive-ui'
+import { use } from 'echarts/core'
+import { CanvasRenderer } from 'echarts/renderers'
+import { LineChart } from 'echarts/charts'
+import { GridComponent, TooltipComponent } from 'echarts/components'
+import VChart from 'vue-echarts'
 import { useAuthStore } from '@/stores/auth'
+import { useWorkspaceViewStore } from '@/stores/workspaceView'
+import { useUsageStore } from '@/stores/usage'
+import { aiSceneLabel } from '@/utils/constants'
 import { setPassword, updateProfile } from '@/api/auth'
 
-// ponytail: streamlined mine page from messy duplicate feature hub into clean user profile & account security
+// ponytail: simplified settings page - removed redundant MCP & audit-share stub cards (already in nav),
+// fortified password reset with confirmation check, added workspace view & table density preferences.
+
+use([CanvasRenderer, LineChart, GridComponent, TooltipComponent])
+
 const router = useRouter()
 const message = useMessage()
 const authStore = useAuthStore()
+const workspaceViewStore = useWorkspaceViewStore()
+const usageStore = useUsageStore()
 
 const user = ref(authStore.user)
+
+// ── AI 用量（本人口径，跨账套聚合；数据来自 llm_usage 埋点） ──
+const usageLoading = computed(() => usageStore.loading)
+const currentMonth = computed(
+  () =>
+    usageStore.summary?.currentMonth ?? {
+      calls: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+    },
+)
+const previousMonth = computed(
+  () =>
+    usageStore.summary?.previousMonth ?? {
+      calls: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+    },
+)
+const usageScenes = computed(() => usageStore.summary?.byScene ?? [])
+const usageDaily = computed(() => usageStore.summary?.daily ?? [])
+const maxSceneTokens = computed(() =>
+  Math.max(1, ...usageScenes.value.map((row) => row.totalTokens)),
+)
+// 配额块仅在套餐已设限时渲染（额度数值待定期间 limitTokens 恒为 null，整块隐藏）
+const quotaInfo = computed(() => {
+  const quota = usageStore.summary?.quota
+  return quota && quota.limitTokens !== null ? quota : null
+})
+const quotaPercent = computed(() => {
+  const quota = quotaInfo.value
+  if (!quota || !quota.limitTokens) return 0
+  const effective = quota.limitTokens + (quota.bonusTokens || 0)
+  return Math.min(100, Math.round((quota.usedTokens / effective) * 100))
+})
+
+function formatTokens(n: number): string {
+  if (!n) return '0'
+  if (n >= 10000) return `${(n / 10000).toFixed(2)} 万`
+  return n.toLocaleString()
+}
+
+const usageChartOption = computed(() => ({
+  tooltip: { trigger: 'axis' },
+  grid: { left: 48, right: 12, top: 16, bottom: 24 },
+  xAxis: {
+    type: 'category',
+    data: usageDaily.value.map((d) => d.date.slice(5)),
+    axisTick: { show: false },
+    axisLabel: { interval: 9, fontSize: 10 },
+  },
+  yAxis: { type: 'value', axisLabel: { fontSize: 10 } },
+  series: [
+    {
+      name: '消耗 tokens',
+      type: 'line',
+      smooth: true,
+      data: usageDaily.value.map((d) => d.totalTokens),
+      itemStyle: { color: '#1747b0' },
+      areaStyle: { color: 'rgba(23, 71, 176, 0.08)' },
+    },
+  ],
+}))
 
 async function handleLogout() {
   authStore.logout()
@@ -54,12 +146,14 @@ async function handleSaveProfile() {
 const pwdVisible = ref(false)
 const pwdOld = ref('')
 const pwdNew = ref('')
+const pwdConfirm = ref('')
 const pwdSaving = ref(false)
 const hasPassword = computed(() => !!authStore.user?.has_password)
 
 function openPwdModal() {
   pwdOld.value = ''
   pwdNew.value = ''
+  pwdConfirm.value = ''
   pwdVisible.value = true
 }
 
@@ -70,6 +164,10 @@ async function handleSavePassword() {
   }
   if (pwdNew.value.length < 8) {
     message.warning('密码长度至少 8 位')
+    return
+  }
+  if (pwdNew.value !== pwdConfirm.value) {
+    message.warning('两次输入的新密码不一致')
     return
   }
   pwdSaving.value = true
@@ -90,6 +188,34 @@ async function handleSavePassword() {
   }
 }
 
+// ── 工作台偏好 ──
+const currentWorkspaceMode = computed({
+  get: () => workspaceViewStore.mode,
+  set: (val) => {
+    workspaceViewStore.setMode(val)
+    message.success(val === 'boss' ? '已切换至老板模式' : '已切换至会计模式')
+  },
+})
+
+// ── 表格密度偏好 ──
+const DENSITY_STORAGE_KEY = 'solo:table-density'
+const tableDensity = ref(localStorage.getItem(DENSITY_STORAGE_KEY) || 'default')
+
+function handleDensityChange(val: string) {
+  tableDensity.value = val
+  try {
+    localStorage.setItem(DENSITY_STORAGE_KEY, val)
+    message.success(val === 'compact' ? '已设为紧凑密度' : '已设为标准密度')
+  } catch {
+    // ignore
+  }
+}
+
+function maskPhone(phone?: string) {
+  if (!phone) return ''
+  return phone.replace(/(\d{3})\d{4}(\d{4})/, '$1****$2')
+}
+
 onMounted(async () => {
   if (!authStore.user && authStore.token) {
     try {
@@ -98,18 +224,20 @@ onMounted(async () => {
     } catch {
       // ignore
     }
+  } else {
+    user.value = authStore.user
   }
+  // 个人页强制重取，导航栏摘要的缓存可能已经旧了
+  usageStore.ensureLoaded(true)
 })
 </script>
 
 <template>
   <div class="mine-page">
     <div class="page-header">
-      <div class="page-header-left">
-        <div class="title-section">
-          <h2>个人设置</h2>
-          <p class="subtitle">管理您的个人资料、账号安全与登录凭证</p>
-        </div>
+      <div class="title-section">
+        <h2>个人设置</h2>
+        <p class="subtitle">管理您的个人资料、账号安全与工作台交互偏好</p>
       </div>
     </div>
 
@@ -121,9 +249,14 @@ onMounted(async () => {
         <div class="user-detail">
           <div class="user-name-line">
             <span class="user-name">{{ user?.nickname || '未设置昵称' }}</span>
-            <NTag size="tiny" type="info" :bordered="false">管理员</NTag>
+            <NTag size="tiny" type="info" :bordered="false">
+              {{ authStore.companies.length ? `${authStore.companies.length} 个主体账套` : '未绑定主体' }}
+            </NTag>
           </div>
-          <div class="user-phone">绑定手机：{{ user?.phone || '未绑定' }}</div>
+          <div class="user-meta-line">
+            <span class="user-phone">登录手机：{{ user?.phone ? maskPhone(user.phone) : '未绑定' }}</span>
+            <span v-if="user?.user_id" class="user-id">UID: {{ user.user_id.slice(0, 10) }}...</span>
+          </div>
         </div>
         <NButton secondary size="small" class="action-btn" @click="openProfileModal">
           <template #icon><i class="ri-edit-line" /></template>
@@ -136,9 +269,81 @@ onMounted(async () => {
       </div>
     </NCard>
 
-    <!-- 安全与登录 -->
+    <!-- AI 用量 -->
+    <NCard id="ai-usage" :bordered="false" class="settings-card mb-4">
+      <div class="card-section-title">AI 用量</div>
+      <NSpin :show="usageLoading" size="small">
+        <div class="usage-summary">
+          <div class="usage-stat">
+            <div class="usage-stat-label">本月消耗</div>
+            <div class="usage-stat-value">
+              {{ formatTokens(currentMonth.totalTokens) }}
+              <span class="usage-stat-unit">tokens</span>
+            </div>
+            <div class="usage-stat-sub">
+              {{ currentMonth.calls }} 次调用 · 上月 {{ formatTokens(previousMonth.totalTokens) }}
+            </div>
+          </div>
+          <div class="usage-chart">
+            <VChart
+              v-if="usageDaily.length"
+              :option="usageChartOption"
+              autoresize
+              class="usage-chart-canvas"
+            />
+          </div>
+        </div>
+
+        <div v-if="quotaInfo" class="usage-quota">
+          <div class="quota-line">
+            <span class="quota-plan">{{ quotaInfo.planName }}</span>
+            <span class="quota-period">{{ quotaInfo.periodStart }} ~ {{ quotaInfo.periodEnd }}</span>
+            <span class="quota-usage">
+              已用 {{ formatTokens(quotaInfo.usedTokens) }} / {{ formatTokens(quotaInfo.limitTokens ?? 0) }}
+            </span>
+          </div>
+          <NProgress
+            type="line"
+            :percentage="quotaPercent"
+            :show-indicator="false"
+            :height="8"
+            border-radius="4px"
+            :status="quotaPercent >= 100 ? 'error' : 'default'"
+          />
+          <div class="quota-remaining">
+            {{ quotaPercent >= 100 ? '本期额度已用完，升级套餐或等待下期恢复' : `本期剩余 ${formatTokens(quotaInfo.remainingTokens ?? 0)} tokens` }}
+          </div>
+        </div>
+
+        <div v-if="usageScenes.length" class="usage-scenes">
+          <div v-for="row in usageScenes" :key="row.scene" class="usage-scene-row">
+            <span class="scene-name">{{ aiSceneLabel(row.scene) }}</span>
+            <NProgress
+              class="scene-bar"
+              type="line"
+              :percentage="Math.round((row.totalTokens / maxSceneTokens) * 100)"
+              :show-indicator="false"
+              :height="6"
+              border-radius="3px"
+            />
+            <span class="scene-tokens">{{ formatTokens(row.totalTokens) }}</span>
+          </div>
+        </div>
+        <div v-else class="usage-empty">本月还没有 AI 使用记录，去「AI 会计」试试连续记账吧。</div>
+
+        <div class="profile-tip">
+          <i class="ri-information-line" />
+          统计口径：自然月内本人全部 AI 功能（AI 会计对话、智能记账、单据识别、报表洞察等）的
+          token 消耗，跨账套合并计算；语音与图片识别按调用次数计。
+        </div>
+      </NSpin>
+    </NCard>
+
+    <!-- 账号与安全 -->
     <NCard :bordered="false" class="settings-card mb-4">
       <div class="card-section-title">账号与安全</div>
+
+      <!-- 登录密码 -->
       <div class="setting-item-row">
         <div class="item-icon-box">
           <i class="ri-lock-password-line" />
@@ -150,7 +355,7 @@ onMounted(async () => {
               {{ hasPassword ? '已设置' : '未设置' }}
             </NTag>
           </div>
-          <div class="item-desc">设置后支持使用手机号与密码直接登录</div>
+          <div class="item-desc">设置后支持使用手机号与密码直接登录系统</div>
         </div>
         <NButton secondary size="small" class="action-btn" @click="openPwdModal">
           {{ hasPassword ? '修改密码' : '设置密码' }}
@@ -159,6 +364,7 @@ onMounted(async () => {
 
       <div class="item-divider" />
 
+      <!-- 登录手机号 -->
       <div class="setting-item-row">
         <div class="item-icon-box">
           <i class="ri-smartphone-line" />
@@ -166,67 +372,96 @@ onMounted(async () => {
         <div class="item-info">
           <div class="item-title">
             <span>登录手机号</span>
-            <NTag size="tiny" type="success" :bordered="false">已绑定</NTag>
+            <NTag size="tiny" :type="user?.phone_bound ? 'success' : 'default'" :bordered="false">
+              {{ user?.phone_bound ? '已绑定' : '未绑定' }}
+            </NTag>
           </div>
-          <div class="item-desc">{{ user?.phone || '暂无手机号' }}</div>
+          <div class="item-desc">
+            {{ user?.phone ? `${maskPhone(user.phone)}（用于接收安全验证码及密码找回）` : '未绑定手机号' }}
+          </div>
         </div>
       </div>
-    </NCard>
 
-    <!-- 开放接入与令牌 -->
-    <NCard :bordered="false" class="settings-card mb-4">
-      <div class="card-section-title">开发者与 AI 接入</div>
+      <div class="item-divider" />
+
+      <!-- 微信账号 -->
       <div class="setting-item-row">
-        <div class="item-icon-box mcp-icon">
-          <i class="ri-plug-line" />
+        <div class="item-icon-box wechat-icon">
+          <i class="ri-wechat-fill" />
         </div>
         <div class="item-info">
-          <div class="item-title">AI 连接（MCP 访问令牌）</div>
-          <div class="item-desc">签发用于 Claude Desktop 或外部 Agent 的个人访问令牌</div>
+          <div class="item-title">
+            <span>微信互联</span>
+            <NTag size="tiny" :type="user?.wechat_bound ? 'success' : 'default'" :bordered="false">
+              {{ user?.wechat_bound ? '已绑定' : '未绑定' }}
+            </NTag>
+          </div>
+          <div class="item-desc">
+            {{
+              user?.wechat_bound
+                ? '已关联微信账号，支持与移动端/小程序免密快捷同步'
+                : '绑定微信后可在微信小程序同步登录并接收重要待办通知'
+            }}
+          </div>
         </div>
-        <NButton secondary size="small" class="action-btn" @click="router.push('/mine/mcp')">
-          管理令牌
-        </NButton>
       </div>
     </NCard>
 
-    <!-- 专家协审 -->
+    <!-- 工作台与偏好设置 -->
     <NCard :bordered="false" class="settings-card mb-4">
-      <div class="card-section-title">专家协审</div>
+      <div class="card-section-title">工作台偏好</div>
+
+      <!-- 默认工作台模式 -->
       <div class="setting-item-row">
         <div class="item-icon-box">
-          <i class="ri-shield-check-line" />
+          <i class="ri-dashboard-line" />
         </div>
         <div class="item-info">
-          <div class="item-title">会计师账套体检（Audit Share）</div>
-          <div class="item-desc">生成免注册只读链接，会计师查看当月体检报告并批注，批注意见回流处理</div>
+          <div class="item-title">默认工作台模式</div>
+          <div class="item-desc">
+            设定当前主体账套的导航与工作台模式，老板模式聚焦经营待办，会计模式完整展现科目分录与建账
+          </div>
         </div>
-        <NButton secondary size="small" class="action-btn" @click="router.push('/mine/audit-share')">
-          管理协审链接
-        </NButton>
+        <NRadioGroup v-model:value="currentWorkspaceMode" size="small">
+          <NRadioButton value="boss">老板模式</NRadioButton>
+          <NRadioButton value="accounting">会计模式</NRadioButton>
+        </NRadioGroup>
+      </div>
+
+      <div class="item-divider" />
+
+      <!-- 表格行高密度 -->
+      <div class="setting-item-row">
+        <div class="item-icon-box">
+          <i class="ri-table-line" />
+        </div>
+        <div class="item-info">
+          <div class="item-title">数据表格显示密度</div>
+          <div class="item-desc">
+            调整凭证列表、明细账簿与报表等表格的紧凑程度，紧凑模式一屏展现更多行
+          </div>
+        </div>
+        <NRadioGroup :value="tableDensity" size="small" @update:value="handleDensityChange">
+          <NRadioButton value="default">标准</NRadioButton>
+          <NRadioButton value="compact">紧凑</NRadioButton>
+        </NRadioGroup>
       </div>
     </NCard>
 
-    <!-- 退出登录 -->
-    <NCard :bordered="false" class="settings-card logout-card">
-      <div class="logout-row">
-        <div>
-          <div class="logout-title">退出当前账号</div>
-          <div class="logout-desc">退出后需要重新通过手机短信或密码登录系统</div>
-        </div>
-        <NButton quaternary type="error" size="small" @click="handleLogout">
-          <template #icon><i class="ri-logout-box-r-line" /></template>
-          退出登录
-        </NButton>
-      </div>
-    </NCard>
+    <!-- 底部退出登录操作 -->
+    <div class="logout-section">
+      <NButton quaternary type="error" size="medium" class="logout-btn" @click="handleLogout">
+        <template #icon><i class="ri-logout-box-r-line" /></template>
+        退出当前账号
+      </NButton>
+    </div>
 
     <!-- 弹窗：设置/修改密码 -->
     <NModal
       v-model:show="pwdVisible"
       preset="card"
       :title="hasPassword ? '修改密码' : '设置密码'"
-      style="max-width: 400px; border-radius: var(--solo-radius-lg);"
+      style="max-width: 420px; border-radius: var(--solo-radius-lg);"
     >
       <NForm style="margin-top: 8px;">
         <NFormItem v-if="hasPassword" label="当前密码">
@@ -246,7 +481,19 @@ onMounted(async () => {
             v-model:value="pwdNew"
             type="password"
             show-password-on="click"
-            placeholder="至少 8 位"
+            placeholder="至少 8 位密码"
+          >
+            <template #prefix>
+              <i class="ri-lock-password-line input-icon" />
+            </template>
+          </NInput>
+        </NFormItem>
+        <NFormItem label="确认新密码">
+          <NInput
+            v-model:value="pwdConfirm"
+            type="password"
+            show-password-on="click"
+            placeholder="请再次输入新密码"
           >
             <template #prefix>
               <i class="ri-lock-password-line input-icon" />
@@ -295,28 +542,33 @@ onMounted(async () => {
 
 <style scoped>
 .mine-page {
-  max-width: 680px;
+  max-width: 760px;
   margin: 0 auto;
+  padding: 8px 16px 48px;
 }
 .page-header {
   margin-bottom: 24px;
 }
-.page-header h2 {
+.title-section h2 {
   margin: 0;
   font-size: 22px;
   font-weight: 700;
   color: var(--solo-text-primary);
 }
-.page-header .subtitle {
+.title-section .subtitle {
   margin: 4px 0 0;
   font-size: 13px;
   color: var(--solo-text-muted);
 }
-.mb-4 { margin-bottom: 16px; }
+.mb-4 {
+  margin-bottom: 16px;
+}
 
 .settings-card {
   border-radius: var(--solo-radius-lg);
-  padding: 4px;
+  border: 1px solid var(--solo-border);
+  background: var(--solo-bg-card);
+  padding: 6px;
 }
 .card-section-title {
   font-size: 13px;
@@ -334,15 +586,15 @@ onMounted(async () => {
   gap: 16px;
 }
 .user-avatar {
-  width: 54px;
-  height: 54px;
-  border-radius: 50%;
+  width: 52px;
+  height: 52px;
+  border-radius: var(--solo-radius-pill);
   background: var(--solo-primary);
   color: #fff;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 22px;
+  font-size: 20px;
   font-weight: 700;
   flex-shrink: 0;
 }
@@ -356,14 +608,24 @@ onMounted(async () => {
   gap: 8px;
 }
 .user-name {
-  font-size: 17px;
+  font-size: 16px;
   font-weight: 650;
   color: var(--solo-text-primary);
 }
-.user-phone {
-  font-size: 13px;
-  color: var(--solo-text-muted);
+.user-meta-line {
+  display: flex;
+  align-items: center;
+  gap: 16px;
   margin-top: 4px;
+}
+.user-phone {
+  font-size: 12.5px;
+  color: var(--solo-text-muted);
+}
+.user-id {
+  font-size: 12px;
+  color: var(--solo-text-muted);
+  font-family: var(--solo-font-mono, monospace);
 }
 .profile-tip {
   display: flex;
@@ -372,8 +634,8 @@ onMounted(async () => {
   margin-top: 14px;
   font-size: 12px;
   color: var(--solo-text-muted);
-  background: var(--solo-border-light, #f1f4f8);
-  border-radius: var(--solo-radius, 8px);
+  background: var(--solo-bg-soft);
+  border-radius: var(--solo-radius);
   padding: 8px 12px;
   line-height: 1.4;
 }
@@ -388,8 +650,8 @@ onMounted(async () => {
 .item-icon-box {
   width: 36px;
   height: 36px;
-  border-radius: 8px;
-  background: var(--solo-bg-blue-soft, #eff6ff);
+  border-radius: var(--solo-radius);
+  background: var(--solo-bg-blue-soft);
   color: var(--solo-primary);
   display: flex;
   align-items: center;
@@ -397,9 +659,9 @@ onMounted(async () => {
   font-size: 18px;
   flex-shrink: 0;
 }
-.item-icon-box.mcp-icon {
-  background: #f5f3ff;
-  color: #7c3aed;
+.item-icon-box.wechat-icon {
+  background: var(--solo-income-bg);
+  color: var(--solo-income);
 }
 .item-info {
   flex: 1;
@@ -417,35 +679,146 @@ onMounted(async () => {
   font-size: 12.5px;
   color: var(--solo-text-muted);
   margin-top: 2px;
+  line-height: 1.4;
 }
 .item-divider {
   height: 1px;
-  background: var(--solo-border-light, #edf0f4);
+  background: var(--solo-border-light);
   margin: 14px 0;
 }
 .action-btn {
   flex-shrink: 0;
 }
 
-/* Logout Row */
-.logout-card {
-  border: 1px dashed var(--solo-border, #dde3ea);
+/* AI 用量 */
+.usage-summary {
+  display: flex;
+  align-items: stretch;
+  gap: 20px;
 }
-.logout-row {
+.usage-stat {
+  flex-shrink: 0;
+  min-width: 150px;
+}
+.usage-stat-label {
+  font-size: 12px;
+  color: var(--solo-text-muted);
+}
+.usage-stat-value {
+  font-size: 26px;
+  font-weight: 700;
+  color: var(--solo-text-primary);
+  line-height: 1.3;
+}
+.usage-stat-unit {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--solo-text-muted);
+  margin-left: 4px;
+}
+.usage-stat-sub {
+  font-size: 12px;
+  color: var(--solo-text-muted);
+  margin-top: 2px;
+}
+.usage-chart {
+  flex: 1;
+  min-width: 0;
+}
+.usage-chart-canvas {
+  width: 100%;
+  height: 110px;
+}
+.usage-scenes {
+  margin-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.usage-scene-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 16px;
+  gap: 10px;
 }
-.logout-title {
-  font-size: 14px;
+.scene-name {
+  width: 96px;
+  flex-shrink: 0;
+  font-size: 12.5px;
+  color: var(--solo-text-secondary);
+}
+.scene-bar {
+  flex: 1;
+  min-width: 0;
+}
+.scene-tokens {
+  width: 88px;
+  flex-shrink: 0;
+  text-align: right;
+  font-size: 12px;
+  color: var(--solo-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.usage-empty {
+  margin-top: 12px;
+  font-size: 12.5px;
+  color: var(--solo-text-muted);
+  background: var(--solo-bg-soft);
+  border-radius: var(--solo-radius);
+  padding: 10px 12px;
+}
+
+/* 配额块：套餐设限后才出现（额度数值待定期间整块隐藏） */
+.usage-quota {
+  margin-top: 14px;
+  padding: 12px;
+  background: var(--solo-bg-soft);
+  border-radius: var(--solo-radius);
+}
+.quota-line {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+.quota-plan {
+  font-size: 13px;
   font-weight: 600;
   color: var(--solo-text-primary);
 }
-.logout-desc {
-  font-size: 12.5px;
+.quota-period {
+  font-size: 11.5px;
   color: var(--solo-text-muted);
-  margin-top: 2px;
+}
+.quota-usage {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--solo-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+.quota-remaining {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--solo-text-muted);
+}
+@media (max-width: 640px) {
+  .usage-summary {
+    flex-direction: column;
+    gap: 8px;
+  }
+  .usage-chart {
+    width: 100%;
+  }
+}
+
+/* Logout Section */
+.logout-section {
+  display: flex;
+  justify-content: center;
+  margin-top: 24px;
+}
+.logout-btn {
+  color: var(--solo-expense);
 }
 
 .profile-hint {
@@ -455,8 +828,8 @@ onMounted(async () => {
   margin-top: 4px;
   font-size: 12.5px;
   color: var(--solo-text-muted);
-  background: var(--solo-border-light, #f3f4f6);
-  border-radius: var(--solo-radius, 8px);
+  background: var(--solo-bg-soft);
+  border-radius: var(--solo-radius);
   padding: 8px 10px;
   line-height: 1.5;
 }

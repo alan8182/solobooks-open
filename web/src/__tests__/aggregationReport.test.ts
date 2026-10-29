@@ -19,7 +19,7 @@
 
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   compareAlert,
   compareOutcome,
@@ -319,6 +319,14 @@ import { NDialogProvider, NMessageProvider } from 'naive-ui'
 import { defineComponent, h } from 'vue'
 import { useWorkspaceViewStore } from '@/stores/workspaceView'
 
+const exportMock = vi.hoisted(() => ({
+  saveWorkbook: vi.fn(),
+}))
+
+vi.mock('@/utils/export', () => ({
+  saveWorkbook: exportMock.saveWorkbook,
+}))
+
 // API 层全部 mock：组件 onMounted 会打 store.bootstrap() 与 list 端点。
 // 金额一律给**已是 number** 的值——api/aggregation.ts 的归一化保证这一点，
 // 若这里传字符串就等于在测一条不存在的契约。
@@ -613,6 +621,54 @@ describe('report.vue 渲染', () => {
     await wrapper.findAll('button').find((b) => b.text() === '查询')?.trigger('click')
     await flush()
     expect(wrapper.text()).toContain('该期间无已过账的损益类凭证行')
+    wrapper.unmount()
+  })
+
+  it('点击「本月」快捷胶囊自动设置月份并触发报表查询', async () => {
+    const wrapper = mountPage((await import('@/pages/aggregation/report.vue')).default)
+    await flush()
+    const currentMonthButton = wrapper.findAll('button').find((b) => b.text() === '本月')
+    expect(currentMonthButton).toBeDefined()
+    await currentMonthButton?.trigger('click')
+    await flush()
+    expect(apiMock.getReport).toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('有数据时「导出 Excel」按钮可用，点击触发 saveWorkbook', async () => {
+    apiMock.getReport.mockResolvedValue({
+      dimensionId: 'd1',
+      dimensionCode: 'RD',
+      dimensionName: '研发项目',
+      basis: 'period',
+      start: '2026-01',
+      end: '2026-01',
+      scopePrefixes: ['5'],
+      items: [
+        { memberId: 'm1', code: 'M1', name: '平台组', status: 'active', allocatedAmount: 120, allocatedLineCount: 1 },
+      ],
+      totals: {
+        lineAmount: 120,
+        allocatedAmount: 120,
+        unassignedAmount: 0,
+        balanced: true,
+        allocatedLineCount: 1,
+        partialLineCount: 0,
+        unallocatedLineCount: 0,
+        lineCount: 1,
+      },
+    })
+    const wrapper = mountPage((await import('@/pages/aggregation/report.vue')).default)
+    await flush()
+    await selectMonthRange(wrapper, ['2026-01', '2026-01'])
+    await flush()
+    await wrapper.findAll('button').find((b) => b.text() === '查询')?.trigger('click')
+    await flush()
+
+    const exportBtn = wrapper.findAll('button').find((b) => b.text().includes('导出 Excel'))
+    expect(exportBtn?.attributes('disabled')).toBeUndefined()
+    await exportBtn?.trigger('click')
+    expect(exportMock.saveWorkbook).toHaveBeenCalled()
     wrapper.unmount()
   })
 })

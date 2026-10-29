@@ -41,6 +41,23 @@ VAT_EXEMPT_INCOME_ACCOUNT_NAME = "营业外收入"
 # 只有销售商品/服务类收入才计提增值税；营业外收入、利息收入、往来款不计提。
 VAT_SALES_CATEGORIES = {"主营业务收入", "其他业务收入"}
 
+NON_VAT_SALES_CATEGORIES = {
+    "营业外收入",
+    "利息收入",
+    "财务费用-利息收入",
+    "投资收益",
+    "公允价值变动损益",
+    "资产处置收益",
+    "政府补助",
+    "补贴收入",
+    "股东投入",
+    "股东垫付",
+    "股东取现",
+    "往来退款",
+    "其他应收款",
+    "其他应付款",
+}
+
 _TAXPAYER_ALIASES = {
     "small_scale": SMALL_SCALE,
     "smallscale": SMALL_SCALE,
@@ -112,8 +129,35 @@ def get_vat_config(company: dict[str, Any] | None) -> VatConfig:
     )
 
 
-def is_vat_sales_entry(category: Any) -> bool:
-    return str(category or "").strip() in VAT_SALES_CATEGORIES
+def is_vat_sales_entry(category: Any, account_code: Any = None) -> bool:
+    """判断是否为增值税应税销售业务（除明确免征/非应税的利息、营业外收入、往来款外，所有经营性销售与服务收入均属增值税应税范围）。"""
+    cat = str(category or "").strip()
+    if not cat or cat in NON_VAT_SALES_CATEGORIES:
+        return False
+    if cat in VAT_SALES_CATEGORIES:
+        return True
+    code = str(account_code or "").strip()
+    if code:
+        if code.startswith("5001") or code.startswith("5051"):
+            return True
+        if code.startswith("5301") or code.startswith("5603") or code.startswith("1") or code.startswith("2") or code.startswith("3"):
+            return False
+
+    try:
+        from services.account_mapper import lookup
+        acct = lookup(cat)
+        if acct:
+            acct_code = str(acct.get("accountCode") or "")
+            if acct_code.startswith("5001") or acct_code.startswith("5051"):
+                return True
+            if acct_code.startswith(("54", "56", "66")):
+                # 费用同名词（如"咨询费"、"设计费"），在收入场景下应按主营业务收入计税
+                return True
+            return False
+    except Exception:
+        pass
+
+    return True
 
 
 async def get_vat_config_from_session(session: Any, company_id: str) -> VatConfig:

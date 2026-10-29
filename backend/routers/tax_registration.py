@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from deps.auth import AuthContext, require_auth
+from core.errors import AccountingError
 from services import filing_deadline_service, tax_registration_service
 from services.llm import chat_vision_json
 from services.zhipu_ocr import resolve_receipt_image_mime, validate_receipt_image_bytes
@@ -173,6 +174,8 @@ async def recognize(file: UploadFile = File(...), ctx: AuthContext = Depends(req
             user_id=ctx.user_id,
             company_id=ctx.company_id,
         )
+    except AccountingError:
+        raise  # 配额超限保持 402，不转 502
     except Exception as exc:  # noqa: BLE001 —— 模型侧异常统一转 502，前端提示改用粘贴
         raise HTTPException(status_code=502, detail=f"识别失败，请改用复制粘贴：{exc}") from exc
 

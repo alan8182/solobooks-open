@@ -6,8 +6,16 @@ from decimal import Decimal
 from services.bank_service import (
     build_balance_reconciliation,
     diagnose_matched_statement_effect,
+    extract_statement_counterparty,
     normalize_statement_description,
 )
+
+
+def test_extract_statement_counterparty():
+    assert extract_statement_counterparty("汇兑 | 投资款 (对方: 中国工商银行)") == "中国工商银行"
+    assert extract_statement_counterparty("入账 | 附言: 订单 123 (对方: 客户A)") == "客户A"
+    assert extract_statement_counterparty("网银转账") == ""
+    assert extract_statement_counterparty(None) == ""
 
 
 def test_normalize_statement_description_removes_repeated_comment():

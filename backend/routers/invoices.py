@@ -26,6 +26,7 @@ async def get_invoices(
     direction: Optional[str] = Query(None, description="income / expense"),
     keyword: Optional[str] = Query(None, description="发票号/对方/项目模糊匹配"),
     status: Optional[str] = Query(None, description="normal / red / reversed"),
+    posting: Optional[str] = Query(None, description="pending（待过账）/ posted（已过账）"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
     ctx: AuthContext = Depends(require_auth),
@@ -38,6 +39,7 @@ async def get_invoices(
         direction=direction,
         keyword=keyword,
         status=status,
+        posting=posting,
         page=page,
         page_size=page_size,
     )

@@ -581,7 +581,7 @@ class TestInvoice:
                 return MockEntry(fake_entry)
             return None
             
-        async def fake_classify_invoice(row, company_name):
+        async def fake_classify_invoice(row, company_name, *, user_id="", company_id=""):
             return {
                 "direction": "expense",
                 "category": "信息技术服务费",
@@ -627,7 +627,7 @@ class TestInvoice:
                     return self.d.get(name)
             return MockEntry(fake_entry)
             
-        async def fake_classify_invoice(row, company_name):
+        async def fake_classify_invoice(row, company_name, *, user_id="", company_id=""):
             captured_row.append(row)
             return {
                 "direction": "expense",
@@ -676,6 +676,9 @@ class TestBankReconciliation:
         from services import bank_service, database, entry_service
 
         await entry_service._ensure_schema()
+
+        # _ensure_schema 的进程级 once 标记指向的是旧库；每个测试是全新内存库，必须重置
+        bank_service._schema_ready = False
 
         uri = f"file:bank-test-{uuid.uuid4().hex}?mode=memory&cache=shared"
         keeper = await aiosqlite.connect(uri, uri=True)

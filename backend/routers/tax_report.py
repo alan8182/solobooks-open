@@ -4,6 +4,7 @@
 """Official tax report export routes."""
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote
@@ -19,6 +20,7 @@ from services.tax_filing_export_service import (
 )
 
 router = APIRouter(prefix="/api/tax-report", tags=["tax-report"], dependencies=[Depends(require_auth)])
+logger = logging.getLogger(__name__)
 
 
 @router.get("/xiaoqiye/month-quarter/preview")
@@ -63,10 +65,10 @@ async def export_xiaoqiye_month_quarter(
         path = export_month_quarter_xls(data)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+    except (FileNotFoundError, RuntimeError) as e:
+        # FileNotFoundError/RuntimeError 可能携带内部路径等敏感信息，仅记日志不下发
+        logger.exception("小企业报表导出失败 company=%s period=%s", ctx.company_id, period)
+        raise HTTPException(status_code=500, detail="报表文件生成失败，请稍后重试或联系管理员") from e
 
     filename = Path(path).name
     quoted = quote(filename)

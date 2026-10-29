@@ -144,12 +144,20 @@ const CATEGORY_DEBIT_MAP: Record<string, { code: string; name: string }> = {
   '老板取现': { code: '122102', name: '其他应收款-股东' },
   '其他应收款': { code: '122103', name: '其他应收款-员工往来' },
   '其他应付款': { code: '2241', name: '其他应付款-其他' },
-  '往来款': { code: '122103', name: '其他应收款-员工往来' },
+  '往来款': { code: '122199', name: '其他应收款-待收款项' },
 }
 
 // 权威映射（分类 → 科目）：从后端 /api/categories/account-mapping 加载，覆盖上面的兜底表。
 // 未加载或加载失败时回落到 CATEGORY_DEBIT_MAP，保证凭证预览不因网络问题中断。
 let _accountMapping: Record<string, { code: string; name: string }> | null = null
+
+// 分类模糊组（随 /account-mapping 同源下发）：银行流水层面不可判定、正确科目
+// 取决于账外事实的分类。组内候选需展开交用户选择，且禁止沉淀自动入账规则。
+let _ambiguityGroups: Record<string, string[]> = {}
+
+export function getAmbiguityGroup(category: string): string[] {
+  return _ambiguityGroups[category] || []
+}
 
 export async function loadAccountMapping(): Promise<void> {
   try {
@@ -163,6 +171,9 @@ export async function loadAccountMapping(): Promise<void> {
     }
     if (Object.keys(map).length > 0) {
       _accountMapping = map
+    }
+    if (res?.ambiguityGroups && typeof res.ambiguityGroups === 'object') {
+      _ambiguityGroups = res.ambiguityGroups
     }
   } catch {
     // 保留兜底表

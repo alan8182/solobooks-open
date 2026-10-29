@@ -72,20 +72,20 @@
 │   ├── docs/           # 前端设计规范与页面交互文档
 │   └── vite.config.ts  # 含 dev 代理
 ├── deploy/             # Docker/生产部署配置
-├── docs/               # 开发与运维文档
-└── 梭罗记账_PRD_v4.md   # 当前产品需求文档（v4.1）
+├── brand/              # 品牌素材（logo、favicon）
+└── docs/               # 开发与运维文档
 ```
 
 ## 文档索引
 
 | 文档 | 说明 |
 |---|---|
-| [梭罗记账_PRD_v4.md](梭罗记账_PRD_v4.md) | 产品需求文档 v4.1：功能现状、边界、税务口径与路线图 |
 | [web/docs/pages-and-interactions.md](web/docs/pages-and-interactions.md) | 前端页面、路由与交互逻辑总览 |
-| [DESIGN.md](DESIGN.md) / [DESIGN_SYSTEM.md](DESIGN_SYSTEM.md) | 视觉与设计系统规范 |
 | [docs/development-workflow.md](docs/development-workflow.md) | 本地热更新、Docker 构建与数据库变更流程 |
 | [docs/finance-core-runbook.md](docs/finance-core-runbook.md) | 财务核心运维与排障手册 |
 | [MCP接入方案.md](MCP接入方案.md) / [docs/mcp-integration.md](docs/mcp-integration.md) | 外部 AI 接入设计与使用说明；在线版图文指南见 [AI 连接中心](https://solobooks.cn/ai-connect)（源码 `web/src/pages/mcp-guide/`） |
+
+> 产品需求文档（`梭罗记账_PRD_v4.md`）与视觉设计规范（`DESIGN.md`、`DESIGN_SYSTEM.md`）为内部文档，仅在私有开发仓库中维护，不随本开源库发布。
 
 ## 快速开始（本地开发）
 

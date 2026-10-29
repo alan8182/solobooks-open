@@ -78,6 +78,7 @@ const natureOptions = [
 
 const billingStatusOptions = [
   { label: '全部单据状态', value: 'all' },
+  { label: '未开票收入（免税申报）', value: 'no_invoice' },
   { label: '待补发票/收据', value: 'pending' },
   { label: '已有发票/收据', value: 'complete' },
 ]
@@ -141,7 +142,7 @@ function isInRange(entry: Entry, range: TimeFilter): boolean {
 }
 
 function hasDocument(entry: Entry): boolean {
-  return Boolean(entry.billingStatus && entry.billingStatus !== 'no_document')
+  return Boolean(entry.billingStatus && entry.billingStatus !== 'no_document' && entry.billingStatus !== 'no_invoice')
 }
 
 function matchesKeyword(entry: Entry, query: string): boolean {
@@ -162,6 +163,7 @@ const filteredEntries = computed(() => entryStore.activeEntries.filter((entry) =
   if (!isInRange(entry, timeFilter.value)) return false
   if (!matchesEntryNature(entry, natureFilter.value)) return false
   if (categoryFilter.value && entry.category !== categoryFilter.value) return false
+  if (billingStatusFilter.value === 'no_invoice' && (entry.direction !== 'income' || entry.billingStatus !== 'no_invoice')) return false
   if (billingStatusFilter.value === 'pending' && hasDocument(entry)) return false
   if (billingStatusFilter.value === 'complete' && !hasDocument(entry)) return false
   if (postingStatusFilter.value && normalizedPostingStatus(entry.voucherStatus) !== postingStatusFilter.value) return false
@@ -180,6 +182,45 @@ const totalExpense = computed(() => filteredEntries.value
 
 const netProfit = computed(() => totalIncome.value - totalExpense.value)
 const pendingCount = computed(() => filteredEntries.value.filter((entry) => !hasDocument(entry)).length)
+const uninvoicedCount = computed(() =>
+  entryStore.activeEntries.filter((entry) => entry.direction === 'income' && entry.billingStatus === 'no_invoice').length,
+)
+
+const currentQuarterInfo = computed(() => {
+  const now = new Date()
+  const year = now.getFullYear()
+  const month = now.getMonth() + 1
+  const q = Math.ceil(month / 3)
+  const qStartMonth = (q - 1) * 3 + 1
+  const qEndMonth = q * 3
+  const qStartDate = `${year}-${String(qStartMonth).padStart(2, '0')}-01`
+  const qEndDate = `${year}-${String(qEndMonth).padStart(2, '0')}-${new Date(year, qEndMonth, 0).getDate()}`
+
+  const quarterSales = entryStore.activeEntries
+    .filter((e) => {
+      if (e.direction !== 'income') return false
+      if (['opening', 'closing', 'reversal'].includes(String(e.entryType || ''))) return false
+      const d = String(e.occurDate || e.created_at || '').slice(0, 10)
+      return d >= qStartDate && d <= qEndDate
+    })
+    .reduce((sum, e) => {
+      const amt = Number((e as any).amountExcludingTax || e.amount || 0)
+      return sum + amt
+    }, 0)
+
+  const limit = 300000
+  const remaining = Math.max(0, limit - quarterSales)
+  const percent = Math.min(100, Math.round((quarterSales / limit) * 100))
+
+  return {
+    label: `${year} 年第 ${q} 季度 (Q${q})`,
+    sales: quarterSales,
+    limit,
+    remaining,
+    percent,
+    isOver: quarterSales >= limit,
+  }
+})
 
 const categoryOptions = computed(() => Array.from(new Set(
   entryStore.activeEntries.map((entry) => entry.category).filter(Boolean),
@@ -201,6 +242,9 @@ function dateLabel(entry: Entry): string {
 }
 
 function billingStatusLabel(entry: Entry): string {
+  if (entry.direction === 'income' && entry.billingStatus === 'no_invoice') {
+    return '未开票收入'
+  }
   return hasDocument(entry) ? '已有单据' : '待补单据'
 }
 
@@ -263,13 +307,14 @@ const columns = computed<DataTableColumns<Entry>>(() => [
   {
     title: '单据',
     key: 'billingStatus',
-    width: 100,
-    // 正常态（已有单据）不出彩：一屏十几行都标绿，等于用颜色把"没事"重复十几遍，
-    // 真正「待补单据」的那几行就淹掉了。只有缺单据才用 warning。
-    render: (row) => h(SoloStatusBadge, {
-      tone: hasDocument(row) ? 'neutral' : 'warning',
-      plain: true,
-    }, { default: () => billingStatusLabel(row) }),
+    width: 104,
+    render: (row) => {
+      const isUninvoiced = row.direction === 'income' && row.billingStatus === 'no_invoice'
+      return h(SoloStatusBadge, {
+        tone: isUninvoiced ? 'info' : hasDocument(row) ? 'neutral' : 'warning',
+        plain: true,
+      }, { default: () => billingStatusLabel(row) })
+    },
   },
   {
     title: '状态',
@@ -368,10 +413,6 @@ usePageRefresh(() => entryStore.fetchEntries())
           <template #icon><i class="ri-download-2-line" /></template>
           导出 Excel
         </NButton>
-        <NButton type="primary" @click="router.push('/copilot')">
-          <template #icon><i class="ri-sparkling-fill" /></template>
-          AI 记账
-        </NButton>
       </NSpace>
     </div>
 
@@ -394,6 +435,31 @@ usePageRefresh(() => entryStore.fetchEntries())
         <div class="summary-stats">
           <span>共 {{ filteredEntries.length }} 笔</span>
           <span v-if="pendingCount">{{ pendingCount }} 笔待补单据</span>
+          <span v-if="uninvoicedCount" class="uninvoiced-stat-link" @click="billingStatusFilter = 'no_invoice'">
+            {{ uninvoicedCount }} 笔未开票收入
+          </span>
+        </div>
+      </div>
+
+      <!-- P1: 当季增值税免税进度条 -->
+      <div class="quarter-vat-gauge">
+        <div class="gauge-header">
+          <span class="gauge-title">
+            <i class="ri-shield-star-line gauge-icon" />
+            {{ currentQuarterInfo.label }} 小微免税额度监控 (季度 30 万)
+          </span>
+          <span class="gauge-meta" :class="{ 'text-warn': currentQuarterInfo.sales > 250000 && !currentQuarterInfo.isOver, 'text-danger': currentQuarterInfo.isOver }">
+            {{ currentQuarterInfo.isOver
+              ? `已达/超过免税起征点（销售额 ${formatMoney(currentQuarterInfo.sales)}）`
+              : `已确认销售 ${formatMoney(currentQuarterInfo.sales)} / 剩余免税额度 ${formatMoney(currentQuarterInfo.remaining)}` }}
+          </span>
+        </div>
+        <div class="gauge-track">
+          <div
+            class="gauge-fill"
+            :class="{ 'fill-safe': currentQuarterInfo.sales < 250000, 'fill-warn': currentQuarterInfo.sales >= 250000 && !currentQuarterInfo.isOver, 'fill-danger': currentQuarterInfo.isOver }"
+            :style="{ width: `${currentQuarterInfo.percent}%` }"
+          />
         </div>
       </div>
     </NCard>
@@ -779,5 +845,68 @@ usePageRefresh(() => entryStore.fetchEntries())
     flex-basis: 100%;
     justify-content: flex-start;
   }
+}
+
+.quarter-vat-gauge {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--solo-border-light, #eaecf0);
+}
+.gauge-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+.gauge-title {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-weight: 600;
+  color: var(--solo-text-primary);
+}
+.gauge-icon {
+  color: var(--solo-income, #0f7354);
+  font-size: 14px;
+}
+.gauge-meta {
+  font-size: 11.5px;
+  color: var(--solo-text-muted);
+}
+.gauge-meta.text-warn {
+  color: #d97706;
+  font-weight: 600;
+}
+.gauge-meta.text-danger {
+  color: #dc2626;
+  font-weight: 600;
+}
+.gauge-track {
+  width: 100%;
+  height: 6px;
+  background: var(--solo-bg-secondary, #f3f4f6);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.gauge-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.3s ease;
+}
+.gauge-fill.fill-safe {
+  background: var(--solo-income, #0f7354);
+}
+.gauge-fill.fill-warn {
+  background: #f59e0b;
+}
+.gauge-fill.fill-danger {
+  background: #ef4444;
+}
+.uninvoiced-stat-link {
+  color: var(--solo-income, #0f7354);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 </style>

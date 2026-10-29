@@ -197,7 +197,14 @@ async def run_agent_stream(
 
                 if (
                     ok
-                    and name in ("propose_voucher", "propose_vouchers", "propose_match", "propose_accrual")
+                    and name in (
+                        "propose_voucher",
+                        "propose_vouchers",
+                        "propose_match",
+                        "propose_accrual",
+                        "propose_company_setup",
+                        "propose_opening_balance",
+                    )
                     and isinstance(result, dict)
                     and result.get("actionId")
                 ):

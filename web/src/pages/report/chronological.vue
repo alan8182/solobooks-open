@@ -2,10 +2,11 @@
 <script setup lang="ts">
 import { ref, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NButton, NCard, NDatePicker, NFormItem, NSpin, NTag, useMessage } from 'naive-ui'
+import { NButton, NCard, NFormItem, NSpin, NTag, useMessage } from 'naive-ui'
 import { getChronologicalLedger } from '@/api/ledger'
 import type { ChronologicalResponse } from '@/api/ledger'
 import { formatDate, formatMoney, getCurrentMonth } from '@/utils/format'
+import { SoloMonthPicker } from '@/components/ui'
 
 const route = useRoute()
 const router = useRouter()
@@ -66,7 +67,7 @@ onMounted(query)
 
     <div class="filter-bar mb-4">
       <NFormItem label="会计月份" label-placement="left" :show-feedback="false">
-        <NDatePicker v-model:formatted-value="month" type="month" value-format="yyyy-MM" format="yyyy-MM" style="width: 150px;" />
+        <SoloMonthPicker v-model:value="month" style="width: 150px;" />
       </NFormItem>
       <NButton type="primary" @click="query">查询账页</NButton>
     </div>

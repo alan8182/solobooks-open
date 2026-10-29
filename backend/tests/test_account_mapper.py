@@ -158,6 +158,19 @@ class TestGetVoucherHint:
         assert hint["credit"][0]["accountName"] == "微信支付待结算"
         assert hint["credit"][0]["amount"] == Decimal("19.82")
 
+    def test_wanglai_expense_lands_in_neutral_receivable(self):
+        """非员工的往来暂付（平台验证款/供应商往来）不进员工往来 122103。"""
+        hint = get_voucher_hint("expense", "往来款", Decimal("0.15"))
+        assert hint["credit"][0]["accountCode"] == "1002"
+        assert hint["debit"][0]["accountCode"] == "122199"
+        assert hint["debit"][0]["accountName"] == "其他应收款-待收款项"
+
+    def test_wanglai_income_lands_in_payable(self):
+        hint = get_voucher_hint("income", "往来款", Decimal("500"))
+        assert hint["debit"][0]["accountCode"] == "1002"
+        assert hint["credit"][0]["accountCode"] == "2241"
+        assert hint["credit"][0]["accountName"] == "其他应付款-其他"
+
     def test_alipay_settlement_hint(self):
         hint = get_voucher_hint("income", "支付宝结算", 100.00)
         assert hint["debit"][0]["accountCode"] == "1002"

@@ -256,6 +256,11 @@ async def _opening_result(
     if has_prior:
         return "done", "已按上年余额自动结转", True
 
+    # onboardingType 存在 payload 字典里（company 是 SQLAlchemy 模型，不能直接 .get）
+    payload = company.payload or {}
+    if str(payload.get("onboardingType") or "").strip() == "migration":
+        return "todo", "从原代账迁入，请导入或录入期初余额", False
+
     start = book_start_date(company)
     if start is not None and start >= first_day:
         return "waived", "从零起账，没有历史余额", False

@@ -97,7 +97,12 @@ function auxiliaryText(line: any): string {
         <tr v-for="(line, index) in voucherLines" :key="index">
           <td class="cell-summary" :title="line.code">{{ entry.title }}</td>
           <td>
-            <div>{{ line.name }}</div>
+            <div class="line-name-row">
+              <span>{{ line.name }}</span>
+              <span v-if="line.code === '2221026' && line.side === 'credit'" class="vat-exempt-tag">
+                💡 季≤30万免税（结账自动转出）
+              </span>
+            </div>
             <div v-if="auxiliaryText(line)" class="aux-hint">辅助：{{ auxiliaryText(line) }}</div>
           </td>
           <td class="amount">
@@ -209,6 +214,17 @@ function auxiliaryText(line: any): string {
 .qty-hint { font-size: 11px; color: var(--solo-text-muted, #636e7c); line-height: 1.4; }
 .total-capital, .total { font-weight: 700; }
 .aux-hint { margin-top: 2px; font-size: 11px; color: #4b5563; }
+.line-name-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.vat-exempt-tag {
+  font-size: 11px;
+  color: var(--solo-income, #0f7354);
+  font-weight: normal;
+}
 .blank-row { display: none; }
 .voucher-sign {
   display: flex;
@@ -240,6 +256,7 @@ function auxiliaryText(line: any): string {
   .voucher-title { border-bottom-color: #000; }
   .voucher-table th,
   .voucher-table td { border-color: #000; }
+  .vat-exempt-tag { display: none !important; }
   .blank-row { display: table-row; }
   .page-break { break-after: page; page-break-after: always; }
 }

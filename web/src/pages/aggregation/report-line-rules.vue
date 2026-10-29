@@ -244,7 +244,6 @@ import {
   NButton,
   NCard,
   NDataTable,
-  NDatePicker,
   NInput,
   NModal,
   NRadioButton,
@@ -267,6 +266,7 @@ import {
   listReportLineRules,
   replaceReportLineRules,
 } from '@/api/aggregation'
+import { SoloMonthPicker } from '@/components/ui'
 import type { ReportLineCompareResult, SwitchReadinessResult } from '@/api/aggregation'
 import type { ReportLineRule } from '@/api/types'
 // ⚠️ ReportKind / validatePattern / DERIVED_LINES 等已在上方 <script> 块导入。
@@ -362,7 +362,7 @@ async function load(): Promise<void> {
     rules.value = await listReportLineRules(reportKind.value)
   } catch (err) {
     rules.value = []
-    message.error(errorText(err, '报表口径规则加载失败'))
+    message.error(errorText(err))
   } finally {
     loading.value = false
   }
@@ -447,7 +447,7 @@ async function saveRules(): Promise<void> {
     await loadReadiness()
   } catch (err) {
     // ⚠️ 失败时**保留本地 draft**：整批 PUT 已回滚，用户输入不能被清掉
-    message.error(errorText(err, '规则保存失败，草稿已保留，请修改后重试'))
+    message.error(errorText(err))
   } finally {
     saving.value = false
   }
@@ -466,7 +466,7 @@ function confirmArchive(rule: ReportLineRule): void {
         rules.value = rules.value.map((item) => (item.id === archived.id ? archived : item))
         message.success('已归档。该行不再参与口径计算，历史可追溯。')
       } catch (err) {
-        message.error(errorText(err, '归档失败'))
+        message.error(errorText(err))
       }
     },
   })
@@ -497,7 +497,7 @@ async function runCompare(): Promise<void> {
   } catch (err) {
     // ⚠️ 失败分支不按 REPORT_LINE_DUAL_TRACK_DIFF 写：compare_with_baseline 实际不抛该码，
     //    差异走 diffs 数组返回
-    message.error(errorText(err, '双轨对比失败'))
+    message.error(errorText(err))
   } finally {
     comparing.value = false
   }
@@ -706,11 +706,9 @@ watch(reportKind, async () => {
           <NRadioButton value="month">按月</NRadioButton>
           <NRadioButton value="quarter">按季</NRadioButton>
         </NRadioGroup>
-        <NDatePicker
+        <SoloMonthPicker
           v-if="comparePeriodType === 'month'"
           :value="compareMonthValue"
-          type="month"
-          value-format="yyyy-MM"
           style="width: 160px"
           @update:value="onCompareMonthUpdate"
         />
@@ -874,18 +872,14 @@ watch(reportKind, async () => {
 
             <NSpace align="center" :size="10" wrap>
               <NText style="width: 96px; font-size: 13px">生效期</NText>
-              <NDatePicker
+              <SoloMonthPicker
                 :value="draftFromValue(row.key, 'effectiveFrom')"
-                type="month"
-                value-format="yyyy-MM"
                 style="width: 150px"
                 @update:value="(v: any) => onDraftDateUpdate(row.key, 'effectiveFrom', v)"
               />
               <NText depth="3" style="font-size: 12px">至</NText>
-              <NDatePicker
+              <SoloMonthPicker
                 :value="draftFromValue(row.key, 'effectiveTo')"
-                type="month"
-                value-format="yyyy-MM"
                 clearable
                 style="width: 150px"
                 @update:value="(v: any) => onDraftDateUpdate(row.key, 'effectiveTo', v)"

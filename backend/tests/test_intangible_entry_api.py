@@ -41,7 +41,7 @@ def test_confirm_intangible_purchase_then_create_card_from_entry(client, auth_he
     assert body["existingAssetId"] is None
     assert body["originalValue"] == "120000.00"
     assert body["suggestedCategory"] == "software"
-
+    assert body["voucherNo"] and body["summary"] and body["sourceAccount"]
     created = client.post(
         "/api/intangible/assets/from-entry",
         headers=auth_headers,

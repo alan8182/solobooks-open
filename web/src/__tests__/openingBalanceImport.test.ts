@@ -158,4 +158,25 @@ describe('opening balance Excel import and matching', () => {
     expect(res.totalDebit).toBe(10000)
     expect(res.fixedAssets.length).toBe(2)
   })
+
+  it('supports custom mapping overrides and captures unmatched rows', () => {
+    const rows = [
+      { '科目代码': '9999', '科目名称': '特殊往来户', '期初借方': '12000' },
+      { '科目代码': '3001', '科目名称': '实收资本', '期初贷方': '12000' },
+    ]
+
+    // 未提供 mapping 时，9999 无法匹配
+    const unmapped = parseOpeningRows(rows, mockExistingAccounts)
+    expect(unmapped.unmatchedCount).toBe(1)
+    expect(unmapped.unmatchedRows?.length).toBe(1)
+    expect(unmapped.unmatchedRows?.[0].originalCode).toBe('9999')
+    expect(unmapped.isBalanced).toBe(false)
+
+    // 提供 mapping 后，9999 映射到 1122 应收账款
+    const mapped = parseOpeningRows(rows, mockExistingAccounts, { '9999': '1122' })
+    expect(mapped.unmatchedCount).toBe(0)
+    expect(mapped.isBalanced).toBe(true)
+    const matchedReceivable = mapped.items.find(i => i.account_code === '1122')
+    expect(matchedReceivable?.debit_balance).toBe(12000)
+  })
 })

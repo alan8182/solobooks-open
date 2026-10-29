@@ -16,7 +16,7 @@ import type { Entry } from '@/api/types'
 import { getCategories } from '@/api/category'
 import { formatMoney } from '@/utils/format'
 import { sortByDayDesc } from '@/utils/entryGrouping'
-import { SoloDrawer, SoloEmpty, SoloFieldHelp } from '@/components/ui'
+import { SoloDrawer, SoloEmpty, SoloFieldHelp, SoloMonthPicker } from '@/components/ui'
 import { RESCUE_RULES } from '@/utils/rescueRules'
 import { usePageRefresh } from '@/composables/usePageRefresh'
 import { useTabGuard } from '@/composables/useTabGuard'
@@ -456,12 +456,8 @@ onMounted(() => {
         </NButton>
         <label class="month-field">
           月份
-          <NDatePicker
-            v-model:formatted-value="selectedMonth"
-            type="month"
-            value-format="yyyy-MM"
-            format="yyyy-MM"
-            size="small"
+          <SoloMonthPicker
+            v-model:value="selectedMonth"
             clearable
             placeholder="全部月份"
             style="width: 132px;"
@@ -570,7 +566,7 @@ onMounted(() => {
               <NButton type="primary" size="small" @click="router.push('/copilot')">
                 去 AI 记账
               </NButton>
-              <NButton size="small" @click="router.push('/record/invoice-import')">
+              <NButton size="small" @click="router.push('/invoices?import=true')">
                 导入发票
               </NButton>
             </div>

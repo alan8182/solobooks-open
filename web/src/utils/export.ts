@@ -256,3 +256,8 @@ export function exportLedgerBookToExcel(book: LedgerBook) {
   const suffix = meta.scope === 'year' ? `${meta.year}年度` : String(meta.month || '')
   XLSX.writeFile(workbook, `电子账簿_${meta.companyName}_${suffix}.xlsx`)
 }
+
+/** 统一的 Excel 落盘出口：更换 xlsx 实现或加导出埋点时只改这里。 */
+export function saveWorkbook(workbook: XLSX.WorkBook, filename: string) {
+  XLSX.writeFile(workbook, filename)
+}

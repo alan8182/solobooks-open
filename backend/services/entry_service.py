@@ -267,7 +267,8 @@ async def generate_entry_vouchers(
         return output
 
 
-async def list_entries(user_id: str, company_id: str) -> List[Dict[str, Any]]:
+async def list_entries(user_id: str, company_id: str, *, lite: bool = False) -> List[Dict[str, Any]]:
+    """lite=True：跳过分录行序列化（待办派生等只读 metadata 级字段的消费方）。"""
     async with session_scope() as session:
         await ensure_tenant(session, company_id, user_id)
-        return await list_journals(session, company_id)
+        return await list_journals(session, company_id, lite=lite)

@@ -37,6 +37,13 @@ def _seed_users() -> None:
                 ("u-disabled", "被禁用户", 0, 1),
             ],
         )
+        # 生产登录流程必建成员关系；require_auth 按 ensure_tenant 同口径校验成员归属，
+        # 播种需对齐（被禁用户的 401 先于成员 403，不受影响）。
+        conn.executemany(
+            "INSERT OR REPLACE INTO company_members (company_id, user_id, role, status)"
+            " VALUES ('c1', ?, 'accountant', 'active')",
+            [("u-admin",), ("u-admin-disabled",), ("u-normal",), ("u-disabled",)],
+        )
         conn.commit()
     finally:
         conn.close()

@@ -6,6 +6,15 @@ import { getAuditLogs } from '@/api/audit'
 import type { AuditLogItem } from '@/api/audit'
 import { SoloEmpty } from '@/components/ui'
 
+const props = withDefaults(
+  defineProps<{
+    embedded?: boolean
+  }>(),
+  {
+    embedded: false,
+  },
+)
+
 const message = useMessage()
 const logs = ref<AuditLogItem[]>([])
 const total = ref(0)
@@ -93,8 +102,8 @@ const columns = [
 </script>
 
 <template>
-  <div class="audit-log-page">
-    <div class="page-header">
+  <div class="audit-log-page" :class="{ 'is-embedded': embedded }">
+    <div v-if="!embedded" class="page-header">
       <h2>审计日志</h2>
     </div>
 
@@ -130,6 +139,10 @@ const columns = [
 .audit-log-page {
   max-width: 960px;
   margin: 0 auto;
+}
+.audit-log-page.is-embedded {
+  max-width: 100%;
+  margin: 0;
 }
 .page-header {
   margin-bottom: 20px;

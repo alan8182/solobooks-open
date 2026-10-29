@@ -84,10 +84,11 @@ describe('audit share 路由', () => {
   })
 
   it('/mine/audit-share 管理页需要登录', () => {
-    const layout = routes.find((r) => r.path === '/')
-    const child = layout?.children?.find((r) => r.name === 'AuditShareManage')
+    const root = routes.find((r) => r.path === '/')
+    const workbenchShell = root?.children?.find((r) => r.path === '')
+    const child = workbenchShell?.children?.find((r) => r.name === 'AuditShareManage')
     expect(child?.path).toBe('mine/audit-share')
-    expect(layout?.meta?.requiresAuth).toBe(true)
+    expect(workbenchShell?.meta?.requiresAuth).toBe(true)
   })
 })
 

@@ -17,7 +17,9 @@ describe('sidebar navigation structure', () => {
       '/',
       '/copilot',
       '/todos',
+      '/private-expenses',
       '/ledger',
+      '/invoices',
       '/bank',
       '/closing-wizard',
       '/tax-filing',
@@ -34,46 +36,43 @@ describe('sidebar navigation structure', () => {
     expect(groups).toEqual(['日常', '账务', '周期', '工具'])
   })
 
-  it('groups invoices, vouchers and low-frequency tools into secondary menus', () => {
-    const invoice = NAV_ITEMS.find((item) => item.label === '发票')
+  it('groups vouchers and low-frequency tools into secondary menus', () => {
     const vouchers = NAV_ITEMS.find((item) => item.label === '凭证与账簿')
     const special = NAV_ITEMS.find((item) => item.label === '专项核算')
     const settings = NAV_ITEMS.find((item) => item.label === '设置')
 
-    expect(invoice?.children?.map((item) => item.path)).toEqual([
-      '/invoices',
-      '/record/invoice-import',
-    ])
     expect(vouchers?.children?.map((item) => item.path)).toEqual([
       '/vouchers',
       '/ledger/books',
       '/ledger/book',
+      '/reports/archive',
     ])
     expect(special?.children?.map((item) => item.path)).toEqual([
       '/assets',
-      '/intangibles',
       '/rd-expenses',
       '/mine/salary',
       '/private-expenses',
-      '/recurring',
       '/aggregation',
     ])
     expect(settings?.children?.map((item) => item.path)).toEqual([
-      '/mine/companies',
-      // 上手引导紧挨公司信息：主体配完了才谈得上「把账做起来」
-      '/guide',
-      // 税费种认定紧挨公司信息：同属「主体与税局口径」的配置
+      // 税费种认定：税局口径的配置
       '/tax-registration',
       '/mine/accounts',
       '/mine/contacts',
       '/mine/opening',
-      '/mine/legacy-import',
       '/mine/backup',
-      '/mine/audit-log',
       '/mine/mcp',
       '/mine',
     ])
     expect(NAV_ITEMS.some((item) => item.label === '财务工具')).toBe(false)
+  })
+
+  it('keeps invoice ledger as a top-level direct navigation item in accounting group', () => {
+    const invoiceItem = NAV_ITEMS.find((item) => item.path === '/invoices')
+    expect(invoiceItem).toBeDefined()
+    expect(invoiceItem?.label).toBe('发票台账')
+    expect(invoiceItem?.group).toBe('账务')
+    expect(invoiceItem?.children).toBeUndefined()
   })
 
   it('never exposes a navigation path that does not resolve to a route', () => {
@@ -115,9 +114,25 @@ describe('landing page routing', () => {
     expect(publicPaths).toEqual(expect.arrayContaining(['/landing', '/login', '/agreement', '/privacy']))
   })
 
-  it('keeps the workbench root protected', () => {
+  it('keeps the workbench root protected while / itself is the public landing', () => {
+    // 根路径按登录态分流：/ 本身公开（匿名呈现官网），内层工作台壳仍要求登录
     const root = routes.find((route) => route.path === '/')
-    expect(root?.meta?.requiresAuth).toBe(true)
+    expect(root?.meta?.requiresAuth).toBe(false)
+    const workbenchShell = root?.children?.find((route) => route.path === '')
+    expect(workbenchShell?.meta?.requiresAuth).toBe(true)
+  })
+})
+
+describe('platform console routing', () => {
+  it('mounts the admin console at /console instead of the scannable /admin', () => {
+    // 公开后台路径是爆破字典的高频词，改名只降低被扫概率；真正的门是后端 require_admin
+    const consoleRoute = routes.find((route) => route.path === '/console')
+    expect(consoleRoute?.name).toBeUndefined()
+    expect(consoleRoute?.meta?.requiresAuth).toBe(true)
+    expect(consoleRoute?.children?.some((child) => child.name === 'AdminOverview')).toBe(true)
+
+    const legacy = routes.find((route) => route.path === '/admin')
+    expect(legacy, '/admin 应已下线，避免旧路径继续被扫描命中').toBeUndefined()
   })
 })
 
@@ -125,8 +140,8 @@ describe('auth redirect guard rules', () => {
   const protectedRoute = { path: '/ledger', meta: { requiresAuth: true } }
   const publicRoute = { path: '/landing', meta: { requiresAuth: false } }
 
-  it('directs unauthenticated root visits to the landing page', () => {
-    expect(resolveAuthRedirect({ path: '/', meta: {} }, null)).toBe('/landing')
+  it('leaves unauthenticated root visits in place so RootSwitch renders the landing inline', () => {
+    expect(resolveAuthRedirect({ path: '/', meta: {} }, null)).toBeNull()
   })
 
   it('directs unauthenticated protected visits to login', () => {
