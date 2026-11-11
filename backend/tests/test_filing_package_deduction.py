@@ -61,7 +61,7 @@ async def _create_company(company_id: str) -> None:
             Company(
                 company_id=company_id,
                 owner_user_id="u-ded",
-                payload={},
+                payload={"taxId": "91330100MA2TEST001"},
                 created_at="2026-01-01T00:00:00+00:00",
                 updated_at="2026-01-01T00:00:00+00:00",
             )

@@ -22,10 +22,10 @@ async def _ensure_schema() -> None:
 
 
 @pytest.mark.asyncio
-async def test_propose_accrual_depreciation_graceful_without_assets():
-    """M2：计提确认动作——批准路径调用现有计提服务；无资产时优雅返回空结果。"""
+async def test_legacy_unbound_depreciation_action_expires_without_writing():
+    """历史计提动作没有快照绑定，审批时必须过期且不执行任何写入。"""
     await _ensure_schema()  # 固定资产表在 P1 WP-B 起由 ORM create_all 建
-    from services.entry_service import list_entries
+    from core.errors import AccountingError
 
     company_id = "c-agent-accrual"
     user_id = "owner-1"
@@ -38,27 +38,21 @@ async def test_propose_accrual_depreciation_graceful_without_assets():
         payload={"kind": "depreciation", "month": "2026-09", "preview": {"pendingCount": 0, "pendingTotal": 0}},
         evidence={"created_via": "pytest"},
     )
-    decision = await agent_actions.approve_action(
-        action["id"], user_id=user_id, company_id=company_id
-    )
-    assert decision["status"] == "approved"
-    accrual = decision["result"]["accrual"]
-    assert accrual["kind"] == "depreciation"
-    assert accrual["month"] == "2026-09"
-    # 无在用资产 → 计提服务空跑（processed/skipped 均为 0，不报错）
-    summary = accrual["summary"]
-    assert isinstance(summary, dict)
-
-    # 没有任何账目产生
-    entries = await list_entries(user_id, company_id)
-    assert not [e for e in entries if e.get("source") == "agent"]
+    with pytest.raises(AccountingError) as exc:
+        await agent_actions.approve_action(
+            action["id"], user_id=user_id, company_id=company_id
+        )
+    assert exc.value.code == "CLOSING_SNAPSHOT_STALE"
+    draft = await agent_actions.get_action(action["id"], company_id=company_id)
+    assert draft["status"] == "expired"
+    assert draft["result"]["code"] == "CLOSING_SNAPSHOT_STALE"
 
 
 @pytest.mark.asyncio
-async def test_propose_accrual_amortization_graceful_without_assets():
-    """M2：无形资产摊销确认动作——批准路径调用无形资产摊销服务；无资产时优雅返回空结果。"""
+async def test_legacy_unbound_amortization_action_expires_without_writing():
+    """历史摊销动作没有快照绑定，审批时必须过期且不执行任何写入。"""
     await _ensure_schema()
-    from services.entry_service import list_entries
+    from core.errors import AccountingError
 
     company_id = "c-agent-amort"
     user_id = "owner-1"
@@ -71,24 +65,21 @@ async def test_propose_accrual_amortization_graceful_without_assets():
         payload={"kind": "amortization", "month": "2026-09", "preview": {"pendingCount": 0, "pendingTotal": 0}},
         evidence={"created_via": "pytest"},
     )
-    decision = await agent_actions.approve_action(
-        action["id"], user_id=user_id, company_id=company_id
-    )
-    assert decision["status"] == "approved"
-    accrual = decision["result"]["accrual"]
-    assert accrual["kind"] == "amortization"
-    assert accrual["month"] == "2026-09"
-    summary = accrual["summary"]
-    assert isinstance(summary, dict)
-
-    entries = await list_entries(user_id, company_id)
-    assert not [e for e in entries if e.get("source") == "agent"]
+    with pytest.raises(AccountingError) as exc:
+        await agent_actions.approve_action(
+            action["id"], user_id=user_id, company_id=company_id
+        )
+    assert exc.value.code == "CLOSING_SNAPSHOT_STALE"
+    draft = await agent_actions.get_action(action["id"], company_id=company_id)
+    assert draft["status"] == "expired"
 
 
 @pytest.mark.asyncio
-async def test_propose_asset_closure_action_branch():
-    """资产处理确认包走 propose_accrual 的新 kind，批准后返回 assetClosure。"""
+async def test_legacy_unbound_asset_closure_action_expires():
+    """历史资产处理动作也必须有结账快照绑定，否则不得执行。"""
     await _ensure_schema()
+    from core.errors import AccountingError
+
     company_id = "c-agent-asset-closure"
     user_id = "owner-1"
     action = await agent_actions.create_action(
@@ -108,12 +99,13 @@ async def test_propose_asset_closure_action_branch():
         },
         evidence={"created_via": "pytest"},
     )
-    decision = await agent_actions.approve_action(
-        action["id"], user_id=user_id, company_id=company_id
-    )
-    assert decision["status"] == "approved"
-    assert decision["result"]["assetClosure"]["fixedCards"] == []
-    assert decision["result"]["assetClosure"]["intangibleCards"] == []
+    with pytest.raises(AccountingError) as exc:
+        await agent_actions.approve_action(
+            action["id"], user_id=user_id, company_id=company_id
+        )
+    assert exc.value.code == "CLOSING_SNAPSHOT_STALE"
+    draft = await agent_actions.get_action(action["id"], company_id=company_id)
+    assert draft["status"] == "expired"
 
 
 @pytest.mark.asyncio
@@ -200,12 +192,12 @@ async def test_batch_propose_and_partial_approve_writes_profile():
     assert prefs["UU跑腿"]["category"] == "交通费"
     assert prefs["修正:UU跑腿"]["category"] == "交通费"
 
-    # 再次批准同一动作 → 409
-    from fastapi import HTTPException
-
-    with pytest.raises(HTTPException) as exc:
-        await agent_actions.approve_action(action["id"], user_id=user_id, company_id=company_id)
-    assert exc.value.status_code == 409
+    # 网络重试再次批准同一动作 → 返回原结果，不重复记账
+    replay = await agent_actions.approve_action(
+        action["id"], user_id=user_id, company_id=company_id
+    )
+    assert replay["status"] == "approved"
+    assert replay["result"] == decision["result"]
 
 
 @pytest.mark.asyncio
@@ -396,6 +388,122 @@ async def test_run_agent_stream_thinking_and_reasoning_events(monkeypatch):
     assert "50000" in token_events[0]["content"]
 
 
+def test_product_agent_receives_closing_draft_tools_but_no_lock_tool():
+    """产品内 AI 可检查和起草修复动作，但不能直接锁账。"""
+    from agent.tools import (
+        PRODUCT_AGENT_DISABLED_TOOLS,
+        PRODUCT_AGENT_TOOL_SCHEMAS,
+        TOOLS_BY_NAME,
+    )
+
+    exposed = {schema["function"]["name"] for schema in PRODUCT_AGENT_TOOL_SCHEMAS}
+    assert PRODUCT_AGENT_DISABLED_TOOLS == frozenset()
+    assert {
+        "run_close_checks",
+        "list_unmatched",
+        "preview_accruals",
+        "preview_asset_actions",
+        "propose_match",
+        "propose_accrual",
+        "propose_asset_closure",
+    } <= exposed
+    assert "close_period" not in TOOLS_BY_NAME
+    assert "close_period" not in exposed
+
+
+@pytest.mark.asyncio
+async def test_product_agent_runs_closing_check_with_product_context(monkeypatch):
+    """对话可执行共享检查工具，并明确携带 product 来源。"""
+    await _ensure_schema()
+    import json
+
+    import agent.loop as loop_mod
+
+    round_no = 0
+
+    async def fake_chat_tools_stream_async(*_args, **_kwargs):
+        nonlocal round_no
+        round_no += 1
+        if round_no == 1:
+            yield {
+                "type": "final",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc-close",
+                        "name": "run_close_checks",
+                        "arguments": json.dumps({"month": "2026-10"}),
+                    }
+                ],
+            }
+        else:
+            yield {
+                "type": "final",
+                "content": "请回到月度结账向导处理。",
+                "tool_calls": [],
+            }
+
+    execute_calls = []
+
+    async def execute_check(name, arguments, ctx):
+        execute_calls.append((name, arguments, ctx))
+        return {
+            "schemaVersion": "closing.v1",
+            "snapshotHash": "a" * 64,
+            "canClose": False,
+            "period": "2026-10",
+            "manualClose": {
+                "url": "https://solobooks.cn/closing-wizard?month=2026-10&step=3",
+                "label": "打开网页处理阻断项并重新检查",
+                "status": "action_required",
+                "requiresLogin": True,
+                "message": "当前仍有结账阻断项。",
+            },
+            "findings": [],
+        }
+
+    monkeypatch.setattr(loop_mod, "chat_tools_stream_async", fake_chat_tools_stream_async)
+    monkeypatch.setattr(loop_mod, "execute_tool", execute_check)
+
+    ctx = loop_mod.LoopContext(
+        user_id="owner-1",
+        company_id="c-agent-close-boundary",
+        conversation_id="conv-close-boundary",
+    )
+    events = []
+    async for event in loop_mod.run_agent_stream(
+        ctx,
+        [{"role": "user", "content": "帮我结 2026-10 的账"}],
+    ):
+        events.append(event)
+
+    assert execute_calls == [
+        (
+            "run_close_checks",
+            {"month": "2026-10"},
+            loop_mod.LoopContext(
+                user_id="owner-1",
+                company_id="c-agent-close-boundary",
+                conversation_id="conv-close-boundary",
+            ).tool_ctx(),
+        )
+    ]
+    result_event = next(
+        event
+        for event in events
+        if event["type"] == "tool_result" and event["name"] == "run_close_checks"
+    )
+    assert result_event["ok"] is True
+    assert execute_calls[0][2].source == "product"
+    assert execute_calls[0][2].conversation_id == "conv-close-boundary"
+    link_event = next(event for event in events if event["type"] == "closing_link")
+    assert link_event["closingLink"]["url"].endswith(
+        "/closing-wizard?month=2026-10&step=3"
+    )
+    assert link_event["closingLink"]["month"] == "2026-10"
+    assert link_event["closingLink"]["requiresLogin"] is True
+
+
 @pytest.mark.asyncio
 async def test_workspace_view_is_injected_into_agent_prompt(monkeypatch):
     """老板/会计视图应进入系统提示词，但视图本身不改变权限。"""
@@ -427,8 +535,13 @@ async def test_workspace_view_is_injected_into_agent_prompt(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_propose_company_setup_and_opening_balance_tools():
-    """验证 AI 会计对话内的主体建账与期初余额导入工具（含差额自动配平与容器中文字段映射）。"""
+async def test_propose_company_setup_tool():
+    """验证 AI CFO 对话内的主体建账工具。
+
+    期初余额曾也在这里：`propose_opening_balance` 让老板口述科目余额、
+    对话侧生成期初卡。该路径已整体移除——期初是整张表的事，口述既容易听错
+    科目，也承载不了固定资产卡片与往来单位明细。现在只走期初建账工作台。
+    """
     from agent.tools import ToolContext, execute_tool
 
     await _ensure_schema()
@@ -448,24 +561,296 @@ async def test_propose_company_setup_and_opening_balance_tools():
     assert setup_res["status"] == "pending"
     assert setup_res["onboardingType"] == "migration"
 
-    opening_res = await execute_tool(
-        "propose_opening_balance",
-        {
-            "start_period": "2026-10",
-            "items": [
-                {"account_name": "银行存款", "debit_balance": 120000},
-                {"account_name": "固定资产", "debit_balance": 30000},
-                {"account_name": "累计折旧", "debit_balance": 5000},  # 自动纠正到贷方
-                {"account_name": "实收资本", "credit_balance": 100000},
-            ],
-            "auto_plug_difference": True,
+
+@pytest.mark.asyncio
+async def test_company_setup_approval_requires_tax_id():
+    """对话建账卡与新增主体表单同口径：税号必填，缺税号不得建出主体。"""
+    from fastapi import HTTPException
+
+    await _ensure_schema()
+    action = await agent_actions.create_action(
+        company_id="c-agent-setup-notax",
+        user_id="owner-setup",
+        action_type="propose_company_setup",
+        title="新公司从零建账确认",
+        payload={
+            "onboardingType": "new",
+            "name": "杭州无税号测试有限公司",
+            "taxId": "",
+            "startDate": "2026-11-01",
         },
-        ctx,
+        evidence={"created_via": "pytest"},
     )
-    assert opening_res["status"] == "pending"
-    assert opening_res["balanced"] is True
-    assert opening_res["totalDebit"] == "150000.00"
-    assert opening_res["totalCredit"] == "150000.00"
-    assert opening_res["autoPlugged"]["accountCode"] == "3104006"
-    assert opening_res["autoPlugged"]["amount"] == 45000.0
+
+    with pytest.raises(HTTPException) as exc:
+        await agent_actions.approve_action(
+            action["id"], user_id="owner-setup", company_id="c-agent-setup-notax"
+        )
+
+    assert exc.value.status_code == 422
+    assert "统一社会信用代码" in str(exc.value.detail)
+    draft = await agent_actions.get_action(action["id"], company_id="c-agent-setup-notax")
+    assert draft["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_company_setup_from_demo_creates_company_and_token():
+    """演示账套确认建账卡要真的建出正式账套并返回切换 token。
+
+    这条路径曾因 `services.jwt_service` 改名后残留旧 import 直接 ModuleNotFoundError，
+    前端只看到「确认失败」，所以除了税号校验还要守住创建链路本身。
+    """
+    await _ensure_schema()
+    from services.account_service import (
+        create_company,
+        get_or_create_user_by_phone,
+        set_user_current_company,
+    )
+    from services.token_service import decode_access_token
+
+    user, _, _ = await get_or_create_user_by_phone("13900000009")
+    demo = await create_company(user["user_id"], "演示账套", {"isDemo": True})
+    await set_user_current_company(user["user_id"], demo["company_id"])
+    action = await agent_actions.create_action(
+        company_id=demo["company_id"],
+        user_id=user["user_id"],
+        action_type="propose_company_setup",
+        title="新公司从零建账确认",
+        payload={
+            "onboardingType": "new",
+            "name": "杭州对话建账测试有限公司",
+            "taxId": "91330100MA2TEST001",
+            "startDate": "2026-11-01",
+        },
+        evidence={"created_via": "pytest"},
+    )
+
+    decision = await agent_actions.approve_action(
+        action["id"], user_id=user["user_id"], company_id=demo["company_id"]
+    )
+
+    result = decision["result"]
+    assert result["switchedFromDemo"] is True
+    assert result["companyId"] != demo["company_id"]
+    token_payload = decode_access_token(result["accessToken"])
+    assert token_payload["company_id"] == result["companyId"]
+
+
+# ---------------------------------------------------------------------------
+# 税务政策回答规范与政策要点卡（提示词纪律）
+# ---------------------------------------------------------------------------
+
+
+def test_agent_prompt_contains_tax_policy_discipline():
+    """系统提示词包含政策回答规范、要点卡锚点与反编造条款。"""
+    from datetime import datetime
+
+    from agent.prompts import AGENT_SYSTEM_PROMPT
+    from services.tax_policy_card import POLICY_CARD_MD, POLICY_CARD_VERIFIED_AT
+
+    assert "## 税务政策回答规范" in AGENT_SYSTEM_PROMPT
+    assert "## 政策要点卡" in AGENT_SYSTEM_PROMPT
+    assert "禁止编造政策文号" in AGENT_SYSTEM_PROMPT
+    assert "不得凭记忆作答" in AGENT_SYSTEM_PROMPT
+    assert "具体以主管税务机关执行口径为准" in AGENT_SYSTEM_PROMPT
+    assert "manualClose.url" in AGENT_SYSTEM_PROMPT
+    assert "禁止输出 `/closing-wizard?...` 这种相对路径" in AGENT_SYSTEM_PROMPT
+
+    # 要点卡内容锚点（文号与有效期已经 cn-tax-sources 流程核验后冻结）
+    assert "2023 年第 19 号" in POLICY_CARD_MD
+    assert "2023 年第 12 号" in POLICY_CARD_MD
+    assert "2023 年第 37 号" in POLICY_CARD_MD
+    assert "2027-12-31" in POLICY_CARD_MD
+    assert "增值税法" in POLICY_CARD_MD
+    datetime.strptime(POLICY_CARD_VERIFIED_AT, "%Y-%m-%d")
+
+    # 模板占位符与 format 注入闭环：loop._build_system_prompt 以 card=/opening_url= 填充
+    assert "{card}" in AGENT_SYSTEM_PROMPT
+    assert "{opening_url}" in AGENT_SYSTEM_PROMPT
+    rendered = AGENT_SYSTEM_PROMPT.format(
+        today="2026-10-30",
+        weekday="周五",
+        month="2026-10",
+        card=POLICY_CARD_MD,
+        opening_url="https://solobooks.cn/mine/opening",
+    )
+    assert "财政部 税务总局公告 2023 年第 19 号" in rendered
+    # 期初口述路径已移除：提示词只给工作台入口，不再有对话内生成期初卡的说法
+    assert "https://solobooks.cn/mine/opening" in rendered
+    assert "propose_opening_balance" not in AGENT_SYSTEM_PROMPT
+    # 回归「回复里还在教口述/传表两选一」：期初一律引到工作台，对话里不追问科目明细
+    assert "上传期初表" not in AGENT_SYSTEM_PROMPT
+    assert "不要在对话里追问期初科目明细" in AGENT_SYSTEM_PROMPT
+    assert "期初一律引到工作台" in AGENT_SYSTEM_PROMPT
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_general_taxpayer_branch():
+    """一般纳税人画像注入"小规模政策不适用"分支；小规模不注入。"""
+    await _ensure_schema()
+    from agent.loop import LoopContext, _build_system_prompt
+    from agent.memory import save_profile
+
+    general_id = "c-agent-policy-general"
+    await save_profile(general_id, {"taxpayerType": "general", "industry": ""})
+    prompt = await _build_system_prompt(LoopContext(user_id="owner-1", company_id=general_id))
+    assert "该公司为增值税一般纳税人" in prompt
+    assert "小规模纳税人减免政策（1% 征收率、月销售额 10 万元以下免征）不适用" in prompt
+
+    small_id = "c-agent-policy-small"
+    await save_profile(small_id, {"taxpayerType": "small_scale", "industry": ""})
+    prompt_small = await _build_system_prompt(LoopContext(user_id="owner-1", company_id=small_id))
+    assert "该公司为增值税一般纳税人" not in prompt_small
+
+
+def test_tool_result_compaction_always_returns_valid_json():
+    """长工具结果只能按结构裁剪，不能把残缺 JSON 交给模型猜测。"""
+    import json
+
+    from agent.loop import _tool_result_content
+    from agent.prompts import TOOL_RESULT_MAX_CHARS
+
+    result = {
+        "count": 100,
+        "items": [
+            {
+                "statementId": f"stmt-{index}",
+                "description": "很长的银行流水描述" * 300,
+            }
+            for index in range(100)
+        ],
+    }
+    content = _tool_result_content(result)
+    parsed = json.loads(content)
+
+    assert len(content) <= TOOL_RESULT_MAX_CHARS
+    assert parsed["count"] == 100
+    assert isinstance(parsed["items"], list)
+
+
+@pytest.mark.asyncio
+async def test_statement_vouchers_use_database_fields(monkeypatch):
+    """银行流水凭证只接收 ID 与分类，金额/日期/摘要由数据库记录决定。"""
+    await _ensure_schema()
+    import services.bank_service as bank_service
+    import services.category_service as category_service
+    from agent.tools import ToolContext, _propose_statement_vouchers
+
+    statements = [
+        {
+            "id": "stmt-in",
+            "amount": 50000.0,
+            "transaction_date": "2026-05-22",
+            "description": "入账 | 附言: 实缴出资款 (对方: 张三)",
+            "matched_entry_ids": [],
+            "matched_entry_id": None,
+        },
+        {
+            "id": "stmt-out",
+            "amount": -500.0,
+            "transaction_date": "2026-05-31",
+            "description": "出账 | 附言: 往来款 (对方: 李四)",
+            "matched_entry_ids": [],
+            "matched_entry_id": None,
+        },
+    ]
+
+    async def fake_get_statements(_company_id, _statement_id=None):
+        return statements
+
+    async def fake_list_categories(_company_id):
+        return [
+            {"name": "股东投入", "direction": "owner_transfer"},
+            {"name": "往来款", "direction": "expense"},
+        ]
+
+    monkeypatch.setattr(bank_service, "get_statements", fake_get_statements)
+    monkeypatch.setattr(category_service, "list_categories", fake_list_categories)
+
+    ctx = ToolContext(user_id="owner-1", company_id="c-agent-statement-vouchers")
+    result = await _propose_statement_vouchers(
+        ctx,
+        proposals=[
+            {"statementId": "stmt-in", "category": "股东投入"},
+            {"statementId": "stmt-out", "category": "往来款"},
+        ],
+    )
+
+    assert result["status"] == "pending"
+    assert result["count"] == 2
+    assert result["totals"] == {
+        "signedNet": 49500.0,
+        "inflow": 50000.0,
+        "outflow": 500.0,
+        "absolute": 50500.0,
+    }
+    assert result["items"][0]["amount"] == 50000.0
+    assert result["items"][0]["occurDate"] == "2026-05-22"
+    assert result["items"][0]["title"] == "实缴出资款"
+    assert result["items"][1]["amount"] == 500.0
+
+    draft = await agent_actions.get_action(result["actionId"], company_id=ctx.company_id)
+    assert draft["payload"]["items"][0]["statementId"] == "stmt-in"
+    assert draft["payload"]["items"][0]["sourceType"] == "bank_statement"
+
+
+@pytest.mark.asyncio
+async def test_general_voucher_tool_rejects_statement_source():
+    """通用记账工具不得接收银行流水 ID，避免模型自由改写流水字段。"""
+    from agent.tools import ToolContext, _propose_vouchers
+
+    ctx = ToolContext(user_id="owner-1", company_id="c-agent-statement-guard")
+    with pytest.raises(ValueError, match="propose_statement_vouchers"):
+        await _propose_vouchers(
+            ctx,
+            proposals=[
+                {
+                    "direction": "income",
+                    "amount": 100,
+                    "title": "伪造流水",
+                    "category": "营业外收入",
+                    "statementId": "stmt-1",
+                }
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_statement_voucher_rejects_authoritative_field_edits():
+    """审批时不允许改写银行流水的金额、日期、摘要或方向。"""
+    from fastapi import HTTPException
+
+    await _ensure_schema()
+    action = await agent_actions.create_action(
+        company_id="c-agent-statement-edit",
+        user_id="owner-1",
+        action_type="propose_vouchers",
+        title="银行流水待确认记账（1 笔）",
+        payload={
+            "items": [
+                {
+                    "direction": "income",
+                    "amount": 50000,
+                    "title": "实缴出资款",
+                    "category": "股东投入",
+                    "occurDate": "2026-05-22",
+                    "statementId": "stmt-1",
+                    "sourceType": "bank_statement",
+                }
+            ]
+        },
+        evidence={"created_via": "pytest"},
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await agent_actions.approve_action(
+            action["id"],
+            user_id="owner-1",
+            company_id="c-agent-statement-edit",
+            edits={"0": {"amount": 999999}},
+        )
+
+    assert exc.value.status_code == 422
+    draft = await agent_actions.get_action(action["id"], company_id="c-agent-statement-edit")
+    assert draft["status"] == "pending"
 

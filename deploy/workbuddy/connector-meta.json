@@ -19,7 +19,9 @@
     "Generate the quarterly VAT and corporate income tax filing package"
   ],
   "icon": "icon.png",
-  "version": "1.1.0",
+  "version": "1.2.0",
+  "auth_mode": "token",
+  "minWorkbuddyVersion": "4.23.0",
   "category": "finance",
   "tags": ["记账", "财税", "一人公司", "纳税申报", "流水对账"],
   "homepage": "https://solobooks.cn",

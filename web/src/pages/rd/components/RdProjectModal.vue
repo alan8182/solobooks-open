@@ -1,6 +1,6 @@
 <!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import {
   NButton, NForm, NFormItem, NInput, NModal, NSelect, NSpace, useMessage,
 } from 'naive-ui'
@@ -12,7 +12,21 @@ import type { RdProject } from '@/api/types'
 const props = defineProps<{
   show: boolean
   project?: RdProject | null
+  projects?: RdProject[]
 }>()
+
+// 编号格式 RD-<年>-<序号>。新建时按已有项目推下一个，用户仍可改。
+const nextCode = computed(() => {
+  const year = dayjs().year()
+  const prefix = `RD-${year}-`
+  const max = (props.projects || [])
+    .map((p) => String(p.code || ''))
+    .filter((c) => c.startsWith(prefix))
+    .map((c) => parseInt(c.slice(prefix.length), 10))
+    .filter((n) => Number.isFinite(n))
+    .reduce((a, b) => Math.max(a, b), 0)
+  return `${prefix}${String(max + 1).padStart(2, '0')}`
+})
 
 const emit = defineEmits<{
   (e: 'update:show', val: boolean): void
@@ -50,7 +64,7 @@ watch(
       }
     } else {
       form.value = {
-        code: '',
+        code: nextCode.value,
         name: '',
         manager: '',
         startDate: dayjs().format('YYYY-MM-DD'),

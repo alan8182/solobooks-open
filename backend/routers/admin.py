@@ -20,9 +20,16 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select, text
 
 from config import LLM_PRICE_TABLE
-from db.models import AgentAction, AuthUser, Company, CompanyMember, JournalEntry, LlmUsage
+from db.models import AgentAction, AuthUser, Company, CompanyMember, IndustryTemplate, JournalEntry, LlmUsage
 from db.session import session_scope
 from deps.auth import AuthContext, require_admin
+from services.industry_template_service import (
+    IndustryTemplateValues,
+    create_template,
+    list_templates,
+    serialize_template,
+    update_template,
+)
 from services.llm import llm_circuit_state
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -299,7 +306,14 @@ class AdminUserPatchRequest(BaseModel):
     is_platform_admin: Optional[bool] = Field(None, alias="isPlatformAdmin")
 
 
-async def _write_audit_log(operator_id: str, action: str, target_id: str, detail: dict) -> None:
+async def _write_audit_log(
+    operator_id: str,
+    action: str,
+    target_id: str,
+    detail: dict,
+    *,
+    target_type: str = "user",
+) -> None:
     """管理操作留痕；写入失败不影响主操作（留痕是尽力而为，不阻塞业务）。"""
     from db.models import AdminAuditLog
 
@@ -309,13 +323,88 @@ async def _write_audit_log(operator_id: str, action: str, target_id: str, detail
                 AdminAuditLog(
                     operator_id=operator_id,
                     action=action,
-                    target_type="user",
+                    target_type=target_type,
                     target_id=target_id,
                     detail=detail,
                 )
             )
     except Exception:  # noqa: BLE001
         logger.warning("admin_audit_logs 写入失败（忽略）: action=%s target=%s", action, target_id)
+
+
+@router.get("/industry-templates")
+async def admin_industry_templates(
+    q: str = Query(default="", max_length=128),
+    _admin: AuthContext = Depends(require_admin),
+):
+    """行业模板目录：管理员可看到隐藏、停用和自定义模板。"""
+    async with session_scope() as session:
+        rows = await list_templates(
+            session,
+            include_hidden=True,
+            include_disabled=True,
+            query=q,
+        )
+        return {
+            "items": [serialize_template(template) for template in rows],
+            "total": len(rows),
+        }
+
+
+@router.post("/industry-templates")
+async def admin_create_industry_template(
+    values: IndustryTemplateValues,
+    admin: AuthContext = Depends(require_admin),
+):
+    try:
+        async with session_scope() as session:
+            template = await create_template(session, values, user_id=admin.user_id)
+            result = serialize_template(template)
+        await _write_audit_log(
+            admin.user_id,
+            "create_industry_template",
+            result["id"],
+            {"code": result["code"], "name": result["name"]},
+            target_type="industry_template",
+        )
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.put("/industry-templates/{template_id}")
+async def admin_update_industry_template(
+    template_id: str,
+    values: IndustryTemplateValues,
+    admin: AuthContext = Depends(require_admin),
+):
+    try:
+        async with session_scope() as session:
+            template: IndustryTemplate | None = await update_template(
+                session,
+                template_id,
+                values,
+                user_id=admin.user_id,
+            )
+            if template is None:
+                raise HTTPException(status_code=404, detail="行业模板不存在")
+            result = serialize_template(template)
+            audit_detail = {
+                "code": result["code"],
+                "name": result["name"],
+                "version": result["version"],
+                "enabled": result["enabled"],
+            }
+        await _write_audit_log(
+            admin.user_id,
+            "update_industry_template",
+            result["id"],
+            audit_detail,
+            target_type="industry_template",
+        )
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 def _user_summary(user: AuthUser, company_count: int = 0, roles: Optional[list] = None) -> dict:

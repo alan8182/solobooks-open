@@ -8,6 +8,7 @@ import {
   NSpin, NPagination, NSelect,
 } from 'naive-ui'
 import { SoloMonthPicker, SoloEmpty } from '@/components/ui'
+import BossTrackNav from '@/components/business/BossTrackNav.vue'
 import PrivateExpenseDrawer from './components/PrivateExpenseDrawer.vue'
 import {
   getExpenses, deleteExpense, getExpenseSummary, getAllExpenses,
@@ -429,13 +430,14 @@ usePageRefresh(loadData)
 
 <template>
   <div class="pe-page">
+    <BossTrackNav />
     <div class="page-header">
       <div class="header-left">
         <div class="title-row">
           <h2>小私账</h2>
           <NTag size="small" :bordered="false" round type="info">老板个人对账</NTag>
         </div>
-        <p class="subtitle">记录未入公账的老板垫付与私户代收，自动核算对账净额，支撑报销冲抵与合规平账</p>
+        <p class="subtitle">把个人垫付与公司公账算清楚，不仅是税务合规底线，更是银行授信与投资人尽调时评估公司治理规范度的第一道门槛</p>
       </div>
       <div class="header-actions">
         <NButton size="small" secondary :loading="exporting" @click="handleExport">
@@ -582,7 +584,7 @@ usePageRefresh(loadData)
 
 <style scoped>
 .pe-page {
-  max-width: 1240px;
+  max-width: var(--page-width);
   margin: 0 auto;
   padding: 16px 0 48px 0;
   width: 100%;

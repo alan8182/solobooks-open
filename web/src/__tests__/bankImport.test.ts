@@ -9,8 +9,11 @@ import {
   bankColumnDescriptionRole,
   detectBankColumnMapping,
   formatBankDate,
+  formatBankTime,
   parseMoney,
   extractStatementCounterparty,
+  isBankCounterpartySourceBlocked,
+  normalizeBankReference,
 } from '@/utils/bankImport'
 
 // 杭州银行交易明细报表的真实表头：日期信息只在「交易时间」列
@@ -35,6 +38,28 @@ describe('formatBankDate', () => {
   })
 })
 
+describe('normalizeBankReference', () => {
+  it('接受可精确表示的流水号', () => {
+    expect(normalizeBankReference('178234433994')).toBe('178234433994')
+    expect(normalizeBankReference(178234433994)).toBe('178234433994')
+    expect(normalizeBankReference(' 1782344339 94 ')).toBe('178234433994')
+    expect(normalizeBankReference('178234433994.00')).toBe('178234433994')
+    expect(normalizeBankReference('0012345')).toBe('0012345')
+  })
+
+  it('拒绝浮点失真、全零占位与科学计数法', () => {
+    expect(normalizeBankReference(1e25)).toBe('')
+    expect(normalizeBankReference(259755500999999978999999978)).toBe('')
+    expect(normalizeBankReference('2.5975550099999998e+24')).toBe('')
+    expect(normalizeBankReference('000000000000')).toBe('')
+    expect(normalizeBankReference('')).toBe('')
+    expect(normalizeBankReference(null)).toBe('')
+    expect(normalizeBankReference(undefined)).toBe('')
+    expect(normalizeBankReference(true)).toBe('')
+    expect(normalizeBankReference('1'.repeat(65))).toBe('')
+  })
+})
+
 describe('detectBankColumnMapping', () => {
   it('杭州银行表头：交易时间是唯一日期来源，须兜底选中', () => {
     const map = detectBankColumnMapping(HZ_BANK_HEADERS)
@@ -48,10 +73,10 @@ describe('detectBankColumnMapping', () => {
     expect(map['对手方开户名']).toBe('')
   })
 
-  it('交易日期与交易时间并存时优先日期列，避免起息时间覆盖交易日', () => {
+  it('交易日期与交易时间并存时优先日期列，时间列作时间源不作日期源', () => {
     const map = detectBankColumnMapping(['交易日期', '交易时间', '交易金额', '余额'])
     expect(map['交易日期']).toBe('transaction_date')
-    expect(map['交易时间']).toBe('')
+    expect(map['交易时间']).toBe('transaction_time')
   })
 
   it('付款人名称等对手方列不会被误判为金额列', () => {
@@ -86,6 +111,15 @@ describe('bankColumnDescriptionRole', () => {
     expect(bankColumnDescriptionRole('己方开户行')).toBe('')
     expect(bankColumnDescriptionRole('己方银行户名')).toBe('')
     expect(bankColumnDescriptionRole('序号')).toBe('')
+  })
+
+  it('只拦截账户/开户字段，不按银行名称误伤真实对手户名', () => {
+    expect(isBankCounterpartySourceBlocked('对手方开户名')).toBe(true)
+    expect(isBankCounterpartySourceBlocked('收款人开户行')).toBe(true)
+    expect(isBankCounterpartySourceBlocked('对方银行账号')).toBe(true)
+    expect(isBankCounterpartySourceBlocked('己方银行户名')).toBe(true)
+    expect(isBankCounterpartySourceBlocked('对方户名')).toBe(false)
+    expect(isBankCounterpartySourceBlocked('对方账号名称')).toBe(false)
   })
 
   it('「对方账号名称」含名称词，仍按户名收集', () => {
@@ -237,6 +271,47 @@ describe('buildBankRows', () => {
     expect(rows[0].description).toBe('(对方: 特约商户A)')
   })
 
+  it('显式映射开户行/开户名时仍不会拼进交易对手', () => {
+    const rawData = [
+      {
+        '交易日期': '2026-05-31',
+        '金额': '-500.00',
+        '摘要': '汇兑',
+        '对手方开户名': '招商银行股份有限公司杭州分行',
+        '收款人开户行': '招商银行股份有限公司杭州分行',
+        '付款人开户行': '招商银行股份有限公司杭州分行',
+      },
+    ]
+    const { rows } = buildBankRows(rawData, {
+      '交易日期': 'transaction_date',
+      '金额': 'amount',
+      '摘要': 'description',
+      '对手方开户名': 'counterparty_name',
+      '收款人开户行': 'payee_name',
+      '付款人开户行': 'payer_name',
+    })
+    expect(rows[0].description).toBe('汇兑')
+    expect(extractStatementCounterparty(rows[0].description)).toBe('')
+  })
+
+  it('合法的对方户名列仍允许银行作为真实交易对手', () => {
+    const { rows } = buildBankRows(
+      [{
+        '交易日期': '2026-05-31',
+        '金额': '-500.00',
+        '摘要': '汇兑',
+        '对方户名': '招商银行股份有限公司杭州分行',
+      }],
+      {
+        '交易日期': 'transaction_date',
+        '金额': 'amount',
+        '摘要': 'description',
+        '对方户名': '',
+      },
+    )
+    expect(rows[0].description).toBe('汇兑 (对方: 招商银行股份有限公司杭州分行)')
+  })
+
   it('解析不出合法日期的行被跳过并计数，不送后端', () => {
     const { rows, skippedInvalidDate } = buildBankRows(
       [hzRow(), hzRow({ '交易时间': '交易时间', '附言': '附言', '摘要': '摘要' })],
@@ -260,3 +335,164 @@ describe('buildBankRows', () => {
     expect(parseMoney('')).toBe(0)
   })
 })
+
+// 中国银行企业网银导出：日期与时间拆成两列（'20260520' + '21:46:46'），
+// 交易金额单列带符号，表头中英双语。表头名取自真实文件，不要改简写。
+const BOC_HEADERS = [
+  '交易类型[ Transaction Type ]', '业务类型[ Business type ]',
+  '付款人名称[ Payer\'s Name ]', '收款人名称[ Payee\'s Name ]',
+  '交易日期[ Transaction Date ]', '交易时间[ Transaction time ]',
+  '交易货币[ Trade Currency ]', '交易金额[ Trade Amount ]',
+  '交易后余额[ After-transaction balance ]',
+  '交易流水号[ Transaction reference number ]',
+  '客户申请号[ Online Banking Transaction Ref.(Bank Ref.) ]',
+  '客户业务编号[ Customer Transaction Ref.(Customer Ref.) ]',
+  '凭证号码[ Voucher number ]', '记录标识号[ Record ID ]',
+  '摘要[ Reference ]',
+]
+
+const bocRow = (over: Record<string, unknown> = {}) => ({
+  '交易类型[ Transaction Type ]': '往账',
+  '业务类型[ Business type ]': '收费',
+  '付款人名称[ Payer\'s Name ]': '陕西澜晞文化传媒有限责任公司',
+  '收款人名称[ Payee\'s Name ]': '',
+  '交易日期[ Transaction Date ]': '20260520',
+  '交易时间[ Transaction time ]': '21:46:46',
+  '交易货币[ Trade Currency ]': 'CNY',
+  '交易金额[ Trade Amount ]': '-4.50',
+  '交易后余额[ After-transaction balance ]': '220.50',
+  '交易流水号[ Transaction reference number ]': '178234433994',
+  '客户申请号[ Online Banking Transaction Ref.(Bank Ref.) ]': '',
+  '客户业务编号[ Customer Transaction Ref.(Customer Ref.) ]': '',
+  '凭证号码[ Voucher number ]': '',
+  '记录标识号[ Record ID ]': '259755500999999978999999978',
+  '摘要[ Reference ]': '对公跨行转账汇款手续费',
+  ...over,
+})
+
+describe('formatBankTime', () => {
+  it('归一化裸时间、补零与缺秒', () => {
+    expect(formatBankTime('21:46:46')).toBe('21:46:46')
+    expect(formatBankTime('9:09')).toBe('09:09:00')
+    expect(formatBankTime('09:09:10')).toBe('09:09:10')
+  })
+
+  it('时间列写成完整日期时间时取其时分秒', () => {
+    expect(formatBankTime('2026-05-20 21:46:46')).toBe('21:46:46')
+  })
+
+  it('Excel 时间序列值（一天的小数）换算为时分秒', () => {
+    expect(formatBankTime(21.75 / 24)).toBe('21:45:00')
+    expect(formatBankTime(0)).toBe('00:00:00')
+  })
+
+  it('非时间值与越界小时返回空串', () => {
+    expect(formatBankTime('交易时间')).toBe('')
+    expect(formatBankTime('20260520')).toBe('')
+    expect(formatBankTime(20260520)).toBe('')
+    expect(formatBankTime('25:00')).toBe('')
+    expect(formatBankTime('')).toBe('')
+    expect(formatBankTime(null)).toBe('')
+  })
+})
+
+describe('银行流水日期+时间合并', () => {
+  it('中国银行表头：时间列识别为 transaction_time，日期列仍是交易日期', () => {
+    const map = detectBankColumnMapping(BOC_HEADERS)
+    expect(map['交易日期[ Transaction Date ]']).toBe('transaction_date')
+    expect(map['交易时间[ Transaction time ]']).toBe('transaction_time')
+    expect(map['交易后余额[ After-transaction balance ]']).toBe('balance')
+    expect(map['交易金额[ Trade Amount ]']).toBe('amount')
+  })
+
+  it('交易流水号是身份列；摘要[ Reference ] 归描述，记录标识号等不映射', () => {
+    const map = detectBankColumnMapping(BOC_HEADERS)
+    expect(map['交易流水号[ Transaction reference number ]']).toBe('transaction_reference')
+    expect(map['摘要[ Reference ]']).toBe('description')
+    expect(map['记录标识号[ Record ID ]']).toBe('')
+    expect(map['客户申请号[ Online Banking Transaction Ref.(Bank Ref.) ]']).toBe('')
+    expect(map['客户业务编号[ Customer Transaction Ref.(Customer Ref.) ]']).toBe('')
+    expect(map['凭证号码[ Voucher number ]']).toBe('')
+  })
+
+  it('空引用号列不覆盖已取到的流水号', () => {
+    const { rows } = buildBankRows([bocRow()], {
+      '交易日期[ Transaction Date ]': 'transaction_date',
+      '交易流水号[ Transaction reference number ]': 'transaction_reference',
+      '凭证号码[ Voucher number ]': 'transaction_reference',
+    })
+    expect(rows[0].transaction_reference).toBe('178234433994')
+  })
+
+  it('拆列的日期与时间并成 YYYY-MM-DD HH:mm:ss', () => {
+    const { rows, skippedInvalidDate } = buildBankRows([bocRow()], detectBankColumnMapping(BOC_HEADERS))
+    expect(skippedInvalidDate).toBe(0)
+    expect(rows[0].transaction_date).toBe('2026-05-20 21:46:46')
+    expect(rows[0].amount).toBe(-4.5)
+    expect(rows[0].balance).toBe(220.5)
+  })
+
+  it('同一秒内的多笔同额手续费全部保留，靠余额区分不同交易', () => {
+    // 真实文件里 2026-05-17 14:02:48 一秒内连发三笔 -4.50 手续费
+    const rows = [
+      bocRow({ '交易后余额[ After-transaction balance ]': '3,241.00' }),
+      bocRow({ '交易后余额[ After-transaction balance ]': '2,736.50' }),
+      bocRow({ '交易后余额[ After-transaction balance ]': '2,332.00' }),
+    ]
+    const { rows: built, skippedInvalidDate } = buildBankRows(rows, detectBankColumnMapping(BOC_HEADERS))
+    expect(skippedInvalidDate).toBe(0)
+    expect(built).toHaveLength(3)
+    expect(built.map(r => r.balance)).toEqual([3241, 2736.5, 2332])
+    expect(new Set(built.map(r => `${r.transaction_date}|${r.amount}`)).size).toBe(1)
+  })
+
+  it('每行携带文件行序与互不相同的交易流水号', () => {
+    const references = Array.from({ length: 13 }, (_, i) => String(178234400000 + i * 2))
+    const fileRows = references.map((ref, i) => bocRow({
+      '交易流水号[ Transaction reference number ]': ref,
+      '交易后余额[ After-transaction balance ]': String(3000 - i),
+    }))
+    const { rows } = buildBankRows(fileRows, detectBankColumnMapping(BOC_HEADERS))
+    expect(rows.map(r => r.transaction_reference)).toEqual(references)
+    expect(rows.map(r => r.source_row_index)).toEqual([...Array(13).keys()])
+    expect(new Set(rows.map(r => r.transaction_reference)).size).toBe(13)
+  })
+
+  it('用户把时间列设为忽略时仍自动兜底取时间，不因映射丢信息', () => {
+    const { rows } = buildBankRows([bocRow()], {
+      '交易日期[ Transaction Date ]': 'transaction_date',
+      '交易时间[ Transaction time ]': '',
+      '交易金额[ Trade Amount ]': 'amount',
+      '交易后余额[ After-transaction balance ]': 'balance',
+    })
+    expect(rows[0].transaction_date).toBe('2026-05-20 21:46:46')
+  })
+
+  it('时间列值不是时间时不硬拼，保持纯日期', () => {
+    const { rows } = buildBankRows(
+      [bocRow({ '交易时间[ Transaction time ]': '' })],
+      detectBankColumnMapping(BOC_HEADERS),
+    )
+    expect(rows[0].transaction_date).toBe('2026-05-20')
+  })
+
+  it('日期列本身带时分秒时不再二次拼接（杭州银行单列形态）', () => {
+    const { rows } = buildBankRows(
+      [{ '交易时间': '2026-08-08 05:50:27', '支出金额（元）': '0.00', '收入金额（元）': '5.95' }],
+      detectBankColumnMapping(HZ_BANK_HEADERS),
+    )
+    expect(rows[0].transaction_date).toBe('2026-08-08 05:50:27')
+  })
+
+  it('打印/导出时间列是报表元数据，不当作交易时间盖到每笔上', () => {
+    const headers = ['交易日期', '交易金额', '账户余额', '打印时间']
+    const map = detectBankColumnMapping(headers)
+    expect(map['打印时间']).toBe('')
+    const { rows } = buildBankRows(
+      [{ '交易日期': '20260520', '交易金额': '-4.50', '账户余额': '220.50', '打印时间': '2026-09-01 08:30:00' }],
+      map,
+    )
+    expect(rows[0].transaction_date).toBe('2026-05-20')
+  })
+})
+

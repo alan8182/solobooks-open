@@ -1,0 +1,17 @@
+{
+  "title": "梭罗记账 连接配置",
+  "title_en": "SoloBooks Connection Settings",
+  "description": "请填写您的凭证，凭证仅保存在本机 ~/.workbuddy 目录下。",
+  "docUrl": "https://solobooks.cn/ai-connect",
+  "docLabel": "如何获取凭证？",
+  "fields": [
+    {
+      "key": "SOLOBOOKS_ACCOUNTING_TOKEN",
+      "label": "访问令牌",
+      "label_en": "Access Token",
+      "type": "password",
+      "required": true,
+      "placeholder": "请填写您在梭罗记账获取的访问令牌（sbk_ 开头）"
+    }
+  ]
+}

@@ -272,3 +272,39 @@ def test_same_amount_invoice_and_expense_merge_into_single_paired_todo():
     assert meta["aiSuggestion"]["action"] == "link_invoice_expense"
     assert "研发相关支出" in meta["aiSuggestion"]["label"]
     assert "deepseek" in meta["aiSuggestion"]["reason"].lower() or "深度求索" in meta["aiSuggestion"]["reason"]
+
+
+def _payable_shape_pair(*, invoice_overrides: dict) -> list[dict]:
+    """跨期"发票先到、付款后确认"的典型凭证对：5 月公户付款 + 6 月同额供应商发票。"""
+    payment = _entry(
+        id="e-pay", direction="expense", amount="500.00",
+        title="支付杭州深度求索人工智能基础技术研究有限公司往来款",
+        occurDate="2026-05-31", source="bank_import", billingStatus="no_document",
+    )
+    invoice = _entry(
+        id="e-inv", direction="expense", amount="500.00",
+        title="发票-杭州深度求索人工智能基础技术研究有限公司",
+        merchant="杭州深度求索人工智能基础技术研究有限公司",
+        occurDate="2026-06-02", source="invoice_import", billingStatus="has_invoice",
+    )
+    invoice.update(invoice_overrides)
+    return [payment, invoice]
+
+
+def test_posted_archive_only_invoice_still_matches_missing_doc_expense():
+    """已过账的 archive-only 发票（平台手续费误归档后确认/跨期确认）仍进撮合池，
+    否则付款侧「待补票据」无人认领——发票列表有票、待办却永远报缺（2026-10-31 实测）。"""
+    entries = _payable_shape_pair(invoice_overrides={"isArchiveOnly": True, "voucherStatus": "posted"})
+    todos = _derive_entry_todos(entries)
+    rules = [t["meta"]["ruleId"] for t in todos]
+    assert rules == ["invoice_unpaid"]
+    assert todos[0]["meta"]["candidateExpenseId"] == "e-pay"
+    assert todos[0]["meta"]["aiSuggestion"]["action"] == "link_invoice_expense"
+
+
+def test_draft_archive_only_invoice_stays_out_of_matching_pool():
+    """draft 底稿（纯证据未记账）不进撮合池：付款侧待补票据保留，发票侧不催付款。"""
+    entries = _payable_shape_pair(invoice_overrides={"isArchiveOnly": True, "voucherStatus": "draft"})
+    todos = _derive_entry_todos(entries)
+    rules = [t["meta"]["ruleId"] for t in todos]
+    assert rules == ["missing_document"]

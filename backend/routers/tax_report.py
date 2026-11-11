@@ -62,6 +62,12 @@ async def export_xiaoqiye_month_quarter(
         blocking_checks = [check["message"] for check in data.checks if check.get("level") == "error"]
         if blocking_checks:
             raise ValueError("报税前校验未通过：" + "；".join(blocking_checks))
+        if not data.year_start_known:
+            # 模板年初列是必填项，推不出来就宁可不导，不能拿期初数冒充年初数。
+            raise ValueError(
+                "年初余额未导入，报表「年初余额」列无法填报。"
+                "请到「期初工作台」重新导入含「年初余额」或「本年累计发生额」列的科目余额表（期间从 1 月起）"
+            )
         path = export_month_quarter_xls(data)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

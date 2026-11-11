@@ -1028,6 +1028,9 @@ async function deleteEntry() {
                     💡 小微企业免税政策：小规模纳税人季度销售额 ≤ 30 万元时，期末结账系统将自动生成免税凭证全额冲平转入收益，无需实际缴税。
                   </NTooltip>
                 </div>
+                <div v-if="line.auxiliary?.partner_name" class="line-aux">
+                  往来单位：{{ line.auxiliary.partner_name }}
+                </div>
               </td>
               <td>
                 <NTag size="tiny" :type="line.side === 'debit' ? 'error' : 'success'" :bordered="false">
@@ -1249,7 +1252,7 @@ async function deleteEntry() {
 
 <style scoped>
 .detail-page {
-  max-width: 720px;
+  max-width: var(--page-width-narrow);
   margin: 0 auto;
 }
 .page-header {
@@ -1597,6 +1600,11 @@ async function deleteEntry() {
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
+}
+.line-aux {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--solo-text-muted, #6b7280);
 }
 .vat-exempt-badge {
   display: inline-flex;

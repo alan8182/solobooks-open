@@ -368,7 +368,7 @@ const businessHealthReports = computed(() => {
       {
         path: '/reports/health',
         label: '企业健康体检',
-        desc: '企业综合健康评分，排查现金流与发票断档风险',
+        desc: '从账实相符、公私边界、现金跑道评估合规与融资尽调就绪度',
         icon: 'ri-heart-pulse-line',
       },
       {
@@ -519,10 +519,10 @@ watch(() => viewStore.mode, () => {
         <h2>{{ viewStore.isBoss ? '经营概览' : '报表中心' }}</h2>
         <p class="subtitle">
           <template v-if="viewStore.isBoss">
-            企业实时收支、手头现钱与往来账款
+            企业实时收支、手头现钱与往来账款——看懂利润与现金流底牌，建立老板财务直觉
           </template>
           <template v-else>
-            随时掌握企业真实收支、账上资金与税费状况
+            随时掌握企业真实收支、账上资金与税费状况，输出经得起审计与融资尽调的标准报表
           </template>
         </p>
       </div>
@@ -682,11 +682,11 @@ watch(() => viewStore.mode, () => {
           </template>
         </div>
 
-        <!-- AI 会计经营简评（手动触发） -->
+        <!-- AI CFO 经营简评（手动触发） -->
         <div class="ai-summary-box">
           <div class="ai-summary-header">
             <div class="summary-badge">
-              <i class="ri-sparkling-fill" />
+              <i class="ri-line-chart-line" />
               <span>AI 经营诊断与建议</span>
             </div>
             <NButton
@@ -697,14 +697,14 @@ watch(() => viewStore.mode, () => {
               @click="fetchDiagnosis"
             >
               <template #icon>
-                <i :class="aiSummary ? 'ri-refresh-line' : 'ri-magic-line'" />
+                <i :class="aiSummary ? 'ri-refresh-line' : 'ri-file-chart-line'" />
               </template>
               {{ aiSummary ? '重新诊断' : '生成诊断建议' }}
             </NButton>
           </div>
           <p v-if="aiSummary" class="summary-text">{{ aiSummary }}</p>
           <p v-else class="summary-hint">
-            基于本期收支、净利润与支出结构，由 AI 会计分析经营健康度并给出改善建议。
+            基于本期收支、净利润与支出结构，由 AI CFO 分析经营健康度并给出改善建议。
           </p>
         </div>
 
@@ -820,7 +820,7 @@ watch(() => viewStore.mode, () => {
       <section v-if="viewStore.isBoss" class="boss-accounting-link">
         <div>
           <strong>需要查看法定报表、账簿或做账底稿？</strong>
-          <p>这些属于会计工作区，切换后可以查看完整报表与凭证。</p>
+          <p>老板视角看现金进出与真利润，会计视角看权责发生制与法定三表。同一套账自由切换，随时备查审计与融资尽调底稿。</p>
         </div>
         <NButton size="small" secondary type="primary" @click="viewStore.setMode('accounting')">
           切换到会计视图
@@ -832,7 +832,7 @@ watch(() => viewStore.mode, () => {
 
 <style scoped>
 .report-page {
-  max-width: 1240px;
+  max-width: var(--page-width);
   margin: 0 auto;
   display: flex;
   flex-direction: column;

@@ -14,6 +14,7 @@ import {
   readGuideState,
   resetGuideState,
   resolveChecklistDisplay,
+  shouldOpenL0Modal,
   writeGuideState,
 } from '@/stores/guideState'
 import type { SetupReadiness } from '@/api/types'
@@ -131,5 +132,59 @@ describe('guide state timing rules', () => {
         NOW,
       ),
     ).toBe('hidden')
+  })
+})
+
+describe('shouldOpenL0Modal 起跑线弹窗准入守卫', () => {
+  const baseContext = {
+    isReplay: false,
+    hasManualCompany: false,
+    isCurrentDemo: true,
+    l0SeenAt: null,
+    userL0Seen: false,
+    legacyDismissed: false,
+    sessionShown: false,
+    companyCreatedAt: '2026-10-18T09:00:00+08:00',
+    now: new Date('2026-10-20T21:00:00+08:00'),
+  }
+
+  it('全新演示账套用户首次进入，且未建真实账套，允许弹窗引导', () => {
+    expect(shouldOpenL0Modal({ ...baseContext })).toBe(true)
+  })
+
+  it('已有手动设置的真实账套时，绝不自动弹建账引导', () => {
+    expect(shouldOpenL0Modal({ ...baseContext, hasManualCompany: true })).toBe(false)
+  })
+
+  it('当前账套已是非演示账套（真实账套），绝不自动弹建账引导', () => {
+    expect(shouldOpenL0Modal({ ...baseContext, isCurrentDemo: false })).toBe(false)
+  })
+
+  it('账号或账套已看过/关过，不再重复弹出', () => {
+    expect(shouldOpenL0Modal({ ...baseContext, l0SeenAt: '2026-10-19T10:00:00+08:00' })).toBe(false)
+    expect(shouldOpenL0Modal({ ...baseContext, userL0Seen: true })).toBe(false)
+    expect(shouldOpenL0Modal({ ...baseContext, legacyDismissed: true })).toBe(false)
+    expect(shouldOpenL0Modal({ ...baseContext, sessionShown: true })).toBe(false)
+  })
+
+  it('建账超过 14 天的用户，不予弹窗打扰', () => {
+    expect(
+      shouldOpenL0Modal({
+        ...baseContext,
+        companyCreatedAt: '2026-09-01T09:00:00+08:00',
+      }),
+    ).toBe(false)
+  })
+
+  it('在 /guide 点击重看新手引导时，始终允许重放', () => {
+    expect(
+      shouldOpenL0Modal({
+        ...baseContext,
+        isReplay: true,
+        hasManualCompany: true,
+        isCurrentDemo: false,
+        userL0Seen: true,
+      }),
+    ).toBe(true)
   })
 })

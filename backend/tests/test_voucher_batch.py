@@ -47,7 +47,8 @@ async def accounting_sessions():
             "id TEXT PRIMARY KEY, company_id TEXT NOT NULL, transaction_date TEXT NOT NULL, "
             "description TEXT NOT NULL, amount NUMERIC(20,2) NOT NULL, "
             "balance NUMERIC(20,2) NOT NULL, statement_id TEXT NOT NULL, "
-            "matched_entry_id TEXT, description_normalized INTEGER NOT NULL, created_at TEXT NOT NULL)"
+            "matched_entry_id TEXT, description_normalized INTEGER NOT NULL, created_at TEXT NOT NULL, "
+            "transaction_reference TEXT, source_row_index INTEGER)"
         )
         await connection.exec_driver_sql(
             "CREATE TABLE bank_statement_matches (statement_id TEXT, company_id TEXT, entry_id TEXT, "
@@ -227,3 +228,74 @@ async def test_batch_post_by_month(accounting_sessions):
 
         sep_entry = await get_journal(session, "sep-1", company_id="c-batch-3")
         assert sep_entry.status == "draft"
+
+
+def archive_payload(entry_id: str, occurred_on: str = "2026-08-05") -> dict:
+    payload = sample_payload(entry_id, occurred_on)
+    payload["isArchiveOnly"] = True
+    payload["title"] = f"底稿-{entry_id}"
+    return payload
+
+
+@pytest.mark.asyncio
+async def test_batch_post_by_month_skips_archive_only_drafts(accounting_sessions):
+    """整月批量过账不得把归档底稿（平台手续费发票等仅归档证据）扫进过账。"""
+    async with accounting_sessions() as session:
+        async with session.begin():
+            await ensure_tenant(session, "c-batch-4", "user-owner")
+            await create_entry(
+                session, sample_payload("aug-good", "2026-08-05"),
+                company_id="c-batch-4", user_id="user-owner", request_id="create-good", confirm=False,
+            )
+            await create_entry(
+                session, archive_payload("aug-evidence"),
+                company_id="c-batch-4", user_id="user-owner", request_id="create-evidence", confirm=False,
+            )
+
+        req = MagicMock()
+        req.headers.get.return_value = "req-batch-4"
+        ctx = AuthContext(user_id="user-owner", company_id="c-batch-4")
+
+        result = await batch_post_entries_route(
+            BatchPostRequest(month="2026-08"), request=req, ctx=ctx, session=session,
+        )
+
+        assert result.total == 1
+        assert result.postedEntryIds == ["aug-good"]
+        assert result.failedCount == 0
+
+        evidence = await get_journal(session, "aug-evidence", company_id="c-batch-4")
+        assert evidence.status == "draft"
+
+
+@pytest.mark.asyncio
+async def test_batch_post_explicit_archive_only_entry_reports_failed(accounting_sessions):
+    """显式把底稿 id 传进批量过账：不抛 500，进 failedEntries 带原因，其余正常过账。"""
+    async with accounting_sessions() as session:
+        async with session.begin():
+            await ensure_tenant(session, "c-batch-5", "user-owner")
+            await create_entry(
+                session, sample_payload("good-x"),
+                company_id="c-batch-5", user_id="user-owner", request_id="create-good", confirm=False,
+            )
+            await create_entry(
+                session, archive_payload("evidence-x"),
+                company_id="c-batch-5", user_id="user-owner", request_id="create-evidence", confirm=False,
+            )
+
+        req = MagicMock()
+        req.headers.get.return_value = "req-batch-5"
+        ctx = AuthContext(user_id="user-owner", company_id="c-batch-5")
+
+        result = await batch_post_entries_route(
+            BatchPostRequest(entryIds=["good-x", "evidence-x"]), request=req, ctx=ctx, session=session,
+        )
+
+        assert result.postedCount == 1
+        assert result.postedEntryIds == ["good-x"]
+        assert result.failedCount == 1
+        assert result.failedEntries[0].entryId == "evidence-x"
+        assert result.failedEntries[0].code == "ARCHIVE_ONLY_ENTRY"
+
+        evidence = await get_journal(session, "evidence-x", company_id="c-batch-5")
+        assert evidence.status == "draft"

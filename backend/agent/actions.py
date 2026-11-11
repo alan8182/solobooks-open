@@ -9,6 +9,7 @@ create_entry(confirm=True)），保证 agent 发起的账与手工记账走完�
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -16,7 +17,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 
 from agent.prompts import ACTION_EXPIRE_HOURS
-from core.errors import AccountingError
+from core.errors import AccountingError, CLOSING_SNAPSHOT_STALE
 from db.models import AgentAction, new_id
 from db.session import session_scope
 from services.account_mapper import get_voucher_hint, normalize_payer
@@ -27,10 +28,14 @@ from services.vat_service import get_vat_config_from_session, is_vat_sales_entry
 logger = logging.getLogger(__name__)
 
 # propose_voucher 允许进入确定性管线的业务字段白名单（与 ConfirmRequest 对齐）
+# 统一社会信用代码/纳税人识别号：与前端新增主体表单保持同一允许长度。
+_TAX_ID_RE = re.compile(r"^(?:[0-9A-Z]{15}|[0-9A-Z]{17}|[0-9A-Z]{18}|[0-9A-Z]{20})$")
+
 _VOUCHER_PAYLOAD_KEYS = (
     "direction", "amount", "title", "category", "accountCode", "accountName",
     "billingStatus", "invoiceType", "invoiceNumber", "buyerTaxId", "sellerTaxId",
     "merchant", "occurDate", "paymentDate", "sourceType", "dedupFingerprint", "payer",
+    "linkedStatementId",
 )
 
 
@@ -39,6 +44,15 @@ def _now() -> datetime:
 
 
 def serialize_action(row: AgentAction) -> Dict[str, Any]:
+    evidence = row.evidence or {}
+    created_at = row.created_at
+    if created_at is not None and created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    expires_at = (
+        (created_at + timedelta(hours=ACTION_EXPIRE_HOURS)).isoformat()
+        if created_at is not None
+        else None
+    )
     return {
         "id": row.id,
         "actionType": row.action_type,
@@ -49,8 +63,21 @@ def serialize_action(row: AgentAction) -> Dict[str, Any]:
         "status": row.status,
         "conversationId": row.conversation_id,
         "createdAt": row.created_at.isoformat() if row.created_at else None,
+        "expiresAt": expires_at,
+        "actionVersion": int(evidence.get("actionVersion") or 1),
+        "closingBinding": evidence.get("closingBinding"),
         "resolvedAt": row.resolved_at.isoformat() if row.resolved_at else None,
     }
+
+
+def _is_closing_repair(action_type: str, evidence: Dict[str, Any] | None) -> bool:
+    evidence = evidence or {}
+    if action_type in {"propose_match", "propose_accrual"}:
+        return True
+    # Bank-statement voucher drafts remain usable as ordinary daily bookkeeping.
+    # Only actions explicitly created by the old closing flow or bound to a
+    # closing snapshot are subject to the closing authorization.
+    return bool(evidence.get("closingBinding")) or evidence.get("created_via") == "agent_close"
 
 
 def _batch_items(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -77,7 +104,6 @@ async def create_action(
         "propose_match",
         "propose_accrual",
         "propose_company_setup",
-        "propose_opening_balance",
     ):
         raise ValueError(f"unsupported action_type: {action_type}")
     if action_type == "propose_vouchers" and not _batch_items(payload):
@@ -93,9 +119,45 @@ async def create_action(
         raise ValueError("propose_accrual.kind 必须是 depreciation、amortization 或 salary")
     if action_type == "propose_company_setup" and not str(payload.get("name") or "").strip():
         raise ValueError("propose_company_setup 需要公司名称 name")
-    if action_type == "propose_opening_balance" and not payload.get("items"):
-        raise ValueError("propose_opening_balance 需要期初科目列表 items")
+    evidence = dict(evidence or {})
+    closing_binding = evidence.get("closingBinding")
+    if closing_binding:
+        from services.closing_workflow_service import action_payload_hash
+
+        binding_for_hash = {
+            key: closing_binding.get(key)
+            for key in ("month", "findingId", "baseSnapshotHash", "periodVersion")
+        }
+        evidence["requestHash"] = action_payload_hash(
+            action_type,
+            {"payload": payload, "closingBinding": binding_for_hash},
+        )
+        evidence["actionVersion"] = int(evidence.get("actionVersion") or 1)
     async with session_scope() as session:
+        if closing_binding:
+            pending_rows = (
+                await session.execute(
+                    select(AgentAction)
+                    .where(
+                        AgentAction.company_id == company_id,
+                        AgentAction.action_type == action_type,
+                        AgentAction.status == "pending",
+                    )
+                    .order_by(AgentAction.created_at.desc())
+                )
+            ).scalars().all()
+            for pending in pending_rows:
+                pending_evidence = pending.evidence or {}
+                if pending_evidence.get("requestHash") == evidence["requestHash"]:
+                    logger.info(
+                        "closing_action_deduplicated company_id=%s action_id=%s "
+                        "action_type=%s surface=%s",
+                        company_id,
+                        pending.id,
+                        action_type,
+                        closing_binding.get("surface") or "unknown",
+                    )
+                    return serialize_action(pending)
         row = AgentAction(
             id=new_id(),
             company_id=company_id,
@@ -104,11 +166,22 @@ async def create_action(
             action_type=action_type,
             title=(title or "")[:255],
             payload=payload,
-            evidence=evidence or {},
+            evidence=evidence,
             status="pending",
         )
         session.add(row)
         await session.flush()
+        if closing_binding:
+            logger.info(
+                "closing_action_created company_id=%s action_id=%s action_type=%s "
+                "surface=%s month=%s snapshot_hash=%s",
+                company_id,
+                row.id,
+                action_type,
+                closing_binding.get("surface") or "unknown",
+                closing_binding.get("month"),
+                closing_binding.get("baseSnapshotHash"),
+            )
         return serialize_action(row)
 
 
@@ -171,6 +244,9 @@ async def approve_action(
     exclude_set = {int(i) for i in (exclude_indexes or [])}
     edit_map = {int(k): dict(v) for k, v in (edits or {}).items()}
     profile_updates: List[Dict[str, str]] = []
+    stale_error: AccountingError | None = None
+    stale_action_snapshot: Dict[str, Any] | None = None
+    result: Dict[str, Any] = {}
 
     async with session_scope() as session:
         row = (
@@ -185,9 +261,62 @@ async def approve_action(
         if await _expire_stale(row):
             raise HTTPException(status_code=409, detail="动作已过期，请让 AI 重新发起")
         if row.status != "pending":
+            if row.status == "approved":
+                return {
+                    "id": action_id,
+                    "status": "approved",
+                    "result": row.result or {},
+                }
             raise HTTPException(status_code=409, detail=f"动作已处理（{row.status}）")
 
-        if row.action_type in ("propose_voucher", "propose_vouchers"):
+        evidence = row.evidence or {}
+        if _is_closing_repair(row.action_type, evidence):
+            from services.closing_workflow_service import validate_closing_action_binding
+            from services.accounting_core_service import get_or_create_period
+
+            try:
+                binding = evidence.get("closingBinding") or {}
+                month = str(binding.get("month") or (row.payload or {}).get("month") or "")
+                if month:
+                    # Hold the same period lock across validation and execution.
+                    # A prepared action cannot race a concurrent bookkeeping write.
+                    await get_or_create_period(session, company_id, month, lock=True)
+                await validate_closing_action_binding(
+                    session,
+                    company_id,
+                    row.action_type,
+                    row.payload or {},
+                    binding,
+                    user_id=user_id,
+                )
+            except AccountingError as exc:
+                if exc.code != CLOSING_SNAPSHOT_STALE:
+                    raise
+                stale_error = exc
+                stale_action_snapshot = {
+                    "action_type": row.action_type,
+                    "title": row.title,
+                    "payload": row.payload,
+                    "evidence": evidence,
+                    "code": exc.code,
+                    "context": exc.context,
+                }
+                row.status = "expired"
+                row.resolved_at = _now()
+                row.result = {
+                    "code": exc.code,
+                    "message": exc.message,
+                    "latestSnapshot": (exc.context or {}).get("latestSnapshot"),
+                }
+
+        if stale_error is not None:
+            pass
+        elif row.action_type in ("propose_match", "propose_accrual") and edit_map:
+            raise HTTPException(
+                status_code=422,
+                detail="结账修复动作只能按系统快照执行，不能修改金额、日期或科目字段",
+            )
+        elif row.action_type in ("propose_voucher", "propose_vouchers"):
             result = await _approve_voucher_items(
                 session,
                 row,
@@ -273,15 +402,21 @@ async def approve_action(
                 update_company,
             )
             from services.accounting_core_service import ensure_tenant
-            from services.jwt_service import create_access_token
+            from services.token_service import create_access_token
 
             merged = {**(row.payload or {}), **dict(edit_map.get(0) or {})}
             name = str(merged.get("name") or "").strip()
             if not name:
                 raise HTTPException(status_code=422, detail="请填写公司名称")
             tax_id = str(merged.get("taxId") or "").strip().upper()
-            if tax_id and len(tax_id) != 18:
-                raise HTTPException(status_code=422, detail="统一社会信用代码需为 18 位")
+            # 与「新增主体」表单同口径：税号是申报与报表报送的必填项，建账时就要填全。
+            if not tax_id:
+                raise HTTPException(status_code=422, detail="请填写统一社会信用代码（纳税人识别号）")
+            if not _TAX_ID_RE.fullmatch(tax_id):
+                raise HTTPException(
+                    status_code=422,
+                    detail="统一社会信用代码格式不正确（15/17/18/20 位字母数字）",
+                )
             onboarding_type = str(merged.get("onboardingType") or "new").strip()
             if onboarding_type not in ("new", "migration"):
                 onboarding_type = "new"
@@ -334,62 +469,35 @@ async def approve_action(
                     "onboardingType": onboarding_type,
                 }
             row.payload = {**merged, "name": name, **company_fields}
-        elif row.action_type == "propose_opening_balance":
-            from services.account_service import get_company
-            from services.accounting_core_service import _json_safe, ensure_tenant
-            from services.opening_balance_service import save_opening_balances
-
-            current_co = await get_company(company_id) or {}
-            if current_co.get("isDemo"):
-                raise HTTPException(
-                    status_code=409,
-                    detail="当前仍为演示账套，请先确认上方「主体建账信息卡片」创建正式账套后，再导入期初余额",
-                )
-            merged = {**(row.payload or {}), **dict(edit_map.get(0) or {})}
-            start_period = str(merged.get("startPeriod") or "").strip()
-            fiscal_year = int(
-                merged.get("fiscalYear")
-                or (start_period[:4] if len(start_period) >= 4 else datetime.now().year)
-            )
-            items = list(merged.get("items") or [])
-            ytd_items = list(merged.get("ytdItems") or [])
-            tax_memory = dict(merged.get("taxMemory") or {})
-            await ensure_tenant(session, company_id, user_id)
-            saved = await save_opening_balances(
-                company_id,
-                fiscal_year,
-                items,
-                user_id=user_id,
-                step_up_token=step_up_token,
-                request_id=f"agent-action-{row.id}",
-                start_period=start_period or None,
-                ytd_items=ytd_items or None,
-                tax_memory=tax_memory or None,
-                session=session,
-            )
-            row.payload = merged
-            result = {
-                "opening": _json_safe(saved),
-                "fiscalYear": fiscal_year,
-                "startPeriod": start_period,
-            }
         else:  # pragma: no cover — create_action 已限制类型
             raise HTTPException(status_code=422, detail=f"不支持的动作类型：{row.action_type}")
 
-        row.status = "approved"
-        row.resolved_at = _now()
-        row.resolved_by = user_id
-        row.result = result
-        action_snapshot = {
-            "action_type": row.action_type,
-            "title": row.title,
-            "payload": row.payload,
-            "evidence": row.evidence,
-            "exclude_indexes": sorted(exclude_set),
-            "edits": {str(k): v for k, v in edit_map.items()},
-        }
+        if stale_error is None:
+            row.status = "approved"
+            row.resolved_at = _now()
+            row.resolved_by = user_id
+            row.result = result
+            action_snapshot = {
+                "action_type": row.action_type,
+                "title": row.title,
+                "payload": row.payload,
+                "evidence": row.evidence,
+                "exclude_indexes": sorted(exclude_set),
+                "edits": {str(k): v for k, v in edit_map.items()},
+            }
 
     # 事务已提交，现在安全地回写公司画像（agent 越用越准的来源；失败不阻塞确认结果）
+    if stale_error is not None:
+        await log_action(
+            company_id,
+            user_id,
+            "agent_action_expire_stale",
+            "agent_action",
+            action_id,
+            stale_action_snapshot,
+        )
+        raise stale_error
+
     for update in profile_updates:
         try:
             from agent.memory import record_category_correction
@@ -449,22 +557,87 @@ async def _approve_voucher_items(
     """凭证类动作（单笔/批量）的逐行确定性入账；返回 result.items。"""
     booked_results: List[Dict[str, Any]] = []
     for index, raw in enumerate(items):
+        statement_id = str(raw.get("statementId") or "").strip()
+        if not statement_id:
+            continue
+        invalid_edit_keys = sorted(set(edit_map.get(index) or {}) - {"category"})
+        if invalid_edit_keys:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "银行流水凭证只能修改分类，金额、日期、摘要、方向和对方面由"
+                    f"原始流水决定；不允许修改：{', '.join(invalid_edit_keys)}"
+                ),
+            )
+
+    statement_category_directions: Optional[Dict[str, str]] = None
+    if any(
+        isinstance(raw, dict)
+        and raw.get("sourceType") == "bank_statement"
+        and str(raw.get("statementId") or "").strip()
+        for raw in items
+    ):
+        from services.category_service import list_categories
+
+        statement_category_directions = {
+            str(row.get("name") or ""): str(row.get("direction") or "")
+            for row in await list_categories(company_id)
+        }
+
+    for index, raw in enumerate(items):
         if index in exclude_set:
             booked_results.append({"index": index, "status": "excluded"})
             continue
         edited = dict(edit_map.get(index) or {})
+        statement_id = str(raw.get("statementId") or "").strip()
         try:
-            merged = {**raw, **{k: v for k, v in edited.items() if v not in (None, "")}}
-            booking = await _book_voucher_payload(
-                session,
-                merged,
-                user_id=user_id,
-                company_id=company_id,
-                request_id=f"agent-action-{row.id}-{index}",
-                allow_backfill=allow_backfill,
-                backfill_reason=backfill_reason,
-            )
-            booking.update({"index": index, "status": "booked"})
+            async with session.begin_nested():
+                if raw.get("sourceType") == "bank_statement" and not statement_id:
+                    raise HTTPException(status_code=422, detail="银行流水凭证缺少 statementId")
+                merged = {**raw, **{k: v for k, v in edited.items() if v not in (None, "")}}
+                if statement_id and statement_category_directions is not None:
+                    final_category = str(merged.get("category") or "").strip()
+                    category_direction = statement_category_directions.get(final_category)
+                    expected_direction = str(raw.get("direction") or "").strip()
+                    if category_direction is None:
+                        raise HTTPException(
+                            status_code=422,
+                            detail=f"分类 {final_category!r} 不在当前账套的有效分类中",
+                        )
+                    if category_direction != expected_direction:
+                        raise HTTPException(
+                            status_code=422,
+                            detail=(
+                                f"分类 {final_category!r} 的收支方向与银行流水不一致；"
+                                "请选择同一方向的有效分类"
+                            ),
+                        )
+                booking = await _book_voucher_payload(
+                    session,
+                    merged,
+                    user_id=user_id,
+                    company_id=company_id,
+                    request_id=f"agent-action-{row.id}-{index}",
+                    allow_backfill=allow_backfill,
+                    backfill_reason=backfill_reason,
+                )
+                if statement_id:
+                    # 凭证与流水匹配必须同生共死：匹配失败时 savepoint 会回滚，
+                    # 不会留下已过账但流水仍未匹配的半成品。
+                    from services.bank_settlement_service import confirm_statement_match
+
+                    bank_match = await confirm_statement_match(
+                        session,
+                        company_id=company_id,
+                        user_id=user_id,
+                        statement_id=statement_id,
+                        entry_ids=[str(booking["entryId"])],
+                        request_id=f"agent-action-{row.id}-{index}-bank-match",
+                        allow_backfill=allow_backfill,
+                        backfill_reason=backfill_reason,
+                    )
+                    booking["bankMatch"] = bank_match
+                booking.update({"index": index, "status": "booked"})
             booked_results.append(booking)
             # 画像回写延迟到事务提交之后（见 approve_action 末尾），避免事务内嵌套写库
             merchant = str(merged.get("merchant") or merged.get("title") or "").strip()

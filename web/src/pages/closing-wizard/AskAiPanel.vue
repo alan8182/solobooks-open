@@ -4,7 +4,7 @@
 -->
 <script setup lang="ts">
 /**
- * 行内问 AI 弹窗：分类模糊时与 AI 结账助手对话，仅分析建议、不代操作。
+ * 行内问 AI 弹窗：分类模糊时获取辅助建议，仅分析建议、不代操作。
  * 从 closing-wizard/index.vue 拆出：流式对话/思考态/快捷提问/结论提取全部自包含；
  * 上下文（流水事实、候选科目）由父页算好传入，accept 事件由父页落地入账。
  */
@@ -222,7 +222,7 @@ function accept() {
           <i class="ri-search-line"></i> {{ toolHint }}<span class="ask-ai-dots"><i></i><i></i><i></i></span>
         </div>
         <div v-else-if="thinking" class="ask-ai-hint">
-          <i class="ri-sparkling-2-line"></i> AI 正在思考<span class="ask-ai-dots"><i></i><i></i><i></i></span>
+          <i class="ri-chat-3-line"></i> AI 正在思考<span class="ask-ai-dots"><i></i><i></i><i></i></span>
         </div>
       </div>
 
@@ -257,7 +257,7 @@ function accept() {
         </div>
         <div v-if="!streaming && chatMessages.length >= 1" class="ask-ai-confirm-row">
           <div class="ask-ai-confirm-conclusion">
-            <i class="ri-sparkling-2-fill" style="color: var(--solo-primary); font-size: 15px;"></i>
+            <i class="ri-check-double-line" style="color: var(--solo-primary); font-size: 15px;"></i>
             <span class="ask-ai-confirm-label">AI 结论</span>
             <span class="ask-ai-confirm-value">{{ conclusion || '未明确，按当前建议' }}</span>
           </div>

@@ -1,10 +1,18 @@
 """SoloBooks FastAPI 入口。"""
+import logging
 import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from config import CORS_ORIGINS
+
+# 无这句时 Python 根日志级别默认 WARNING，各 service 的 logger.info（如邮件收取的
+# 「轮询启动」/收取摘要）在生产全被吞掉，运维排查失去唯一线索（2026-11-06）
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 
 
 @asynccontextmanager
@@ -28,8 +36,20 @@ async def lifespan(_app: FastAPI):
     # FastAPI 不会自动运行挂载子应用的 lifespan；lifespan(app) 返回异步上下文
     from agent.mcp_server import mcp_app
 
+    # 邮件单据收取轮询：配置齐全才启动（services/mail_fetcher.start_polling）
+    from services.mail_fetcher import start_polling
+
+    mail_task = start_polling()
+
     async with mcp_app.lifespan(_app):
         yield
+
+    if mail_task is not None:
+        mail_task.cancel()
+        try:
+            await mail_task
+        except Exception:
+            pass
     await dispose_engine()
 
 
@@ -85,8 +105,11 @@ from routers.admin import router as admin_router
 from routers.mcp_tokens import router as mcp_tokens_router
 from routers.usage import router as usage_router
 from routers.setup import router as setup_router
+from routers.industry_templates import router as industry_templates_router
 from routers.audit_share import owner_router as audit_share_owner_router
 from routers.audit_share import public_router as audit_share_public_router
+from routers.health_scan import router as health_scan_router
+from routers.mailbox import router as mailbox_router
 
 app.include_router(record_router)
 app.include_router(copilot_router)
@@ -123,8 +146,11 @@ app.include_router(mcp_tokens_router)
 app.include_router(usage_router)
 # 上手引导：必须注册在 app.mount("/", mcp_asgi_app) 之前，否则会被 MCP 兜底吞掉
 app.include_router(setup_router)
+app.include_router(industry_templates_router)
 app.include_router(audit_share_owner_router)
 app.include_router(audit_share_public_router)
+app.include_router(health_scan_router)
+app.include_router(mailbox_router)
 
 
 @app.middleware("http")

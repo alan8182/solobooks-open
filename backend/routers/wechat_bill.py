@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from typing import Any, Dict, List, Optional
 
 from deps.auth import AuthContext, require_auth
+from services.vat_service import UnsupportedTaxpayerType
 from services.wechat_bill_service import (
     parse_wechat_bill,
     import_wechat_bill,
@@ -38,17 +39,21 @@ async def parse_bill(file: UploadFile = File(...), ctx: AuthContext = Depends(re
 @router.post("/import")
 async def import_bill(req: ImportRowsRequest, ctx: AuthContext = Depends(require_auth)):
     """将预览通过的行批量导入为记账条目（支持汇总记账与逐笔明细）。"""
-    if req.importMode == "summary" and req.summary:
-        result = await import_wechat_bill_summary(
-            ctx.company_id, ctx.user_id, req.summary,
-            occur_date=req.occurDate or "",
-            allow_backfill=bool(req.allowBackfill), backfill_reason=req.backfillReason,
-        )
-    else:
-        result = await import_wechat_bill(
-            ctx.company_id, ctx.user_id, req.rows or [],
-            allow_backfill=bool(req.allowBackfill), backfill_reason=req.backfillReason,
-        )
+    try:
+        if req.importMode == "summary" and req.summary:
+            result = await import_wechat_bill_summary(
+                ctx.company_id, ctx.user_id, req.summary,
+                occur_date=req.occurDate or "",
+                allow_backfill=bool(req.allowBackfill), backfill_reason=req.backfillReason,
+            )
+        else:
+            result = await import_wechat_bill(
+                ctx.company_id, ctx.user_id, req.rows or [],
+                allow_backfill=bool(req.allowBackfill), backfill_reason=req.backfillReason,
+            )
+    except UnsupportedTaxpayerType as exc:
+        # 与手动记账同口径：一般纳税人等不支持的增值税配置直接 422，不用错误口径生成凭证。
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     await log_action(ctx.company_id, ctx.user_id, "import", "wechat_bill", None,
                      {"imported": result["imported"], "failed": result["failed"], "ignored_duplicates": result.get("ignored_duplicates", 0), "mode": req.importMode})
     return result

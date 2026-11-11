@@ -34,6 +34,10 @@ export interface SalaryRecord {
   personal_social_security: number
   personal_tax: number
   company_social_security: number
+  personal_social_insurance?: number
+  personal_housing_fund?: number
+  company_social_insurance?: number
+  company_housing_fund?: number
   net_salary: number
   total_cost: number
 }
@@ -186,6 +190,8 @@ export interface PayrollRates {
   rates: Record<'socialPersonal' | 'socialCompany' | 'housingPersonal' | 'housingCompany', string>
   defaults: Record<'socialPersonal' | 'socialCompany' | 'housingPersonal' | 'housingCompany', string>
   isCustomized: boolean
+  region?: string
+  regionDesc?: string
 }
 
 export function getPayrollRates(): Promise<PayrollRates> {
@@ -201,6 +207,32 @@ export function updatePayrollRates(
   if (options?.recalculate) params.set('recalculate', 'true')
   const query = params.toString()
   return apiClient.put<PayrollRates>(`/api/salary/rates${query ? `?${query}` : ''}`, rates)
+}
+
+export interface ParsedTaxRatesItem {
+  name: string
+  payer: 'company' | 'personal'
+  rate: number
+  ratePercent?: string
+}
+
+export interface ParsedTaxRatesResult {
+  success: boolean
+  province: string
+  socialCompany: number
+  socialPersonal: number
+  housingCompany: number
+  housingPersonal: number
+  summary: string
+  items: ParsedTaxRatesItem[]
+}
+
+export function parsePayrollRatesScreenshot(file: File | Blob): Promise<ParsedTaxRatesResult> {
+  const formData = new FormData()
+  formData.append('file', file, (file as File).name || 'screenshot.png')
+  return apiClient.post<ParsedTaxRatesResult>('/api/salary/rates/parse-screenshot', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  })
 }
 
 /** 个税累计预扣试算结果（金额均为两位小数字符串）。 */
@@ -240,6 +272,24 @@ export function previewSalaryTax(payload: {
   otherDeduction?: number
 }): Promise<TaxPreview> {
   return apiClient.post<TaxPreview>('/api/salary/tax/preview', payload)
+}
+
+export interface TaxPreviewBatchResult {
+  items: TaxPreview[]
+  totalTaxDue: string
+}
+
+export function previewSalaryTaxBatch(payload: {
+  month: string
+  items: Array<{
+    employeeId: string
+    gross: number
+    withheld: number
+    specialAdditional?: number | null
+    otherDeduction?: number
+  }>
+}): Promise<TaxPreviewBatchResult> {
+  return apiClient.post<TaxPreviewBatchResult>('/api/salary/tax/preview-batch', payload)
 }
 
 /** 账套部门字典项：isRd 决定该部门工资走研发支出还是管理费用。 */

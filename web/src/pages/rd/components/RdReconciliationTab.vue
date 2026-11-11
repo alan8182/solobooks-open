@@ -83,9 +83,11 @@ function navigateToVoucher(entryId: string) {
         <NGrid :cols="4" :x-gap="12" class="kpi-grid mb-4">
           <NGridItem>
             <div class="kpi-item">
-              <span class="kpi-label">口径规则版本</span>
-              <span class="kpi-value font-mono">{{ reconciliation.policyVersion }}</span>
-              <span class="kpi-hint">{{ reconciliation.policyLabel }}</span>
+              <span class="kpi-label">适用的预审规则</span>
+              <span class="kpi-value kpi-value-rule" :title="`${reconciliation.policyLabel}（${reconciliation.policyVersion}）`">
+                {{ reconciliation.policyLabel }}
+              </span>
+              <span class="kpi-hint">系统内置口径</span>
             </div>
           </NGridItem>
           <NGridItem>
@@ -313,6 +315,7 @@ function navigateToVoucher(entryId: string) {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  height: 100%;
 }
 .kpi-label {
   font-size: 12px;
@@ -323,6 +326,10 @@ function navigateToVoucher(entryId: string) {
   font-weight: 700;
   color: var(--solo-text-primary);
 }
+.kpi-value-rule {
+  font-size: 14px;
+  line-height: 1.4;
+}
 .kpi-value .unit {
   font-size: 12px;
   color: var(--solo-text-muted);
@@ -331,6 +338,7 @@ function navigateToVoucher(entryId: string) {
 .kpi-hint {
   font-size: 11px;
   color: var(--solo-text-secondary);
+  margin-top: auto;
 }
 .text-green {
   color: var(--solo-income);

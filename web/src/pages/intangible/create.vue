@@ -550,7 +550,7 @@ async function handleSubmit() {
 
 <style scoped>
 .create-page {
-  max-width: 1080px;
+  max-width: var(--page-width);
   margin: 0 auto;
   padding: 16px 0 48px 0;
 }

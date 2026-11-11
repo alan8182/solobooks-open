@@ -134,7 +134,7 @@ function openWholeBook() {
 <style scoped>
 .books-page {
   width: 100%;
-  max-width: 1360px;
+  max-width: var(--page-width-wide);
   margin: 0 auto;
 }
 

@@ -19,6 +19,7 @@ from models.schemas import (
     RecordBatchRequest, RecordBatchResponse,
     ConfirmRequest, ConfirmResponse,
     EntryUpdateRequest,
+    VoucherPreviewRequest,
     VoucherLinesAdjustRequest,
     SpeechTextResponse,
     CloudFileRequest,
@@ -41,26 +42,18 @@ from services.tax_rules import compute_vat, get_risk_tags, is_tax_deductible, sa
 from db.session import get_db_session
 from services.accounting_core_service import (
     RD_ACCOUNT_BY_TYPE,
+    RD_ACCOUNT_NAMES,
     adjust_voucher_lines,
     create_entry,
     delete_draft,
     ensure_tenant,
     get_idempotent_response,
     list_journals,
+    preview_voucher_lines,
     save_idempotent_response,
     serialize_journal,
     update_draft,
 )
-
-RD_ACCOUNT_NAMES = {
-    "personnel": "研发支出-人员人工",
-    "direct_input": "研发支出-直接投入",
-    "depreciation_amortization": "研发支出-折旧与摊销",
-    "design": "研发支出-设计费",
-    "testing": "研发支出-试验费",
-    "outsourced": "研发支出-委外研发费",
-    "other": "研发支出-其他研发费用",
-}
 
 router = APIRouter(prefix="/api/record", tags=["record"], dependencies=[Depends(require_auth)])
 
@@ -718,6 +711,36 @@ async def patch_entry(
         response=response,
     )
     return response
+
+
+@router.post("/entries/{entry_id}/voucher-preview")
+async def preview_entry_voucher(
+    entry_id: str,
+    req: VoucherPreviewRequest,
+    ctx: AuthContext = Depends(require_auth),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """结账向导第二步：确认付款方式后预览将落账的借贷行（只读，不写库）。
+
+    预览与「认可入账」共用 _normalize_voucher_lines/get_voucher_hint，
+    保证看到的科目就是落账的科目。
+    """
+    await ensure_tenant(session, ctx.company_id, ctx.user_id)
+    return await preview_voucher_lines(
+        session,
+        entry_id,
+        company_id=ctx.company_id,
+        payer=req.payer,
+        payment_status=req.paymentStatus,
+        category=req.category,
+        rd_detail={
+            "rdProjectId": req.rdProjectId,
+            "rdExpenseType": req.rdExpenseType,
+            "rdOriginalAmount": req.rdOriginalAmount,
+            "rdAllocationMethod": req.rdAllocationMethod,
+            "rdAllocationBasis": req.rdAllocationBasis,
+        },
+    )
 
 
 @router.patch("/entries/{entry_id}/voucher-lines")

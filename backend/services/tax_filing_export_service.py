@@ -15,7 +15,11 @@ from zoneinfo import ZoneInfo
 
 from services.account_mapper import get_voucher_hint
 from services.account_service import get_user_profile
-from services.opening_balance_service import get_opening_balances
+from services.opening_balance_service import (
+    get_opening_balances,
+    get_opening_partner_balances,
+    get_year_start_balances,
+)
 from core.money import ZERO, money
 from db.session import session_scope
 from services.accounting_core_service import ensure_tenant, journal_entries_for_reports
@@ -49,9 +53,17 @@ class StatementData:
     balance_opening: Dict[str, Decimal] = field(default_factory=dict)
     balance_period_opening: Dict[str, Decimal] = field(default_factory=dict)
     profit_current: Dict[str, Decimal] = field(default_factory=dict)
+    # 利润表「本年累计」：标准凭证按净额 + YTD 过渡凭证按方向毛额（收入取贷方、
+    # 费用取借方），还原原账本启用前月份的利润表
     profit_ytd: Dict[str, Decimal] = field(default_factory=dict)
+    # 本年累计的净额口径：仅供资产负债表权益（retained_earnings）与勾稽使用。
+    # 用户期初凭证里已挂 3103/3104 的累计损益，若权益项再用毛额口径会二次计入
+    profit_ytd_net: Dict[str, Decimal] = field(default_factory=dict)
     cash_current: Dict[str, Decimal] = field(default_factory=dict)
     cash_ytd: Dict[str, Decimal] = field(default_factory=dict)
+    # 年初（1 月 1 日）余额是否已知：年中建账又没导入年初数时为 False，
+    # 此时 balance_opening 全为 0，报表不得把它当真实年初填报
+    year_start_known: bool = True
     checks: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -130,12 +142,107 @@ def _normal_balance(code: str, debit: Decimal, credit: Decimal) -> Decimal:
     return debit - credit
 
 
+# 资产负债表不得按科目净额相互抵销（会小企01表填列说明）：同一往来科目下，
+# 借方余额的明细列资产项目，贷方余额的明细列负债项目。
+_PARTNER_RECLASS_PAIRS = (
+    ("1122", "2203"),  # 应收账款 ↔ 预收账款
+    ("1123", "2202"),  # 预付账款 ↔ 应付账款
+    ("1221", "2241"),  # 其他应收款 ↔ 其他应付款
+)
+
+
+def _reclass_target(code: str) -> str | None:
+    """往来科目明细记到反向时，报表要把它挪到对面的科目。"""
+    for asset, liability in _PARTNER_RECLASS_PAIRS:
+        if code == asset:
+            return liability
+        if code == liability:
+            return asset
+    # 其他应收在报表里按 1221* 前缀汇总，子科目也要按方向分流
+    if code.startswith("1221"):
+        return "2241"
+    return None
+
+
+def _line_partner(line: dict[str, Any]) -> str:
+    auxiliary = line.get("auxiliary")
+    if isinstance(auxiliary, dict) and auxiliary.get("partner_name"):
+        return str(auxiliary["partner_name"]).strip()
+    return str(line.get("partnerName") or line.get("partner_name") or "").strip()
+
+
+def _partner_bucket_map(
+    items: list[dict[str, Any]],
+    balances: Dict[str, Decimal],
+) -> Dict[tuple[str, str], Decimal]:
+    """把带客商维度的余额行拆成 (科目, 客商) 桶。
+
+    balances 是同一批数据的科目级汇总。有客商明细时按明细方向判断；老快照没有
+    客商字段时整科目落进无客商桶，只能按科目净额方向判断（净额在贷方就不拆）。
+    """
+    buckets: Dict[tuple[str, str], Decimal] = {}
+    for item in items or []:
+        code = str(item.get("account_code") or "")
+        if not code:
+            continue
+        key = (code, str(item.get("partner_name") or "").strip())
+        buckets[key] = _d2(buckets.get(key, ZERO) + _normal_balance(
+            code,
+            money(item.get("debit_balance") or ZERO),
+            money(item.get("credit_balance") or ZERO),
+        ))
+    by_code: Dict[str, Decimal] = {}
+    for (code, _partner), value in buckets.items():
+        by_code[code] = _d2(by_code.get(code, ZERO) + value)
+    # 科目级合计与客商明细之和对不上时，把差额落到无客商桶，避免拼接丢金额
+    for code, value in balances.items():
+        diff = _d2(value - by_code.get(code, ZERO))
+        if diff:
+            key = (code, "")
+            buckets[key] = _d2(buckets.get(key, ZERO) + diff)
+    return buckets
+
+
+def _partner_balance_map(
+    opening_buckets: Dict[tuple[str, str], Decimal],
+    movements: Dict[str, dict[str, Any]],
+) -> Dict[tuple[str, str], Decimal]:
+    out = dict(opening_buckets)
+    for code, info in movements.items():
+        for partner, bucket in (info.get("partners") or {}).items():
+            key = (code, partner)
+            out[key] = _d2(out.get(key, ZERO) + _normal_balance(code, bucket["debit"], bucket["credit"]))
+    return out
+
+
+def _apply_partner_reclass(
+    balances: Dict[str, Decimal],
+    buckets: Dict[tuple[str, str], Decimal],
+) -> Dict[str, Decimal]:
+    """把反向余额的客商明细从原科目挪到对面科目，科目净额保持不变。
+
+    只改报表取数，不动账务：挪出去多少就在对面加回多少，资产 = 负债 + 权益
+    的恒等式不变（两边同时等额增加）。
+    """
+    out = dict(balances)
+    for (code, _partner), value in buckets.items():
+        if value >= ZERO:
+            continue
+        target = _reclass_target(code)
+        if not target:
+            continue
+        out[code] = _d2(out.get(code, ZERO) - value)
+        out[target] = _d2(out.get(target, ZERO) - value)
+    return out
+
+
 def _opening_balance_map(items: list[dict[str, Any]]) -> Dict[str, Decimal]:
     out: Dict[str, Decimal] = {}
     for item in items:
         code = str(item.get("account_code") or "")
         if code:
-            out[code] = _d2(_normal_balance(
+            # 同一科目可能有多行（按客商拆分的年初快照），必须累加
+            out[code] = _d2(out.get(code, ZERO) + _normal_balance(
                 code,
                 money(item.get("debit_balance") or ZERO),
                 money(item.get("credit_balance") or ZERO),
@@ -165,22 +272,46 @@ def _is_ytd_opening(entry: dict[str, Any]) -> bool:
     return entry.get("entryType") == "opening" and str(entry.get("id") or "").endswith("-ytd")
 
 
+def _is_reversal_of_opening(entry: dict[str, Any]) -> bool:
+    """冲销期初凭证的冲销凭证（主凭证或 YTD）。
+
+    期初凭证本身不进报表发生额（由期初余额映射代替），冲销它的凭证必须对称
+    排除，否则「期初重设 → 冲销 → 重导」后期初净额被抵消成零——2026-11 实测：
+    报表货币资金归零、资产负债表拆成镜像对、LEDGER_TO_REPORT 阻断。
+    """
+    return (
+        entry.get("entryType") == "reversal"
+        and str(entry.get("reversalOf") or "").startswith("opening-")
+    )
+
+
 def _account_movements(
     entries: list[dict[str, Any]],
     start: date,
     end: date,
     *,
     include_ytd_opening: bool = False,
+    ytd_opening_only: bool = False,
 ) -> Dict[str, dict[str, Any]]:
     totals: Dict[str, dict[str, Any]] = {}
     for entry in entries:
         if entry.get("isClosingTransfer"):
             continue
+        if _is_reversal_of_opening(entry):
+            continue
         if entry.get("entryType") == "opening":
-            # 当期发生额不含期初；本年累计与期初余额列要计入 YTD 过渡凭证，
-            # 否则年中建账的企业利润表"本年累计"缺启用前月份（账表断裂）。
-            if not (include_ytd_opening and _is_ytd_opening(entry)):
+            # 当期发生额不含期初；本年累计与期初余额列只计入「已过账」的 YTD 过渡
+            # 凭证，否则年中建账的企业利润表"本年累计"缺启用前月份（账表断裂），
+            # 且冲销重设后旧代 YTD 会与新代重复计入（旧代靠自己的冲销凭证侥幸
+            # 抵消净额，毛额层面仍是重复）。
+            is_posted_ytd = _is_ytd_opening(entry) and entry.get("voucherStatus") == "posted"
+            if ytd_opening_only:
+                if not is_posted_ytd:
+                    continue
+            elif not (include_ytd_opening and is_posted_ytd):
                 continue
+        elif ytd_opening_only:
+            continue
         occur_date = _parse_entry_date(entry.get("occurDate") or entry.get("date") or entry.get("time"))
         if not occur_date or occur_date < start or occur_date > end:
             continue
@@ -190,8 +321,17 @@ def _account_movements(
                 code = str(line.get("accountCode") or "")
                 if not code:
                     continue
-                bucket = totals.setdefault(code, {"name": line.get("accountName", ""), "debit": ZERO, "credit": ZERO})
-                bucket[field] += money(line.get("amount") or ZERO)
+                bucket = totals.setdefault(
+                    code,
+                    {"name": line.get("accountName", ""), "debit": ZERO, "credit": ZERO, "partners": {}},
+                )
+                amount = money(line.get("amount") or ZERO)
+                bucket[field] += amount
+                # 客商维度只用于报表按方向重分类（应付借余 → 预付）
+                partner_bucket = bucket["partners"].setdefault(
+                    _line_partner(line), {"debit": ZERO, "credit": ZERO},
+                )
+                partner_bucket[field] += amount
     return totals
 
 
@@ -202,29 +342,33 @@ def _current_balance_map(opening: Dict[str, Decimal], movements: Dict[str, dict[
     return out
 
 
-def _profit_map(movements: Dict[str, dict[str, Any]]) -> Dict[str, Decimal]:
-    balances = {code: _normal_balance(code, info["debit"], info["credit"]) for code, info in movements.items()}
+def _profit_items(balances: Dict[str, Decimal]) -> Dict[str, Decimal]:
+    """利润表行项计算：入参为「每科目余额」，净额/毛额口径由调用方决定。
+
+    行项一律按科目前缀归集：迁移/期初数据常挂在末级码（5001001、5301004），
+    精确匹配会把它们静默漏掉。各 4 位科目族前缀互不重叠，前缀归集无歧义。
+    """
     # 研发费用只含费用化部分（4301001* 与 4301 本身）；4301002 资本化属资产，不进损益
     rd_capitalized = _sum_prefix(balances, "4301002")
     research = _d2(_sum_prefix(balances, "4301") - rd_capitalized)
     management = _d2(_sum_prefix(balances, "5602") + research)
     finance = _sum_prefix(balances, "5603")
     out = {
-        "revenue": _sum_codes(balances, ["5001", "5051"]),
+        "revenue": _sum_prefix(balances, "5001", "5051"),
         "cost": _d2(_sum_prefix(balances, "5401") + _sum_prefix(balances, "5402")),
-        "tax_surcharge": _sum_codes(balances, ["5403"]),
+        "tax_surcharge": _sum_prefix(balances, "5403"),
         "sales_expense": _sum_prefix(balances, "5601"),
         # 广告费和业务宣传费只含 5601015 广告费与 5601016 业务宣传费；
         # 用 "560101" 前缀会把 5601011 运输费误计入广宣费限额基数。
-        "advertising": _sum_codes(balances, ["5601015", "5601016"]),
+        "advertising": _sum_prefix(balances, "5601015", "5601016"),
         "management_expense": management,
-        "entertainment": _sum_codes(balances, ["5602002"]),
+        "entertainment": _sum_prefix(balances, "5602002"),
         "research_expense": research,
         "finance_expense": finance,
-        "investment_income": _sum_codes(balances, ["5111"]),
-        "non_operating_income": _sum_codes(balances, ["5301"]),
-        "non_operating_expense": _sum_codes(balances, ["5711"]),
-        "income_tax": _sum_codes(balances, ["5801"]),
+        "investment_income": _sum_prefix(balances, "5111"),
+        "non_operating_income": _sum_prefix(balances, "5301"),
+        "non_operating_expense": _sum_prefix(balances, "5711"),
+        "income_tax": _sum_prefix(balances, "5801"),
     }
     out["operating_profit"] = _d2(
         out["revenue"] - out["cost"] - out["tax_surcharge"]
@@ -236,6 +380,37 @@ def _profit_map(movements: Dict[str, dict[str, Any]]) -> Dict[str, Decimal]:
     )
     out["net_profit"] = _d2(out["total_profit"] - out["income_tax"])
     return out
+
+
+def _profit_map(movements: Dict[str, dict[str, Any]]) -> Dict[str, Decimal]:
+    balances = {code: _normal_balance(code, info["debit"], info["credit"]) for code, info in movements.items()}
+    return _profit_items(balances)
+
+
+# YTD 毛额读取时的收入性质码：贷方累计即收入（_profit_map 读到的全部贷方性质损益码）
+_YTD_GROSS_REVENUE_CODES = {"5001", "5051", "5111", "5301"}
+
+
+def _profit_items_gross(movements: Dict[str, dict[str, Any]]) -> Dict[str, Decimal]:
+    """YTD 过渡凭证的方向毛额读取：收入性质码取贷方累计，其余损益码取借方累计。
+
+    原账本每月结转损益时，损益科目本年累计借贷双方等额（净额为 0），净额口径
+    会把启用前月份的利润表读成全 0；方向毛额恰好还原原账本的利润表本年累计。
+    """
+    revenue_prefixes = tuple(_YTD_GROSS_REVENUE_CODES)
+    balances = {
+        code: (info["credit"] if code.startswith(revenue_prefixes) else info["debit"])
+        for code, info in movements.items()
+    }
+    return _profit_items(balances)
+
+
+def _merge_profit_items(*parts: Dict[str, Decimal]) -> Dict[str, Decimal]:
+    merged: Dict[str, Decimal] = {}
+    for part in parts:
+        for key, value in part.items():
+            merged[key] = _d2(merged.get(key, ZERO) + value)
+    return merged
 
 
 def _cash_map(entries: list[dict[str, Any]], start: date, end: date, opening_cash: Decimal) -> Dict[str, Decimal]:
@@ -263,6 +438,8 @@ def _cash_map(entries: list[dict[str, Any]], start: date, end: date, opening_cas
     salary_categories = {"人力成本", "工资", "薪酬", "社保", "公积金"}
     for entry in entries:
         if entry.get("entryType") == "opening" or entry.get("isClosingTransfer"):
+            continue
+        if _is_reversal_of_opening(entry):
             continue
         occur_date = _parse_entry_date(entry.get("occurDate") or entry.get("date") or entry.get("time"))
         if not occur_date or occur_date < start or occur_date > end:
@@ -452,15 +629,57 @@ async def build_statement_data(
             period_range.start.year,
             session=session,
         )
-    return build_statement_data_from_entries(entries, opening_items, period_range, company)
+        year_start_items, year_start_known = await get_year_start_balances(
+            company_id,
+            period_range.start.year,
+            session=session,
+        )
+        opening_partner_items = await get_opening_partner_balances(
+            company_id,
+            period_range.start.year,
+            session=session,
+        )
+    return build_statement_data_from_entries(
+        entries,
+        opening_items,
+        period_range,
+        company,
+        year_start_items=year_start_items,
+        year_start_known=year_start_known,
+        opening_partner_items=opening_partner_items,
+    )
 
 
-def build_statement_data_from_entries(entries: list[dict], opening_items: list[dict], period_range: PeriodRange, company: dict) -> StatementData:
+def build_statement_data_from_entries(
+    entries: list[dict],
+    opening_items: list[dict],
+    period_range: PeriodRange,
+    company: dict,
+    *,
+    year_start_items: list[dict] | None = None,
+    year_start_known: bool = True,
+    opening_partner_items: list[dict] | None = None,
+) -> StatementData:
     """Use the same report mapping for exports and transactional close checks."""
     opening = _opening_balance_map(opening_items)
+    opening_buckets = _partner_bucket_map(opening_partner_items or [], opening)
+    # 报表「年初余额」列：优先用导入时存的年初快照。期初余额是建账时点的数，
+    # 年中建账时拿它当年初会整体错一截（2026-10 启用 → 期初是 9 月 30 日）。
+    # 快照也没有时：建账月为 1 月（known）就按期初；否则年初未知，置零并标记。
+    if year_start_items:
+        year_start = _opening_balance_map(year_start_items)
+    elif year_start_known:
+        year_start = opening
+    else:
+        year_start = {}
     movements_current = _account_movements(entries, period_range.start, period_range.end)
     movements_ytd = _account_movements(
         entries, period_range.fiscal_year_start, period_range.end, include_ytd_opening=True,
+    )
+    # 利润表本年累计的两个成分：标准凭证（净额）与 YTD 过渡凭证（方向毛额）
+    movements_ytd_standard = _account_movements(entries, period_range.fiscal_year_start, period_range.end)
+    movements_ytd_opening = _account_movements(
+        entries, period_range.fiscal_year_start, period_range.end, ytd_opening_only=True,
     )
     movements_before_period = _account_movements(
         entries,
@@ -468,14 +687,36 @@ def build_statement_data_from_entries(entries: list[dict], opening_items: list[d
         period_range.start - timedelta(days=1),
         include_ytd_opening=True,
     )
-    current = _current_balance_map(opening, movements_ytd)
-    period_opening = _current_balance_map(opening, movements_before_period)
+    # 往来科目按「科目 + 客商」方向重分类，期初 / 期末 / 年初同一口径
+    current = _apply_partner_reclass(
+        _current_balance_map(opening, movements_ytd),
+        _partner_balance_map(opening_buckets, movements_ytd),
+    )
+    period_opening = _apply_partner_reclass(
+        _current_balance_map(opening, movements_before_period),
+        _partner_balance_map(opening_buckets, movements_before_period),
+    )
+    year_start = _apply_partner_reclass(
+        year_start, _partner_bucket_map(year_start_items or [], year_start),
+    )
     profit_current = _profit_map(movements_current)
-    profit_ytd = _profit_map(movements_ytd)
+    # 利润表本年累计：标准凭证按净额 + YTD 过渡凭证按方向毛额（收入取贷方累计、
+    # 费用取借方累计），原账本每月结转损益时损益科目净额为 0，净额口径会把启用
+    # 前月份读成全 0。
+    profit_ytd = _merge_profit_items(
+        _profit_map(movements_ytd_standard),
+        _profit_items_gross(movements_ytd_opening),
+    )
+    # 资产负债表权益与勾稽仍用净额口径：用户期初凭证里已挂 3103/3104 的累计损益，
+    # retained_earnings 若再用毛额口径会把累计损益二次计入
+    profit_ytd_net = _profit_map(movements_ytd)
     profit_before_period = _profit_map(movements_before_period)
-    balance_current, balance_opening = _build_balance_rows(current, opening, profit_ytd)
+    balance_current, _ = _build_balance_rows(current, opening, profit_ytd_net)
+    _, balance_opening = _build_balance_rows(year_start, year_start, {})
     balance_period_opening, _ = _build_balance_rows(period_opening, opening, profit_before_period)
-    opening_cash = balance_opening["cash"]
+    # 现金流量表的起算现金只能是账套里的期初金额（建账时点），不能跟着报表年初列走：
+    # 账套之前没有分录，用建账期初 + 建账后流水才与期末货币资金对得上。
+    opening_cash = _sum_codes(opening, CASH_ACCOUNT_CODES)
     period_opening_cash = _sum_codes(period_opening, CASH_ACCOUNT_CODES)
     data = StatementData(
         company_name=str(company.get("name") or ""),
@@ -486,8 +727,10 @@ def build_statement_data_from_entries(entries: list[dict], opening_items: list[d
         balance_period_opening=balance_period_opening,
         profit_current=profit_current,
         profit_ytd=profit_ytd,
+        profit_ytd_net=profit_ytd_net,
         cash_current=_cash_map(entries, period_range.start, period_range.end, period_opening_cash),
         cash_ytd=_cash_map(entries, period_range.fiscal_year_start, period_range.end, opening_cash),
+        year_start_known=year_start_known,
     )
     data.checks = _build_checks(data, opening_items)
     return data
@@ -495,8 +738,8 @@ def build_statement_data_from_entries(entries: list[dict], opening_items: list[d
 
 def _build_checks(data: StatementData, opening_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     checks = [
-        {"level": "ok" if data.tax_id else "error", "message": "纳税人识别号已填写" if data.tax_id else "缺少纳税人识别号，请先在公司设置中填写纳税人识别号"},
-        {"level": "ok" if data.company_name else "error", "message": "纳税人名称已填写" if data.company_name else "缺少纳税人名称，请先在公司设置中填写公司名称"},
+        {"level": "ok" if data.tax_id else "error", "message": "纳税人识别号已填写" if data.tax_id else "缺少统一社会信用代码（纳税人识别号），请先到「主体管理」补填后再导出"},
+        {"level": "ok" if data.company_name else "error", "message": "纳税人名称已填写" if data.company_name else "缺少纳税人名称，请先到「主体管理」填写公司名称"},
     ]
     opening_debit = sum((money(i.get("debit_balance") or ZERO) for i in opening_items), ZERO)
     opening_credit = sum((money(i.get("credit_balance") or ZERO) for i in opening_items), ZERO)
@@ -516,6 +759,15 @@ def _build_checks(data: StatementData, opening_items: list[dict[str, Any]]) -> l
         "level": "ok" if cash_difference == ZERO else "error",
         "message": f"现金流量表与货币资金差额 {cash_difference}",
     })
+    if not data.year_start_known:
+        checks.append({
+            "level": "warning",
+            "message": (
+                "年初余额未导入：本年不是 1 月建账，账套里只有建账时点的期初余额，"
+                "推不出 1 月 1 日的年初数。请重新导入含「年初余额」或「本年累计发生额」"
+                "列的科目余额表（期间从 1 月起），否则年初列不能填报"
+            ),
+        })
     return checks
 
 

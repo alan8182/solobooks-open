@@ -240,4 +240,35 @@ describe('研发费用模块（/rd-expenses）重构优化', () => {
     expect(wrapper.text()).toContain('发票 OCR 增强模型')
     expect(wrapper.text()).toContain('RD-2026-01')
   })
+
+  it('口径规则卡片展示预审规则名称，不直接渲染内部规则代号', async () => {
+    setActivePinia(createPinia())
+    const testRouter = createTestRouter('reconciliation')
+    await testRouter.isReady()
+
+    const TestHost = defineComponent({
+      render() {
+        return h(NDialogProvider, null, {
+          default: () =>
+            h(NMessageProvider, null, {
+              default: () => h(RdExpensesPage),
+            }),
+        })
+      },
+    })
+
+    const wrapper = mount(TestHost, {
+      global: {
+        plugins: [testRouter],
+      },
+    })
+
+    await nextTick()
+    await new Promise((resolve) => setTimeout(resolve, 60))
+
+    expect(wrapper.text()).toContain('适用的预审规则')
+    expect(wrapper.text()).toContain('小微企业研发费用税前加计扣除口径')
+    // 内部规则代号不应作为界面文案暴露给用户
+    expect(wrapper.text()).not.toContain('2026.Q3')
+  })
 })

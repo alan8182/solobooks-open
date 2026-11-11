@@ -34,7 +34,7 @@ EXPENSE_REVENUE_CODES = frozenset([
     "5001", "5051", "5111", "5301", "5401", "5401001", "5401002", "5402", "5403",
     "5601", "5601001", "5601006", "5601011", "5601015", "5601016",
     "5602", "5602001", "5602002", "5602004", "5602005", "5602006", "5602007",
-    "5602011", "5602013", "5602014", "5602015", "5602016", "5602999",
+    "5602011", "5602013", "5602014", "5602015", "5602016", "5602017", "5602999",
     "5603", "5603001", "5603002", "5603003", "5603004",
     "5711", "5801", "4301",
 ])
@@ -45,12 +45,29 @@ def _is_expense_revenue(code: Any) -> bool:
     return is_profit_loss_code(code) or code in EXPENSE_REVENUE_CODES
 
 
-def _entry_id(company_id: str, fiscal_year: int) -> str:
-    return f"opening-{company_id}-{fiscal_year}"
+# 期初凭证 id 的代数。冲销只把原凭证置 reversed、不删行（A1 要求留审计历史），
+# 而 create_entry 按 id 查重，同一 id 无法二次创建 —— 所以「冲销后重导」必须换
+# 一代 id。第 1 代沿用裸 id 以兼容已有库；第 2 代起带 -g{n} 后缀。
+_OPENING_GEN_MARK = "-g"
 
 
-def _ytd_entry_id(company_id: str, fiscal_year: int) -> str:
-    return f"opening-{company_id}-{fiscal_year}-ytd"
+def _entry_id(company_id: str, fiscal_year: int, generation: int = 1) -> str:
+    base = f"opening-{company_id}-{fiscal_year}"
+    return base if generation <= 1 else f"{base}{_OPENING_GEN_MARK}{generation}"
+
+
+def _ytd_entry_id(company_id: str, fiscal_year: int, generation: int = 1) -> str:
+    return f"{_entry_id(company_id, fiscal_year, generation)}-ytd"
+
+
+def _entry_generation(entry_id: str, company_id: str, fiscal_year: int) -> int:
+    """从凭证 id 反解代数；裸 id（第 1 代）与无法解析的都算第 1 代。"""
+    suffix = entry_id[len(f"opening-{company_id}-{fiscal_year}"):]
+    if suffix.startswith(_OPENING_GEN_MARK):
+        head = suffix[len(_OPENING_GEN_MARK):].split("-")[0]
+        if head.isdigit():
+            return int(head)
+    return 1
 
 
 async def _load_accounts_allowing_referenced(
@@ -140,44 +157,101 @@ def _validate_opening_account(account_map: dict[str, ChartAccount], code: str) -
         )
 
 
-async def _find_entry(session: AsyncSession, company_id: str, fiscal_year: int) -> JournalEntry | None:
-    return (
+def _opening_id_prefix(company_id: str, fiscal_year: int) -> str:
+    return f"opening-{company_id}-{fiscal_year}"
+
+
+async def _live_opening_entries(
+    session: AsyncSession, company_id: str, fiscal_year: int
+) -> list[JournalEntry]:
+    """该年度所有「活」期初凭证（未被冲销）。
+
+    冲销只把原凭证置 reversed 并留作审计历史，所以按确定性 id 单点查会命中
+    墓碑。用 id 前缀 + 状态过滤拿到活的那一代（含 YTD 过渡凭证）。
+    """
+    prefix = _opening_id_prefix(company_id, fiscal_year)
+    rows = (
         await session.execute(
             select(JournalEntry).where(
-                JournalEntry.id == _entry_id(company_id, fiscal_year),
                 JournalEntry.company_id == company_id,
                 JournalEntry.entry_type == "opening",
+                JournalEntry.status != "reversed",
+                JournalEntry.id.startswith(prefix),
             )
         )
-    ).scalar_one_or_none()
+    ).scalars().all()
+    return list(rows)
+
+
+async def _find_entry(session: AsyncSession, company_id: str, fiscal_year: int) -> JournalEntry | None:
+    """当前有效的期初主凭证（未冲销）。已冲销的留作审计历史，不算数。"""
+    entries = await _live_opening_entries(session, company_id, fiscal_year)
+    mains = [e for e in entries if not e.id.endswith("-ytd")]
+    return max(mains, key=lambda e: _entry_generation(e.id, company_id, fiscal_year)) if mains else None
 
 
 async def _find_ytd_entry(session: AsyncSession, company_id: str, fiscal_year: int) -> JournalEntry | None:
-    return (
+    entries = await _live_opening_entries(session, company_id, fiscal_year)
+    ytds = [e for e in entries if e.id.endswith("-ytd")]
+    return max(ytds, key=lambda e: _entry_generation(e.id, company_id, fiscal_year)) if ytds else None
+
+
+async def _next_opening_generation(session: AsyncSession, company_id: str, fiscal_year: int) -> int:
+    """下一代期初凭证代数：已有凭证的最大代数 + 1（含已冲销的，避免撞 id）。"""
+    prefix = _opening_id_prefix(company_id, fiscal_year)
+    ids = (
         await session.execute(
-            select(JournalEntry).where(
-                JournalEntry.id == _ytd_entry_id(company_id, fiscal_year),
+            select(JournalEntry.id).where(
                 JournalEntry.company_id == company_id,
                 JournalEntry.entry_type == "opening",
+                JournalEntry.id.startswith(prefix),
             )
         )
-    ).scalar_one_or_none()
+    ).scalars().all()
+    gens = [_entry_generation(i, company_id, fiscal_year) for i in ids]
+    return (max(gens) + 1) if gens else 1
+
+
+async def _non_opening_activity(
+    session: AsyncSession,
+    company_id: str,
+    *,
+    before: date,
+    on_or_after: date | None = None,
+    effective_only: bool = False,
+) -> tuple[int, date | None]:
+    """统计 [on_or_after, before) 内非期初分录的条数与最早日期。
+
+    effective_only 排除已冲销的原分录和冲销分录：两者净额为零，不应阻止
+    期初重导（「冲销重置后重导」是正常流程）。
+    """
+    conditions = [
+        JournalEntry.company_id == company_id,
+        JournalEntry.occurred_on < before,
+        JournalEntry.entry_type != "opening",
+        JournalEntry.status.in_(("posted", "reversed", "draft", "pending_review")),
+    ]
+    if on_or_after is not None:
+        conditions.append(JournalEntry.occurred_on >= on_or_after)
+    if effective_only:
+        conditions.append(JournalEntry.entry_type != "reversal")
+        conditions.append(JournalEntry.status != "reversed")
+    count, earliest = (
+        await session.execute(
+            select(func.count(), func.min(JournalEntry.occurred_on))
+            .select_from(JournalEntry)
+            .where(*conditions)
+        )
+    ).one()
+    return int(count or 0), earliest
 
 
 async def _has_activity_before(session: AsyncSession, company_id: str, fiscal_year: int) -> bool:
     """该年 1 月 1 日之前是否存在业务分录（opening 除外）。"""
-    boundary = date(fiscal_year, 1, 1)
-    count = (
-        await session.execute(
-            select(func.count()).select_from(JournalEntry).where(
-                JournalEntry.company_id == company_id,
-                JournalEntry.occurred_on < boundary,
-                JournalEntry.entry_type != "opening",
-                JournalEntry.status.in_(("posted", "reversed", "draft", "pending_review")),
-            )
-        )
-    ).scalar_one()
-    return bool(count)
+    count, _ = await _non_opening_activity(
+        session, company_id, before=date(fiscal_year, 1, 1)
+    )
+    return count > 0
 
 
 async def derive_opening_items(
@@ -214,6 +288,50 @@ async def derive_opening_items(
             "derived": True,
         })
     return items
+
+
+async def get_year_start_balances(
+    company_id: str,
+    fiscal_year: int,
+    *,
+    session: AsyncSession | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """年初（1 月 1 日）余额快照，返回 (items, known)。
+
+    报表「年初余额」列不能拿建账时点的期初顶替：年中建账时两者差着建账前
+    几个月的全部变动（例如 2026-10 启用的账套，期初是 9 月 30 日余额）。
+    快照在导入期初时随凭证一起落库（期初凭证 metadata 的 yearStartBalances）。
+
+    known 的判定：
+    - 没有期初凭证 → 年初由历史分录派生，口径本来就是年初，known=True；
+    - 有凭证且存了快照 → known=True，用快照；
+    - 有凭证但没快照：建账月为 1 月时期初 == 年初，known=True；
+      年中建账则 1 月 1 日余额无从得知，known=False（报表不得填数）。
+    """
+    if session is None:
+        async with session_scope() as owned_session:
+            return await get_year_start_balances(
+                company_id, fiscal_year, session=owned_session,
+            )
+    entry = await _find_entry(session, company_id, fiscal_year)
+    if entry is None:
+        return [], True
+    raw = (entry.metadata_json or {}).get("yearStartBalances") or []
+    items = [
+        {
+            "account_code": str(row.get("accountCode") or ""),
+            "account_name": str(row.get("accountName") or ""),
+            # 客商维度保留到报表：往来科目要按明细方向重分类（应付借余 → 预付）
+            "partner_name": str(row.get("partnerName") or ""),
+            "debit_balance": money_text(money(row.get("debit") or ZERO)),
+            "credit_balance": money_text(money(row.get("credit") or ZERO)),
+        }
+        for row in raw
+        if isinstance(row, dict) and row.get("accountCode")
+    ]
+    if items:
+        return items, True
+    return [], entry.occurred_on.month == 1
 
 
 async def get_opening_balances(
@@ -274,6 +392,47 @@ async def get_opening_balances(
             "derived": False,
         }
         for account in accounts
+    ]
+
+
+async def get_opening_partner_balances(
+    company_id: str,
+    fiscal_year: int,
+    *,
+    session: AsyncSession | None = None,
+) -> list[dict[str, Any]]:
+    """期初凭证按「科目 + 客商」拆分的余额，报表按明细方向重分类用。
+
+    《小企业会计准则》资产负债表不得按科目净额相互抵销：应付账款某客商是借方
+    余额时要列进预付账款，其他应付款某人是借方余额时要列进其他应收款。
+    `get_opening_balances` 是科目级汇总，客商维度在这里单独取一次。
+    """
+    if session is None:
+        async with session_scope() as owned_session:
+            return await get_opening_partner_balances(
+                company_id, fiscal_year, session=owned_session,
+            )
+    entry = await _find_entry(session, company_id, fiscal_year)
+    if entry is None:
+        return []
+    lines = (
+        await session.execute(
+            select(JournalLine).where(JournalLine.journal_entry_id == entry.id)
+        )
+    ).scalars().all()
+    buckets: dict[tuple[str, str], list[Decimal]] = {}
+    for line in lines:
+        partner = str((line.auxiliary or {}).get("partner_name") or "").strip()
+        bucket = buckets.setdefault((line.account_code, partner), [ZERO, ZERO])
+        bucket[0 if line.direction == "debit" else 1] += money(line.amount)
+    return [
+        {
+            "account_code": code,
+            "partner_name": partner,
+            "debit_balance": money_text(debit),
+            "credit_balance": money_text(credit),
+        }
+        for (code, partner), (debit, credit) in buckets.items()
     ]
 
 
@@ -342,6 +501,10 @@ async def get_opening_details(
         "migrationNote": "",
         "startPeriod": f"{fiscal_year}-01",
     }
+    # 只有真正保存过（税务备忘里写过 startPeriod）或已有期初凭证时，start_period
+    # 才算用户的选择；否则上面那个 {year}-01 只是兜底显示值，不能当成建账时间——
+    # 前端要按公司信息里的启用日期重新给默认值。
+    saved_start_period: str | None = None
     try:
         prof_row = (
             await session.execute(
@@ -350,11 +513,18 @@ async def get_opening_details(
         ).scalar_one_or_none()
         if prof_row and prof_row.profile and "taxOpening" in prof_row.profile:
             tax_memory.update(prof_row.profile["taxOpening"])
+            saved_start_period = (prof_row.profile.get("taxOpening") or {}).get("startPeriod") or None
     except Exception:
         pass
 
     entry = await _find_entry(session, company_id, fiscal_year)
-    start_period = tax_memory.get("startPeriod") or (entry.occurred_on.strftime("%Y-%m") if entry else f"{fiscal_year}-01")
+    entry_period = entry.occurred_on.strftime("%Y-%m") if entry else None
+    saved_start_period = saved_start_period or entry_period
+    # 税务备忘里的 startPeriod 每个账套只存一个值，换年度查时不能拿它冒充该年的
+    # 建账时间（否则查 2027 会返回 2026-01）
+    if saved_start_period and not saved_start_period.startswith(f"{fiscal_year}-"):
+        saved_start_period = None
+    start_period = saved_start_period or f"{fiscal_year}-01"
 
     # ponytail: 尝试读取关联的期初固定资产卡片（P1 WP-B 起写核心 ORM，
     # 返回字段保持 legacy payload 形状，前端 opening 页无需感知）
@@ -363,11 +533,14 @@ async def get_opening_details(
         from core.fixed_asset_categories import CATEGORY_LABELS
         from db.models import FixedAsset
 
+        # 卡片挂的是「活的那一代」期初凭证；用 entry.id 而非确定性裸 id，
+        # 否则冲销重导后卡片会指向已冲销的旧凭证。
+        live_entry_id = entry.id if entry else _entry_id(company_id, fiscal_year)
         cards = (
             await session.execute(
                 select(FixedAsset).where(
                     FixedAsset.company_id == company_id,
-                    FixedAsset.source_entry_id == _entry_id(company_id, fiscal_year),
+                    FixedAsset.source_entry_id == live_entry_id,
                     FixedAsset.deleted_at.is_(None),
                 )
             )
@@ -390,15 +563,87 @@ async def get_opening_details(
     except Exception:
         pass
 
+    year_start_items = [
+        {
+            "account_code": str(row.get("accountCode") or ""),
+            "account_name": str(row.get("accountName") or ""),
+            "partner_name": str(row.get("partnerName") or ""),
+            "debit_balance": money_text(money(row.get("debit") or ZERO)),
+            "credit_balance": money_text(money(row.get("credit") or ZERO)),
+        }
+        for row in ((entry.metadata_json or {}).get("yearStartBalances") or [])
+        if isinstance(row, dict) and row.get("accountCode")
+    ] if entry else []
+
     return {
         "items": balance_items,
         "ytd_items": ytd_items,
+        # 年初快照：重导时前端原样带回，不用重新解析 Excel
+        "year_start_items": year_start_items,
         "start_period": start_period,
+        "start_period_saved": bool(saved_start_period),
         "tax_memory": tax_memory,
         "fixed_assets": fixed_assets,
-        "is_locked": bool(entry and entry.status in ("posted", "reversed")),
+        # 只认 posted：冲销后原凭证是墓碑，页面必须解锁让用户重新导入
+        "is_locked": bool(entry and entry.status == "posted"),
         "voucher_no": entry.voucher_no if entry else None,
     }
+
+
+async def _resolve_opening_partners(
+    session: AsyncSession,
+    company_id: str,
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """给只带 partner_name 的期初行补 partner_id（按名字复用或建档）。
+
+    复用 `auxiliary_service` 的归一化名 + 编码分配，但在**调用方 session** 内
+    建档：期初保存与建档案同一事务，保存失败不会留下孤儿客商档案
+    （`ensure_partner_by_name` 走独立 session_scope，脱离本次事务，不适合这里）。
+    名字为空或解析失败时原样放行——不强制建档，与「匹配不上就留纯文本」的克制一致。
+    """
+    from db.models import Partner
+    from services.auxiliary_service import CODE_PREFIX, _mnemonic, _normalize_name, _next_code
+
+    names = {
+        str(item.get("partner_name") or "").strip()
+        for item in items
+        if str(item.get("partner_name") or "").strip()
+        and not str(item.get("partner_id") or "").strip()
+    }
+    if not names:
+        return items
+
+    existing = (
+        await session.execute(select(Partner).where(Partner.company_id == company_id))
+    ).scalars().all()
+    by_name = {_normalize_name(row.name): row for row in existing}
+
+    resolved: list[dict[str, Any]] = []
+    for item in items:
+        payload = dict(item)
+        name = str(payload.get("partner_name") or "").strip()
+        if not name or str(payload.get("partner_id") or "").strip():
+            resolved.append(payload)
+            continue
+        key = _normalize_name(name)
+        partner = by_name.get(key)
+        if partner is None:
+            code = await _next_code(session, company_id, Partner, CODE_PREFIX["both"])
+            partner = Partner(
+                company_id=company_id,
+                code=code,
+                name=name,
+                type="both",
+                mnemonic=_mnemonic(name),
+            )
+            session.add(partner)
+            await session.flush()
+            by_name[key] = partner
+        payload["partner_name"] = partner.name
+        payload["partner_id"] = partner.id
+        resolved.append(payload)
+    return resolved
 
 
 async def save_opening_balances(
@@ -411,6 +656,7 @@ async def save_opening_balances(
     request_id: str,
     start_period: str | None = None,
     ytd_items: list[dict[str, Any]] | None = None,
+    year_start_items: list[dict[str, Any]] | None = None,
     tax_memory: dict[str, Any] | None = None,
     fixed_assets: list[dict[str, Any]] | None = None,
     session: AsyncSession | None = None,
@@ -426,6 +672,7 @@ async def save_opening_balances(
                 request_id=request_id,
                 start_period=start_period,
                 ytd_items=ytd_items,
+                year_start_items=year_start_items,
                 tax_memory=tax_memory,
                 fixed_assets=fixed_assets,
                 session=owned_session,
@@ -448,6 +695,14 @@ async def save_opening_balances(
              "occurredOn": existing.occurred_on.isoformat(),
              "entryType": existing.entry_type},
         )
+    # 1. 解析启用期间与生效日期（双计校验要用，提到活动检查之前）
+    period_str = (start_period or f"{fiscal_year}-01").strip()
+    try:
+        pyear, pmonth = [int(p) for p in period_str.split("-")[:2]]
+    except Exception:
+        pyear, pmonth = fiscal_year, 1
+    occur_date = date(pyear, pmonth, 1)
+
     # 跨年防双计：已有历史分录的年份，期初余额由历史派生；再手工录期初会重复计入
     prior_activity = await _has_activity_before(session, company_id, fiscal_year)
     if prior_activity:
@@ -459,13 +714,30 @@ async def save_opening_balances(
             {"fiscalYear": fiscal_year},
         )
 
-    # 1. 解析启用期间与生效日期
-    period_str = (start_period or f"{fiscal_year}-01").strip()
-    try:
-        pyear, pmonth = [int(p) for p in period_str.split("-")[:2]]
-    except Exception:
-        pyear, pmonth = fiscal_year, 1
-    occur_date = date(pyear, pmonth, 1)
+    # 同年防双计：建账月之前本年已有业务分录，这些业务的结果已经包含在
+    # 导入的期初余额表里，再生成期初凭证会把同一段期间算两遍。
+    if pmonth > 1 and pyear == fiscal_year:
+        prior_count, earliest = await _non_opening_activity(
+            session,
+            company_id,
+            on_or_after=date(fiscal_year, 1, 1),
+            before=occur_date,
+            effective_only=True,
+        )
+        if prior_count:
+            earliest_text = f"（最早 {earliest.isoformat()}）" if earliest else ""
+            raise AccountingError(
+                "OPENING_PRIOR_ACTIVITY",
+                f"{fiscal_year} 年 1-{pmonth - 1} 月已有 {prior_count} 条业务分录"
+                f"{earliest_text}。期初余额应包含这些业务的结果，再生成期初凭证会重复计入；"
+                "请先冲销或删除这些分录，或把建账月份调到最早一笔业务之前",
+                409,
+                {
+                    "before": occur_date.isoformat(),
+                    "count": prior_count,
+                    "earliestOccurredOn": earliest.isoformat() if earliest else None,
+                },
+            )
 
     # 写侧前置校验：期初凭证不可变，容器/停用/不存在科目必须当场拦下，
     # 并给出可操作的换科目提示（详见 _validate_opening_account）
@@ -479,6 +751,12 @@ async def save_opening_balances(
     }
 
     # 2. 组装资产负债期初分录（可挂接客商辅助信息）
+    # 期初分录不做辅助核算归一化（accounting_core_service 里 opening 豁免
+    # normalize_line_auxiliary），所以 partner_id 必须在这里解析好：只给了名字的
+    # 行，按名字取或建往来单位档案，再落 id。否则期初的往来余额在按 partner_id
+    # 分组的账龄里会全部塌进「未指定往来单位」，老板看不出欠谁钱。
+    items = await _resolve_opening_partners(session, company_id, items)
+
     debit_lines: list[dict[str, Any]] = []
     credit_lines: list[dict[str, Any]] = []
     total_debit = ZERO
@@ -550,21 +828,43 @@ async def save_opening_balances(
             },
         )
 
+    # 年初（1 月 1 日）快照：只用于报表「年初余额」列，不进分录、不参与试算平衡。
+    # 随期初凭证一起落库，冲销重设换新一代凭证时由重导覆盖，不会留下两份数据。
+    year_start_payload = [
+        {
+            "accountCode": str(item.get("account_code") or "").strip(),
+            "accountName": str(item.get("account_name") or "").strip(),
+            "partnerName": str(item.get("partner_name") or "").strip(),
+            "debit": money_text(money(item.get("debit_balance") or ZERO, allow_negative=False)),
+            "credit": money_text(money(item.get("credit_balance") or ZERO, allow_negative=False)),
+        }
+        for item in (year_start_items or [])
+        if str(item.get("account_code") or "").strip()
+        and (
+            money(item.get("debit_balance") or ZERO) != ZERO
+            or money(item.get("credit_balance") or ZERO) != ZERO
+        )
+    ]
+
     title_desc = f"{pyear} 年 {pmonth} 月期初余额" if pmonth > 1 else f"{fiscal_year} 年期初余额"
+    # 换代：冲销过的旧代留作审计历史，重导必须用新 id（同 id 无法二次创建）
+    generation = await _next_opening_generation(session, company_id, fiscal_year)
     entry = await create_entry(
         session,
         {
-            "id": _entry_id(company_id, fiscal_year),
+            "id": _entry_id(company_id, fiscal_year, generation),
             "direction": "owner_transfer",
             "amount": total_debit,
             "title": title_desc,
             "category": "期初余额",
             "occurDate": occur_date.isoformat(),
             "sourceType": "opening_balance",
-            "dedupFingerprint": f"opening:{company_id}:{fiscal_year}",
+            # 来源键带代数：同一账套年间可重导多次，每次是独立来源
+            "dedupFingerprint": f"opening:{company_id}:{fiscal_year}:{generation}",
             "entryType": "opening",
             "voucherAuthority": "system",
             "voucherLines": {"debit": debit_lines, "credit": credit_lines},
+            **({"yearStartBalances": year_start_payload} if year_start_payload else {}),
         },
         company_id=company_id,
         user_id=user_id,
@@ -624,14 +924,14 @@ async def save_opening_balances(
             ytd_entry = await create_entry(
                 session,
                 {
-                    "id": _ytd_entry_id(company_id, fiscal_year),
+                    "id": _ytd_entry_id(company_id, fiscal_year, generation),
                     "direction": "owner_transfer",
                     "amount": balanced_ytd_amount,
                     "title": f"{pyear} 年 1-{pmonth - 1} 月损益累计发生额",
                     "category": "期初余额",
                     "occurDate": ytd_occur_date.isoformat(),
                     "sourceType": "opening_balance_ytd",
-                    "dedupFingerprint": f"opening_ytd:{company_id}:{fiscal_year}",
+                    "dedupFingerprint": f"opening_ytd:{company_id}:{fiscal_year}:{generation}",
                     "entryType": "opening",
                     "voucherAuthority": "system",
                     "voucherLines": {"debit": ytd_debits, "credit": ytd_credits},
@@ -720,7 +1020,7 @@ async def save_opening_balances(
                     },
                     company_id=company_id,
                     user_id=user_id,
-                    source_entry_id=_entry_id(company_id, fiscal_year),
+                    source_entry_id=_entry_id(company_id, fiscal_year, generation),
                     accumulated_depreciation=money(fa.get("accumulated_depreciation") or fa.get("accumulatedDepreciation") or ZERO),
                     last_depreciated_period=anchor_period,
                     status="active",
@@ -806,7 +1106,7 @@ async def reset_opening_balances(
             await session.execute(
                 select(FixedAsset).where(
                     FixedAsset.company_id == company_id,
-                    FixedAsset.source_entry_id == _entry_id(company_id, fiscal_year),
+                    FixedAsset.source_entry_id == entry.id,
                 )
             )
         ).scalars().all()
@@ -820,6 +1120,45 @@ async def reset_opening_balances(
             for card in opening_cards:
                 await session.delete(card)
             await session.flush()
+    except Exception:
+        pass
+
+    # 来源行置 void（墓碑），否则重导时 create_entry 按 external_key 查重会抛
+    # DUPLICATE_SOURCE —— delete_draft 就是这么做的，reset 此前漏了这一步。
+    try:
+        from db.models import SourceTransaction
+
+        source_rows = (
+            await session.execute(
+                select(SourceTransaction).where(
+                    SourceTransaction.company_id == company_id,
+                    SourceTransaction.source_type.in_(("opening_balance", "opening_balance_ytd")),
+                    SourceTransaction.status != "void",
+                )
+            )
+        ).scalars().all()
+        for row in source_rows:
+            row.status = "void"
+        if source_rows:
+            await session.flush()
+    except Exception:
+        pass
+
+    # 重设期初意味着建账时间也要重新选：清掉上次保存的 startPeriod（其余税务备忘
+    # 保留），下次打开页面按公司信息里的启用日期给默认值，而不是钉在旧月份。
+    try:
+        from db.models import CompanyProfile
+
+        prof_row = (
+            await session.execute(
+                select(CompanyProfile).where(CompanyProfile.company_id == company_id)
+            )
+        ).scalar_one_or_none()
+        tax_opening = dict((prof_row.profile or {}).get("taxOpening") or {}) if prof_row else {}
+        if tax_opening.pop("startPeriod", None) is not None:
+            profile = dict(prof_row.profile or {})
+            profile["taxOpening"] = tax_opening
+            prof_row.profile = profile
     except Exception:
         pass
 

@@ -50,11 +50,12 @@ def test_balance_reconciliation_uses_first_pre_transaction_balance_as_opening():
     }
 
 
-def test_balance_reconciliation_restores_same_day_reverse_export_order():
+def test_balance_reconciliation_orders_same_day_rows_by_file_row_index():
+    """同日多笔按文件行序还原时序，与 id 大小无关（倒序导出的真实顺序在行序里）。"""
     result = build_balance_reconciliation([
-        {"id": "import-10", "transaction_date": "2026-06-04", "amount": 0.74, "balance": 100.0},
-        {"id": "import-11", "transaction_date": "2026-06-04", "amount": -0.74, "balance": 99.26},
-        {"id": "import-09", "transaction_date": "2026-06-06", "amount": 1.0, "balance": 101.0},
+        {"id": "import-10", "transaction_date": "2026-06-04", "amount": 0.74, "balance": 100.0, "source_row_index": 1},
+        {"id": "import-11", "transaction_date": "2026-06-04", "amount": -0.74, "balance": 99.26, "source_row_index": 0},
+        {"id": "import-09", "transaction_date": "2026-06-06", "amount": 1.0, "balance": 101.0, "source_row_index": 2},
     ], book_bank_balance=101)
 
     assert result["opening_balance"] == 100.0

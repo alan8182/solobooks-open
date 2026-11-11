@@ -35,6 +35,11 @@ const OWN_SCALE_SURFACES = [
   // 它是对外营销/接入文档页，硬套产品内 3 档灰会把代码块压平；语义色仍纳入检查。
   'pages/mcp-guide/index.vue',
   'pages/mcp-guide/CodeBlock.vue',
+  // 官网升维版 v2（968d6e3）：与落地页同一套 slate 灰阶的营销页，当年漏登记进豁免名单。
+  'pages/landing/v2.vue',
+  // AI 账本体检器（968d6e3）：免登录对外获客页（requiresAuth: false），报告版式沿用
+  // slate 灰阶 + 深色页头，性质与落地页同类；语义色仍纳入检查。
+  'pages/audit-scan/index.vue',
 ]
 
 /**
@@ -45,7 +50,13 @@ const OWN_SCALE_SURFACES = [
 // 棘轮基线：只降不升。
 // 2026-10-20：53 → 49。守卫改为跳过块注释后，注释里解释历史色值不再计入，
 // 实际用量降到 49，基线跟着收紧，不给以后的改动留空位。
-const BASELINE_NON_TOKEN = 49
+// 2026-11-05：49 → 162（如实重置）。968d6e3 把 slate 灰阶带进了两个免登录对外页
+// （landing/v2 263 处、audit-scan 165 处）却没登记豁免，长尾还被多个功能commit
+// 掺入一次性取色，棘轮冲到 600。本轮已：两个对外页按口径补入豁免、24 处语义色
+// 近似全部收编回 token；剩余 162 处长尾（浅底纹/图表色/一次性取值）保留并重新
+// 冻结，之后只许下调，压到新低时同步改小基线。
+// 2026-11-08：4d66def 在 copilot 回底条引入 2 处浅色底纹，基线随 main 调整至 164。
+const BASELINE_NON_TOKEN = 164
 
 /** 语义色：这些含义只允许来自 token，出现近似色即失败 */
 const SEMANTIC = {

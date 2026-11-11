@@ -325,7 +325,7 @@ CATEGORY_TO_ACCOUNT = {
     },
     "股东垫付": {
         "accountCode": "2241",
-        "accountName": "其他应付款-股东",
+        "accountName": "其他应付款",
         "accountType": "负债",
         "defaultCounterparty": "1002"
     },
@@ -343,7 +343,7 @@ CATEGORY_TO_ACCOUNT = {
     },
     "其他应付款": {
         "accountCode": "2241",
-        "accountName": "其他应付款-其他",
+        "accountName": "其他应付款",
         "accountType": "负债",
         "defaultCounterparty": "1002"
     },
@@ -364,13 +364,13 @@ CATEGORY_TO_ACCOUNT = {
     },
     "股东垫付报销": {
         "accountCode": "2241",
-        "accountName": "其他应付款-股东",
+        "accountName": "其他应付款",
         "accountType": "负债",
         "defaultCounterparty": "1002"
     },
     "员工垫付报销": {
         "accountCode": "2241",
-        "accountName": "其他应付款-员工",
+        "accountName": "其他应付款",
         "accountType": "负债",
         "defaultCounterparty": "1002"
     },
@@ -550,7 +550,7 @@ def get_voucher_hint(
     if payment_status_str == "unpaid":
         if direction == "expense":
             counterparty = "2202" if acct_code in ("1403", "1405") else "2241"
-            payable_name = "应付账款" if counterparty == "2202" else "其他应付款-发票待付款"
+            payable_name = "应付账款" if counterparty == "2202" else "其他应付款"
         elif direction == "income":
             counterparty = "1122"
             payable_name = "应收账款"
@@ -560,24 +560,24 @@ def get_voucher_hint(
     elif payer == PAYER_BOSS:
         if direction == "expense":
             counterparty = "2241"
-            payable_name = "其他应付款-股东"
+            payable_name = "其他应付款"
         elif direction == "income":
             counterparty = "122102"
             payable_name = "其他应收款-股东"
         else:
             counterparty = "2241"
-            payable_name = "其他应付款-股东"
+            payable_name = "其他应付款"
     elif payer == EMPLOYEE_PAYER_PREFIX or payer.startswith(f"{EMPLOYEE_PAYER_PREFIX}:"):
-        emp_name = payer.split(":", 1)[1].strip() if ":" in payer else ""
+        # 姓名不再拼进科目名（科目名只取科目表），员工身份落在行辅助核算上
         if direction == "expense":
             counterparty = "2241"
-            payable_name = f"其他应付款-员工往来({emp_name})" if emp_name else "其他应付款-员工往来"
+            payable_name = "其他应付款"
         elif direction == "income":
             counterparty = "122103"
-            payable_name = f"其他应收款-员工往来({emp_name})" if emp_name else "其他应收款-员工往来"
+            payable_name = "其他应收款-员工往来"
         else:
             counterparty = "2241"
-            payable_name = f"其他应付款-员工往来({emp_name})" if emp_name else "其他应付款-员工往来"
+            payable_name = "其他应付款"
     elif payer == "prepaid_deduct":
         if direction == "expense":
             counterparty = "1123"
@@ -608,7 +608,7 @@ def get_voucher_hint(
             payable_name = COUNTERPARTY_ACCOUNTS.get(counterparty, {}).get("accountName", "银行存款")
     else:
         counterparty = acct.get("defaultCounterparty", "1002")
-        payable_name = acct_name if acct_code == "2241" else "其他应付款-其他"
+        payable_name = acct_name if acct_code == "2241" else "其他应付款"
 
     # 资本往来（股东投入/取现/垫付报销）本身就是公户收付，去向只决定往来科目名称，对手方保持默认
     if direction == "owner_transfer":

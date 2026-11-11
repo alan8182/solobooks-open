@@ -26,7 +26,9 @@ def _load_seed() -> dict:
     return data
 
 
-def _build_seed_rows(company_id: str, now: str) -> List[tuple]:
+def _build_seed_rows(
+    company_id: str, now: str, extra_accounts: Optional[List[dict]] = None
+) -> List[tuple]:
     """Build seed rows from chart_of_accounts.json into a 3-level tree."""
     data = _load_seed()
     groups = data.get("accounts", {})
@@ -60,6 +62,34 @@ def _build_seed_rows(company_id: str, now: str) -> List[tuple]:
                     level, group_name, acct_type, True,
                     True, True, now, now,
                 ))
+
+    for info in extra_accounts or []:
+        code = str(info.get("code") or "").strip()
+        name = str(info.get("name") or "").strip()
+        if not code or not name or code in seen_codes:
+            continue
+        seen_codes.add(code)
+        parent_code = str(
+            info.get("parentCode") or info.get("parent_code") or ""
+        ).strip()
+        category = str(info.get("category") or "").strip()
+        account_type = str(info.get("type") or "").strip()
+        is_leaf = bool(info.get("isLeaf", info.get("is_leaf", True)))
+        rows.append((
+            f"acct-{company_id}-{code}",
+            company_id,
+            code,
+            name,
+            parent_code or None,
+            1 + (len(code) > 4) + (len(code) > 7),
+            category or None,
+            account_type or None,
+            is_leaf,
+            True,
+            True,
+            now,
+            now,
+        ))
 
     return rows
 
@@ -96,6 +126,11 @@ async def _ensure_schema() -> None:
 
 
 async def _seed_system_accounts(company_id: str) -> None:
+    from services.industry_template_service import (
+        account_presets,
+        template_for_company,
+    )
+
     conn = await get_conn()
     try:
         cursor = await conn.execute(
@@ -116,8 +151,10 @@ async def _seed_system_accounts(company_id: str) -> None:
             await conn.commit()
             return
 
+        template = await template_for_company(company_id)
+        presets = list(account_presets(template))
         now = _now_iso()
-        seed_rows = _build_seed_rows(company_id, now)
+        seed_rows = _build_seed_rows(company_id, now, presets)
 
         if seed_rows:
             await conn.executemany(

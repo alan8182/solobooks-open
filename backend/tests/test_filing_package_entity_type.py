@@ -30,7 +30,10 @@ async def _create_company(
     from db.models import Company
     from db.session import session_scope
 
-    payload = {"type": entity_type} if entity_type else {}
+    # 申报作业包要求统一社会信用代码：给测试账套一个合法占位
+    payload = {"taxId": "91330100MA2TEST001"}
+    if entity_type:
+        payload["type"] = entity_type
     async with session_scope() as session:
         session.add(
             Company(

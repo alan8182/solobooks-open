@@ -32,9 +32,28 @@ LLM_SEND_ENABLE_THINKING = os.getenv("LLM_SEND_ENABLE_THINKING", "1").strip().lo
 # 深度思考开关：默认关闭以保证日常记账低时延；需要深度分析时可通过前端动态开启或在 .env 设置
 QWEN_ENABLE_THINKING = os.getenv("QWEN_ENABLE_THINKING", "false").strip().lower() == "true"
 
+# ── 政策检索（DeepSeek Search：agent 实时核验税务政策，唯一对外检索出口）──
+# 文档 https://api-docs.deepseek.com/zh-cn/guides/search：每 1000 次成功请求 5 元，
+# 失败/无结果不计费。Key 默认回落 LLM_API_KEY（当前 .env 即 DeepSeek key，同账户同主机）。
+# 应急停用：.env 设 POLICY_SEARCH_OFF=1，工具返回 disabled 并走"未核实"降级。
+DEEPSEEK_SEARCH_BASE_URL = os.getenv("DEEPSEEK_SEARCH_BASE_URL", "").strip() or "https://api.deepseek.com/v1"
+DEEPSEEK_SEARCH_API_KEY = os.getenv("DEEPSEEK_SEARCH_API_KEY", "").strip() or LLM_API_KEY
+POLICY_SEARCH_DOMAINS = tuple(
+    d.strip()
+    for d in os.getenv(
+        "POLICY_SEARCH_DOMAINS",
+        "chinatax.gov.cn,mof.gov.cn,gov.cn,flk.npc.gov.cn",
+    ).split(",")
+    if d.strip()
+)
+POLICY_SEARCH_TIMEOUT_S = float(os.getenv("POLICY_SEARCH_TIMEOUT_S", "15"))
+POLICY_SEARCH_OFF = os.getenv("POLICY_SEARCH_OFF", "0").strip().lower() in ("1", "true", "yes", "on")
+
 # 服务配置
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8001"))
+# 网页端公开地址：用于让 MCP/对话把最终锁账引导回登录后的产品页面。
+APP_PUBLIC_URL = (os.getenv("APP_PUBLIC_URL", "").strip() or "https://solobooks.cn").rstrip("/")
 # CORS：默认仅本地开发前端（vite 5173）。allow_credentials=True 时通配符源
 # 等效全开（Starlette 回显任意 Origin），生产必须显式配置白名单。
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
@@ -109,3 +128,28 @@ if _llm_price_raw:
 RD_DEPARTMENTS = tuple(
     part.strip() for part in os.getenv("RD_DEPARTMENTS", "研发部").split(",") if part.strip()
 )
+
+# ── 邮件单据通道（专属收件地址，catch-all 邮箱 IMAP 拉取）────────────────
+# 邮箱侧是中转站：拉取入库后即删信，长期存储在本地 data/inbox/。
+# 换邮箱服务商只需改这里的 IMAP 配置与 DNS MX 指向，地址码与前端零改动。
+# 未配置 IMAP 三项时轮询不启动（功能入口仍可见，提示未开通）。
+MAIL_INBOUND_IMAP_HOST = os.getenv("MAIL_INBOUND_IMAP_HOST", "").strip()
+MAIL_INBOUND_IMAP_PORT = int(os.getenv("MAIL_INBOUND_IMAP_PORT", "993"))
+MAIL_INBOUND_IMAP_USER = os.getenv("MAIL_INBOUND_IMAP_USER", "").strip()
+MAIL_INBOUND_IMAP_PASSWORD = os.getenv("MAIL_INBOUND_IMAP_PASSWORD", "")
+# 专属地址展示用域名（收件地址 = address_code@域名），须与 catch-all 域名一致
+MAIL_INBOUND_DOMAIN = os.getenv("MAIL_INBOUND_DOMAIN", "solobooks.cn").strip().lstrip("@").lower()
+# 轮询间隔（秒）；0 或未配置 IMAP 时不启动后台收取
+MAIL_POLL_SECONDS = max(int(os.getenv("MAIL_POLL_SECONDS", "180") or 0), 0)
+# 单附件大小上限（MB）：超出仍留档可下载，但不进入待导入
+MAIL_INBOUND_MAX_ATTACHMENT_MB = int(os.getenv("MAIL_INBOUND_MAX_ATTACHMENT_MB", "50") or 50)
+
+
+def mail_inbound_enabled() -> bool:
+    """IMAP 配置齐全且域名已设置时，邮件收取链路可用。"""
+    return bool(
+        MAIL_INBOUND_IMAP_HOST
+        and MAIL_INBOUND_IMAP_USER
+        and MAIL_INBOUND_IMAP_PASSWORD
+        and MAIL_INBOUND_DOMAIN
+    )

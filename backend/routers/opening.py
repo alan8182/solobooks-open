@@ -30,6 +30,9 @@ class OpeningBalanceItem(BaseModel):
     debit_balance: Decimal = Decimal("0")
     credit_balance: Decimal = Decimal("0")
     partner_name: Optional[str] = None
+    # 期初分录不做辅助核算归一化，partner_id 只能由调用方带进来。
+    # 缺失时服务层按 partner_name 解析（见 _resolve_opening_partners）。
+    partner_id: Optional[str] = None
 
 
 class TaxOpeningMemory(BaseModel):
@@ -45,6 +48,8 @@ class SaveOpeningRequest(BaseModel):
     start_period: Optional[str] = None  # 如 "2026-06"，为空默认 "{fiscal_year}-01"
     items: List[OpeningBalanceItem]
     ytd_items: Optional[List[OpeningBalanceItem]] = None  # 年中建账损益本年累计发生额
+    # 年初（1 月 1 日）余额快照：只填报表「年初余额」列，不进凭证
+    year_start_items: Optional[List[OpeningBalanceItem]] = None
     tax_memory: Optional[TaxOpeningMemory] = None
     fixed_assets: Optional[List[dict]] = None
 
@@ -95,6 +100,9 @@ async def save_balances(
         request_id=request.headers.get("X-Request-ID") or f"opening:{ctx.company_id}:{req.fiscal_year}",
         start_period=req.start_period,
         ytd_items=[item.model_dump() for item in req.ytd_items] if req.ytd_items else None,
+        year_start_items=(
+            [item.model_dump() for item in req.year_start_items] if req.year_start_items else None
+        ),
         tax_memory=req.tax_memory.model_dump() if req.tax_memory else None,
         fixed_assets=req.fixed_assets,
         session=session,

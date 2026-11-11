@@ -44,6 +44,8 @@ describe('tab page registry', () => {
     expect(tabTitle('/reports', false)).toBe('经营报表')
     expect(tabTitle('/reports', true)).toBe('经营')
     expect(tabTitle('/vouchers', true)).toBe('记账凭证')
+    expect(tabTitle('/mine/salary', true)).toBe('工资薪金')
+    expect(tabTitle('/mine/salary', false)).toBe('薪酬管理')
   })
 })
 

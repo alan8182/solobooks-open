@@ -104,7 +104,9 @@ async def purge_company(
             raise CompanyNotFoundError("主体不存在或无权删除")
 
         payload = company.payload or {}
-        company_name = str(payload.get("name") or "")
+        # 双侧都 strip：历史数据可能存有前导/尾随空格（创建入口早期未 trim），
+        # 只对输入 strip 会让用户永远对不上看不见的空格
+        company_name = str(payload.get("name") or "").strip()
         if (confirm_name or "").strip() != company_name:
             raise CompanyDeleteError("主体名称不匹配，请输入完整名称后再试")
 

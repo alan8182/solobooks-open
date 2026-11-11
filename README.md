@@ -5,18 +5,18 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-SoloBooks_v2.0-blue.svg" alt="SoloBooks License v2.0" /></a>
   <a href="#技术栈"><img src="https://img.shields.io/badge/Python-3.13-brightgreen.svg" alt="Python 3.13" /></a>
   <a href="#技术栈"><img src="https://img.shields.io/badge/Vue-3.x-42b883.svg" alt="Vue 3" /></a>
-  <a href="MCP接入方案.md"><img src="https://img.shields.io/badge/MCP-Supported-purple.svg" alt="MCP Supported" /></a>
+  <a href="docs/mcp-integration.md"><img src="https://img.shields.io/badge/MCP-Supported-purple.svg" alt="MCP Supported" /></a>
 </p>
 
-梭罗记账（SoloBooks）是一套面向**一人公司（OPC）与小微企业**的 AI 智能记账与自助报税系统。以「智能记账 + 规范对账 + 结账检查 + 自助报税」为完整闭环，帮助创业者把日常收支、全电发票、银行与微信流水沉淀为标准会计账簿，并通过 AI 报税副驾与电子税务局申报作业包，让经营者零财务门槛也能自己轻松完成记账与报税。
+梭罗记账（SoloBooks）是一套面向**一人公司（OPC）与小微企业**的 AI 智能记账与自助报税系统。以「智能记账 + 规范对账 + 结账检查 + 自助报税」为完整闭环，帮助创业者把日常收支、全电发票、银行与微信流水沉淀为标准会计账簿，并通过电子税务局申报作业包，让经营者零财务门槛也能自己轻松完成记账与报税。
 
 > **为什么做梭罗记账？**
 > 梭罗一个人在瓦尔登湖畔独立生活、劳作与记录——一个人的公司，更值得一套清晰透明、自主可控的账税体系。
 >
-> 过去，小微企业找外部代账机构，往往只是因为“报税门槛高、怕填错表”；但传统代账一年收取数千元，绝大多数只做机械的流水记录，既不帮你看懂经营数据，遇到税收政策变化也难以深度跟进。
+> 过去，小微企业找外部代账机构，往往只是因为“报税门槛高、怕填错表”；但传统代账把老板当成“甩手掌柜”，绝大多数只抄发票、不对银行流水、公私往来全塞进“其他应收款”。这不仅让老板永远看不懂自己生意的真实底牌，更在公司未来申请银行授信、申报补贴或股权融资尽调（DD）时，留下一本必须推倒重做的烂账。
 >
-> **在 AI 时代，记账报税完全可以由创业者自己掌控。**
-> 随着数电发票与新版电子税务局的全面推行，记账与报税的规则正在变得高度结构化。借助大模型与确定性复式记账引擎，AI 能够自动完成票据分类、凭证归集、对账平账，并一键生成电子税务局小抄与申报底稿。梭罗记账的初衷，正是把**“记账的主动权”**与**“报税的自由度”**真正交还给每一位超级个体与小微经营者——不用受制于外部代账中介，自己也能轻松管好账、独立报好税！
+> **我们坚信两件事：第一，做老板的一定要懂一点财务；第二，好公司不是融到资才开始规范财务，而是从第一天起就按你期许的样子管账。**
+> 随着数电发票与新版电子税务局的全面推行，借助大模型与确定性复式记账引擎，AI 已经能自动完成票据分类、凭证归集、流水配平，并一键生成电子税务局申报底稿。梭罗记账不仅把**“记账的主动权”**与**“报税的自由度”**交还给创业者，更通过“老板白话视图 + 会计标准账表”的同源映射，陪你在日常经营中自然建立财务直觉，从第一天起养出一本**票流一致、公私分明、随时经得起审计与投资人尽调**的体面账。
 
 > 📌 **授权说明**：本项目采用**源码可用许可**（[SoloBooks License v2.0](LICENSE)）：个人、个体工商户、一人公司与小微企业可**永久免费自托管**用于本企业内部记账与报税（含产生经营收入的日常记账）；未经书面授权，**不得**对外提供 SaaS 托管、付费云平台或第三方商业代账服务。商业授权（Partner License）与合作请联系：**founder@jiezixingchen.com**。
 
@@ -26,6 +26,7 @@
 
 - **老板 / 会计双视图**：顶部一键切换经营视角与专业视角，同一套账、同一个 URL；视图只改变导航与信息密度，不改变权限
 - **智能记账**：AI 识别文字/语音/单据 → 自动判断收支方向、金额与费用分类，生成记账凭证草稿；AI 只起草，入账必须人工确认
+- **越用越准的专属记忆规则**：每家企业独立的分类规则库——你确认过的流水会记住「对手方 + 用途 + 金额区间」，下次同类流水自动优先命中；命中与纠正全程留痕，规则可查看、可修改、可停用，系统越用越懂你的生意
 - **自助报税与申报小抄**：增值税、企业所得税预缴/汇算、经营所得个税（A 表预缴 / B 表汇算 / C 表提示，仅查账征收）测算；一键生成电子税务局申报数据包，自主申报不求人
 - **发票全流程**：全电发票 Excel 导入（标准列名自动映射）、AI 智能分类、发票台账、明细查验与进销项核对
 - **流水智能认领**：银行流水 / 微信账单导入后，以流水为客观事实认领到发票或凭证；月结第 4 步统一「认领 + 配平」，历史遗留流水单独列出
@@ -47,7 +48,7 @@
 | 后端 | Python 3.13 · FastAPI · SQLAlchemy(async) · Alembic |
 | 数据库 | PostgreSQL 16 |
 | 前端 Web | Vue 3 · TypeScript · Vite · Naive UI · Pinia · Tailwind |
-| 小程序 | uni-app（**默认不公开，另行处理**） |
+| 移动端 | uni-app Vue 3 + TypeScript（`mobile/`，微信小程序为主渠道；仅私有仓库维护） |
 | 部署 | Docker Compose · Nginx |
 
 ## 目录结构
@@ -64,15 +65,17 @@
 │   └── tests/          # 后端测试
 ├── web/                # Vue 前端
 │   ├── src/
-│   │   ├── pages/      # 页面（工作台/AI 会计/账本/报表/结账/归集…）
+│   │   ├── pages/      # 页面（工作台/AI CFO/账本/报表/结账/归集…）
 │   │   ├── components/ # 组件
 │   │   ├── api/        # API 客户端
 │   │   ├── stores/     # Pinia 状态
 │   │   └── utils/      # 工具函数
 │   ├── docs/           # 前端设计规范与页面交互文档
 │   └── vite.config.ts  # 含 dev 代理
+├── mobile/             # 移动端工程（uni-app Vue 3 + TS，微信小程序为主渠道）
 ├── deploy/             # Docker/生产部署配置
 ├── brand/              # 品牌素材（logo、favicon）
+├── archive/            # 已归档历史方案与赛后材料（仅私有仓库维护）
 └── docs/               # 开发与运维文档
 ```
 
@@ -83,9 +86,9 @@
 | [web/docs/pages-and-interactions.md](web/docs/pages-and-interactions.md) | 前端页面、路由与交互逻辑总览 |
 | [docs/development-workflow.md](docs/development-workflow.md) | 本地热更新、Docker 构建与数据库变更流程 |
 | [docs/finance-core-runbook.md](docs/finance-core-runbook.md) | 财务核心运维与排障手册 |
-| [MCP接入方案.md](MCP接入方案.md) / [docs/mcp-integration.md](docs/mcp-integration.md) | 外部 AI 接入设计与使用说明；在线版图文指南见 [AI 连接中心](https://solobooks.cn/ai-connect)（源码 `web/src/pages/mcp-guide/`） |
+| [docs/mcp-integration.md](docs/mcp-integration.md) | 外部 AI 接入设计与使用说明；在线版图文指南见 [AI 连接中心](https://solobooks.cn/ai-connect)（源码 `web/src/pages/mcp-guide/`） |
 
-> 产品需求文档（`梭罗记账_PRD_v4.md`）与视觉设计规范（`DESIGN.md`、`DESIGN_SYSTEM.md`）为内部文档，仅在私有开发仓库中维护，不随本开源库发布。
+> 产品需求文档（`archive/梭罗记账_PRD_v4.md`，已归档）与视觉设计规范（`DESIGN.md`、`DESIGN_SYSTEM.md`）为内部文档，仅在私有开发仓库中维护，不随本开源库发布。
 
 ## 快速开始（本地开发）
 

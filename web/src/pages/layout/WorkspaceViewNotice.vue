@@ -25,8 +25,8 @@ const targetView = computed<WorkspaceView>(() => (
 
 const noticeText = computed(() => (
   targetView.value === 'accounting'
-    ? '当前页面属于会计视图，你正在老板视图中查看。'
-    : '当前页面属于老板视图，你正在会计视图中查看。'
+    ? '当前页面属于会计视图，你正在老板视图中查看。同一套账支持老板看现金与利润、会计看准则分录与尽调底稿。'
+    : '当前页面属于老板视图，你正在会计视图中查看。同一套账支持老板白话视角与会计准则视角同源对照。'
 ))
 
 function switchView() {
@@ -57,7 +57,8 @@ function switchView() {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 16px;
+  max-width: var(--page-width);
+  margin: 0 auto 16px;
   padding: 10px 14px;
   border: 1px solid var(--solo-border);
   border-radius: var(--solo-radius, 8px);

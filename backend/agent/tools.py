@@ -55,6 +55,8 @@ def _set_analysis_cache(tool_name: str, company_id: str, key_arg: str, val: Any)
 class ToolContext:
     user_id: str
     company_id: str
+    source: str = "product"
+    conversation_id: Optional[str] = None
 
 
 ToolHandler = Callable[..., Awaitable[Any]]
@@ -519,23 +521,38 @@ async def _get_entry_detail(ctx: ToolContext, entry_id: str) -> Any:
 # 结账工具（M2）
 # ---------------------------------------------------------------------------
 
-async def _run_close_checks(ctx: ToolContext, month: str) -> Any:
+async def _run_close_checks(
+    ctx: ToolContext,
+    month: str,
+    findingLimit: int = 100,
+    findingCursor: int = 0,
+) -> Any:
     """运行结账五项检查（账证/账账/账实/账表/税表）。"""
     month_str = str(month)
-    cached = _get_analysis_cache("run_close_checks", ctx.company_id, month_str)
-    if cached is not None:
-        return cached
 
     from db.session import session_scope
-    from services.accounting_core_service import period_close_checks
+    from services.closing_workflow_service import get_closing_snapshot
 
     async with session_scope() as session:
-        result = await period_close_checks(session, ctx.company_id, month_str)
-        _set_analysis_cache("run_close_checks", ctx.company_id, month_str, result)
-        return result
+        return await get_closing_snapshot(
+            session,
+            ctx.company_id,
+            month_str,
+            user_id=ctx.user_id,
+            compact=True,
+            finding_limit=findingLimit,
+            finding_cursor=findingCursor,
+        )
 
 
-async def _list_unmatched(ctx: ToolContext, month: Optional[str] = None, limit: int = 20) -> Any:
+async def _list_unmatched(
+    ctx: ToolContext,
+    month: Optional[str] = None,
+    limit: int = 20,
+    snapshotHash: Optional[str] = None,
+    findingLimit: int = 20,
+    findingCursor: int = 0,
+) -> Any:
     """票/流/账差异：未匹配流水清单（带 ID）+ AI 对账建议（带可直接用的 ID 对）。"""
     from datetime import datetime, timezone
     from services.bank_service import get_difference_report, ai_suggest_matches, get_statements
@@ -543,6 +560,25 @@ async def _list_unmatched(ctx: ToolContext, month: Optional[str] = None, limit: 
 
     target_month = str(month or "").strip() or datetime.now(timezone.utc).strftime("%Y-%m")
     month = period_start_for(target_month).strftime("%Y-%m")
+    from db.session import session_scope
+    from services.closing_workflow_service import get_closing_snapshot, validate_snapshot_hash
+
+    async with session_scope() as session:
+        if snapshotHash:
+            snapshot = await validate_snapshot_hash(
+                session,
+                ctx.company_id,
+                month,
+                snapshotHash,
+                user_id=ctx.user_id,
+            )
+        else:
+            snapshot = await get_closing_snapshot(
+                session,
+                ctx.company_id,
+                month,
+                user_id=ctx.user_id,
+            )
     diff = await get_difference_report(ctx.company_id, month)
 
     # 本月未匹配流水的真实 ID 清单（difference report 只有摘要，没有 ID）
@@ -579,8 +615,34 @@ async def _list_unmatched(ctx: ToolContext, month: Optional[str] = None, limit: 
         if isinstance(s, dict) and s.get("statementId") in {row["id"] for row in unmatched_rows}
     ]
 
+    book_findings = [
+        item
+        for item in (snapshot.get("findings") or [])
+        if item.get("checkCode") == "BOOK_TO_ACTUAL"
+    ]
+    cursor = max(0, int(findingCursor or 0))
+    page_size = max(1, min(int(findingLimit or 20), 100))
+    page = book_findings[cursor:cursor + page_size]
+    next_cursor = cursor + len(page)
+
+    async with session_scope() as session:
+        await validate_snapshot_hash(
+            session,
+            ctx.company_id,
+            month,
+            snapshot.get("snapshotHash"),
+            user_id=ctx.user_id,
+        )
+
     return {
         "month": month,
+        "schemaVersion": snapshot.get("schemaVersion"),
+        "snapshotHash": snapshot.get("snapshotHash"),
+        "periodVersion": snapshot.get("periodVersion"),
+        "generatedAt": snapshot.get("generatedAt"),
+        "findings": page,
+        "findingsTotal": len(book_findings),
+        "nextFindingCursor": next_cursor if next_cursor < len(book_findings) else None,
         "unmatchedStatements": [
             {
                 "statementId": r["id"],
@@ -593,20 +655,59 @@ async def _list_unmatched(ctx: ToolContext, month: Optional[str] = None, limit: 
         "aiSuggestions": suggestions,
         "aiSuggestionsError": suggestions_error,
         "usage": (
-            "仅对 type=match 的建议：将完整 matchedEntryIds 传入 propose_match，不能只取第一笔；其他类型需人工核对。"
-            "对 unmatchedStatements 里没有建议的流水：先用 search_books/list_entries 找到对应账目拿到 entry id，"
-            "再调 propose_match；确实找不到对应账目的，问用户是否需要新建账目。"
+            "AI 建议只用于展示，执行时必须使用 findings[].findingId、snapshotHash 和权威 statementId。"
+            "已有凭证的匹配将完整 matchedEntryIds 传入 propose_match；没有对应凭证的流水使用 "
+            "propose_statement_vouchers，逐笔传 statementId 与服务端有效 category。"
+            "其他类型需人工核对；金额、方向、日期、摘要一律以工具返回为准。"
         ),
         "differenceSummary": _truncate(diff, 3000),
     }
 
 
-async def _preview_accruals(ctx: ToolContext, month: str) -> Any:
+async def _preview_accruals(
+    ctx: ToolContext,
+    month: str,
+    snapshotHash: Optional[str] = None,
+) -> Any:
     """预览本月待计提事项：折旧（未计提的在用固定资产）、摊销（未计提的在用无形资产）与工资（工资表状态）。"""
     from services.database import get_conn
 
     period = str(month)
-    result: Dict[str, Any] = {"month": period}
+    from db.session import session_scope
+    from services.closing_workflow_service import get_closing_snapshot, validate_snapshot_hash
+
+    async with session_scope() as session:
+        if snapshotHash:
+            snapshot = await validate_snapshot_hash(
+                session,
+                ctx.company_id,
+                period,
+                snapshotHash,
+                user_id=ctx.user_id,
+            )
+        else:
+            snapshot = await get_closing_snapshot(
+                session,
+                ctx.company_id,
+                period,
+                user_id=ctx.user_id,
+            )
+    result: Dict[str, Any] = {
+        "month": period,
+        "schemaVersion": snapshot.get("schemaVersion"),
+        "snapshotHash": snapshot.get("snapshotHash"),
+        "periodVersion": snapshot.get("periodVersion"),
+        "findings": [
+            item
+            for item in (snapshot.get("findings") or [])
+            if item.get("checkCode")
+            in {
+                "FIXED_ASSET_DEPRECIATION",
+                "INTANGIBLE_AMORTIZATION",
+                "PAYROLL_ACCRUAL",
+            }
+        ],
+    }
 
     # 折旧：在用固定资产中本期 planned 且未过账的（P1 WP-B 起读核心 ORM）
     pending_depreciation: List[Dict[str, Any]] = []
@@ -707,6 +808,14 @@ async def _preview_accruals(ctx: ToolContext, month: str) -> Any:
     except Exception:
         logger.exception("salary preview failed")
         result["salary"] = {"sheetExists": False, "status": None, "employeeCount": 0, "message": "工资模块未初始化"}
+    async with session_scope() as session:
+        await validate_snapshot_hash(
+            session,
+            ctx.company_id,
+            period,
+            snapshot.get("snapshotHash"),
+            user_id=ctx.user_id,
+        )
     return result
 
 
@@ -714,6 +823,9 @@ async def _propose_match(
     ctx: ToolContext,
     statement_id: str,
     entry_ids: List[str],
+    month: str,
+    snapshotHash: str,
+    findingId: str,
     note: Optional[str] = None,
 ) -> Any:
     """创建银行流水↔账目对账建议（待用户确认后落账）。"""
@@ -759,27 +871,71 @@ async def _propose_match(
     if not entries_display:
         return {"error": "账目记录不存在"}
 
+    payload = {
+        "statementId": statement_id,
+        "entryIds": clean_ids,
+        "statement": {
+            "date": str(stmt["transaction_date"]),
+            "description": stmt["description"],
+            "amount": float(stmt["amount"] or 0),
+        },
+        "entries": entries_display,
+    }
+    from db.session import session_scope
+    from services.closing_workflow_service import (
+        closing_action_binding,
+        validate_closing_action_binding,
+    )
+
+    binding_request = {
+        "month": str(month),
+        "findingId": str(findingId),
+        "baseSnapshotHash": str(snapshotHash),
+        "periodVersion": None,
+        "surface": ctx.source,
+    }
+    async with session_scope() as session:
+        snapshot, finding = await validate_closing_action_binding(
+            session,
+            ctx.company_id,
+            "propose_match",
+            payload,
+            binding_request,
+            user_id=ctx.user_id,
+        )
+    closing_binding = closing_action_binding(snapshot, finding, surface=ctx.source)
+
     action = await create_action(
         company_id=ctx.company_id,
         user_id=ctx.user_id,
         action_type="propose_match",
         title="银行流水对账建议",
-        payload={
-            "statementId": statement_id,
-            "entryIds": clean_ids,
-            "statement": {
-                "date": str(stmt["transaction_date"]),
-                "description": stmt["description"],
-                "amount": float(stmt["amount"] or 0),
-            },
-            "entries": entries_display,
+        payload=payload,
+        evidence={
+            "note": note or "",
+            "created_via": "agent_closing_repair",
+            "closingBinding": closing_binding,
+            "actionVersion": 1,
         },
-        evidence={"note": note or "", "created_via": "agent_close"},
+        conversation_id=ctx.conversation_id,
     )
-    return {"actionId": action["id"], "status": action["status"], "message": "对账建议已创建，等待用户确认"}
+    return {
+        "actionId": action["id"],
+        "status": action["status"],
+        "snapshotHash": snapshotHash,
+        "findingId": findingId,
+        "message": "对账草稿已创建，等待用户确认；当前尚未执行匹配",
+    }
 
 
-async def _propose_accrual(ctx: ToolContext, kind: str, month: str, note: Optional[str] = None) -> Any:
+async def _propose_accrual(
+    ctx: ToolContext,
+    kind: str,
+    month: str,
+    snapshotHash: str,
+    findingId: str,
+    note: Optional[str] = None,
+) -> Any:
     """创建计提确认草稿（折旧/摊销/工资），用户确认后执行现有计提服务。"""
     from agent.actions import create_action
 
@@ -790,7 +946,7 @@ async def _propose_accrual(ctx: ToolContext, kind: str, month: str, note: Option
     if not month:
         return {"error": "需要月份（YYYY-MM）"}
 
-    preview = await _preview_accruals(ctx, month)
+    preview = await _preview_accruals(ctx, month, snapshotHash=snapshotHash)
     kind_preview = preview.get(kind) or {}
 
     title_map = {
@@ -800,40 +956,128 @@ async def _propose_accrual(ctx: ToolContext, kind: str, month: str, note: Option
     }
     title = f"{title_map.get(kind, '计提')}（{month}）"
 
+    payload = {
+        "kind": kind,
+        "month": month,
+        "preview": kind_preview,
+    }
+    from db.session import session_scope
+    from services.closing_workflow_service import (
+        closing_action_binding,
+        validate_closing_action_binding,
+    )
+
+    binding_request = {
+        "month": month,
+        "findingId": str(findingId),
+        "baseSnapshotHash": str(snapshotHash),
+        "periodVersion": None,
+        "surface": ctx.source,
+    }
+    async with session_scope() as session:
+        snapshot, finding = await validate_closing_action_binding(
+            session,
+            ctx.company_id,
+            "propose_accrual",
+            payload,
+            binding_request,
+            user_id=ctx.user_id,
+        )
+    closing_binding = closing_action_binding(snapshot, finding, surface=ctx.source)
+
     action = await create_action(
         company_id=ctx.company_id,
         user_id=ctx.user_id,
         action_type="propose_accrual",
         title=title,
-        payload={
-            "kind": kind,
-            "month": month,
-            "preview": kind_preview,
+        payload=payload,
+        evidence={
+            "note": note or "",
+            "created_via": "agent_closing_repair",
+            "closingBinding": closing_binding,
+            "actionVersion": 1,
         },
-        evidence={"note": note or "", "created_via": "agent_close"},
+        conversation_id=ctx.conversation_id,
     )
     return {
         "actionId": action["id"],
         "status": action["status"],
+        "snapshotHash": snapshotHash,
+        "findingId": findingId,
         "preview": kind_preview,
-        "message": "计提草稿已创建，等待用户确认后执行",
+        "message": "计提草稿已创建，等待用户确认；当前尚未执行计提",
     }
 
 
-async def _preview_asset_actions(ctx: ToolContext, month: str) -> Any:
+async def _preview_asset_actions(
+    ctx: ToolContext,
+    month: str,
+    snapshotHash: Optional[str] = None,
+) -> Any:
     """预览资产处理：缺卡交易、待提折旧/摊销、阻塞项。"""
     from services.asset_closure_service import preview_asset_closure
+    from db.session import session_scope
+    from services.closing_workflow_service import get_closing_snapshot, validate_snapshot_hash
 
-    return await preview_asset_closure(ctx.company_id, ctx.user_id, str(month))
+    async with session_scope() as session:
+        if snapshotHash:
+            snapshot = await validate_snapshot_hash(
+                session,
+                ctx.company_id,
+                str(month),
+                snapshotHash,
+                user_id=ctx.user_id,
+            )
+        else:
+            snapshot = await get_closing_snapshot(
+                session,
+                ctx.company_id,
+                str(month),
+                user_id=ctx.user_id,
+            )
+    preview = await preview_asset_closure(ctx.company_id, ctx.user_id, str(month))
+    async with session_scope() as session:
+        await validate_snapshot_hash(
+            session,
+            ctx.company_id,
+            str(month),
+            snapshot.get("snapshotHash"),
+            user_id=ctx.user_id,
+        )
+    return {
+        **preview,
+        "schemaVersion": snapshot.get("schemaVersion"),
+        "snapshotHash": snapshot.get("snapshotHash"),
+        "periodVersion": snapshot.get("periodVersion"),
+        "findings": [
+            item
+            for item in (snapshot.get("findings") or [])
+            if item.get("checkCode")
+            in {
+                "ASSET_CLOSURE",
+                "FIXED_ASSET_DEPRECIATION",
+                "INTANGIBLE_AMORTIZATION",
+                "FIXED_ASSET_RECONCILIATION",
+                "IMPAIRMENT_TEST_DUE",
+            }
+        ],
+    }
 
 
-async def _propose_asset_closure(ctx: ToolContext, month: str, note: Optional[str] = None) -> Any:
+async def _propose_asset_closure(
+    ctx: ToolContext,
+    month: str,
+    snapshotHash: str,
+    findingId: str,
+    note: Optional[str] = None,
+) -> Any:
     """把建卡和折旧/摊销补提合成一张待确认动作。"""
     from services.asset_closure_service import (
         build_asset_closure_payload,
         preview_asset_closure,
     )
 
+    await _preview_asset_actions(ctx, str(month), snapshotHash=snapshotHash)
     preview = await preview_asset_closure(ctx.company_id, ctx.user_id, str(month))
     payload = build_asset_closure_payload(preview)
     has_processable = bool(
@@ -850,19 +1094,51 @@ async def _propose_asset_closure(ctx: ToolContext, month: str, note: Optional[st
             "message": "当前没有可处理的资产建卡或待补提折旧/摊销事项。",
         }
 
+    from db.session import session_scope
+    from services.closing_workflow_service import (
+        closing_action_binding,
+        validate_closing_action_binding,
+    )
+
+    binding_request = {
+        "month": str(month),
+        "findingId": str(findingId),
+        "baseSnapshotHash": str(snapshotHash),
+        "periodVersion": None,
+        "surface": ctx.source,
+    }
+    async with session_scope() as session:
+        snapshot, finding = await validate_closing_action_binding(
+            session,
+            ctx.company_id,
+            "propose_accrual",
+            payload,
+            binding_request,
+            user_id=ctx.user_id,
+        )
+    closing_binding = closing_action_binding(snapshot, finding, surface=ctx.source)
+
     action = await agent_actions.create_action(
         company_id=ctx.company_id,
         user_id=ctx.user_id,
         action_type="propose_accrual",
         title=f"资产处理确认（{month}）",
         payload=payload,
-        evidence={"note": note or "", "created_via": "agent_close"},
+        evidence={
+            "note": note or "",
+            "created_via": "agent_closing_repair",
+            "closingBinding": closing_binding,
+            "actionVersion": 1,
+        },
+        conversation_id=ctx.conversation_id,
     )
     return {
         "actionId": action["id"],
         "status": action["status"],
+        "snapshotHash": snapshotHash,
+        "findingId": findingId,
         "preview": preview,
-        "message": "资产处理确认已创建，等待老板确认后执行。",
+        "message": "资产处理草稿已创建，等待老板确认；当前尚未建卡或计提。",
     }
 
 
@@ -871,12 +1147,28 @@ async def _generate_close_report(ctx: ToolContext, month: str) -> Any:
     month = str(month)
     checks = await _run_close_checks(ctx, month)
     try:
-        unmatched = await _list_unmatched(ctx, month)
+        unmatched = await _list_unmatched(
+            ctx,
+            month,
+            snapshotHash=checks.get("snapshotHash"),
+        )
     except Exception:
         logger.exception("list_unmatched for report failed")
         unmatched = {"status": "unavailable", "message": "票流账差异查询失败，未完成核验，请重试"}
-    accruals = await _preview_accruals(ctx, month)
-    report_can_close = bool(checks.get("canClose")) and unmatched.get("status") != "unavailable"
+    try:
+        accruals = await _preview_accruals(
+            ctx,
+            month,
+            snapshotHash=checks.get("snapshotHash"),
+        )
+    except Exception:
+        logger.exception("preview_accruals for report failed")
+        accruals = {"status": "unavailable", "message": "计提状态查询失败，未完成核验，请重试"}
+    report_can_close = (
+        bool(checks.get("canClose"))
+        and unmatched.get("status") != "unavailable"
+        and accruals.get("status") != "unavailable"
+    )
 
     lines: List[str] = [f"# 结账检查报告（{month}）", ""]
     lines.append(f"期间状态：{checks.get('periodStatus')}；可结账：{'是' if report_can_close else '否'}（核心检查 {checks.get('blockingCount')} 项阻塞）")
@@ -912,6 +1204,16 @@ async def _generate_close_report(ctx: ToolContext, month: str) -> Any:
     if unmatched.get("unmatchedStatements"):
         lines.append(f"未匹配银行流水 {len(unmatched['unmatchedStatements'])} 笔。")
 
+    findings = checks.get("findings") or []
+    if findings:
+        lines.extend(["", "## 可处理问题", "", "| findingId | 问题 | 笔数 | 金额 | 可发起动作 |", "|---|---|---:|---:|---|"])
+        for finding in findings[:30]:
+            repairs = "、".join(finding.get("allowedRepairs") or []) or "需人工处理"
+            lines.append(
+                f"| {finding.get('findingId')} | {finding.get('title')} | "
+                f"{finding.get('count', 0)} | {finding.get('amount') or '—'} | {repairs} |"
+            )
+
     dep = accruals.get("depreciation") or {}
     amo = accruals.get("amortization") or {}
     sal = accruals.get("salary") or {}
@@ -924,12 +1226,43 @@ async def _generate_close_report(ctx: ToolContext, month: str) -> Any:
     if not report_can_close:
         lines.append("1. 处理上方阻塞项（对账/待处理凭证），完成后重新运行检查")
     lines.append("1. 需要计提的先发起计提确认")
-    lines.append("1. 全部通过后由用户在结账向导中点击锁账（agent 不会代为锁账）")
+    from services.closing_workflow_service import manual_close_guidance
+
+    # Report-level readiness can be stricter than the core snapshot (for
+    # example when a supplementary query failed), so align the link text with
+    # the report's final conclusion while keeping the same authoritative URL.
+    manual_close = manual_close_guidance(month, report_can_close)
+    lines.append(
+        f"1. 全部通过后由用户打开[月度结账向导]({manual_close['url']})点击锁账"
+        "（AI 和 MCP 不会代为锁账）"
+    )
+    lines.extend(["", "## 网页锁账入口", "", f"[{manual_close['label']}]({manual_close['url']})", "", manual_close["message"]])
 
     from services.audit_service import log_action
+    from db.session import session_scope
+    from services.closing_workflow_service import validate_snapshot_hash
 
     await log_action(ctx.company_id, ctx.user_id, "agent_close_report", "period", month, {"canClose": checks.get("canClose")})
-    return {"month": month, "canClose": report_can_close, "differenceStatus": unmatched.get("status", "available"), "report": "\n".join(lines), "checks": checks, "accruals": accruals}
+    async with session_scope() as session:
+        await validate_snapshot_hash(
+            session,
+            ctx.company_id,
+            month,
+            checks.get("snapshotHash"),
+            user_id=ctx.user_id,
+        )
+    return {
+        "month": month,
+        "schemaVersion": checks.get("schemaVersion"),
+        "snapshotHash": checks.get("snapshotHash"),
+        "periodVersion": checks.get("periodVersion"),
+        "canClose": report_can_close,
+        "differenceStatus": unmatched.get("status", "available"),
+        "report": "\n".join(lines),
+        "manualClose": manual_close,
+        "checks": checks,
+        "accruals": accruals,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -963,8 +1296,31 @@ _VOUCHER_PROPOSAL_SCHEMA = {
         "payer": _PAYER_SCHEMA,
         "merchant": {"type": "string", "description": "对方商户/单位，可选"},
         "note": {"type": "string", "description": "给用户的备注，可选"},
+        "statementId": {
+            "type": "string",
+            "description": "仅供服务端拒绝误用；银行流水必须调用 propose_statement_vouchers，不要使用本工具",
+        },
     },
     "required": ["direction", "amount", "title", "category"],
+}
+
+_STATEMENT_VOUCHER_PROPOSAL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "statementId": {
+            "type": "string",
+            "description": "list_unmatched 返回的银行流水 statementId；必须原样传入，禁止改写",
+        },
+        "category": {
+            "type": "string",
+            "description": (
+                "流水对应的有效分类，如办公费、营业外收入、股东投入、往来款。"
+                "分类方向必须与流水收支方向一致"
+            ),
+        },
+        "note": {"type": "string", "description": "给用户的分类依据说明，可选"},
+    },
+    "required": ["statementId", "category"],
 }
 
 
@@ -988,6 +1344,10 @@ async def _propose_vouchers(ctx: ToolContext, proposals: List[dict], note: Optio
         if not isinstance(p, dict):
             raise ValueError(f"proposals[{i}] 应为对象")
         cleaned = _enforce_schema(p, _VOUCHER_PROPOSAL_SCHEMA, f"proposals[{i}]")
+        if cleaned.get("statementId"):
+            raise ValueError(
+                f"proposals[{i}] 来自银行流水，必须调用 propose_statement_vouchers，不能使用 propose_vouchers"
+            )
         _assert_real_date(cleaned.get("occur_date"), f"proposals[{i}].")
         item = {
             "direction": cleaned.get("direction"),
@@ -1018,11 +1378,232 @@ async def _propose_vouchers(ctx: ToolContext, proposals: List[dict], note: Optio
         payload={"items": items},
         evidence={"note": note or "", "created_via": "agent_chat_batch"},
     )
+    income_total = sum(
+        (Decimal(str(item.get("amount") or 0)) for item in items if item.get("direction") == "income"),
+        Decimal("0"),
+    )
+    expense_total = sum(
+        (Decimal(str(item.get("amount") or 0)) for item in items if item.get("direction") == "expense"),
+        Decimal("0"),
+    )
     return {
         "actionId": action["id"],
         "status": action["status"],
         "count": len(items),
-        "message": "批量草稿已创建，等待用户在清单中一次性确认；用户可逐行排除或修改分类",
+        "totals": {
+            "income": float(income_total),
+            "expense": float(expense_total),
+        },
+        "items": [
+            {
+                "index": index,
+                "title": item.get("title"),
+                "direction": item.get("direction"),
+                "amount": item.get("amount"),
+                "occurDate": item.get("occurDate"),
+            }
+            for index, item in enumerate(items)
+        ],
+        "message": "待确认清单已创建，尚未生成凭证，也未入账；用户确认后才执行",
+    }
+
+
+async def _propose_statement_vouchers(
+    ctx: ToolContext,
+    proposals: List[dict],
+    month: Optional[str] = None,
+    snapshotHash: Optional[str] = None,
+    findingId: Optional[str] = None,
+    note: Optional[str] = None,
+) -> Any:
+    """按银行流水 ID 创建待确认凭证清单。
+
+    金额、方向、日期、摘要和对方均由数据库原始流水决定。模型只负责分类，
+    因此无法通过自由改写 amount/title/occur_date 制造不存在的流水凭证。
+    """
+    from services.bank_service import (
+        extract_statement_counterparty,
+        get_statements,
+        normalize_statement_description,
+    )
+    from services.category_service import list_categories
+
+    if not proposals:
+        return {"error": "proposals 为空"}
+
+    statement_rows = await get_statements(ctx.company_id)
+    statements = {str(row.get("id") or ""): row for row in statement_rows}
+    categories = {str(row.get("name") or ""): row for row in await list_categories(ctx.company_id)}
+
+    items: List[Dict[str, Any]] = []
+    statement_ids: List[str] = []
+    signed_net = Decimal("0")
+    inflow_total = Decimal("0")
+    outflow_total = Decimal("0")
+    absolute_total = Decimal("0")
+
+    for index, raw in enumerate(proposals):
+        cleaned = _enforce_schema(
+            raw,
+            _STATEMENT_VOUCHER_PROPOSAL_SCHEMA,
+            f"proposals[{index}]",
+        )
+        statement_id = str(cleaned.get("statementId") or "").strip()
+        if not statement_id:
+            raise ValueError(f"proposals[{index}] 缺少 statementId")
+        if statement_id in statement_ids:
+            raise ValueError(f"银行流水 {statement_id} 在同一清单中重复出现")
+        statement = statements.get(statement_id)
+        if statement is None:
+            raise ValueError(f"银行流水 {statement_id} 不存在或不属于当前账套")
+        if statement.get("matched_entry_ids") or statement.get("matched_entry_id"):
+            raise ValueError(f"银行流水 {statement_id} 已完成对账，不能再次生成凭证")
+
+        category = str(cleaned.get("category") or "").strip()
+        category_row = categories.get(category)
+        if category_row is None:
+            raise ValueError(
+                f"分类 {category!r} 不在当前账套的有效分类中；"
+                "请使用系统分类（如股东投入、办公费、营业外收入、往来款）"
+            )
+        direction = str(category_row.get("direction") or "").strip()
+        if direction not in ("income", "expense", "owner_transfer"):
+            raise ValueError(f"分类 {category!r} 缺少有效方向")
+
+        signed_amount = Decimal(str(statement.get("amount") or 0))
+        if signed_amount == 0:
+            raise ValueError(f"银行流水 {statement_id} 金额为 0，不能生成凭证")
+        if direction == "income" and signed_amount <= 0:
+            raise ValueError(f"流水 {statement_id} 是支出，不能使用收入分类 {category!r}")
+        if direction == "expense" and signed_amount >= 0:
+            raise ValueError(f"流水 {statement_id} 是收入，不能使用支出分类 {category!r}")
+
+        normalized = normalize_statement_description(str(statement.get("description") or ""))
+        title_parts = [part.strip() for part in normalized.split("|") if part.strip()]
+        remarks = [
+            re.sub(r"^(?:附言|备注|用途)\s*[:：]\s*", "", part)
+            for part in title_parts
+            if re.match(r"^(?:附言|备注|用途)\s*[:：]", part)
+        ]
+        title = (remarks[-1] if remarks else (title_parts[0] if title_parts else normalized)).strip()
+        title = re.sub(r"\s*\(对方\s*[:：].*\)\s*$", "", title).strip()
+        if not title or title == "-":
+            title = f"银行流水 {str(statement.get('transaction_date') or '')[:10]}"
+        merchant = extract_statement_counterparty(str(statement.get("description") or ""))
+        occur_date = str(statement.get("transaction_date") or "")[:10]
+
+        amount = signed_amount if direction == "owner_transfer" else abs(signed_amount)
+        item: Dict[str, Any] = {
+            "direction": direction,
+            "amount": float(amount),
+            "title": title[:120],
+            "category": category,
+            "payer": "company_account",
+            "occurDate": occur_date,
+            "paymentDate": occur_date,
+            "statementId": statement_id,
+            "sourceType": "bank_statement",
+            "dedupFingerprint": statement_id,
+            "linkedStatementId": statement_id,
+        }
+        if merchant:
+            item["merchant"] = merchant
+        if cleaned.get("note"):
+            item["note"] = cleaned["note"]
+        items.append(item)
+        statement_ids.append(statement_id)
+
+        signed_net += signed_amount
+        if signed_amount > 0:
+            inflow_total += signed_amount
+        else:
+            outflow_total += abs(signed_amount)
+        absolute_total += abs(signed_amount)
+
+    binding_inputs = [month, snapshotHash, findingId]
+    if any(binding_inputs) and not all(binding_inputs):
+        raise ValueError("结账修复必须同时提供 month、snapshotHash 和 findingId")
+
+    closing_binding = None
+    evidence: Dict[str, Any] = {
+        "note": note or "",
+        "created_via": "agent_chat_bank_statement_batch",
+        "sourceType": "bank_statement",
+        "statementIds": statement_ids,
+        "totals": {
+            "signedNet": float(signed_net),
+            "inflow": float(inflow_total),
+            "outflow": float(outflow_total),
+            "absolute": float(absolute_total),
+        },
+    }
+    if all(binding_inputs):
+        from db.session import session_scope
+        from services.closing_workflow_service import (
+            closing_action_binding,
+            validate_closing_action_binding,
+        )
+
+        payload = {"items": items}
+        binding_request = {
+            "month": str(month),
+            "findingId": str(findingId),
+            "baseSnapshotHash": str(snapshotHash),
+            "periodVersion": None,
+            "surface": ctx.source,
+        }
+        async with session_scope() as session:
+            snapshot, finding = await validate_closing_action_binding(
+                session,
+                ctx.company_id,
+                "propose_vouchers",
+                payload,
+                binding_request,
+                user_id=ctx.user_id,
+            )
+        closing_binding = closing_action_binding(snapshot, finding, surface=ctx.source)
+        evidence.update({
+            "created_via": "agent_closing_repair",
+            "closingBinding": closing_binding,
+            "actionVersion": 1,
+        })
+
+    action = await agent_actions.create_action(
+        company_id=ctx.company_id,
+        user_id=ctx.user_id,
+        action_type="propose_vouchers",
+        title=f"银行流水待确认记账（{len(items)} 笔）",
+        payload={"items": items},
+        evidence=evidence,
+        conversation_id=ctx.conversation_id,
+    )
+    return {
+        "actionId": action["id"],
+        "status": action["status"],
+        "source": "bank_statement",
+        "snapshotHash": snapshotHash if closing_binding else None,
+        "findingId": findingId if closing_binding else None,
+        "count": len(items),
+        "totals": {
+            "signedNet": float(signed_net),
+            "inflow": float(inflow_total),
+            "outflow": float(outflow_total),
+            "absolute": float(absolute_total),
+        },
+        "items": [
+            {
+                "index": index,
+                "statementId": item["statementId"],
+                "title": item["title"],
+                "direction": item["direction"],
+                "amount": item["amount"],
+                "occurDate": item["occurDate"],
+                "category": item["category"],
+            }
+            for index, item in enumerate(items)
+        ],
+        "message": "待确认清单已创建，尚未生成凭证，也未入账",
+        "onApproval": "仅在用户确认后生成凭证，并同步匹配清单内对应的银行流水；放弃则不生成凭证，流水保持未匹配",
     }
 
 
@@ -1077,64 +1658,9 @@ async def _propose_voucher(
 
 
 # ---------------------------------------------------------------------------
-# 建账与期初导入工具（新公司从零建账 / 代账旧账迁入）
+# 建账工具（新公司从零建账 / 代账旧账迁入；期初余额走网页工作台，不由对话生成）
 # ---------------------------------------------------------------------------
 
-_CONTAINER_TO_LEAF_CODE = {
-    "1221": "122103",
-    "2211": "2211001",
-    "2221": "2221026",
-    "2241": "224101",
-    "3104": "3104006",
-}
-
-_ACCOUNT_NAME_ALIASES = {
-    "现金": "1001",
-    "库存现金": "1001",
-    "银行存款": "1002",
-    "银行": "1002",
-    "应收账款": "1122",
-    "预付账款": "1123",
-    "其他应收款": "122103",
-    "原材料": "1403",
-    "库存商品": "1405",
-    "存货": "1405",
-    "固定资产": "1601",
-    "累计折旧": "1602",
-    "无形资产": "1701",
-    "累计摊销": "1702",
-    "长期待摊费用": "1801",
-    "短期借款": "2001",
-    "应付账款": "2202",
-    "预收账款": "2203",
-    "合同负债": "2203",
-    "应付职工薪酬": "2211001",
-    "应付工资": "2211001",
-    "工资": "2211001",
-    "应交税费": "2221026",
-    "未交增值税": "2221026",
-    "其他应付款": "224101",
-    "股东垫款": "224101",
-    "老板垫款": "224101",
-    "实收资本": "3001",
-    "注册资本": "3001",
-    "资本公积": "3002",
-    "盈余公积": "3101",
-    "本年利润": "3103",
-    "未分配利润": "3104006",
-    "利润分配": "3104006",
-}
-
-_OPENING_ITEM_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "account_code": {"type": "string", "description": "科目代码（如 1002、1122、2202、3001、3104006），可选"},
-        "account_name": {"type": "string", "description": "科目名称（如 银行存款、应收账款、实收资本），可选"},
-        "debit_balance": {"type": "number", "description": "借方期初余额（元，>=0）", "minimum": 0},
-        "credit_balance": {"type": "number", "description": "贷方期初余额（元，>=0）", "minimum": 0},
-        "partner_name": {"type": "string", "description": "往来单位名称（应收/应付/其他应收/其他应付可选填）"},
-    },
-}
 
 
 async def _propose_company_setup(
@@ -1189,198 +1715,6 @@ async def _propose_company_setup(
         "onboardingType": onboarding_type,
         "isFromDemo": is_from_demo,
         "message": "主体建账确认卡已创建，等待老板在卡片中核对并点击确认",
-    }
-
-
-async def _propose_opening_balance(
-    ctx: ToolContext,
-    items: List[dict],
-    ytd_items: Optional[List[dict]] = None,
-    start_period: Optional[str] = None,
-    prior_year_loss: Optional[float] = 0.0,
-    prepaid_cit_tax: Optional[float] = 0.0,
-    auto_plug_difference: Optional[bool] = False,
-    note: Optional[str] = None,
-) -> Any:
-    """创建期初余额导入确认卡（试算借贷平衡，老板确认并完成验证后生成正式期初凭证）。"""
-    from sqlalchemy import select
-    from core.money import ZERO, money, money_text
-    from db.models import ChartAccount
-    from db.session import session_scope
-    from services.account_service import get_company
-    from services.accounting_core_service import ensure_tenant
-    from services.opening_balance_service import _is_expense_revenue
-
-    company = await get_company(ctx.company_id) or {}
-    raw_start = str(start_period or (company.get("startDate") or "")[:7] or datetime.now().strftime("%Y-%m")).strip()
-    if not re.fullmatch(MONTH_PATTERN, raw_start):
-        raw_start = datetime.now().strftime("%Y-%m")
-    fiscal_year = int(raw_start.split("-")[0])
-
-    async with session_scope() as session:
-        await ensure_tenant(session, ctx.company_id, ctx.user_id)
-        accounts = (
-            await session.execute(
-                select(ChartAccount)
-                .where(ChartAccount.company_id == ctx.company_id, ChartAccount.is_active.is_(True))
-                .order_by(ChartAccount.code)
-            )
-        ).scalars().all()
-
-    by_code = {a.code: a for a in accounts}
-    leaf_by_name = {a.name: a for a in accounts if a.is_leaf}
-
-    def _resolve_account(raw_code: str, raw_name: str) -> tuple[str, str]:
-        code = _CONTAINER_TO_LEAF_CODE.get(raw_code, raw_code)
-        if code and code in by_code:
-            acc = by_code[code]
-            if acc.is_leaf:
-                return acc.code, acc.name
-            # 容器科目：找第一个启用末级子科目
-            for c_code, c_acc in by_code.items():
-                if c_acc.is_leaf and c_code.startswith(code):
-                    return c_acc.code, c_acc.name
-        if raw_name:
-            if raw_name in leaf_by_name:
-                acc = leaf_by_name[raw_name]
-                return acc.code, acc.name
-            alias_code = _ACCOUNT_NAME_ALIASES.get(raw_name)
-            if alias_code and alias_code in by_code:
-                return alias_code, by_code[alias_code].name
-            for a_name, acc in leaf_by_name.items():
-                if raw_name in a_name or a_name in raw_name:
-                    return acc.code, acc.name
-        return code or "1002", raw_name or "银行存款"
-
-    norm_items: List[Dict[str, Any]] = []
-    norm_ytd: List[Dict[str, Any]] = []
-    total_debit = ZERO
-    total_credit = ZERO
-
-    for idx, raw in enumerate(items or []):
-        if not isinstance(raw, dict):
-            continue
-        cleaned = _enforce_schema(raw, _OPENING_ITEM_SCHEMA, f"items[{idx}]")
-        code, name = _resolve_account(
-            str(cleaned.get("account_code") or "").strip(),
-            str(cleaned.get("account_name") or "").strip(),
-        )
-        debit = money(cleaned.get("debit_balance") or 0, allow_negative=False)
-        credit = money(cleaned.get("credit_balance") or 0, allow_negative=False)
-        if debit == ZERO and credit == ZERO:
-            continue
-        # 备抵科目（1602 累计折旧 / 1702 累计摊销）余额恒在贷方
-        if code in ("1602", "1702") and debit > ZERO and credit == ZERO:
-            credit, debit = debit, ZERO
-
-        if _is_expense_revenue(code):
-            norm_ytd.append({
-                "account_code": code,
-                "account_name": name,
-                "debit_balance": money_text(debit),
-                "credit_balance": money_text(credit),
-            })
-            continue
-
-        total_debit += debit
-        total_credit += credit
-        norm_items.append({
-            "account_code": code,
-            "account_name": name,
-            "debit_balance": money_text(debit),
-            "credit_balance": money_text(credit),
-            "partner_name": str(cleaned.get("partner_name") or "").strip(),
-        })
-
-    for idx, raw in enumerate(ytd_items or []):
-        if not isinstance(raw, dict):
-            continue
-        cleaned = _enforce_schema(raw, _OPENING_ITEM_SCHEMA, f"ytd_items[{idx}]")
-        code, name = _resolve_account(
-            str(cleaned.get("account_code") or "").strip(),
-            str(cleaned.get("account_name") or "").strip(),
-        )
-        debit = money(cleaned.get("debit_balance") or 0, allow_negative=False)
-        credit = money(cleaned.get("credit_balance") or 0, allow_negative=False)
-        if debit == ZERO and credit == ZERO:
-            continue
-        norm_ytd.append({
-            "account_code": code,
-            "account_name": name,
-            "debit_balance": money_text(debit),
-            "credit_balance": money_text(credit),
-        })
-
-    if not norm_items:
-        return {"error": "请至少提供一项资产、负债或所有者权益的期初余额"}
-
-    auto_plugged: Optional[Dict[str, Any]] = None
-    if auto_plug_difference and total_debit != total_credit:
-        diff = total_debit - total_credit
-        plug_code, plug_name = _resolve_account("3104006", "未分配利润")
-        if diff > ZERO:
-            norm_items.append({
-                "account_code": plug_code,
-                "account_name": plug_name,
-                "debit_balance": "0.00",
-                "credit_balance": money_text(diff),
-                "partner_name": "",
-            })
-            total_credit += diff
-            auto_plugged = {"accountCode": plug_code, "accountName": plug_name, "direction": "credit", "amount": float(diff)}
-        else:
-            abs_diff = abs(diff)
-            norm_items.append({
-                "account_code": plug_code,
-                "account_name": plug_name,
-                "debit_balance": money_text(abs_diff),
-                "credit_balance": "0.00",
-                "partner_name": "",
-            })
-            total_debit += abs_diff
-            auto_plugged = {"accountCode": plug_code, "accountName": plug_name, "direction": "debit", "amount": float(abs_diff)}
-
-    balanced = bool(total_debit > ZERO and total_debit == total_credit)
-    diff_val = abs(total_debit - total_credit)
-    payload = {
-        "fiscalYear": fiscal_year,
-        "startPeriod": raw_start,
-        "items": norm_items,
-        "ytdItems": norm_ytd,
-        "taxMemory": {
-            "priorYearLoss": float(prior_year_loss or 0),
-            "prepaidCitTax": float(prepaid_cit_tax or 0),
-            "migrationNote": note or "AI 会计对话导入期初",
-        },
-        "totalDebit": money_text(total_debit),
-        "totalCredit": money_text(total_credit),
-        "difference": money_text(diff_val),
-        "balanced": balanced,
-        "autoPlugged": auto_plugged,
-    }
-    action = await agent_actions.create_action(
-        company_id=ctx.company_id,
-        user_id=ctx.user_id,
-        action_type="propose_opening_balance",
-        title=f"期初余额导入确认（{raw_start}）",
-        payload=payload,
-        evidence={"note": note or "", "created_via": "agent_onboarding"},
-    )
-    return {
-        "actionId": action["id"],
-        "status": action["status"],
-        "balanced": balanced,
-        "totalDebit": money_text(total_debit),
-        "totalCredit": money_text(total_credit),
-        "difference": money_text(diff_val),
-        "autoPlugged": auto_plugged,
-        "itemCount": len(norm_items),
-        "ytdItemCount": len(norm_ytd),
-        "message": (
-            "期初余额确认卡已生成（借贷已平衡），等待老板确认后入账"
-            if balanced
-            else f"期初余额确认卡已生成，当前借贷差额 {money_text(diff_val)} 元，可在卡片中一键计入未分配利润配平或去期初工作台细调"
-        ),
     }
 
 
@@ -1492,6 +1826,18 @@ async def _generate_filing_package(ctx: ToolContext, period: str) -> Any:
 # ---------------------------------------------------------------------------
 # 注册表
 # ---------------------------------------------------------------------------
+
+async def _search_tax_policy(ctx: ToolContext, query: str, include_content: bool = False) -> Any:
+    from services.web_search_service import search_tax_policy
+
+    return await search_tax_policy(
+        query,
+        count=5,
+        need_content=include_content,
+        user_id=ctx.user_id,
+        company_id=ctx.company_id,
+    )
+
 
 def _obj(properties: Dict[str, Any], required: Optional[List[str]] = None) -> Dict[str, Any]:
     return {"type": "object", "properties": properties, "required": required or []}
@@ -1718,8 +2064,19 @@ TOOLS: List[Tool] = [
     ),
     Tool(
         name="run_close_checks",
-        description="运行指定月份的结账五项检查（账证/账账/账实/账表/税表），返回每项通过/阻塞状态。",
-        parameters=_obj({"month": {"type": "string", "description": "月份，格式 YYYY-MM", "pattern": MONTH_PATTERN}}, ["month"]),
+        description=(
+            "运行指定月份的确定性结账检查，返回 closing.v1 快照、snapshotHash、periodVersion "
+            "、可处理 findings 和 manualClose 网页入口。金额、笔数、状态与权威 ID 只能原样引用；"
+            "最终锁账必须由用户在网页完成。"
+        ),
+        parameters=_obj(
+            {
+                "month": {"type": "string", "description": "月份，格式 YYYY-MM", "pattern": MONTH_PATTERN},
+                "findingLimit": {"type": "integer", "description": "问题分页条数，默认 100，最大 100"},
+                "findingCursor": {"type": "integer", "description": "问题分页游标，默认 0"},
+            },
+            ["month"],
+        ),
         handler=_run_close_checks,
     ),
     Tool(
@@ -1729,6 +2086,9 @@ TOOLS: List[Tool] = [
             {
                 "month": {"type": "string", "description": "月份，格式 YYYY-MM，缺省取当月", "pattern": MONTH_PATTERN},
                 "limit": {"type": "integer", "description": "建议条数上限，默认 20"},
+                "snapshotHash": {"type": "string", "description": "可选；传入 run_close_checks 返回的哈希时校验数据是否已变化"},
+                "findingLimit": {"type": "integer", "description": "问题分页条数，默认 20，最大 100"},
+                "findingCursor": {"type": "integer", "description": "问题分页游标，默认 0"},
             },
         ),
         handler=_list_unmatched,
@@ -1736,7 +2096,13 @@ TOOLS: List[Tool] = [
     Tool(
         name="preview_accruals",
         description="预览本月待计提事项：折旧（未计提的在用固定资产及金额）、摊销（未计提的在用无形资产及金额）与工资（工资表状态）。",
-        parameters=_obj({"month": {"type": "string", "description": "月份，格式 YYYY-MM", "pattern": MONTH_PATTERN}}, ["month"]),
+        parameters=_obj(
+            {
+                "month": {"type": "string", "description": "月份，格式 YYYY-MM", "pattern": MONTH_PATTERN},
+                "snapshotHash": {"type": "string", "description": "可选；结账修复前应传最新快照哈希"},
+            },
+            ["month"],
+        ),
         handler=_preview_accruals,
     ),
     Tool(
@@ -1745,53 +2111,68 @@ TOOLS: List[Tool] = [
             "预览资产处理事项：缺固定资产/无形资产卡片的原交易、待补提折旧/摊销期间、"
             "以及不能处理的原因。用于零基础老板一键确认资产处理前的检查。"
         ),
-        parameters=_obj({"month": {"type": "string", "description": "月份，格式 YYYY-MM", "pattern": MONTH_PATTERN}}, ["month"]),
+        parameters=_obj(
+            {
+                "month": {"type": "string", "description": "月份，格式 YYYY-MM", "pattern": MONTH_PATTERN},
+                "snapshotHash": {"type": "string", "description": "可选；结账修复前应传最新快照哈希"},
+            },
+            ["month"],
+        ),
         handler=_preview_asset_actions,
     ),
     Tool(
         name="propose_match",
         description=(
-            "发起一条银行流水↔账目的对账建议（生成待确认动作，用户确认后才真正对账）。"
-            "statement_id/entry_ids 来自 list_unmatched 的差异或建议数据。"
+            "基于当前结账快照发起银行流水↔账目的待确认对账草稿。"
+            "必须原样传 snapshotHash、findingId 和 list_unmatched 返回的权威 ID；"
+            "创建后仍未匹配、未入账，用户确认后才执行。"
         ),
         parameters=_obj(
             {
                 "statement_id": {"type": "string", "description": "银行流水 ID"},
                 "entry_ids": {"type": "array", "items": {"type": "string"}, "description": "要匹配的账目 ID 列表"},
+                "month": {"type": "string", "description": "结账月份 YYYY-MM", "pattern": MONTH_PATTERN},
+                "snapshotHash": {"type": "string", "description": "run_close_checks 返回的 snapshotHash"},
+                "findingId": {"type": "string", "description": "run_close_checks 返回的 findingId"},
                 "note": {"type": "string", "description": "给用户的说明，可选"},
             },
-            ["statement_id", "entry_ids"],
+            ["statement_id", "entry_ids", "month", "snapshotHash", "findingId"],
         ),
         handler=_propose_match,
     ),
     Tool(
         name="propose_accrual",
         description=(
-            "发起计提确认草稿（kind=depreciation 折旧 / amortization 摊销 / salary 工资；month 格式 YYYY-MM）。"
-            "用户确认后执行现有计提服务；已计提过会被幂等跳过。"
+            "基于当前结账快照发起计提确认草稿（kind=depreciation / amortization / salary）。"
+            "必须传 snapshotHash 和 findingId；用户确认后才执行，当前不会生成任何凭证。"
         ),
         parameters=_obj(
             {
                 "kind": {"type": "string", "enum": ["depreciation", "amortization", "salary"]},
                 "month": {"type": "string", "description": "月份，格式 YYYY-MM", "pattern": MONTH_PATTERN},
+                "snapshotHash": {"type": "string", "description": "run_close_checks 返回的 snapshotHash"},
+                "findingId": {"type": "string", "description": "对应计提问题的 findingId"},
                 "note": {"type": "string", "description": "给用户的说明，可选"},
             },
-            ["kind", "month"],
+            ["kind", "month", "snapshotHash", "findingId"],
         ),
         handler=_propose_accrual,
     ),
     Tool(
         name="propose_asset_closure",
         description=(
-            "发起资产处理确认：自动建立缺卡的固定资产/无形资产，并补提截至指定月份的折旧/摊销。"
-            "只生成待确认动作，老板在对话窗口确认后才执行。"
+            "基于当前结账快照发起资产处理确认草稿：缺卡建卡与折旧/摊销补提。"
+            "必须传 snapshotHash 和 ASSET_CLOSURE finding 的 findingId；"
+            "只生成待确认动作，老板确认后才执行。"
         ),
         parameters=_obj(
             {
                 "month": {"type": "string", "description": "月份，格式 YYYY-MM", "pattern": MONTH_PATTERN},
+                "snapshotHash": {"type": "string", "description": "run_close_checks 返回的 snapshotHash"},
+                "findingId": {"type": "string", "description": "资产/折旧/摊销问题的 findingId"},
                 "note": {"type": "string", "description": "给老板的说明，可选"},
             },
-            ["month"],
+            ["month", "snapshotHash", "findingId"],
         ),
         handler=_propose_asset_closure,
     ),
@@ -1806,6 +2187,24 @@ TOOLS: List[Tool] = [
         description="查询未来征期（默认 45 天内）：税种、期间、截止日、剩余天数。用户问'什么时候报税/该报什么'时调用。",
         parameters=_obj({"upcoming_days": {"type": "integer", "description": "向前看的天数，默认 45"}}),
         handler=_get_filing_deadlines,
+    ),
+    Tool(
+        name="search_tax_policy",
+        description=(
+            "检索税务政策（官方白名单：税务总局/财政部/国务院/国家法律法规数据库，服务端强制，无法绕过）。"
+            "仅两个用途：核对「政策要点卡」之外的税务口径；临期政策查延续公告。"
+            "query 只传政策关键词（税种/主题/优惠名/年份，如'设备器具 一次性扣除 2027 延续'），"
+            "严禁包含公司名、金额、人名等经营信息。include_content=true 时结果附带网页正文（默认关闭省 token）。"
+            "ok=false（disabled/timeout/empty/rate_limited 等）时按'未核实'处理：明确告知用户并给自查入口，禁止编造。"
+        ),
+        parameters=_obj(
+            {
+                "query": {"type": "string", "description": "政策关键词，多个用空格分隔；禁止公司名/金额/人名等经营信息"},
+                "include_content": {"type": "boolean", "description": "可选，true 时结果附带网页正文；默认 false"},
+            },
+            ["query"],
+        ),
+        handler=_search_tax_policy,
     ),
     Tool(
         name="generate_filing_package",
@@ -1868,8 +2267,9 @@ TOOLS: List[Tool] = [
     Tool(
         name="propose_vouchers",
         description=(
-            "批量创建多条记账凭证草稿（一张清单，用户一次性确认；用户可逐行排除或修改分类）。"
-            "适用于：用户一次说好几笔账、导入的账单流水要记账等。"
+            "批量创建用户口述或单据识别出的多条记账清单（一张清单，用户一次性确认；可逐行排除或修改分类）。"
+            "仅适用于用户明确说出的业务；禁止用于银行流水。银行流水必须使用 propose_statement_vouchers，"
+            "否则金额和日期可能被改写。"
             "每个元素字段与 propose_voucher 相同。信息不齐或没把握的行不要混进来，"
             "先单独向用户确认后再补一份草稿。"
         ),
@@ -1885,6 +2285,31 @@ TOOLS: List[Tool] = [
             ["proposals"],
         ),
         handler=_propose_vouchers,
+    ),
+    Tool(
+        name="propose_statement_vouchers",
+        description=(
+            "按未匹配银行流水创建待确认记账清单。每个元素只需传 statementId 和有效 category；"
+            "金额、收支方向、日期、摘要和对方均由服务端从银行流水原始记录读取，模型不得也不能改写。"
+            "创建后仍只是待确认动作，尚未生成凭证、尚未入账；用户确认后才生成凭证并同步匹配流水。"
+            "凡准备处理 list_unmatched 中的流水，必须使用本工具。用于结账修复时必须同时传 "
+            "month、snapshotHash、findingId；日常流水记账可省略这三个字段。"
+        ),
+        parameters=_obj(
+            {
+                "proposals": {
+                    "type": "array",
+                    "description": "银行流水分类列表，每项含 statementId/category，可选 note",
+                    "items": _STATEMENT_VOUCHER_PROPOSAL_SCHEMA,
+                },
+                "month": {"type": "string", "description": "结账修复时必填，YYYY-MM", "pattern": MONTH_PATTERN},
+                "snapshotHash": {"type": "string", "description": "结账修复时必填，run_close_checks 返回的快照哈希"},
+                "findingId": {"type": "string", "description": "结账修复时必填，对应流水问题的 findingId"},
+                "note": {"type": "string", "description": "给用户的整体备注，可选"},
+            },
+            ["proposals"],
+        ),
+        handler=_propose_statement_vouchers,
     ),
     Tool(
         name="propose_company_setup",
@@ -1930,59 +2355,19 @@ TOOLS: List[Tool] = [
         ),
         handler=_propose_company_setup,
     ),
-    Tool(
-        name="propose_opening_balance",
-        description=(
-            "发起代账转入/旧账交接的期初余额导入确认卡（老板核对并完成验证后生成正式期初凭证）。"
-            "items 为资产/负债/所有者权益期初余额列表："
-            "资产类（1001库存现金、1002银行存款、1122应收账款、122103其他应收款、1405库存商品、1601固定资产等）填 debit_balance；"
-            "备抵/负债/权益类（1602累计折旧、1702累计摊销、2001短期借款、2202应付账款、2211001应付职工薪酬-工资、"
-            "2221026应交税费-未交增值税、224101其他应付款-股东、3001实收资本、3104006未分配利润等）填 credit_balance"
-            "（若未分配利润为累计亏损则填 debit_balance）。"
-            "年中转入若有 1 月至起账前一月的累计收入/费用，放入 ytd_items。"
-            "若老板只报了主要资产负债且同意差额计入未分配利润，可设 auto_plug_difference=true 自动配平。"
-        ),
-        parameters=_obj(
-            {
-                "items": {
-                    "type": "array",
-                    "description": "资产/负债/权益期初余额列表",
-                    "items": _OPENING_ITEM_SCHEMA,
-                },
-                "ytd_items": {
-                    "type": "array",
-                    "description": "年中建账可选：本年 1 月至启用前一月的损益累计发生额（如 5001 主营业务收入 credit_balance、5602001 办公费 debit_balance）",
-                    "items": _OPENING_ITEM_SCHEMA,
-                },
-                "start_period": {
-                    "type": "string",
-                    "description": "启用期间 YYYY-MM，可选（默认取主体启用月份）",
-                    "pattern": MONTH_PATTERN,
-                },
-                "prior_year_loss": {
-                    "type": "number",
-                    "description": "以前年度待弥补亏损（元，>=0），可选",
-                    "minimum": 0,
-                },
-                "prepaid_cit_tax": {
-                    "type": "number",
-                    "description": "本年已预缴企业所得税（元，>=0），可选",
-                    "minimum": 0,
-                },
-                "auto_plug_difference": {
-                    "type": "boolean",
-                    "description": "当借贷不平时，是否自动将差额计入 3104006 未分配利润配平，默认 false",
-                },
-                "note": {"type": "string", "description": "给老板的期初核对说明，可选"},
-            },
-            ["items"],
-        ),
-        handler=_propose_opening_balance,
-    ),
 ]
 
 TOOLS_BY_NAME: Dict[str, Tool] = {t.name: t for t in TOOLS}
 TOOL_SCHEMAS: List[Dict[str, Any]] = [t.openai_schema() for t in TOOLS]
+
+# 产品内 AI 与 MCP 共用同一组结账检查/修复草稿工具。最终锁账没有注册为工具，
+# 仍只能由登录用户在 /closing-wizard 发起。
+PRODUCT_AGENT_DISABLED_TOOLS = frozenset()
+PRODUCT_AGENT_TOOL_SCHEMAS: List[Dict[str, Any]] = [
+    schema
+    for schema in TOOL_SCHEMAS
+    if schema["function"]["name"] not in PRODUCT_AGENT_DISABLED_TOOLS
+]
 
 
 async def execute_tool(name: str, arguments: Dict[str, Any], ctx: ToolContext) -> Any:

@@ -482,15 +482,17 @@ async def _migrate_bank(source: sqlite3.Connection, session) -> None:
         await session.flush()
         bank_insert = text(
             "INSERT INTO bank_statements "
-            "(id, company_id, transaction_date, description, amount, balance, statement_id, matched_entry_id, description_normalized, created_at) "
-            "VALUES (:id, :company_id, :transaction_date, :description, :amount, :balance, :statement_id, :matched_entry_id, :description_normalized, :created_at) "
+            "(id, company_id, transaction_date, description, amount, balance, statement_id, matched_entry_id, description_normalized, created_at, transaction_reference, source_row_index) "
+            "VALUES (:id, :company_id, :transaction_date, :description, :amount, :balance, :statement_id, :matched_entry_id, :description_normalized, :created_at, :transaction_reference, :source_row_index) "
             "ON CONFLICT DO NOTHING"
         ).bindparams(
             bindparam("amount", type_=Numeric(20, 2)),
             bindparam("balance", type_=Numeric(20, 2)),
         )
         await session.execute(bank_insert, {**values, "amount": amount_value, "balance": money(values.get("balance") or 0),
-            "description_normalized": int(values.get("description_normalized") or 0)})
+            "description_normalized": int(values.get("description_normalized") or 0),
+            "transaction_reference": values.get("transaction_reference") or None,
+            "source_row_index": values.get("source_row_index")})
         for match in matches_by_statement.get(values["id"], []):
             target = await session.get(JournalEntry, match["entry_id"])
             if target:

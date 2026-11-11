@@ -371,7 +371,7 @@ onMounted(load)
 .summary-item .label { display: block; font-size: 12px; color: var(--text-3, #888); margin-bottom: 4px; }
 .summary-item .value { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .anomaly-row { border: 1px solid var(--border-2, #eee); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
-.anomaly-row[data-level='high'] { border-left: 3px solid var(--error-5, #d03050); }
+.anomaly-row[data-level='high'] { border-left: 3px solid var(--solo-expense, #bd3d3d); }
 .anomaly-main { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .anomaly-title { font-weight: 500; }
 .anomaly-amount { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--text-2, #555); }
@@ -380,7 +380,7 @@ onMounted(load)
 .comment-box { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; align-items: flex-end; }
 .comment-box :deep(.n-input) { width: 100%; }
 .recon-row { display: flex; gap: 18px; flex-wrap: wrap; font-size: 14px; }
-.recon-bad { color: var(--error-5, #d03050); }
+.recon-bad { color: var(--solo-expense, #bd3d3d); }
 .recon-details { margin-top: 10px; font-size: 13px; }
 .recon-details summary { cursor: pointer; color: var(--text-2, #555); }
 .balance-scroll { overflow-x: auto; border: 1px solid var(--border-2, #eee); border-radius: 8px; }

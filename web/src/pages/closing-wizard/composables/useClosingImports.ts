@@ -106,8 +106,8 @@ export function useClosingImports(options: {
       wechatBillImported.value = true
       wechatBillRows.value = []
       let msg = isSummaryMode
-        ? `微信账单月度汇总完成：已生成 1 张月度综合凭证。`
-        : `微信账单导入完成：${res.imported} 条交易已入账。`
+        ? `微信账单月度汇总完成：已生成 1 张月度综合凭证（收入已价税分离计提增值税）。`
+        : `微信账单导入完成：${res.imported} 条交易已入账（收入已价税分离计提增值税）。`
       if (res.ignored_duplicates > 0) {
         msg += `（已过滤 ${res.ignored_duplicates} 条已存在账目）`
       }
@@ -255,6 +255,10 @@ export function useClosingImports(options: {
         let msg = `成功导入 ${importRes.imported} 张新发票！请在对账步骤查看候选建议并手动确认。`
         if (importRes.ignored_duplicates > 0) {
           msg += `（系统已自动过滤 ${importRes.ignored_duplicates} 张已存在的发票记录）`
+        }
+        const offsets = importRes.offsets || []
+        if (offsets.length > 0) {
+          msg += `；已自动冲抵 ${offsets.length} 笔历史往来暂付款（${offsets.map((o: any) => `¥${o.amount}`).join('、')}），凭证往来侧已直接对冲`
         }
         message.success(msg)
         await reloadAll()

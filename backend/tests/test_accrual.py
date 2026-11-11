@@ -46,7 +46,8 @@ async def sessions():
             "id TEXT PRIMARY KEY, company_id TEXT NOT NULL, transaction_date TEXT NOT NULL, "
             "description TEXT NOT NULL, amount NUMERIC(20,2) NOT NULL, "
             "balance NUMERIC(20,2) NOT NULL, statement_id TEXT NOT NULL, "
-            "matched_entry_id TEXT, description_normalized INTEGER NOT NULL, created_at TEXT NOT NULL)"
+            "matched_entry_id TEXT, description_normalized INTEGER NOT NULL, created_at TEXT NOT NULL, "
+            "transaction_reference TEXT, source_row_index INTEGER)"
         )
         await connection.exec_driver_sql(
             "CREATE TABLE bank_statement_matches (statement_id TEXT, company_id TEXT, entry_id TEXT, "

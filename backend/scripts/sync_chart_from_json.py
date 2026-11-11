@@ -57,35 +57,42 @@ async def sync(dry_run: bool) -> None:
                             "SELECT name, is_leaf FROM chart_accounts WHERE company_id = :c AND code = :code"
                         ), {"c": cid, "code": code})).first()
                         if existing is None:
-                            await session.execute(text(
-                                "INSERT INTO chart_accounts (id, company_id, code, name, parent_code, level, "
-                                "category, type, normal_side, is_leaf, is_system, is_active, created_at, updated_at) "
-                                "VALUES (:id, :c, :code, :name, :parent, :level, :cat, :type, :side, "
-                                ":leaf, true, true, :now, :now) ON CONFLICT DO NOTHING"
-                            ), {
-                                "id": row_id, "c": cid, "code": code, "name": name,
-                                "parent": parent, "level": level, "cat": group,
-                                "type": info.get("type"), "side": info.get("direction"),
-                                "leaf": leaf, "now": now,
-                            })
+                            # dry-run 只统计、不落库（曾因忽略该标志导致「演练」实为写入，
+                            # 违反 A2「修复必须先诊断后执行、可预演」）。
+                            if not dry_run:
+                                await session.execute(text(
+                                    "INSERT INTO chart_accounts (id, company_id, code, name, parent_code, level, "
+                                    "category, type, normal_side, is_leaf, is_system, is_active, created_at, updated_at) "
+                                    "VALUES (:id, :c, :code, :name, :parent, :level, :cat, :type, :side, "
+                                    ":leaf, true, true, :now, :now) ON CONFLICT DO NOTHING"
+                                ), {
+                                    "id": row_id, "c": cid, "code": code, "name": name,
+                                    "parent": parent, "level": level, "cat": group,
+                                    "type": info.get("type"), "side": info.get("direction"),
+                                    "leaf": leaf, "now": now,
+                                })
                             added += 1
                         elif existing[0] != name or existing[1] != leaf:
                             # 元数据随 COA 定义演进（新增子级时父级要翻转 is_leaf），
                             # 不动 is_active —— 用户手工停用的科目不应被重新启用。
-                            await session.execute(text(
-                                "UPDATE chart_accounts SET name = :name, parent_code = :parent, "
-                                "level = :level, category = :cat, type = :type, normal_side = :side, "
-                                "is_leaf = :leaf, updated_at = :now "
-                                "WHERE company_id = :c AND code = :code"
-                            ), {
-                                "name": name, "parent": parent, "level": level, "cat": group,
-                                "type": info.get("type"), "side": info.get("direction"),
-                                "leaf": leaf, "now": now, "c": cid, "code": code,
-                            })
+                            if not dry_run:
+                                await session.execute(text(
+                                    "UPDATE chart_accounts SET name = :name, parent_code = :parent, "
+                                    "level = :level, category = :cat, type = :type, normal_side = :side, "
+                                    "is_leaf = :leaf, updated_at = :now "
+                                    "WHERE company_id = :c AND code = :code"
+                                ), {
+                                    "name": name, "parent": parent, "level": level, "cat": group,
+                                    "type": info.get("type"), "side": info.get("direction"),
+                                    "leaf": leaf, "now": now, "c": cid, "code": code,
+                                })
                             renamed += 1
                 print(f"[sync] {cid}: +{added} renamed={renamed}" + (" (dry-run)" if dry_run else ""))
         finally:
             await session.execute(text("SET session_replication_role = DEFAULT"))
+        if dry_run:
+            # 只读演练：显式回滚，确保没有任何未预期的写入被提交。
+            await session.rollback()
         print("DONE")
 
 

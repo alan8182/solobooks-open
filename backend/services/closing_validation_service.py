@@ -94,7 +94,10 @@ async def bank_close_validation(session: AsyncSession, company_id: str, month_st
     # billing flags or a separate connection's possibly stale view at close time.
     statements = [dict(row) for row in (await session.execute(text(
         "SELECT id, transaction_date, amount, balance FROM bank_statements "
-        "WHERE company_id = :company AND transaction_date >= :start AND transaction_date < :end"
+        "WHERE company_id = :company AND transaction_date >= :start AND transaction_date < :end "
+        # 同秒多笔只靠日期分不出先后，按导入时保存的文件行序；与 bank_service
+        # 的 _STATEMENT_ORDER 保持一致，避免结账校验与余额核对各算一套顺序。
+        "ORDER BY transaction_date, source_row_index IS NULL, source_row_index, id"
     ), {"company": company_id, "start": month_start.isoformat(), "end": next_month.isoformat()})).mappings()]
     stmt_amount_by_id = {stmt["id"]: stmt.get("amount") for stmt in statements}
 

@@ -18,6 +18,10 @@ export interface BankRowDraft {
   description: string
   amount: number
   balance: number
+  /** 银行给的交易流水号（判重身份）；空串表示该行没有可用引用号 */
+  transaction_reference?: string
+  /** 该行在文件解析结果中的 0 基下标，仅用于同秒流水的先后顺序 */
+  source_row_index?: number
 }
 
 export interface BankRowsResult {
@@ -60,6 +64,92 @@ export function parseMoney(val: unknown): number {
   const cleaned = String(val).replace(/,/g, '').trim()
   const num = parseFloat(cleaned)
   return isNaN(num) ? 0 : num
+}
+
+/**
+ * 银行流水号归一化；返回空串表示「该行没有可用的引用号」。
+ *
+ * 只有能精确表示的才收：Excel 把 25 位「记录标识号」按浮点存储，读出来是
+ * 259755500999999978999999978 这类垃圾值，宁可当作没有，也不能拿来判重。
+ * 全零占位列（客户业务编号）同样不是身份。
+ */
+export function normalizeBankReference(val: unknown): string {
+  if (val === null || val === undefined || typeof val === 'boolean') return ''
+  let text: string
+  if (typeof val === 'number') {
+    // 超出 2^53 的整数在 JS 里已经丢精度，转换出来的是看似完整的假号码
+    if (!Number.isSafeInteger(val)) return ''
+    text = String(val)
+  } else {
+    text = String(val)
+  }
+  text = text.trim().replace(/[\s\u3000]/g, '')
+  if (!text) return ''
+  // 科学计数法：精度已不可逆（Excel 存大数的典型形态）
+  if (/[eE][+-]?\d/.test(text)) return ''
+  if (/^\d+\.0+$/.test(text)) text = text.replace(/\.0+$/, '')
+  if (/^0+$/.test(text)) return ''
+  if (text.length > 64) return ''
+  return text
+}
+
+/**
+ * 是否为「纯时间列」：表头带时间但没有日期语义。
+ * 列映射与兜底探测共用，避免两处判断漂移。
+ * 打印/导出/查询/生成 一类时间列是报表元数据（整份文件同一个值），
+ * 当成交易时间会给每笔流水盖上错误时刻，须排除。
+ */
+export function isBankTimeOnlyColumn(colName: string): boolean {
+  const lc = String(colName).toLowerCase()
+  if (/打印|导出|生成|下载|查询|统计|创建|更新/i.test(lc)) return false
+  return /时间|time/i.test(lc) && !/日期|交易日/i.test(lc)
+}
+
+/**
+ * 归一化时间列为 HH:mm:ss，取不到返回空串。
+ * 兼容三种形态：裸时间文本（21:46 / 21:46:46）、整点日期时间文本里取时分秒
+ * （有些银行把「交易时间」列写成 2026-05-20 21:46:46）、以及 Excel 的时间序列值
+ * （只占一天的小数，0.907... = 21:47）。
+ */
+export function formatBankTime(val: unknown): string {
+  if (val === null || val === undefined || val === '') return ''
+  let hour = -1
+  let minute = -1
+  let second = 0
+  if (typeof val === 'number') {
+    if (!Number.isFinite(val) || val < 0 || val >= 1) return ''
+    const total = Math.round(val * 86400)
+    if (total < 0 || total >= 86400) return ''
+    hour = Math.floor(total / 3600)
+    minute = Math.floor((total % 3600) / 60)
+    second = total % 60
+  } else {
+    const s = String(val).trim()
+    const m = s.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/)
+      || s.match(/\d{4}-\d{2}-\d{2}[ T](\d{1,2}):(\d{2})(?::(\d{2}))?/)
+    if (!m) return ''
+    hour = Number(m[1])
+    minute = Number(m[2])
+    second = m[3] === undefined ? 0 : Number(m[3])
+  }
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second > 59) return ''
+  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:${String(second).padStart(2, '0')}`
+}
+
+/**
+ * 未被映射（或被用户设为「忽略」）时，从原始行里兜底找时间列。
+ * 只看「纯时间列」且值能解析成时间的第一列；跳过日期列本身。
+ */
+export function resolveBankRowTime(
+  row: Record<string, unknown>,
+  excludeColumn = '',
+): string {
+  for (const [col, val] of Object.entries(row)) {
+    if (col === excludeColumn || !isBankTimeOnlyColumn(col)) continue
+    const time = formatBankTime(val)
+    if (time) return time
+  }
+  return ''
 }
 
 /**
@@ -150,6 +240,9 @@ export function parseBankWorkbookData(data: Uint8Array): Record<string, unknown>
  * 纯时间列不作日期源，否则起息日期会覆盖交易日期。但杭州银行等只导出「交易时间」
  * 一列，时间列就是唯一日期来源，须兜底选用（formatBankDate 会截掉时分秒），
  * 否则日期全空、后端整批拒绝。
+ * 日期列已选定后，剩下的纯时间列映射为 transaction_time，由 buildBankRows 并进
+ * 交易日期：网银常把日期与时间拆成两列（中国银行「20260520」+「21:46:46」），
+ * 丢掉时间列会让同日流水只剩插入顺序，余额连续性与期初期末反推都失去依据。
  * 支出/收入列必须同时是金额类表头：付款人名称/名义付款人名称 等对手方列含
  * 「付款」，不限定金额列会把它们误判成金额列，导致金额全为 0。
  */
@@ -157,17 +250,13 @@ export function detectBankColumnMapping(columns: string[]): BankColumnMapping {
   const map: BankColumnMapping = {}
   for (const col of columns) map[col] = ''
 
-  const isTimeOnlyCol = (col: string) => {
-    const lc = col.toLowerCase()
-    return /时间|time/i.test(lc) && !/日期|交易日/i.test(lc)
-  }
   const dateCandidates = columns.filter((col) => {
     const lc = col.toLowerCase()
-    return !/对方/.test(lc) && !isTimeOnlyCol(col) && /交易日期|记账日期|入账日期|起息日期|日期|交易日|date/i.test(lc)
+    return !/对方/.test(lc) && !isBankTimeOnlyColumn(col) && /交易日期|记账日期|入账日期|起息日期|日期|交易日|date/i.test(lc)
   })
   const timeCandidates = columns.filter((col) => {
     const lc = col.toLowerCase()
-    return !/对方/.test(lc) && isTimeOnlyCol(col)
+    return !/对方/.test(lc) && isBankTimeOnlyColumn(col)
   })
   const dateCol = dateCandidates.find((col) => /交易日期|记账日期|入账日期|交易日/.test(col))
     || dateCandidates[0]
@@ -177,6 +266,13 @@ export function detectBankColumnMapping(columns: string[]): BankColumnMapping {
   for (const col of columns) {
     const lc = col.toLowerCase()
     if (col === dateCol) map[col] = 'transaction_date'
+    else if (isBankTimeOnlyColumn(col)) map[col] = 'transaction_time'
+    else if (
+      // 只认「交易流水号」这类身份列；裸 reference 会撞上中行的「摘要[ Reference ]」，
+      // 凭证号码/记录标识号/客户申请号都不是稳定身份（会重复或已被浮点摧毁）
+      /交易流水号|银行流水号|交易参考号|交易流水|流水号|transaction\s*reference|serial\s*(?:no|number)/i.test(lc)
+      && !/记录标识号|客户申请号|客户业务编号|名义|开户|摘要/.test(lc)
+    ) map[col] = 'transaction_reference'
     else if (/附言|用途|备注|附加信息|备注信息|附加备注|comment|purpose/i.test(lc)) map[col] = ''
     else if (/账户余额|余额|balance/i.test(lc)) map[col] = 'balance'
     else if (/金额|发生额|amount/i.test(lc) && /支出|借方|支取|付款/i.test(lc) && !/商户支出/i.test(lc)) map[col] = 'expense_amount'
@@ -205,17 +301,24 @@ export function extractStatementCounterparty(description: string): string {
 }
 
 /**
+ * 判断一列是否只描述本方/银行账户信息，不能作为交易对手户名来源。
+ * 自动角色识别和手动字段映射共用这一判断，避免用户把开户行、开户名或账号
+ * 显式映射为对方户名后绕过描述增强的过滤。
+ */
+export function isBankCounterpartySourceBlocked(colName: string): boolean {
+  const name = String(colName).trim()
+  if (/己方|本方|开户行|开户名|银行行号|联行号|支付系统行号/i.test(name)) return true
+  return /账号|卡号/i.test(name) && !/名称|户名/i.test(name)
+}
+
+/**
  * 单列在「描述增强」里的自动角色（与 collectDescriptionParts 同一套判别，
  * 供映射界面展示「这列会被自动并入描述」。返回空串表示该列纯忽略）。
  */
 export function bankColumnDescriptionRole(colName: string): string {
   const name = String(colName).trim()
-  if (/己方|本方/i.test(name)) return ''
+  if (isBankCounterpartySourceBlocked(name)) return ''
   if (/交易类型|业务名称|业务类型|类型|type/i.test(name)) return '交易类型'
-
-  const isBranchCol = /开户名|开户行/i.test(name)
-  const isAcctCol = /账号|卡号/i.test(name) && !/名称/i.test(name)
-  if (isBranchCol || isAcctCol) return ''
 
   if (/收款人|收款方|收款单位/i.test(name)) return '收款人'
   if (/付款人|付款方|付款单位/i.test(name)) return '付款人'
@@ -263,8 +366,11 @@ function collectDescriptionParts(row: Record<string, unknown>): DescriptionParts
 /**
  * 原始行 → 标准流水行。金额语义：存入为正、支取为负（两列并存时取非零的
  * 那列，同银行导出习惯一致）；描述统一走 buildBankStatementDescription 管道
- * 口径（类型 | 摘要 | 附言: x (对方: y)），它是后端去重键（日期+描述+金额）
+ * 口径（类型 | 摘要 | 附言: x (对方: y)），它是后端去重键（日期+描述+金额+余额）
  * 的组成部分，所有入口必须产出同一种格式，否则同一文件重复导入会重复入账。
+ * 日期带时分秒（YYYY-MM-DD HH:mm:ss）：同日同额同摘要的多笔手续费只靠余额和时间
+ * 区分，后端按前 10 位比日期、按完整文本保留先后。
+ * 每行带上交易流水号（判重身份）与文件行序（同秒内的时间先后依据）。
  * 解析不出合法日期的行不返回——后端对坏日期整行报错，一行脏数据会把失败数
  * 刷成 N 条且看不出原因。
  */
@@ -275,8 +381,15 @@ export function buildBankRows(
   const rows: BankRowDraft[] = []
   let skippedInvalidDate = 0
 
-  for (const row of rawRows) {
-    const out: BankRowDraft = { transaction_date: '', description: '', amount: 0, balance: 0 }
+  for (const [rowIndex, row] of rawRows.entries()) {
+    const out: BankRowDraft = {
+      transaction_date: '',
+      description: '',
+      amount: 0,
+      balance: 0,
+      transaction_reference: '',
+      source_row_index: rowIndex,
+    }
     let singleAmount = 0
     let incomeAmount = 0
     let expenseAmount = 0
@@ -289,12 +402,27 @@ export function buildBankRows(
     let mappedPayer = ''
     let mappedComment = ''
     let mappedType = ''
+    let mappedTime = ''
+    let dateSourceColumn = ''
 
     for (const [col, field] of Object.entries(mapping)) {
       if (!field) continue
+      if (
+        ['counterparty_name', 'payee_name', 'payer_name'].includes(field)
+        && isBankCounterpartySourceBlocked(col)
+      ) {
+        continue
+      }
       const val = row[col]
       if (field === 'transaction_date') {
         out.transaction_date = formatBankDate(val)
+        dateSourceColumn = col
+      } else if (field === 'transaction_time') {
+        mappedTime = formatBankTime(val)
+      } else if (field === 'transaction_reference') {
+        // 多列同时被映射时，第一个非空的有效号为准（空列不得覆盖已取到的号）
+        const reference = normalizeBankReference(val)
+        if (reference && !out.transaction_reference) out.transaction_reference = reference
       } else if (field === 'description') {
         const strVal = String(val ?? '').trim()
         if (strVal) out.description = out.description ? `${out.description} | ${strVal}` : strVal
@@ -320,6 +448,16 @@ export function buildBankRows(
       } else if (field === 'transaction_type') {
         mappedType = String(val ?? '').trim()
       }
+    }
+
+    // 日期与时间分列的网银（中国银行「20260520」+「21:46:46」）：把时间并进交易日期，
+    // 保留同日多笔的先后。仅在日期为纯日期时合并——有些银行的「交易时间」列本身就是
+    // 完整日期时间，formatBankDate 已带时分秒，再拼一次会造出畸形值。
+    // mappedTime 为空（用户把时间列设为忽略、或表头不规范没自动选中）时兜底扫原始行，
+    // 与描述增强同一思路：映射操作不该让时间信息凭空消失。
+    const rowTime = mappedTime || resolveBankRowTime(row, dateSourceColumn)
+    if (rowTime && /^\d{4}-\d{2}-\d{2}$/.test(out.transaction_date)) {
+      out.transaction_date = `${out.transaction_date} ${rowTime}`
     }
 
     if (hasIncomeAmount || hasExpenseAmount) {

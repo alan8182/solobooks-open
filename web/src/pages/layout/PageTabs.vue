@@ -239,14 +239,20 @@ onBeforeUnmount(() => {
         role="tab"
         :aria-selected="tab.path === activePath"
         :tabindex="tab.path === activePath ? 0 : -1"
-        :title="tab.title"
+        :title="tab.pinned ? `${tab.title}（固定标签，不可关闭）` : tab.title"
         @click="switchTo(tab)"
         @keydown.enter.prevent="switchTo(tab)"
         @contextmenu.prevent="openMenu($event, tab.path)"
       >
-        <span v-if="tab.pinned" class="tab-pin" aria-hidden="true">
-          <svg width="9" height="9" viewBox="0 0 24 24" fill="none">
-            <path d="M4.4 10.6L13.4 3.2l1.6 6.4 4.6 4.6-6.6 1.4-4 6-4.6-10.6z" fill="currentColor" />
+        <span
+          v-if="tab.pinned"
+          class="tab-pin"
+          role="img"
+          aria-label="固定标签，不可关闭"
+          title="固定标签，不可关闭"
+        >
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M9 3h6v2h-1v5l3 3v2h-4v6h-2v-6H7v-2l3-3V5H9V3Z" fill="currentColor" />
           </svg>
         </span>
         <span class="tab-title">{{ tab.title }}</span>
@@ -372,6 +378,7 @@ onBeforeUnmount(() => {
   padding: 0 12px 0 14px;
   background: var(--solo-bg-page);
   border-bottom: 1px solid var(--solo-border-sidebar);
+  overflow: hidden;
 }
 
 .tabs-strip {
@@ -442,10 +449,10 @@ onBeforeUnmount(() => {
 .tab-pin {
   display: grid;
   place-items: center;
-  width: 9px;
-  height: 9px;
-  color: var(--solo-text-muted);
-  opacity: 0.75;
+  width: 11px;
+  height: 11px;
+  color: var(--solo-primary);
+  opacity: 0.9;
 }
 
 .tab-close {

@@ -4,11 +4,13 @@ import { usePageRefresh } from '@/composables/usePageRefresh'
 import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { NButton } from 'naive-ui'
+import { SoloButton } from '@/components/ui'
 import { useAuthStore } from '@/stores/auth'
 import { useEntryStore } from '@/stores/entry'
 import { useWorkspaceViewStore } from '@/stores/workspaceView'
 import { useTaskInbox } from '@/composables/useTaskInbox'
 import { useSetupReadiness } from '@/composables/useSetupReadiness'
+import { useClosingStatus } from '@/composables/useClosingStatus'
 import TaskInbox from '@/components/business/TaskInbox.vue'
 import SetupChecklist from '@/components/business/SetupChecklist.vue'
 import StatsWidget from '@/components/widgets/StatsWidget.vue'
@@ -21,6 +23,7 @@ const entryStore = useEntryStore()
 // 两个看板各自持有数据，切回首页时要一起重拉，否则问候语是新的、待办还是两小时前的
 const { tasks, loading, partialFailure, reload: reloadTaskInbox } = useTaskInbox()
 const { readiness, loading: readinessLoading, reload: reloadReadiness } = useSetupReadiness()
+const closingStatus = useClosingStatus()
 const quickPrompt = ref('')
 
 function handleQuickSubmit() {
@@ -36,32 +39,36 @@ const proLinks = [
   { path: '/tax-filing', label: '税务申报', icon: 'ri-file-shield-2-line' },
 ]
 
-const bossActions = [
+const bossActions = computed(() => [
   {
-    path: '/invoices?import=true',
-    label: '上传发票',
-    description: 'Excel 批量导入税局发票',
-    icon: 'ri-receipt-line',
+    path: '/closing-wizard',
+    label: '月度结账',
+    description: closingStatus.isClosed.value
+      ? `${closingStatus.badgeText.value} · 可前往税务申报`
+      : '流水/发票 100% 勾稽，沉淀尽调级资产账',
+    icon: 'ri-calendar-check-line',
+    badge: closingStatus.badgeText.value,
+    badgeType: closingStatus.badgeType.value,
+  },
+  {
+    path: '/reports',
+    label: '经营情况',
+    description: '看懂真实净利、现金跑道与收支底牌',
+    icon: 'ri-bar-chart-box-line',
   },
   {
     path: '/bank',
-    label: '上传流水',
-    description: '银行流水、微信支付账单',
-    icon: 'ri-bank-line',
-  },
-  {
-    path: '/private-expenses',
-    label: '小私账',
-    description: '老板个人垫付与代收对账',
+    label: '资金与垫付',
+    description: '公户流水配平、老板垫资隔离，守住尽调底线',
     icon: 'ri-wallet-3-line',
   },
   {
-    path: '/ledger',
-    label: '经营账本',
-    description: '核对日常收支与历史账目',
-    icon: 'ri-book-open-line',
+    path: '/reports/ar-aging',
+    label: '应收与应付',
+    description: '客户待催收款与供应商待付账单',
+    icon: 'ri-hand-coin-line',
   },
-]
+])
 
 const isDemoCurrent = computed(() => {
   const current = authStore.companies.find((c) => c.company_id === authStore.currentCompanyId)
@@ -105,8 +112,8 @@ usePageRefresh(() => Promise.all([reloadTaskInbox(), reloadReadiness(), entrySto
         </h1>
         <p class="greeting-subtitle">
           {{ viewStore.isBoss
-            ? '上传发票或流水，或者直接说一句，就能开始记账。'
-            : '专业工作台。凭证、账簿、结账与申报入口都在这里。' }}
+            ? '月初上传流水发票一键结账，在日常确认中建立老板财务直觉，养出随时经得起授信与融资尽调的合规账。'
+            : '专业工作台。票、流、账、税同源勾稽，凭证、账簿、结账与申报入口都在这里。' }}
         </p>
       </div>
 
@@ -117,19 +124,19 @@ usePageRefresh(() => Promise.all([reloadTaskInbox(), reloadReadiness(), entrySto
         class="primary-action"
         @click="openCopilot"
       >
-        <template #icon><i class="ri-sparkling-fill" /></template>
-        录入凭证 / 问 AI 会计
+        <template #icon><i class="ri-chat-3-line" /></template>
+        录入凭证 / 问 AI CFO
       </NButton>
     </header>
 
     <div v-if="viewStore.isBoss" class="boss-quick-bar">
       <div class="quick-input-container">
-        <i class="ri-sparkling-fill quick-icon" />
+        <i class="ri-chat-3-line quick-icon" />
         <input
           v-model="quickPrompt"
           type="text"
           class="quick-input-field"
-          placeholder="交代一句话记账，例如：“昨天请客户吃饭 380 微信付” 或 “收到技术咨询费 12000”..."
+          placeholder="交代一句话记账，例如：“收到技术咨询费 12000” 或 “这个月的流水已上传，帮我自动对账入账”..."
           @keydown.enter="handleQuickSubmit"
         />
         <button
@@ -156,7 +163,12 @@ usePageRefresh(() => Promise.all([reloadTaskInbox(), reloadReadiness(), entrySto
           <i :class="action.icon" aria-hidden="true" />
         </span>
         <span class="boss-action-copy">
-          <strong>{{ action.label }}</strong>
+          <span class="boss-action-title-row">
+            <strong>{{ action.label }}</strong>
+            <span v-if="action.badge" class="boss-badge" :class="action.badgeType">
+              {{ action.badge }}
+            </span>
+          </span>
           <span>{{ action.description }}</span>
         </span>
         <i class="ri-arrow-right-line boss-action-arrow" aria-hidden="true" />
@@ -181,13 +193,24 @@ usePageRefresh(() => Promise.all([reloadTaskInbox(), reloadReadiness(), entrySto
 
     <!-- 演示账套的样本数据会让清单全绿，但那不是用户自己的进度 -->
     <div v-if="isDemoCurrent" class="demo-onboarding-tip">
-      <i class="ri-information-line" aria-hidden="true" />
-      <span class="demo-onboarding-copy">
-        当前是演示账套，样本数据已满足清单，但不计入你的上手进度。创建自己的账套后，引导会从第一步开始。
-      </span>
-      <NButton size="small" secondary @click="router.push('/mine/companies')">
-        创建我的账套
-      </NButton>
+      <div class="demo-tip-header">
+        <div class="demo-badge">
+          <i class="ri-flask-line" aria-hidden="true" />
+          <span>演示沙盒</span>
+        </div>
+        <span class="demo-onboarding-copy">
+          当前正在体验<strong>演示账套</strong>（含 3 个月经营样本与待办），可自由试记与查看。体验满意后，随时开启你的专属企业账套。
+        </span>
+      </div>
+      <div class="demo-tip-actions">
+        <SoloButton size="small" variant="ghost" @click="router.push('/guide')">
+          上手指南
+        </SoloButton>
+        <SoloButton size="small" variant="primary" @click="router.push('/mine/companies?create=new')">
+          <i class="ri-add-line" aria-hidden="true" />
+          建立我的企业账套
+        </SoloButton>
+      </div>
     </div>
 
     <!-- 上手清单：只在「没配完 + 新手期」出现，就绪后自己折叠成一行 -->
@@ -206,7 +229,7 @@ usePageRefresh(() => Promise.all([reloadTaskInbox(), reloadReadiness(), entrySto
 
 <style scoped>
 .home-workbench {
-  max-width: 1440px;
+  max-width: var(--page-width);
   margin: 0 auto;
   display: flex;
   flex-direction: column;
@@ -216,25 +239,54 @@ usePageRefresh(() => Promise.all([reloadTaskInbox(), reloadReadiness(), entrySto
 .demo-onboarding-tip {
   display: flex;
   align-items: center;
-  gap: 10px;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
   padding: 12px 16px;
   border: 1px solid var(--solo-border);
   border-radius: var(--solo-radius-lg);
   background: var(--solo-bg-blue-soft);
   color: var(--solo-text-secondary);
-  font-size: 12.5px;
+  font-size: 13px;
   line-height: 1.6;
 }
 
-.demo-onboarding-tip > i {
-  flex-shrink: 0;
+.demo-tip-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1 1 480px;
+}
+
+.demo-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: var(--solo-radius-control);
+  background: var(--solo-bg-card);
+  border: 1px solid var(--solo-border);
   color: var(--solo-primary);
-  font-size: 16px;
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
 }
 
 .demo-onboarding-copy {
   flex: 1;
   min-width: 0;
+}
+
+.demo-onboarding-copy strong {
+  color: var(--solo-text-primary);
+  font-weight: 600;
+}
+
+.demo-tip-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
 }
 
 @media (max-width: 640px) {
@@ -416,6 +468,32 @@ usePageRefresh(() => Promise.all([reloadTaskInbox(), reloadReadiness(), entrySto
   gap: 3px;
   min-width: 0;
   flex: 1;
+}
+
+.boss-action-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.boss-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: var(--solo-radius-sm, 4px);
+  line-height: 1.4;
+}
+
+.boss-badge.warning {
+  background: var(--solo-warning-bg);
+  color: var(--solo-warning);
+}
+
+.boss-badge.success {
+  background: var(--solo-income-bg);
+  color: var(--solo-income);
 }
 
 .boss-action-copy strong {

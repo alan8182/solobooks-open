@@ -476,6 +476,7 @@ usePageRefresh(load)
     <RdProjectModal
       v-model:show="showProjectModal"
       :project="editingProject"
+      :projects="projects"
       @success="load"
     />
 
@@ -500,7 +501,7 @@ usePageRefresh(load)
 
 <style scoped>
 .rd-page {
-  max-width: 1240px;
+  max-width: var(--page-width);
   margin: 0 auto;
   padding: 16px 0 48px 0;
   width: 100%;

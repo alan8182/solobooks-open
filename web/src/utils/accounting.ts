@@ -19,6 +19,9 @@ export interface VoucherLine {
   quantity?: number
   unitPrice?: number
   unit?: string
+  // 辅助核算：往来单位等。只用于展示（VoucherSheet 的「辅助：」），
+  // 服务端落库时仍以自己的校验/回填为准。
+  auxiliary?: Record<string, any>
   rdDetail?: {
     projectId: string
     expenseType: string
@@ -54,6 +57,7 @@ export const CHART_OF_ACCOUNTS: Record<string, string> = {
   '221102': '应付职工薪酬-单位社保',
   '221103': '应付职工薪酬-职工福利费',
   '221104': '应付职工薪酬-代扣社保公积金',
+  '221105': '应付职工薪酬-住房公积金',
   '2221012': '应交个人所得税',
   '2221026': '应交增值税（小规模纳税人专用）',
   '2241': '其他应付款',
@@ -84,6 +88,7 @@ export const CHART_OF_ACCOUNTS: Record<string, string> = {
   '5602014': '管理费用-职工福利费',
   '5602015': '管理费用-信息技术服务费',
   '5602016': '管理费用-单位社保',
+  '5602017': '管理费用-住房公积金',
   '5602999': '管理费用-其他',
   '5603': '财务费用',
   '5603002': '财务费用-手续费',
@@ -128,7 +133,7 @@ const CATEGORY_DEBIT_MAP: Record<string, { code: string; name: string }> = {
   '工资发放': { code: '221101', name: '应付职工薪酬-工资' },
   '社保公积金': { code: '221102', name: '应付职工薪酬-单位社保' },
   '供应商付款': { code: '2202', name: '应付账款' },
-  '员工垫付报销': { code: '2241', name: '其他应付款-员工' },
+  '员工垫付报销': { code: '2241', name: '其他应付款' },
   '主营业务收入': { code: '5001', name: '主营业务收入' },
   '其他业务收入': { code: '5051', name: '其他业务收入' },
   '营业外收入': { code: '5301', name: '营业外收入' },
@@ -136,14 +141,14 @@ const CATEGORY_DEBIT_MAP: Record<string, { code: string; name: string }> = {
   '折旧': { code: '5602007', name: '管理费用-折旧费' },
   '股东投入': { code: '3001', name: '实收资本' },
   '资本公积': { code: '3002', name: '资本公积' },
-  '股东垫付': { code: '2241', name: '其他应付款-股东' },
+  '股东垫付': { code: '2241', name: '其他应付款' },
   // 1221 已容器化，往来类一律落末级明细（与后端 account_mapper 对齐）
   '股东取现': { code: '122102', name: '其他应收款-股东' },
   '老板投入': { code: '3001', name: '实收资本' },
-  '老板垫付': { code: '2241', name: '其他应付款-股东' },
+  '老板垫付': { code: '2241', name: '其他应付款' },
   '老板取现': { code: '122102', name: '其他应收款-股东' },
   '其他应收款': { code: '122103', name: '其他应收款-员工往来' },
-  '其他应付款': { code: '2241', name: '其他应付款-其他' },
+  '其他应付款': { code: '2241', name: '其他应付款' },
   '往来款': { code: '122199', name: '其他应收款-待收款项' },
 }
 
@@ -196,6 +201,7 @@ export function normalizeVoucherLines(voucherLines: any): VoucherLine[] {
       quantity: line.quantity != null && line.quantity !== '' ? Number(line.quantity) : undefined,
       unitPrice: line.unitPrice != null && line.unitPrice !== '' ? Number(line.unitPrice) : undefined,
       unit: line.unit || undefined,
+      auxiliary: line.auxiliary || undefined,
       rdDetail: line.rdDetail ? {
         ...line.rdDetail,
         originalAmount: Number(line.rdDetail.originalAmount) || 0,
@@ -212,6 +218,7 @@ export function normalizeVoucherLines(voucherLines: any): VoucherLine[] {
       quantity: line.quantity != null && line.quantity !== '' ? Number(line.quantity) : undefined,
       unitPrice: line.unitPrice != null && line.unitPrice !== '' ? Number(line.unitPrice) : undefined,
       unit: line.unit || undefined,
+      auxiliary: line.auxiliary || undefined,
       rdDetail: line.rdDetail ? {
         ...line.rdDetail,
         originalAmount: Number(line.rdDetail.originalAmount) || 0,
@@ -292,14 +299,22 @@ export function generateVoucherLines(entry: EntryForVoucher): VoucherLine[] {
     if (category === '折旧') {
       lines.push({ code: '1602', name: '累计折旧', side: 'credit', amount: val })
     } else if (entry.payer === 'boss_personal') {
-      lines.push({ code: '2241', name: '其他应付款-股东', side: 'credit', amount: val })
+      // 科目名只取科目表（2241 只有「其他应付款」），垫付人身份落在往来单位上
+      lines.push({
+        code: '2241',
+        name: '其他应付款',
+        side: 'credit',
+        amount: val,
+        auxiliary: { partner_name: '股东' },
+      })
     } else if (entry.payer === 'employee_personal' || entry.payer?.startsWith('employee_personal:')) {
       const employeeName = entry.payer.includes(':') ? entry.payer.split(':').slice(1).join(':').trim() : ''
       lines.push({
         code: '2241',
-        name: employeeName ? `其他应付款-员工往来(${employeeName})` : '其他应付款-员工往来',
+        name: '其他应付款',
         side: 'credit',
         amount: val,
+        auxiliary: employeeName ? { partner_name: employeeName } : undefined,
       })
     } else {
       lines.push({ code: '1002', name: '银行存款', side: 'credit', amount: val })
@@ -310,7 +325,7 @@ export function generateVoucherLines(entry: EntryForVoucher): VoucherLine[] {
       lines.push({ code: '122102', name: '其他应收款-股东', side: 'debit', amount: val })
       lines.push({ code: '1002', name: '银行存款', side: 'credit', amount: val })
     } else {
-      const acct = accountForCategory(normCategory) || { code: '2241', name: '其他应付款-股东' }
+      const acct = accountForCategory(normCategory) || { code: '2241', name: '其他应付款' }
       lines.push({ code: '1002', name: '银行存款', side: 'debit', amount: val })
       lines.push({ code: acct.code, name: acct.name, side: 'credit', amount: val })
     }

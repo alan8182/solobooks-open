@@ -9,7 +9,7 @@
  *
  * 事实来源（改动前请核对后端）：
  * - 端点与传输：backend/agent/mcp_server.py（Streamable HTTP，stateless + JSON 响应）
- * - 工具白名单：agent/mcp_server.py 的 MCP_READ_TOOLS / MCP_WRITE_TOOLS（19 + 5 = 24）
+ * - 工具白名单：agent/mcp_server.py 的 MCP_READ_TOOLS / MCP_WRITE_TOOLS（20 + 7 = 27）
  * - 令牌格式与权限：services/mcp_token_service.py（sbk_ 前缀，sha256 落库）
  * - 技能包：skills/solobooks-tax-filing/SKILL.md
  */
@@ -68,7 +68,7 @@ export const GITHUB_URL = `https://github.com/${GITHUB_REPO}`
 export const TOKEN_PAGE = '/mine/mcp'
 
 /** 对外宣称的工具总数，与后端白名单联动（tests 里有一致性断言） */
-export const TOOL_TOTAL = 24
+export const TOOL_TOTAL = 27
 
 export const ENDPOINT_PATH = '/mcp'
 
@@ -98,7 +98,7 @@ export function mcpRemoteCommand(endpoint: string, token: string): string {
   --header "Authorization: Bearer ${token}"`
 }
 
-// ── 24 个原子工具：只按业务域列名字 ──
+// ── 27 个原子工具：只按业务域列名字 ──
 // 逐条写中文说明会把接入页变成 API 手册，而工具描述本来就由 MCP 在握手时广播给客户端，
 // 用户在自己的 AI 里能看到。这里只需要「有哪些、属于哪一类」。
 
@@ -117,7 +117,7 @@ export const READ_TOOL_GROUPS: ToolGroup[] = [
   {
     title: '票据与流水',
     icon: 'ri-file-list-3-line',
-    tools: ['list_invoice_entries', 'list_bank_statements', 'list_unmatched', 'get_aging', 'get_advance_balances'],
+    tools: ['list_invoice_entries', 'list_bank_statements', 'list_unmatched', 'list_private_expenses', 'get_aging', 'get_advance_balances'],
   },
   {
     title: '结账与资产',
@@ -141,9 +141,11 @@ export const READ_TOOL_GROUPS: ToolGroup[] = [
 export const WRITE_TOOLS: string[] = [
   'propose_voucher',
   'propose_vouchers',
+  'propose_statement_vouchers',
   'propose_match',
   'propose_accrual',
   'propose_asset_closure',
+  'record_private_expense',
 ]
 
 export const READ_TOOL_COUNT = READ_TOOL_GROUPS.reduce((n, g) => n + g.tools.length, 0)
@@ -159,7 +161,7 @@ export const SAFETY_RULES: { icon: string; title: string; detail: string }[] = [
   {
     icon: 'ri-draft-line',
     title: 'AI 只起草，不入账',
-    detail: '所有写入都落成 pending 待确认草稿，必须你在产品内逐笔确认才生成凭证。关账动作根本不对外暴露。',
+    detail: '所有写入都落成 pending 待确认草稿，必须你在产品内逐笔确认才生成凭证。结账修复草稿绑定 snapshotHash；run_close_checks 会返回 manualClose 网页链接，最终锁账由登录用户在网页确认，MCP 不暴露锁账接口。',
   },
   {
     icon: 'ri-shield-keyhole-line',
@@ -224,7 +226,7 @@ export const CLIENT_GUIDES: ClientGuide[] = [
     id: 'claude',
     name: 'Claude',
     vendor: 'Anthropic · Claude Desktop',
-    icon: 'ri-sparkling-2-line',
+    icon: 'ri-chat-3-line',
     tagline: '官方参考客户端，配置一次长期可用',
     transport: 'Streamable HTTP；旧版客户端用 mcp-remote 代理兜底',
     summary:
@@ -240,7 +242,7 @@ export const CLIENT_GUIDES: ClientGuide[] = [
       },
       {
         title: '重启并检查工具',
-        detail: '重开后在对话框输入框右下角点工具图标，应看到 solobooks 下 24 个工具。',
+        detail: '重开后在对话框输入框右下角点工具图标，应看到 solobooks 下 27 个工具。',
       },
     ],
     samples: (ctx) => [
@@ -272,7 +274,7 @@ export const CLIENT_GUIDES: ClientGuide[] = [
 }`,
       },
     ],
-    verify: '对话框工具图标点亮，展开能看到 24 个账务工具；问「这个月赚了多少」应触发 get_month_summary。',
+    verify: '对话框工具图标点亮，展开能看到 27 个账务工具；问「这个月赚了多少」应触发 get_month_summary。',
     tips: [
       'Claude 需要 Node.js 才能跑 npx；没装 Node 请用远程端点配置。',
       'JSON 不允许注释和尾逗号，粘错一个逗号整份配置都会失效。',
@@ -318,7 +320,7 @@ export const CLIENT_GUIDES: ClientGuide[] = [
 超时：60s（报表与结账检查类工具耗时较长）`,
       },
     ],
-    verify: '平台连通性探测通过、工具列表出现 24 项；智能体调试台能看到工具调用日志。',
+    verify: '平台连通性探测通过、工具列表出现 27 项；智能体调试台能看到工具调用日志。',
     tips: [
       '百炼运行在公网，端点必须公网可达；本地实例请用内网穿透或反向代理暴露。',
       '部分版本控制台只支持 SSE，而梭罗记账是 Streamable HTTP 端点，若探测失败优先确认平台是否支持该传输。',
@@ -367,7 +369,7 @@ export const CLIENT_GUIDES: ClientGuide[] = [
         code: remoteConfig(ctx.endpoint, ctx.token),
       },
     ],
-    verify: 'MCP 面板里 solobooks 显示绿灯、工具数 24；Chat 里 @ 工具能看到 propose_voucher 等写入工具。',
+    verify: 'MCP 面板里 solobooks 显示绿灯、工具数 27；Chat 里 @ 工具能看到 propose_voucher 等写入工具。',
     tips: [
       '项目级配置文件会进 Git。令牌不要提交到仓库——用全局配置，或把文件加进 .gitignore。',
       'IDE 的 MCP 连接失败通常没有明显报错，先在终端用 curl 打一次端点确认令牌有效。',
@@ -424,7 +426,7 @@ export const CLIENT_GUIDES: ClientGuide[] = [
         label: '自托管起服务',
         code: `git clone ${ctx.repoUrl}.git && cd solobooks-open
 docker compose -f deploy/docker-compose.yml up -d
-# 端点就绪后自检：未带令牌应返回 401，带令牌应广播 24 个工具
+# 端点就绪后自检：未带令牌应返回 401，带令牌应广播 27 个工具
 python scripts/verify_workbuddy_mcp.py --url http://127.0.0.1:8001/mcp --token ${ctx.token}`,
       },
     ],

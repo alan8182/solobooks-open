@@ -69,6 +69,61 @@ async def test_parse_balance_rows_reports_unknown_accounts():
 
 
 @pytest.mark.asyncio
+async def test_parse_balance_rows_accepts_two_tier_headers():
+    """第三方导出把「期初余额」拆成借/贷两层表头，前端拼成复合列名。
+
+    回归：别名表只有「期初余额(借)」这类写法，真实导出的
+    「期初余额借方 / 本年累计发生额借方」全部读不到，79 行数据被当成空行
+    静默跳过（valid 0、errors 0），用户看到的就是「旧账导入没功能」。
+    """
+    company_id = "c-legacy-two-tier"
+    await _setup_company(company_id)
+
+    rows = [
+        {
+            "科目编码": "1002", "科目名称": "银行存款",
+            "期初余额借方": "5,000.00", "期初余额贷方": "0.00",
+            "本年累计发生额借方": "1,200.00", "本年累计发生额贷方": "0.00",
+        },
+        {
+            "科目编码": "3001", "科目名称": "实收资本",
+            "期初余额借方": "0.00", "期初余额贷方": "5,000.00",
+            "本年累计发生额借方": "0.00", "本年累计发生额贷方": "0.00",
+        },
+    ]
+    result = await parse_balance_rows(company_id, rows)
+
+    assert len(result["valid"]) == 2
+    assert result["totals"]["balanced"] is True
+    bank = next(item for item in result["valid"] if item["accountCode"] == "1002")
+    assert float(bank["debitBalance"]) == pytest.approx(5000.0)
+    assert float(bank["ytdDebit"]) == pytest.approx(1200.0)
+
+
+@pytest.mark.asyncio
+async def test_parse_balance_rows_prefers_period_end_over_opening():
+    """同一张表同时有期初和期末列时，资产负债取期末（建账前一月末）余额。
+
+    年中建账时「期初余额」是 1 月 1 日的数，「期末余额」才是建账前一月末的数；
+    取错列会让资产负债整体偏移，试算仍然平——从界面上看不出来。
+    """
+    company_id = "c-legacy-ending"
+    await _setup_company(company_id)
+
+    rows = [
+        {
+            "科目编码": "1002", "科目名称": "银行存款",
+            "期初余额借方": "1,000.00", "期初余额贷方": "0.00",
+            "期末余额借方": "5,000.00", "期末余额贷方": "0.00",
+        },
+    ]
+    result = await parse_balance_rows(company_id, rows)
+
+    assert len(result["valid"]) == 1
+    assert float(result["valid"][0]["debitBalance"]) == pytest.approx(5000.0)
+
+
+@pytest.mark.asyncio
 async def test_confirm_balance_requires_step_up_token():
     company_id = "c-legacy-balance-stepup"
     await _setup_company(company_id)

@@ -266,7 +266,7 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.voucher-detail-page { max-width: 760px; margin: 0 auto; }
+.voucher-detail-page { max-width: var(--page-width-narrow); margin: 0 auto; }
 .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
 .toolbar-right { display: flex; gap: 8px; }
 .toolbar-nav { display: flex; align-items: center; gap: 6px; }

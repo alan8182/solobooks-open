@@ -13,7 +13,26 @@ export interface PeriodCloseCheck {
   [key: string]: unknown
 }
 
+export interface ClosingFinding {
+  findingId: string
+  checkCode: string
+  severity: 'blocking' | 'warning' | 'info'
+  kind: string
+  title: string
+  count: number
+  amount: string | null
+  authoritativeIds: {
+    statementIds: string[]
+    entryIds: string[]
+    assetIds: string[]
+    scheduleIds: string[]
+  }
+  allowedRepairs: string[]
+  details?: unknown
+}
+
 export interface PeriodCloseChecks {
+  schemaVersion?: 'closing.v1'
   period?: string
   periodStatus?: string
   canClose?: boolean
@@ -21,6 +40,13 @@ export interface PeriodCloseChecks {
   checks?: PeriodCloseCheck[]
   notices?: ClosingNotice[]
   noticeCount?: number
+  snapshotHash?: string
+  generatedAt?: string
+  periodVersion?: number
+  ruleVersions?: Record<string, string>
+  findings?: ClosingFinding[]
+  findingsTotal?: number
+  nextFindingCursor?: number | null
 }
 
 /**

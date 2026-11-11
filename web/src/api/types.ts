@@ -79,6 +79,9 @@ export interface CompanyInfo {
   type?: string
   taxpayerType?: string
   industry?: string
+  industryCode?: string
+  industryTemplateVersion?: number
+  industryTemplateAppliedAt?: string
   startDate?: string
   taxId?: string
   restrictedIndustry?: boolean
@@ -98,9 +101,11 @@ export interface UpdateProfileRequest {
 
 export interface CreateCompanyRequest {
   name: string
+  onboardingType?: 'new' | 'migration'
   type?: string
   taxpayerType?: string
   industry?: string
+  industryCode?: string
   startDate?: string
   taxId?: string
   restrictedIndustry?: boolean
@@ -338,6 +343,43 @@ export interface EntryUpdateRequest {
   autoReverseRepost?: boolean
 }
 
+export interface VoucherPreviewRequest {
+  payer?: string
+  paymentStatus?: 'paid' | 'unpaid'
+  category?: string
+  /** 研发归集明细：分类为「研发支出-费用化支出」时必须一并传入，预览才不会被后端拒绝。 */
+  rdProjectId?: string
+  rdExpenseType?: RdExpenseType
+  rdOriginalAmount?: MoneyInput
+  rdAllocationMethod?: 'direct' | 'timesheet' | 'usage' | 'area' | 'quantity' | 'other'
+  rdAllocationBasis?: string
+}
+
+export interface VoucherPreviewLine {
+  accountCode: string
+  accountName: string
+  amount: string
+  /** 垫付类科目挂的往来单位（老板/具名员工），其他科目不返回 */
+  partnerName?: string
+}
+
+export interface VoucherPreview {
+  entryId: string
+  status: string
+  direction: string
+  category: string
+  payer: string
+  paymentStatus: string
+  amount: string
+  /** rule=分类有明确科目映射；fallback=落到兜底科目 */
+  source: 'rule' | 'fallback'
+  /** 已过账凭证：确认入账会用红冲 + 重记，而不是原地改写 */
+  willReverse: boolean
+  warnings: { code: string; message: string }[]
+  debit: VoucherPreviewLine[]
+  credit: VoucherPreviewLine[]
+}
+
 // ===== Todo Types =====
 export interface TodoItem {
   id: string
@@ -572,6 +614,8 @@ export interface BalanceSheetStandard {
   assets: StandardStatementRow[]
   rights: StandardStatementRow[]
   balanced: boolean
+  /** 年初列是否有可靠来源：年中建账又没导入年初快照时为 false，年初列全 0 */
+  openingKnown?: boolean
 }
 
 export interface BalanceSheetResponse {

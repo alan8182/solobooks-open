@@ -364,8 +364,13 @@ def _derive_entry_todos(
         # 且结账向导「已确认入账去向」区已在跟踪，再催就是让用户重复确认同一件事
         payer_str = payer
         advancement_confirmed = payer_str == "boss_personal" or payer_str.startswith("employee_personal")
+        # 已过账的 archive-only 发票（如"发票先到"被确认过账、或平台手续费误归档后确认）
+        # 是真实费用凭证，必须参与与无票支出的跨单据撮合——排除它会让付款侧"待补票据"
+        # 无人认领（2026-10-31 实测：发票列表里有票、待办却永远报缺）。draft 底稿仍是
+        # 纯证据未记账，不进池。
+        invoice_is_posted = str(entry.get("voucherStatus") or "") == "posted"
         if (source == "invoice_import" and entry_id not in matched_entry_ids
-                and not is_archive_only and not advancement_confirmed
+                and (not is_archive_only or invoice_is_posted) and not advancement_confirmed
                 and str(entry.get("billingStatus") or "") != "reconciled"):
             invoice_unpaid_candidates.append(entry)
 
@@ -807,6 +812,79 @@ async def advise_todos_with_llm(user_id: str, company_id: str) -> List[Dict[str,
     return todos
 
 
+async def _repost_invoice_voucher(
+    session,
+    *,
+    inv_journal,
+    inv_meta: dict,
+    settle_line,
+    expense_entry_id: str,
+    company_id: str,
+    user_id: str,
+) -> str:
+    """红冲后的发票凭证按付款对手科目重挂并重新过账，返回新凭证 id。
+
+    费用借方行原样保留；贷方挂账行改用付款凭证的对手科目（如 2241→2202）并
+    沿用原往来单位辅助核算，与付款凭证相互对冲。dedupFingerprint 必须换新：
+    否则 external_key=发票号会撞已被红冲原凭证占用的来源唯一键（DUPLICATE_SOURCE）。
+    inv_meta 是 metadata+投影合并后的完整字段（发票号/税率等可能只在投影里）。
+    """
+    from services.accounting_core_service import create_entry, _entry_lines
+    from uuid import uuid4
+
+    old_lines = await _entry_lines(session, inv_journal.id)
+    old_debits = [line for line in old_lines if line.direction == "debit"]
+    old_credits = [line for line in old_lines if line.direction == "credit"]
+    partner_auxiliary = next(
+        (dict(line.auxiliary) for line in old_credits if line.auxiliary), None
+    )
+    total = sum((money(line.amount) for line in old_lines if line.direction == "debit"), ZERO)
+
+    def _payload_line(line) -> dict:
+        payload_line = {
+            "amount": money_text(line.amount),
+            "accountCode": str(line.account_code),
+            "accountName": str(line.account_name or ""),
+        }
+        if line.auxiliary:
+            payload_line["auxiliary"] = dict(line.auxiliary)
+        return payload_line
+
+    repost_title = str(inv_journal.summary or "")
+    if repost_title.startswith("补记") and "｜" in repost_title[:12]:
+        repost_title = repost_title.split("｜", 1)[1]
+
+    new_credit = {
+        "amount": money_text(total),
+        "accountCode": str(settle_line.account_code),
+        "accountName": str(settle_line.account_name or ""),
+    }
+    if partner_auxiliary:
+        new_credit["auxiliary"] = partner_auxiliary
+
+    payload = dict(inv_meta)
+    for drop_key in ("id", "voucherLines", "voucherNo", "voucher_no", "dedupFingerprint",
+                     "wechat_transaction_key", "is_archive_only", "isArchiveOnly",
+                     "linkedExpenseEntryId", "linkedInvoiceEntryId", "billingStatus",
+                     "allowBackfill", "backfillReason", "voucherRef", "reversalOfId"):
+        payload.pop(drop_key, None)
+    payload["dedupFingerprint"] = f"inv-relink-{uuid4().hex[:12]}"
+    payload["billingStatus"] = "has_invoice"
+    payload["linkedExpenseEntryId"] = expense_entry_id
+    payload["occurDate"] = inv_journal.occurred_on.isoformat()
+    payload["title"] = repost_title
+    payload["voucherLines"] = {
+        "debit": [_payload_line(line) for line in old_debits],
+        "credit": [new_credit],
+    }
+    created = await create_entry(
+        session, payload,
+        company_id=company_id, user_id=user_id,
+        request_id=f"repost-inv-{uuid4()}", confirm=True,
+    )
+    return str(created.id)
+
+
 async def link_invoice_to_expense(
     invoice_entry_id: str,
     expense_entry_id: str,
@@ -816,13 +894,12 @@ async def link_invoice_to_expense(
 ) -> Dict[str, Any]:
     """将待报销发票凭证与已有支出流水凭证关联核销（解决一笔业务两张卡且重复挂账问题）。"""
     from db.session import session_scope
-    from db.models import Invoice, LegacyEntryProjection, JournalEntry
+    from db.models import Invoice, LegacyEntryProjection
     from services.accounting_core_service import (
         get_journal,
         update_draft,
         reverse_journal,
         delete_draft,
-        _locked_entry_context,
     )
     from core.errors import AccountingError
     from uuid import uuid4
@@ -847,35 +924,9 @@ async def link_invoice_to_expense(
         inv_type = str(inv_meta.get("invoiceType") or inv_meta.get("invoice_type") or "")
         seller = str(inv_meta.get("merchant") or inv_meta.get("seller_name") or "")
 
-        # 1. 把发票元数据反写到实际支出凭证上（已过账凭证走更新跟踪投影字段）
-        exp_updates = {
-            "billingStatus": "has_invoice",
-            "invoiceNumber": inv_number,
-            "invoiceType": inv_type,
-            "linkedInvoiceEntryId": invoice_entry_id,
-        }
-        # merchant 不在 POSTED_PROJECTION_FIELDS 里，如果已过账不能加进去，否则会触发已过账不可改拦截
-        if exp_journal.status in ("draft", "pending_review") and seller and not (exp_journal.metadata_json or {}).get("merchant"):
-            exp_updates["merchant"] = seller
-
-        await update_draft(
-            session,
-            expense_entry_id,
-            exp_updates,
-            company_id=company_id,
-            user_id=user_id,
-            request_id=f"link-exp-{uuid4()}",
-        )
-
-        # 2. 将 invoices 表台账的 entry_id 切换指向实际支出凭证
-        from sqlalchemy import select, update
-        await session.execute(
-            update(Invoice)
-            .where(Invoice.company_id == company_id, Invoice.entry_id == invoice_entry_id)
-            .values(entry_id=expense_entry_id)
-        )
-
-        # 3. 消除重复的发票凭证（若草稿则删除，若已过账且未冲销且期间未关则红冲，并在投影标归档）
+        # 1. 处理发票凭证：草稿删除；已过账分两种形态（见下）。invoice_ref_id 是
+        # 付款凭证 linkedInvoiceEntryId 应指向的"活"发票凭证。
+        invoice_ref_id = invoice_entry_id
         if inv_journal.status in ("draft", "pending_review"):
             await delete_draft(
                 session, invoice_entry_id, company_id=company_id, user_id=user_id,
@@ -883,17 +934,44 @@ async def link_invoice_to_expense(
             )
         elif inv_journal.status == "posted":
             # 检查发票凭证所属期间状态
-            from services.accounting_core_service import get_or_create_period
+            from services.accounting_core_service import get_or_create_period, _entry_lines
             period = await get_or_create_period(session, company_id, inv_journal.period_start)
             if period and period.status == "open":
+                # 付款凭证借方形态决定核销方式（1002 是付款贷方，不算对手科目）：
+                # - 借方是费用科目（5xxx/43）：发票凭证是重复记账 → 照旧红冲，费用由付款凭证承担；
+                # - 借方是应付/往来科目（1xxx/2xxx，跨期"发票先到、付款后确认"时建议层落 2202
+                #   就是这种）：发票凭证是唯一费用记账，直接红冲会让费用凭空消失、利润虚增。
+                #   此时红冲后按原期间重记，贷方挂账行改用付款凭证的对手科目（2241→2202），
+                #   与付款凭证相互对冲平账；付款凭证与其银行流水关联一律不动。
+                exp_debit_lines = [
+                    line for line in await _entry_lines(session, expense_entry_id)
+                    if line.direction == "debit" and str(line.account_code) != "1002"
+                ]
+                payable_shaped = bool(exp_debit_lines) and all(
+                    str(line.account_code).startswith(("1", "2")) for line in exp_debit_lines
+                )
                 await reverse_journal(
                     session,
                     invoice_entry_id,
                     company_id=company_id,
                     user_id=user_id,
                     request_id=f"rev-dup-inv-{uuid4()}",
-                    reason="已关联银行实际支出凭证，自动冲销重复发票挂账",
+                    reason=(
+                        "已关联银行实际支出凭证，冲销后按付款对手科目重订发票挂账"
+                        if payable_shaped else
+                        "已关联银行实际支出凭证，自动冲销重复发票挂账"
+                    ),
                 )
+                if payable_shaped:
+                    invoice_ref_id = await _repost_invoice_voucher(
+                        session,
+                        inv_journal=inv_journal,
+                        inv_meta=inv_meta,
+                        settle_line=max(exp_debit_lines, key=lambda line: money(line.amount)),
+                        expense_entry_id=expense_entry_id,
+                        company_id=company_id,
+                        user_id=user_id,
+                    )
             # 在发票投影上回写已核销与归档标记，确保待办和对账彻底消卡
             inv_updates = {
                 "billingStatus": "reconciled",
@@ -910,6 +988,34 @@ async def link_invoice_to_expense(
                 request_id=f"archive-dup-inv-{uuid4()}",
             )
 
+        # 2. 把发票元数据反写到实际支出凭证上（已过账凭证走更新跟踪投影字段）
+        exp_updates = {
+            "billingStatus": "has_invoice",
+            "invoiceNumber": inv_number,
+            "invoiceType": inv_type,
+            "linkedInvoiceEntryId": invoice_ref_id,
+        }
+        # merchant 不在 POSTED_PROJECTION_FIELDS 里，如果已过账不能加进去，否则会触发已过账不可改拦截
+        if exp_journal.status in ("draft", "pending_review") and seller and not (exp_journal.metadata_json or {}).get("merchant"):
+            exp_updates["merchant"] = seller
+
+        await update_draft(
+            session,
+            expense_entry_id,
+            exp_updates,
+            company_id=company_id,
+            user_id=user_id,
+            request_id=f"link-exp-{uuid4()}",
+        )
+
+        # 3. 将 invoices 表台账的 entry_id 切换指向实际支出凭证
+        from sqlalchemy import update
+        await session.execute(
+            update(Invoice)
+            .where(Invoice.company_id == company_id, Invoice.entry_id == invoice_entry_id)
+            .values(entry_id=expense_entry_id)
+        )
+
     # 4. 同步更新待办状态表中对应的 todoKey 为已完成
     await update_todo_state(f"entry:{invoice_entry_id}:invoice_unpaid", user_id=user_id, company_id=company_id, done=True)
     await update_todo_state(f"entry:{expense_entry_id}:missing_document", user_id=user_id, company_id=company_id, done=True)
@@ -917,6 +1023,8 @@ async def link_invoice_to_expense(
     return {
         "status": "linked",
         "invoiceEntryId": invoice_entry_id,
+        # 挂账重订形态下是重记后的新发票凭证 id（draft/普通形态等于 invoiceEntryId）
+        "linkedInvoiceVoucherId": invoice_ref_id,
         "expenseEntryId": expense_entry_id,
         "invoiceNumber": inv_number,
     }

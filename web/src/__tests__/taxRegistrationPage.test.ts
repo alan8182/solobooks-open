@@ -155,7 +155,7 @@ afterEach(() => {
 })
 
 describe('税费种认定页', () => {
-  it('没有认定行时给出同步与带出两条出路', async () => {
+  it('没有认定行时首推从电子税务局同步，并提供暂不同步先去月度结账兜底出路', async () => {
     harness.list.mockResolvedValue({ items: [], stats: { total: 0, active: 0, groups: {} } })
     harness.preview.mockResolvedValue(emptyPreview())
 
@@ -165,8 +165,17 @@ describe('税费种认定页', () => {
     const text = wrapper.text()
     expect(text).toContain('税费种认定')
     expect(text).toContain('还没有同步税局认定表')
+    expect(text).toContain('从电子税务局同步')
     expect(text).toContain('去同步')
-    expect(text).toContain('按主体类型带出')
+    expect(text).toContain('暂不同步，先去月度结账')
+    expect(text).not.toContain('按主体类型带出')
+
+    const skipBtn = wrapper
+      .findAll('button')
+      .find((b) => b.text().includes('暂不同步，先去月度结账'))
+    expect(skipBtn).toBeTruthy()
+    await skipBtn?.trigger('click')
+    expect(harness.push).toHaveBeenCalledWith({ path: '/closing-wizard', query: { step: '1' } })
   })
 
   it('有认定行时展示归属申报表，并把附加税并进增值税申报表', async () => {
@@ -214,5 +223,39 @@ describe('税费种认定页', () => {
     expect(chip).toBeTruthy()
     await chip?.trigger('click')
     expect(harness.push).toHaveBeenCalledWith({ path: '/tax-filing', query: { period: '2026-Q3' } })
+  })
+
+  it('已同步时展示税费申报已就绪大白话卡片，并支持一键前往月度结账对账', async () => {
+    harness.list.mockResolvedValue({
+      items: [registrationRow()],
+      stats: { total: 1, active: 1, groups: { vat: 1 } },
+    })
+    harness.preview.mockResolvedValue(previewWith('2026-Q3', '2026-10-22', '2026-10'))
+
+    const wrapper = mount(Page, { attachTo: document.body })
+    await flushPromises()
+
+    const text = wrapper.text()
+    expect(text).toContain('税费申报设置已就绪')
+    expect(text).toContain('前往月度结账')
+    expect(text).toContain('返回工作台')
+    expect(text).toContain('增值税申报周期')
+    expect(text).toContain('企业所得税')
+    expect(text).toContain('个人所得税')
+    expect(text).toContain('按月申报')
+
+    const goClosingBtn = wrapper
+      .findAll('button')
+      .find((b) => b.text().includes('前往月度结账'))
+    expect(goClosingBtn).toBeTruthy()
+    await goClosingBtn?.trigger('click')
+    expect(harness.push).toHaveBeenCalledWith({ path: '/closing-wizard', query: { step: '1' } })
+
+    const goDashboardBtn = wrapper
+      .findAll('button')
+      .find((b) => b.text().includes('返回工作台'))
+    expect(goDashboardBtn).toBeTruthy()
+    await goDashboardBtn?.trigger('click')
+    expect(harness.push).toHaveBeenCalledWith('/')
   })
 })

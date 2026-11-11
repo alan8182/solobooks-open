@@ -14,6 +14,13 @@ from typing import Any, Dict, List, Set
 
 from services.database import get_conn
 from services.entry_service import save_entries_bulk
+from services.vat_service import (
+    VAT_PAYABLE_ACCOUNT,
+    VAT_PAYABLE_ACCOUNT_NAME,
+    get_vat_config_by_id,
+    is_vat_sales_entry,
+    split_income_vat,
+)
 from core.money import ZERO, money
 
 WECHAT_CLEARING_CODE = "1012001"
@@ -44,6 +51,19 @@ def _add_days(date_str: str, days: int) -> str:
 
 def _voucher(debit: List[Dict[str, Any]], credit: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {"debit": debit, "credit": credit}
+
+
+def _split_revenue_vat(gross: Decimal, vat_rate: Any) -> tuple[Decimal, Decimal]:
+    """按征收率对收入做价税分离，返回（不含税净额，增值税额）。
+
+    退款红冲（gross 为负）按绝对值拆分后镜像符号，保持与收入金额同号，
+    这样借贷两侧都能直接用 ``abs`` 落行；``split_income_vat`` 本身不接受负数。
+    """
+    if gross < ZERO:
+        net, tax = split_income_vat(-gross, vat_rate)
+        return money(-net), money(-tax)
+    net, tax = split_income_vat(gross, vat_rate)
+    return net, tax
 
 
 def _read_csv_row(line: str) -> List[str]:
@@ -328,8 +348,15 @@ async def import_wechat_bill_summary(
 
     借：1012001 微信支付待结算  （净结算金额 = 订单金额 - 退款金额 - 手续费）
     借：5603002 财务费用-手续费  （总手续费）
-    贷：5001    主营业务收入      （净收入 = 订单总额 - 退款总额）
+    贷：5001    主营业务收入      （不含税净收入，与手动记账同口径价税分离）
+    贷：2221026 应交增值税        （含税净收入 - 不含税净收入，小规模纳税人专用）
+
+    退款大于订单（含税净收入为负）时收入与税额同为红字记在借方；
+    收入科目非增值税应税销售（``is_vat_sales_entry`` 为假）时按含税全额入账、不计提。
     """
+    vat_config = await get_vat_config_by_id(company_id)
+    accrue_vat = is_vat_sales_entry(revenue_name, revenue_code)
+
     total_count = int(_money(summary.get("总交易单数") or summary.get("total_count") or 0))
     order_amount = _money(summary.get("订单总金额") or summary.get("应结订单总金额") or summary.get("order_amount") or 0)
     refund_amount = _money(summary.get("退款总金额") or summary.get("refund_amount") or 0)
@@ -337,6 +364,9 @@ async def import_wechat_bill_summary(
 
     net_revenue = order_amount - refund_amount
     net_clearing = net_revenue - fee_amount
+    revenue_net, revenue_tax = net_revenue, ZERO
+    if accrue_vat and net_revenue != ZERO:
+        revenue_net, revenue_tax = _split_revenue_vat(net_revenue, vat_config.rate)
 
     if not occur_date:
         occur_date = datetime.now().strftime("%Y-%m-%d")
@@ -368,11 +398,15 @@ async def import_wechat_bill_summary(
     elif fee_amount < ZERO:
         credit_lines.append({"accountCode": fee_code, "accountName": fee_name, "amount": abs(fee_amount)})
 
-    # 3. 主营业务收入 (5001)
+    # 3. 主营业务收入 (5001) + 应交增值税 (2221026)
     if net_revenue > ZERO:
-        credit_lines.append({"accountCode": revenue_code, "accountName": revenue_name, "amount": net_revenue})
+        credit_lines.append({"accountCode": revenue_code, "accountName": revenue_name, "amount": revenue_net})
+        if revenue_tax > ZERO:
+            credit_lines.append({"accountCode": VAT_PAYABLE_ACCOUNT, "accountName": VAT_PAYABLE_ACCOUNT_NAME, "amount": revenue_tax})
     elif net_revenue < ZERO:
-        debit_lines.append({"accountCode": revenue_code, "accountName": revenue_name, "amount": abs(net_revenue)})
+        debit_lines.append({"accountCode": revenue_code, "accountName": revenue_name, "amount": -revenue_net})
+        if revenue_tax < ZERO:
+            debit_lines.append({"accountCode": VAT_PAYABLE_ACCOUNT, "accountName": VAT_PAYABLE_ACCOUNT_NAME, "amount": -revenue_tax})
 
     summary_entry = {
         "title": f"微信支付月度汇总-{month_str}",
@@ -389,6 +423,13 @@ async def import_wechat_bill_summary(
         "remark": f"微信支付月度对账汇总（共 {total_count} 笔交易，订单总额 {order_amount}，退款 {refund_amount}，手续费 {fee_amount}）",
         "voucherLines": _voucher(debit_lines, credit_lines),
     }
+    if accrue_vat:
+        summary_entry.update({
+            "vatRate": vat_config.rate,
+            "vatAmount": revenue_tax,
+            "vatSeparated": True,
+            "amountExcludingTax": revenue_net,
+        })
 
     try:
         await save_entries_bulk(
@@ -425,12 +466,15 @@ async def import_wechat_bill(
     """将解析后的微信账单行批量保存为记账条目。
 
     每笔 SUCCESS 生成两条 entry：
-      1. 主营业务收入（订单金额）
+      1. 主营业务收入（订单金额，价税分离：贷 5001 不含税 + 贷 2221026 应交增值税）
       2. 银行及金融手续费（手续费，负向修正）
 
-    每笔 REFUND 生成一条负收入 entry（退款金额）。
+    每笔 REFUND 生成一条负收入 entry（退款金额），税额随收入红冲记借方。
     手续费退还也记入手续费科目（负手续费）。
     """
+    vat_config = await get_vat_config_by_id(company_id)
+    accrue_vat = is_vat_sales_entry(REVENUE_NAME, REVENUE_CODE)
+
     # Load latest existing WeChat transaction keys for dedupe
     existing_wechat = await _load_existing_wechat_transaction_keys(company_id)
     requested_order_nos = {
@@ -515,8 +559,12 @@ async def import_wechat_bill(
 
         try:
             if status == "SUCCESS":
-                # 1. 主收入条目（订单金额）
-                pending_entries.append({
+                # 1. 主收入条目（订单金额，价税分离与手动记账同口径）
+                revenue_net, revenue_tax = _split_revenue_vat(order_amount, vat_config.rate) if accrue_vat else (order_amount, ZERO)
+                revenue_credit = [{"accountCode": REVENUE_CODE, "accountName": REVENUE_NAME, "amount": revenue_net}]
+                if revenue_tax > ZERO:
+                    revenue_credit.append({"accountCode": VAT_PAYABLE_ACCOUNT, "accountName": VAT_PAYABLE_ACCOUNT_NAME, "amount": revenue_tax})
+                revenue_entry = {
                     "title": product,
                     "amount": order_amount,
                     "direction": "income",
@@ -533,9 +581,17 @@ async def import_wechat_bill(
                     **reconciliation_fields,
                     "voucherLines": _voucher(
                         [{"accountCode": WECHAT_CLEARING_CODE, "accountName": WECHAT_CLEARING_NAME, "amount": order_amount}],
-                        [{"accountCode": REVENUE_CODE, "accountName": REVENUE_NAME, "amount": order_amount}],
+                        revenue_credit,
                     ),
-                })
+                }
+                if accrue_vat:
+                    revenue_entry.update({
+                        "vatRate": vat_config.rate,
+                        "vatAmount": revenue_tax,
+                        "vatSeparated": True,
+                        "amountExcludingTax": revenue_net,
+                    })
+                pending_entries.append(revenue_entry)
 
                 # 2. 手续费条目（支出）
                 if fee > ZERO:
@@ -563,8 +619,12 @@ async def import_wechat_bill(
                 pending_results.append({"status": "success", "title": product, "amount": order_amount})
 
             elif status == "REFUND":
-                # 退款：冲销收入（负金额用 income + 负数表示）
-                pending_entries.append({
+                # 退款：冲销收入（负金额用 income + 负数表示），税额随收入红冲记借方
+                refund_net, refund_tax = _split_revenue_vat(-refund_amount, vat_config.rate) if accrue_vat else (-refund_amount, ZERO)
+                revenue_debit = [{"accountCode": REVENUE_CODE, "accountName": REVENUE_NAME, "amount": -refund_net}]
+                if refund_tax < ZERO:
+                    revenue_debit.append({"accountCode": VAT_PAYABLE_ACCOUNT, "accountName": VAT_PAYABLE_ACCOUNT_NAME, "amount": -refund_tax})
+                refund_entry = {
                     "title": f"退款-{product}",
                     "amount": -refund_amount,
                     "direction": "income",
@@ -580,10 +640,18 @@ async def import_wechat_bill(
                     "remark": "微信退款冲销",
                     **reconciliation_fields,
                     "voucherLines": _voucher(
-                        [{"accountCode": REVENUE_CODE, "accountName": REVENUE_NAME, "amount": refund_amount}],
+                        revenue_debit,
                         [{"accountCode": WECHAT_CLEARING_CODE, "accountName": WECHAT_CLEARING_NAME, "amount": refund_amount}],
                     ),
-                })
+                }
+                if accrue_vat:
+                    refund_entry.update({
+                        "vatRate": vat_config.rate,
+                        "vatAmount": refund_tax,
+                        "vatSeparated": True,
+                        "amountExcludingTax": refund_net,
+                    })
+                pending_entries.append(refund_entry)
 
                 # 手续费退还：冲销原手续费，仍在微信待结算科目内闭合，不影响银行。
                 if fee > ZERO:

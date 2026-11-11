@@ -27,7 +27,7 @@ const editing = ref<AuxiliaryItem | null>(null)
 const form = ref({
   name: '',
   code: '',
-  type: 'both' as 'customer' | 'supplier' | 'both',
+  type: 'both' as 'customer' | 'supplier' | 'both' | 'person',
   taxId: '',
   contact: '',
   phone: '',
@@ -39,6 +39,7 @@ const typeOptions = [
   { label: '客户', value: 'customer' },
   { label: '供应商', value: 'supplier' },
   { label: '客户 + 供应商', value: 'both' },
+  { label: '个人（股东/员工）', value: 'person' },
 ]
 
 const kindLabel = computed(() => ({ partner: '往来单位', department: '部门', project: '项目' })[kind.value])
@@ -73,7 +74,7 @@ function openEdit(item: AuxiliaryItem) {
   form.value = {
     name: item.name,
     code: item.code,
-    type: (item.type as 'customer' | 'supplier' | 'both') || 'both',
+    type: (item.type as 'customer' | 'supplier' | 'both' | 'person') || 'both',
     taxId: item.taxId || '',
     contact: item.contact || '',
     phone: item.phone || '',
@@ -206,7 +207,7 @@ onMounted(load)
               <td>{{ item.name }}</td>
               <td v-if="kind === 'partner'">
                 <NTag size="small" :bordered="false">
-                  {{ item.type === 'customer' ? '客户' : item.type === 'supplier' ? '供应商' : '客户+供应商' }}
+                  {{ item.type === 'customer' ? '客户' : item.type === 'supplier' ? '供应商' : item.type === 'person' ? '个人' : '客户+供应商' }}
                 </NTag>
               </td>
               <td v-if="kind === 'partner'" class="mono">{{ item.taxId || '—' }}</td>

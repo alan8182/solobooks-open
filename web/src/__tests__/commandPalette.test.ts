@@ -35,7 +35,7 @@ describe('GlobalSearch / Command Palette', () => {
     wrapper = mount(GlobalSearch, { attachTo: document.body })
     const text = document.body.textContent || ''
     expect(text).toContain('快捷动作')
-    expect(text).toContain('记一笔 / 问 AI 会计')
+    expect(text).toContain('记一笔 / 问 AI CFO')
     expect(text).toContain('上传发票')
     expect(text).toContain('上传银行流水')
     expect(text).toContain('月末结账向导')
@@ -71,7 +71,7 @@ describe('GlobalSearch / Command Palette', () => {
     const actionRows = document.body.querySelectorAll('.command-row')
     expect(actionRows.length).toBeGreaterThan(0)
 
-    // Click the first action ("记一笔 / 问 AI 会计")
+    // Click the first action ("记一笔 / 问 AI CFO")
     const firstRow = actionRows[0] as HTMLElement
     firstRow.click()
     expect(pushMock).toHaveBeenCalledWith('/copilot')

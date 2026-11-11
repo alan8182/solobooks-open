@@ -874,7 +874,7 @@ const columns = computed<DataTableColumns<RuleDraft>>(() => [
 
 <style scoped>
 .agg-rules-page {
-  max-width: 1120px;
+  max-width: var(--page-width);
   margin: 0 auto;
 }
 .page-header {

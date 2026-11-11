@@ -22,7 +22,9 @@ const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, '../..')
 const webRoot = resolve(here, '..')
 
-const read = (p) => readFileSync(p, 'utf8')
+// Windows 上 autocrlf 会把工作区检出成 CRLF，BOM 也可能由编辑器带入；
+// frontmatter 锚点 /^---\n/ 只认 LF，这里统一归一化，避免守卫结果随检出环境漂移。
+const read = (p) => readFileSync(p, 'utf8').replace(/^\uFEFF/, '').replace(/\r\n/g, '\n')
 const norm = (hex) => hex.trim().toUpperCase()
 
 /* ---------- 真值：variables.css ---------- */

@@ -6,12 +6,22 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import type { RouteRecordRaw } from 'vue-router'
 import { resolveAuthRedirect } from './guards'
+import { installSeo } from './seo'
+import { lazyShell } from '@/pages/layout/lazyShell'
 
 export const routes: RouteRecordRaw[] = [
   {
     path: '/landing',
     name: 'Landing',
     component: () => import('@/pages/landing/index.vue'),
+    meta: { requiresAuth: false },
+  },
+  {
+    // 升维版官网首页（科技小微 × 驻场 AI 财务官「点一点、问一问」叙事），
+    // 与 /landing 原版并存做对比验收；原版首页保持不动。
+    path: '/landing-v2',
+    name: 'LandingV2',
+    component: () => import('@/pages/landing/v2.vue'),
     meta: { requiresAuth: false },
   },
   {
@@ -53,6 +63,14 @@ export const routes: RouteRecordRaw[] = [
     meta: { requiresAuth: false },
   },
   {
+    // AI 账本体检器（免登录报表体检与 30 秒极速自测）
+    path: '/audit-scan',
+    alias: ['/health-scan'],
+    name: 'AuditScan',
+    component: () => import('@/pages/audit-scan/index.vue'),
+    meta: { requiresAuth: false },
+  },
+  {
     // 平台管理后台：独立于业务布局；管理员身份由 AdminLayout 调 /api/admin/overview 探测（403 拒绝），不落 localStorage
     // 路径刻意不用 /admin：公开后台路径是爆破工具的高频字典目标，改用非通用词降低被扫到的概率；
     // 后端 require_admin 仍是真正的门（每次请求查库校验 is_platform_admin）
@@ -81,6 +99,11 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('@/pages/admin/AdminCompanies.vue'),
       },
       {
+        path: 'industry-templates',
+        name: 'AdminIndustryTemplates',
+        component: () => import('@/pages/admin/AdminIndustryTemplates.vue'),
+      },
+      {
         path: 'audit-logs',
         name: 'AdminAuditLogs',
         component: () => import('@/pages/admin/AdminAuditLogs.vue'),
@@ -107,13 +130,16 @@ export const routes: RouteRecordRaw[] = [
     children: [
       {
         path: '',
-        component: () => import('@/pages/layout/AppLayout.vue'),
+        // 过一层 lazyShell：Vue Router 会解析匹配链上的懒加载组件，直接挂 AppLayout
+        // 会让匿名访客打开官网也下载工作台（详见 pages/layout/lazyShell.ts）。
+        component: lazyShell(() => import('@/pages/layout/AppLayout.vue')),
         meta: { requiresAuth: true },
         children: [
       {
         path: '',
         name: 'Home',
-        component: () => import('@/pages/home/index.vue'),
+        // Home 同样挂在 `/` 的匹配链上，且静态引入了一堆业务模块，必须一起过壳。
+        component: lazyShell(() => import('@/pages/home/index.vue')),
       },
       {
         // 上手引导总页：首页清单就绪后折叠，想再看只能从这里进。
@@ -121,6 +147,13 @@ export const routes: RouteRecordRaw[] = [
         path: 'guide',
         name: 'Guide',
         component: () => import('@/pages/guide/index.vue'),
+      },
+      {
+        // 图文操作指引独立页（个税代扣代缴等长文）。
+        // 短指引不占路由，走页面内的 GuideTrigger 抽屉。
+        path: 'guides/:id',
+        name: 'GuideDetail',
+        component: () => import('@/pages/guides/detail.vue'),
       },
       {
         path: 'ledger',
@@ -408,10 +441,9 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('@/pages/mine/backup.vue'),
       },
       {
-        // 专家协审（Solo Audit Share）：生成/撤销协审链接 + CPA 批注回流处理
+        // 专家协审（Solo Audit Share）：生成/撤销协审链接 + CPA 批注回流处理（老板与会计视图均直达）
         path: 'mine/audit-share',
         name: 'AuditShareManage',
-        meta: { workspace: ['accounting'] },
         component: () => import('@/pages/mine/audit-share.vue'),
       },
       {
@@ -523,5 +555,8 @@ router.beforeEach((to, _from, next) => {
   }
   next()
 })
+
+// 路由级 SEO：TDK / canonical / robots / OG 随导航同步（映射见 ./seo.ts）
+installSeo(router)
 
 export default router

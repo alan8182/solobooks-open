@@ -8,6 +8,7 @@ import {
 } from '@/utils/taxFiling'
 import { copyToClipboard } from '@/utils/clipboard'
 import { formatMoney } from '@/utils/format'
+import GuideTrigger from '@/components/business/GuideTrigger.vue'
 
 const props = defineProps<{
   pkg: any
@@ -121,11 +122,11 @@ async function copyAmount(val: number, label: string) {
               <NButton
                 v-if="finStatementTask.status !== 'filed' && finStatementTask.status !== 'waived'"
                 type="primary"
-                secondary
                 size="small"
+                class="btn-mark-filed"
                 @click="emit('markFiled', finStatementTask.deadlineId)"
               >
-                <template #icon><i class="ri-check-line" /></template>
+                <template #icon><i class="ri-checkbox-circle-line" /></template>
                 标记「{{ finStatementTask.name }}」已申报办结
               </NButton>
             </div>
@@ -145,11 +146,11 @@ async function copyAmount(val: number, label: string) {
                 <NButton
                   v-if="vatDeadline?.deadlineId && !isVatDone"
                   type="primary"
-                  secondary
-                  size="tiny"
+                  size="small"
+                  class="btn-mark-filed"
                   @click="emit('markFiled', vatDeadline.deadlineId)"
                 >
-                  <template #icon><i class="ri-check-line" /></template>
+                  <template #icon><i class="ri-checkbox-circle-line" /></template>
                   标记「增值税及附加税费」已申报办结
                 </NButton>
               </div>
@@ -194,11 +195,11 @@ async function copyAmount(val: number, label: string) {
                 <NButton
                   v-if="citDeadline?.deadlineId && !isCitDone"
                   type="primary"
-                  secondary
-                  size="tiny"
+                  size="small"
+                  class="btn-mark-filed"
                   @click="emit('markFiled', citDeadline.deadlineId)"
                 >
-                  <template #icon><i class="ri-check-line" /></template>
+                  <template #icon><i class="ri-checkbox-circle-line" /></template>
                   标记「企业所得税预缴」已申报办结
                 </NButton>
               </div>
@@ -249,6 +250,7 @@ async function copyAmount(val: number, label: string) {
             </div>
             <p class="step-instruction">
               除增值税、企业所得税和财报外，请按下方指引完成个税扣缴、印花税等常规申报并点击归档：
+              <GuideTrigger guide="iit" label="个税怎么申报？" hint="含 9 张截图" />
             </p>
             <div v-if="otherTasks.length > 0" class="other-tasks-list">
               <div
@@ -273,11 +275,11 @@ async function copyAmount(val: number, label: string) {
                   <NButton
                     v-else
                     type="primary"
-                    secondary
                     size="small"
+                    class="btn-mark-filed"
                     @click="emit('markFiled', task.deadlineId)"
                   >
-                    <template #icon><i class="ri-check-line" /></template>
+                    <template #icon><i class="ri-checkbox-circle-line" /></template>
                     标记「{{ task.name }}」已申报办结
                   </NButton>
                 </div>
@@ -411,7 +413,7 @@ async function copyAmount(val: number, label: string) {
 
 .step-tag.tag-done {
   background: #d1fae5;
-  color: #065f46;
+  color: var(--solo-income);
 }
 
 .step-instruction {
@@ -529,5 +531,21 @@ async function copyAmount(val: number, label: string) {
   color: var(--solo-income, #0f7354);
   font-size: 13px;
   font-weight: 600;
+}
+
+:deep(.btn-mark-filed) {
+  font-weight: 600;
+  box-shadow: 0 1.5px 4px rgba(2, 132, 199, 0.28), 0 1px 2px rgba(2, 132, 199, 0.16);
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  letter-spacing: 0.2px;
+}
+
+:deep(.btn-mark-filed:hover) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 10px rgba(2, 132, 199, 0.38);
+}
+
+:deep(.btn-mark-filed:active) {
+  transform: translateY(0);
 }
 </style>

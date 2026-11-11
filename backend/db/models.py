@@ -90,6 +90,50 @@ class Company(Base):
     )
 
 
+class IndustryTemplate(Base):
+    """平台维护的行业建账模板。
+
+    公司只保存模板 code/version，模板配置更新不会反向改写已经初始化过的
+    科目或分类；账套首次初始化时按当时版本应用，保证存量账套可复现。
+    """
+
+    __tablename__ = "industry_templates"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True, default=new_id)
+    code: Mapped[str] = mapped_column(String(96), nullable=False, unique=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    group_code: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    group_name: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    restricted_default: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    hidden: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    config: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False, default=dict)
+    is_system: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    created_by: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_industry_templates_enabled_sort", "enabled", "sort_order"),
+        Index("ix_industry_templates_group", "group_code", "sort_order"),
+    )
+
+
 class CompanyMember(Base):
     __tablename__ = "company_members"
 
@@ -1038,7 +1082,7 @@ class Partner(Base):
 
     __table_args__ = (
         UniqueConstraint("company_id", "code", name="uq_partner_company_code"),
-        CheckConstraint("type IN ('customer','supplier','both')", name="ck_partner_type"),
+        CheckConstraint("type IN ('customer','supplier','both','person')", name="ck_partner_type"),
         Index("ix_partner_company_name", "company_id", "name"),
         Index("ix_partner_company_active", "company_id", "is_active"),
     )
@@ -1801,4 +1845,81 @@ class ShareAnnotation(Base):
         ),
         Index("ix_share_annotations_share", "share_id", "created_at"),
         Index("ix_share_annotations_company", "company_id"),
+    )
+
+
+# ── 邮件单据通道（专属收件地址 + 收件箱暂存）──────────────────────────────
+# 设计原则：地址层与收取引擎分离——地址码只存本地部分（不含域名），完整地址
+# 展示时拼接当前配置域名；换邮箱服务商只改 MX 与 .env，地址层与前端零改动。
+
+
+class MailboxAddress(Base):
+    """账套专属收件地址：catch-all 邮箱按本地部分（address_code）定位账套。
+
+    一账套一行，重置 = 原地换 address_code（旧地址随之失配自动失效）。
+    地址不是凭证（投进来的单据仍需登录用户确认才入账），随机码只为不可枚举，
+    因此明文存储以支持反复展示给用户复制。
+    """
+
+    __tablename__ = "mailbox_addresses"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True, default=new_id)
+    company_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("auth_companies.company_id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    # 收件地址本地部分（@ 之前），小写字母数字、去易混淆字符
+    address_code: Mapped[str] = mapped_column(String(32), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class InboxDocument(Base):
+    """邮件收取的附件暂存（收件箱）：待用户在导入向导里一键导入。
+
+    只暂存、不自动入账——解析复用前端 SheetJS 管线，确认权属于用户。
+    (company_id, content_sha256) 唯一实现附件级幂等：同一文件重复投递只留一条。
+    """
+
+    __tablename__ = "inbox_documents"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True, default=new_id)
+    company_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("auth_companies.company_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    file_ext: Mapped[str] = mapped_column(String(16), nullable=False, default="")
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 落盘文件名（相对 INBOX_DIR，内部命名 id.ext，不使用用户文件名拼路径）
+    stored_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    # 待导入类型启发式（invoice/bank/wechat_bill/unknown），仅作前端导入入口建议
+    import_kind: Mapped[str] = mapped_column(String(16), nullable=False, default="unknown")
+    # pending=待导入 / consumed=已导入 / dismissed=用户忽略 / unsupported=白名单外留档
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    # unsupported 的具体原因（加密压缩包/类型不支持/超大小上限），前端据此提示
+    note: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    source: Mapped[str] = mapped_column(String(16), nullable=False, default="email", server_default="email")
+    email_from: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    email_subject: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+    email_message_id: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending','consumed','dismissed','unsupported')",
+            name="ck_inbox_document_status",
+        ),
+        UniqueConstraint("company_id", "content_sha256", name="uq_inbox_company_sha256"),
+        Index("ix_inbox_documents_company_created", "company_id", "created_at"),
     )

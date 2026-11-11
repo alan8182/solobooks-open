@@ -13,6 +13,7 @@ import re
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from db.session import get_db_session
 from deps.auth import AuthContext, require_auth
@@ -28,6 +29,8 @@ from services.bank_service import (
     get_wechat_settlement_candidates, identify_statement_fast_rule, safe_money,
     is_salary_payment_description, is_payroll_liability_description,
     find_duplicate_bank_entries, save_company_category_rule,
+    list_company_category_rules, update_company_category_rule,
+    delete_company_category_rule,
 )
 import services.salary_service as salary_service
 from services.category_service import is_ambiguity_category
@@ -132,6 +135,67 @@ async def repair_effect(req: RepairEffectRequest, ctx: AuthContext = Depends(req
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/reconciliations/resync/{statement_id}")
+async def resync_statement_reconciliation(
+    statement_id: str,
+    ctx: AuthContext = Depends(require_auth),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """重建流水 ↔ 凭证的核心对账链接（幂等自愈）。
+
+    个别入账路径只回写 matched_entry_id 指针、漏掉 sync_bank_reconciliation，
+    造成"第二步已认领、第三步银行核对却说未配对"的分裂。此处以指针与
+    bank_statement_matches 为准重建核心链接；流水本就无指针时返回
+    resynced=False（真未配对，应到第二步走确认配对/认可入账）。
+    """
+    from sqlalchemy import select
+
+    from db.models import JournalEntry
+    from services.accounting_core_service import sync_bank_reconciliation
+
+    await ensure_bank_schema()
+    rows = (await session.execute(
+        text(
+            "SELECT id, transaction_date, description, amount FROM bank_statements "
+            "WHERE company_id = :company AND id = :statement"
+        ),
+        {"company": ctx.company_id, "statement": statement_id},
+    )).mappings().first()
+    if not rows:
+        raise HTTPException(status_code=404, detail="流水不存在")
+
+    match_ids = [str(r[0]) for r in (await session.execute(
+        text("SELECT entry_id FROM bank_statement_matches WHERE company_id = :company AND statement_id = :statement"),
+        {"company": ctx.company_id, "statement": statement_id},
+    )).all()]
+    # 仅保留真实存在的凭证（防悬空引用）
+    entry_ids: list[str] = []
+    for entry_id in dict.fromkeys(match_ids):
+        exists = (await session.execute(
+            select(JournalEntry.id).where(
+                JournalEntry.company_id == ctx.company_id,
+                JournalEntry.id == entry_id,
+            )
+        )).scalar_one_or_none()
+        if exists:
+            entry_ids.append(entry_id)
+    if not entry_ids:
+        return {"resynced": False, "reason": "no_matched_entries"}
+
+    await sync_bank_reconciliation(
+        session,
+        company_id=ctx.company_id,
+        user_id=ctx.user_id,
+        statement_id=statement_id,
+        entry_ids=entry_ids,
+        transaction_date=rows["transaction_date"],
+        description=str(rows["description"] or ""),
+        signed_amount=rows["amount"],
+        request_id=str(uuid4()),
+    )
+    return {"resynced": True, "entryIds": entry_ids}
 
 
 @router.get("/statement-ids")
@@ -251,6 +315,63 @@ class BatchConfirmRulesRequest(BaseModel):
     month: Optional[str] = None
     allowBackfill: bool = False
     backfillReason: Optional[str] = None
+    rememberRule: bool = False
+
+
+class CategoryRuleUpdateRequest(BaseModel):
+    category: Optional[str] = None
+    purposeKey: Optional[str] = Field(default=None, max_length=160)
+    enabled: Optional[bool] = None
+    confidence: Optional[float] = Field(default=None, ge=0.5, le=1.0)
+
+
+@router.get("/category-rules")
+async def list_category_rules(
+    q: str = "",
+    direction: str = "",
+    enabled: Optional[bool] = None,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    ctx: AuthContext = Depends(require_auth),
+):
+    """当前账套的银行流水分类规则。"""
+    return await list_company_category_rules(
+        ctx.company_id,
+        query=q,
+        direction=direction,
+        enabled=enabled,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.patch("/category-rules/{rule_id}")
+async def patch_category_rule(
+    rule_id: str,
+    req: CategoryRuleUpdateRequest,
+    ctx: AuthContext = Depends(require_auth),
+):
+    result = await update_company_category_rule(
+        ctx.company_id,
+        rule_id,
+        req.model_dump(exclude_unset=True),
+        user_id=ctx.user_id,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="分类规则不存在")
+    return result
+
+
+@router.delete("/category-rules/{rule_id}")
+async def remove_category_rule(
+    rule_id: str,
+    ctx: AuthContext = Depends(require_auth),
+):
+    if not await delete_company_category_rule(
+        ctx.company_id, rule_id, user_id=ctx.user_id
+    ):
+        raise HTTPException(status_code=404, detail="分类规则不存在")
+    return {"status": "deleted"}
 
 
 @router.post("/batch-confirm-rules")
@@ -292,6 +413,8 @@ async def batch_confirm_rules(
         return {"status": "ok", "confirmedCount": 0, "confirmedIds": []}
 
     confirmed_ids = []
+    saved_rule_count = 0
+    rule_warnings: list[str] = []
     now = datetime.now(timezone.utc).isoformat()
 
     for stmt in statements:
@@ -357,6 +480,25 @@ async def batch_confirm_rules(
                     signed_amount=stmt["amount"],
                     request_id=req_id,
                 )
+            if req.rememberRule:
+                try:
+                    saved = await save_company_category_rule(
+                        ctx.company_id,
+                        str(stmt["description"] or ""),
+                        stmt["amount"],
+                        str(fast_rule["category"]),
+                        source_statement_id=stmt_id,
+                        user_id=ctx.user_id,
+                    )
+                    if saved:
+                        saved_rule_count += 1
+                except Exception:
+                    logger.exception(
+                        "batch_confirm_rules 保存分类规则失败 company=%s statement=%s",
+                        ctx.company_id,
+                        stmt_id,
+                    )
+                    rule_warnings.append(stmt_id)
             confirmed_ids.append(stmt_id)
         except Exception:
             logger.exception("batch_confirm_rules failed for statement %s", stmt_id)
@@ -366,6 +508,8 @@ async def batch_confirm_rules(
         "status": "ok",
         "confirmedCount": len(confirmed_ids),
         "confirmedIds": confirmed_ids,
+        "savedRuleCount": saved_rule_count,
+        "ruleWarningStatementIds": rule_warnings,
     }
 
 

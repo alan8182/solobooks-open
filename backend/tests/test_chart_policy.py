@@ -33,9 +33,9 @@ FOUR_DIGIT_PARENTS = ("5602", "5601", "5603", "5401", "1101", "1012", "1001", "1
 # 本次新增/启用的明细末级
 NEW_LEAVES = (
     "122101", "122102", "122103",
-    "221101", "221102", "221103", "221104",
+    "221101", "221102", "221103", "221104", "221105",
     "2221012",
-    "5602001", "5602014", "5602016",
+    "5602001", "5602014", "5602016", "5602017",
 )
 
 
@@ -83,6 +83,73 @@ def test_chart_policy_against_full_coa():
     for code in NEW_LEAVES:
         assert code in coa, f"{code} 应在 COA 中"
         assert chart_is_leaf(code, coa[code]) is True, f"明细科目 {code} 必须是末级"
+
+
+def test_coa_subaccount_names_never_double_prefix():
+    """子科目名只能是「裸名」或「直接父级名 + '-' + 裸名」。
+
+    回归背景：4301001xx 曾写成「研发支出-人员人工」（带的是**顶级** 4301 前缀，
+    而非直接父级 4301001），于是 _display_account_name / full_names 判定
+    「未带父级前缀」再次拼接，凭证与账簿显示成
+    「研发支出-费用化支出-研发支出-人员人工」。
+    """
+    coa = _load_coa()
+    offenders: list[tuple[str, str, str, str]] = []
+    for code, info in coa.items():
+        parent_code = str(info.get("parentCode") or "")
+        if not parent_code or parent_code not in coa:
+            continue
+        name = str(info.get("name") or "")
+        parent_name = str(coa[parent_code].get("name") or "")
+        if "-" not in name or name.startswith(f"{parent_name}-"):
+            continue
+        offenders.append((code, name, parent_code, parent_name))
+    detail = "\n".join(
+        "  {} name={!r} parent={} ({})".format(code, name, parent_code, parent_name)
+        for code, name, parent_code, parent_name in offenders
+    )
+    assert not offenders, (
+        "以下子科目名既非裸名、又不带直接父级前缀，会在显示层重复拼接父级：\n" + detail
+    )
+
+
+def test_rd_account_names_render_without_parent_doubling():
+    """研发末级科目经 _display_account_name 后与自身名称逐字一致。
+
+    该函数（及 _prefetch_journals 的 full_names）判定「子科目名是否已带父级前缀」，
+    判定失败就会二次拼接；这里用真实 COA 名称跑一遍渲染，锁死不再重复。
+    """
+    from services.accounting_core_service import RD_ACCOUNT_NAMES, _display_account_name
+
+    coa = _load_coa()
+
+    class _FakeAccount:
+        def __init__(self, code: str, name: str, parent_code: str | None) -> None:
+            self.code = code
+            self.name = name
+            self.parent_code = parent_code
+
+    parent_names = {
+        code: str(info["name"]) for code, info in coa.items()
+    }
+    for expense_type, expected_name in RD_ACCOUNT_NAMES.items():
+        match = next(
+            ((code, info) for code, info in coa.items() if info["name"] == expected_name),
+            None,
+        )
+        assert match is not None, (
+            f"RD_ACCOUNT_NAMES[{expense_type!r}]={expected_name!r} 与 COA 名称不一致"
+        )
+        code, info = match
+        assert info.get("parentCode") == "4301001", (
+            f"{expected_name} 应挂在 4301001 下，实际 parentCode={info.get('parentCode')!r}"
+        )
+        rendered = _display_account_name(
+            _FakeAccount(code, expected_name, info.get("parentCode")), parent_names
+        )
+        assert rendered == expected_name, (
+            f"{code} 渲染成了 {rendered!r}（重复拼接父级前缀）"
+        )
 
 
 @pytest.fixture

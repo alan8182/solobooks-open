@@ -8,9 +8,19 @@ import * as XLSX from 'xlsx'
 import { parseInvoiceRows, importInvoices } from '@/api/invoice'
 import { getRdExpenseTypes, getRdProjects } from '@/api/rd'
 import type { RdExpenseTypeOption, RdProject } from '@/api/types'
+import { usePayeeEmployees } from '@/composables/usePayeeEmployees'
+import {
+  INVOICE_PAYER_OPTIONS,
+  hasUnnamedEmployeePayer,
+  initialInvoicePayer,
+  invoiceRowPayer,
+  type InvoicePayerState,
+} from '@/utils/invoiceImport'
+import type { PayerKind } from '@/utils/fundsChannel'
 import { formatMoney } from '@/utils/format'
 import { SoloDrawer } from '@/components/ui'
 import FileDropzone from '@/components/business/FileDropzone.vue'
+import MailInboxCard from '@/components/business/MailInboxCard.vue'
 
 const props = defineProps<{
   show: boolean
@@ -39,6 +49,9 @@ const classifiedRows = ref<any[]>([])
 // RD options
 const rdProjects = ref<RdProject[]>([])
 const rdExpenseTypes = ref<RdExpenseTypeOption[]>([])
+
+// 垫付人名单：只有选了「员工垫付」才懒加载，老板走固定选项不查员工档案
+const payerEmployees = usePayeeEmployees()
 
 const directionOptions = [
   { label: '进项 (支出)', value: 'expense' },
@@ -123,6 +136,15 @@ function reset() {
   classifiedRows.value = []
   loading.value = false
   importing.value = false
+}
+
+// 邮件收件箱「导入」：只接受发票类附件（卡片已按 kinds 过滤，这里是最后防线）
+function handleInboxImport({ kind, file }: { kind: string; file: File }) {
+  if (kind !== 'invoice') {
+    message.warning('这份附件不是发票表格，请在月度结账向导里导入')
+    return
+  }
+  handleFile(file)
 }
 
 function handleFile(file: File) {
@@ -216,6 +238,7 @@ async function proceedToPreview() {
       ...r,
       _direction: r.direction || 'expense',
       _category: r.category || '其他支出',
+      _payer: initialInvoicePayer(r.payer),
     }))
     if (result.errors.length > 0) {
       message.warning(`${result.errors.length} 行数据无效已跳过`)
@@ -238,6 +261,18 @@ function deletePreviewRow(index: number) {
     message.warning('预览列表已空，已返回上传步骤')
     step.value = 'upload'
   }
+}
+
+function setRowPayer(row: any, kind: PayerKind) {
+  row._payer = {
+    kind,
+    employeeName: kind === 'employee_personal' ? (row._payer?.employeeName || '') : '',
+  } as InvoicePayerState
+  if (kind === 'employee_personal') void payerEmployees.ensure()
+}
+
+function setRowEmployee(row: any, name: string) {
+  row._payer = { kind: 'employee_personal', employeeName: name || '' } as InvoicePayerState
 }
 
 const previewColumns = computed(() => [
@@ -289,6 +324,41 @@ const previewColumns = computed(() => [
     }),
   },
   {
+    title: '付款方',
+    key: '_payer',
+    width: 170,
+    render: (row: any) => {
+      // 销项票的结算方式由应收科目决定，不在这里改对手方
+      if (row._direction !== 'expense') {
+        return h('span', { class: 'payer-na' }, '—')
+      }
+      const children: any[] = [
+        h(NSelect, {
+          value: row._payer?.kind || 'company_account',
+          'onUpdate:value': (v: PayerKind) => setRowPayer(row, v),
+          options: INVOICE_PAYER_OPTIONS,
+          size: 'tiny',
+          'data-testid': 'invoice-payer-kind',
+        }),
+      ]
+      if (row._payer?.kind === 'employee_personal') {
+        children.push(h(NSelect, {
+          value: row._payer?.employeeName || null,
+          'onUpdate:value': (v: string) => setRowEmployee(row, v),
+          options: payerEmployees.options(row._payer?.employeeName),
+          size: 'tiny',
+          filterable: true,
+          clearable: true,
+          loading: payerEmployees.loading.value,
+          placeholder: '选择垫付员工',
+          style: 'margin-top: 4px;',
+          'data-testid': 'invoice-payer-employee',
+        }))
+      }
+      return h('div', { class: 'payer-cell' }, children)
+    },
+  },
+  {
     title: '操作',
     key: 'action',
     width: 65,
@@ -320,12 +390,22 @@ async function handleImport() {
     return
   }
 
+  // 员工垫付必须选到人：裸 employee_personal 不建个人往来，2241 会没有对手方
+  if (hasUnnamedEmployeePayer(
+    validImportableRows.value.map(r => ({ direction: r._direction, payer: r._payer })),
+  )) {
+    message.warning('请选择垫付的员工，或改为老板垫付')
+    return
+  }
+
   importing.value = true
   try {
     const rows = validImportableRows.value.map(r => ({
       ...r,
       direction: r._direction,
       category: r._category,
+      // 默认公司账户（沿用原行为），选了垫付才让后端把 2241 挂到垫付人
+      payer: invoiceRowPayer(r._direction, r._payer),
       rdProjectId: r._rdProjectId,
       rdExpenseType: r._rdExpenseType,
       rdOriginalAmount: r.amount,
@@ -333,15 +413,22 @@ async function handleImport() {
     }))
     const result = await importInvoices(rows, false)
     if (result.imported > 0) {
-      if (duplicatesCount.value > 0) {
-        message.success(`成功导入 ${result.imported} 张发票，已自动剔除 ${duplicatesCount.value} 张重复发票`)
-      } else {
-        message.success(`成功导入 ${result.imported} 张发票`)
+      let successText = duplicatesCount.value > 0
+        ? `成功导入 ${result.imported} 张发票，已自动剔除 ${duplicatesCount.value} 张重复发票`
+        : `成功导入 ${result.imported} 张发票`
+      const offsets = (result as any).offsets || []
+      if (offsets.length > 0) {
+        successText += `；已自动冲抵 ${offsets.length} 笔历史往来暂付款（${offsets.map((o: any) => `¥${o.amount}`).join('、')}）`
       }
+      message.success(successText)
       emit('success')
       emit('update:show', false)
     } else {
-      message.warning('未能成功导入发票，请检查文件格式或重试')
+      // 后端逐行失败时 errors 里是"缺少发票号码"这类解析错误，真正让凭证落库
+      // 失败的原因在 entries[].error（如来源已入账）。只报笼统提示会让用户
+      // 误以为是文件格式问题，这里把第一条真实原因带出来。
+      const rowError = (result as any).entries?.find((r: any) => r?.success === false && r?.error)?.error
+      message.warning(rowError ? `未能导入发票：${rowError}` : '未能成功导入发票，请检查文件格式或重试')
     }
   } catch {
     message.error('导入发票失败')
@@ -361,6 +448,7 @@ async function handleImport() {
     <div class="import-container">
       <!-- Step 1: Upload -->
       <div v-if="step === 'upload'" class="step-upload">
+        <MailInboxCard collapsible :kinds="['invoice']" @import="handleInboxImport" @error="message.error($event)" />
         <FileDropzone
           accept=".xlsx,.xls"
           title="选择或拖拽税务局发票 Excel 文件"
@@ -487,6 +575,14 @@ async function handleImport() {
 }
 .dup-text {
   color: var(--solo-warning, #f59e0b);
+}
+.payer-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.payer-na {
+  color: var(--solo-text-muted, #9ca3af);
 }
 .upload-tip {
   margin-top: 16px;

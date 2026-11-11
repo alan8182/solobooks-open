@@ -241,6 +241,23 @@ class EntryUpdateRequest(BaseModel):
     autoReverseRepost: Optional[bool] = None
 
 
+class VoucherPreviewRequest(BaseModel):
+    """结账向导第二步：按付款方式/分类预览将落账的借贷行，不写库。"""
+
+    payer: Optional[str] = None
+    paymentStatus: Optional[Literal["paid", "unpaid"]] = None
+    category: Optional[str] = None
+    # 研发归集：卡片内选「研发支出-费用化支出」时一并带上，
+    # 否则预览会按 RD_DETAIL_REQUIRED 拒绝，而落账却能通过。
+    rdProjectId: Optional[str] = None
+    rdExpenseType: Optional[Literal[
+        "personnel", "direct_input", "depreciation_amortization", "design", "testing", "outsourced", "other"
+    ]] = None
+    rdOriginalAmount: Optional[Decimal] = None
+    rdAllocationMethod: Optional[Literal["direct", "timesheet", "usage", "area", "quantity", "other"]] = None
+    rdAllocationBasis: Optional[str] = None
+
+
 class VoucherLineAdjustItem(BaseModel):
     """人工调整分录的一行。方向与金额由服务端再校验，这里只做结构约束。"""
 
@@ -728,6 +745,9 @@ class BalanceSheetStandard(BaseModel):
     assets: List[StandardStatementRow]
     rights: List[StandardStatementRow]
     balanced: bool = True
+    # 年初列是否有可靠来源。年中建账又没导入年初快照时为 False，此时年初列全为 0，
+    # 前端应提示「年初数未导入」而不是展示一排 0 让人以为年初真是这样。
+    openingKnown: bool = True
 
 class BalanceSheetResponse(BaseModel):
     month: str

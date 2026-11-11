@@ -10,7 +10,7 @@
 import apiClient from './client'
 
 export interface AgentStreamEvent {
-  type: 'meta' | 'token' | 'reasoning' | 'tool_call' | 'tool_result' | 'action' | 'final' | 'done' | 'error'
+  type: 'meta' | 'token' | 'reasoning' | 'tool_call' | 'tool_result' | 'closing_link' | 'action' | 'final' | 'done' | 'error'
   content?: string
   message?: string
   step?: number
@@ -18,9 +18,19 @@ export interface AgentStreamEvent {
   ok?: boolean
   summary?: string
   arguments?: Record<string, unknown>
+  closingLink?: ClosingLink
   action?: AgentActionItem
   tools?: string[]
   maxSteps?: number
+}
+
+export interface ClosingLink {
+  url: string
+  label: string
+  status: 'ready_to_close' | 'action_required' | string
+  requiresLogin: boolean
+  message: string
+  month: string
 }
 
 export interface AgentActionItem {
@@ -32,6 +42,15 @@ export interface AgentActionItem {
   result: Record<string, unknown> | null
   status: 'pending' | 'approved' | 'rejected' | 'expired'
   createdAt: string | null
+  expiresAt?: string | null
+  actionVersion?: number
+  closingBinding?: {
+    month: string
+    findingId: string
+    baseSnapshotHash: string
+    periodVersion: number
+    surface: 'product' | 'mcp' | string
+  } | null
   resolvedAt: string | null
 }
 
@@ -100,6 +119,10 @@ export async function listAgentActions(status = 'pending'): Promise<AgentActionI
     actions: AgentActionItem[]
   }
   return body.actions
+}
+
+export async function getAgentAction(id: string): Promise<AgentActionItem> {
+  return (await apiClient.get(`/api/agent/actions/${id}`)) as unknown as AgentActionItem
 }
 
 export interface AgentActionDecision {

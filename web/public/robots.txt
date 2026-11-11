@@ -1,0 +1,10 @@
+# 梭罗记账 robots.txt
+# 公开内容（官网落地页、AI 连接指南、协议）允许收录；
+# API / MCP 端点、管理后台与按 token 的私有协审链接禁止收录。
+User-agent: *
+Disallow: /api/
+Disallow: /mcp
+Disallow: /console
+Disallow: /share/
+
+Sitemap: https://solobooks.cn/sitemap.xml

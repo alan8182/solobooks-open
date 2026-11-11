@@ -21,7 +21,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.database import get_conn
-from services.account_mapper import get_voucher_hint
+from services.account_mapper import get_voucher_hint, lookup as lookup_account
+from services.category_service import is_ambiguity_category
 from services.audit_service import log_action
 from core.errors import AccountingError
 from core.money import ZERO, money, money_text
@@ -34,6 +35,55 @@ logger = logging.getLogger(__name__)
 RECONCILIATION_AMOUNT_TOLERANCE = Decimal("0.01")
 
 _NULL_LIKE_DESCRIPTION_VALUES = {"", "null", "undefined", "none", "nil", "-"}
+
+_GENERIC_BANK_MEMO_RE = re.compile(
+    r"汇兑|转账|转出|入账|付款|支付|代扣|代付|附言|备注|用途|往来款|往来",
+    re.I,
+)
+_EXPLICIT_IT_SERVICE_RE = re.compile(
+    r"(?:(?<![a-z0-9])api(?![a-z0-9])|接口调用|接口服务|调用费|token|saas|云服务|软件订阅|"
+    r"信息技术服务|平台技术服务|模型api|大模型服务)",
+    re.I,
+)
+_PREPAYMENT_RE = re.compile(r"预付|预缴|定金|保证金|押金")
+_PROCUREMENT_RE = re.compile(r"货款|材料款|采购款|商品尾款|采购订单|采购合同|应付账款")
+_BANK_FEE_RE = re.compile(r"手续费|转账费|账户管理费|短信费")
+_COUNTERPARTY_IT_INDUSTRY_RE = re.compile(
+    r"人工智能|信息技术|软件开发|软件服务|软件科技|云计算|数据服务|数据科技|网络科技|互联网科技",
+    re.I,
+)
+_REFUND_RE = re.compile(r"退款|退回|冲正|撤销", re.I)
+_RULE_PURPOSE_TRAILING_NUMBER_RE = re.compile(r"(?<!\d)\d{4,}(?!\d)")
+
+_RULE_SCHEMA_COLUMNS = {
+    "id": "TEXT",
+    "counterparty_key": "TEXT NOT NULL DEFAULT ''",
+    "purpose_key": "TEXT NOT NULL DEFAULT ''",
+    "account_code": "TEXT",
+    "confidence": "REAL NOT NULL DEFAULT 0.98",
+    "source_statement_id": "TEXT",
+    "created_by": "TEXT",
+    "enabled": "INTEGER NOT NULL DEFAULT 1",
+    "rule_version": "INTEGER NOT NULL DEFAULT 1",
+    "hit_count": "INTEGER NOT NULL DEFAULT 0",
+    "last_hit_at": "TEXT",
+    "last_hit_statement_id": "TEXT",
+    "override_count": "INTEGER NOT NULL DEFAULT 0",
+    "amount_min": "NUMERIC(20,2)",
+    "amount_max": "NUMERIC(20,2)",
+    "amount_hit_count": "INTEGER NOT NULL DEFAULT 0",
+    "created_at": "TEXT",
+}
+
+_RULE_DIRECTIONAL_REVIEW_CATEGORIES = {
+    "研发支出-费用化支出",
+    "工资发放",
+    "社保公积金",
+    "微信支付结算",
+    "支付宝结算",
+    "平台提现结算",
+    "往来退款",
+}
 
 SALARY_PAYMENT_KEYWORDS = (
     "代发工资", "工资代发", "代发薪资", "代发薪", "薪资", "薪酬",
@@ -127,37 +177,350 @@ def extract_statement_rule_pattern(description: str) -> str:
     return cleaned if len(cleaned) >= 2 else ""
 
 
+def normalize_category_rule_key(value: Any) -> str:
+    """Normalize a tenant rule key without depending on punctuation or ASCII case."""
+    return _description_semantic_key(str(value or ""))[:160]
+
+
+def extract_statement_counterparty_key(description: str) -> str:
+    return normalize_category_rule_key(extract_statement_counterparty(description))
+
+
+def extract_statement_purpose_key(description: str) -> str:
+    """Extract reusable business purpose while discarding bank boilerplate.
+
+    Counterparty identity and business purpose are deliberately stored as two
+    dimensions. A supplier can sell cloud service one month and rent an office
+    the next; collapsing those into one counterparty-only rule silently applies
+    the previous accounting decision to unrelated transactions.
+    """
+    text = re.sub(r"\(对方\s*[:：].*?\)\s*$", "", str(description or ""), flags=re.I)
+    if _REFUND_RE.search(text):
+        return "退款"
+    if _EXPLICIT_IT_SERVICE_RE.search(text):
+        return "信息技术服务"
+    if _PREPAYMENT_RE.search(text):
+        return "预付往来"
+    if _PROCUREMENT_RE.search(text):
+        return "采购"
+    if _BANK_FEE_RE.search(text):
+        return "银行手续费"
+    if is_payroll_liability_description(text):
+        return "社保公积金"
+    if is_salary_payment_description(text):
+        return "工资"
+
+    cleaned = _GENERIC_BANK_MEMO_RE.sub("", text)
+    cleaned = _RULE_PURPOSE_TRAILING_NUMBER_RE.sub("", cleaned)
+    key = normalize_category_rule_key(cleaned)
+    return key if len(key) >= 2 else ""
+
+
+def _category_rule_match_pattern(counterparty_key: str, purpose_key: str) -> str:
+    if counterparty_key and purpose_key:
+        return f"{counterparty_key}::purpose={purpose_key}"
+    if counterparty_key:
+        return counterparty_key
+    return f"purpose={purpose_key}"
+
+
+def _category_rule_account_code(category: str) -> Optional[str]:
+    info = lookup_account(category)
+    return str(info.get("accountCode") or "") if info else None
+
+
+def _category_rule_direction_allowed(category: str, direction: str) -> bool:
+    info = lookup_account(category)
+    if not info:
+        return False
+    account_type = str(info.get("accountType") or "")
+    if direction == "income":
+        # Bank inflows can settle a liability (other payables, shareholder
+        # advance) as well as book revenue. Only reject expense/cost accounts,
+        # with interest income as the explicit expense-account exception.
+        return (
+            account_type not in {"损益-费用", "损益-成本"}
+            or account_type == "损益-收入"
+            or category == "利息收入"
+        )
+    if direction == "expense":
+        return account_type != "损益-收入"
+    return True
+
+
+def _serialize_category_rule(row: Any) -> Dict[str, Any]:
+    item = dict(row)
+    purpose = str(item.get("purpose_key") or "")
+    try:
+        stored_confidence = float(item.get("confidence") or 0.98)
+    except (TypeError, ValueError):
+        stored_confidence = 0.98
+    # Rules without a reusable purpose remain useful hints, but must never be
+    # auto-selected: the same counterparty may carry different businesses.
+    effective_confidence = stored_confidence if purpose else min(stored_confidence, 0.78)
+    item.update({
+        "id": str(item.get("id") or ""),
+        "counterpartyKey": str(item.get("counterparty_key") or ""),
+        "purposeKey": purpose,
+        "matchPattern": str(item.get("match_pattern") or ""),
+        "category": str(item.get("category") or ""),
+        "accountCode": str(item.get("account_code") or _category_rule_account_code(
+            str(item.get("category") or "")
+        ) or ""),
+        "confidence": effective_confidence,
+        "storedConfidence": stored_confidence,
+        "enabled": bool(item.get("enabled", 1)),
+        "ruleVersion": int(item.get("rule_version") or 1),
+        "hitCount": int(item.get("hit_count") or 0),
+        "overrideCount": int(item.get("override_count") or 0),
+        "amountHitCount": int(item.get("amount_hit_count") or 0),
+        "sourceStatementId": item.get("source_statement_id") or "",
+        "createdBy": item.get("created_by") or "",
+        "lastHitAt": item.get("last_hit_at"),
+        "lastHitStatementId": item.get("last_hit_statement_id") or "",
+        "amountMin": item.get("amount_min"),
+        "amountMax": item.get("amount_max"),
+        "createdAt": item.get("created_at") or item.get("updated_at"),
+        "updatedAt": item.get("updated_at"),
+    })
+    return item
+
+
+async def list_company_category_rules(
+    company_id: str,
+    *,
+    query: str = "",
+    direction: str = "",
+    enabled: Optional[bool] = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    await _ensure_schema()
+    clauses = ["company_id = ?"]
+    params: list[Any] = [company_id]
+    if direction in {"income", "expense"}:
+        clauses.append("direction = ?")
+        params.append(direction)
+    if enabled is not None:
+        clauses.append("enabled = ?")
+        params.append(1 if enabled else 0)
+    keyword = str(query or "").strip()
+    if keyword:
+        clauses.append(
+            "(counterparty_key LIKE ? OR purpose_key LIKE ? OR category LIKE ? OR account_code LIKE ?)"
+        )
+        like = f"%{normalize_category_rule_key(keyword)}%"
+        params.extend([like, like, f"%{keyword}%", f"%{keyword}%"])
+
+    conn = await get_conn()
+    try:
+        where = " AND ".join(clauses)
+        count_row = await (
+            await conn.execute(
+                f"SELECT COUNT(*) AS total FROM bank_category_rules WHERE {where}",
+                tuple(params),
+            )
+        ).fetchone()
+        cursor = await conn.execute(
+            "SELECT * FROM bank_category_rules "
+            f"WHERE {where} ORDER BY enabled DESC, updated_at DESC, category ASC "
+            "LIMIT ? OFFSET ?",
+            tuple([*params, max(1, min(limit, 500)), max(0, offset)]),
+        )
+        rows = [_serialize_category_rule(row) for row in await cursor.fetchall()]
+    finally:
+        await conn.close()
+    return {"items": rows, "total": int(count_row["total"] if count_row else 0)}
+
+
+async def update_company_category_rule(
+    company_id: str,
+    rule_id: str,
+    updates: Dict[str, Any],
+    *,
+    user_id: str = "",
+) -> Optional[Dict[str, Any]]:
+    await _ensure_schema()
+    conn = await get_conn()
+    try:
+        row = await (
+            await conn.execute(
+                "SELECT * FROM bank_category_rules WHERE company_id = ? AND id = ?",
+                (company_id, rule_id),
+            )
+        ).fetchone()
+        if not row:
+            return None
+        current = _serialize_category_rule(row)
+        fields: list[str] = []
+        params: list[Any] = []
+        category = str(updates.get("category") or current["category"]).strip()
+        if not lookup_account(category):
+            raise HTTPException(status_code=422, detail="分类不存在")
+        if not _category_rule_direction_allowed(category, str(current.get("direction") or "")):
+            raise HTTPException(status_code=422, detail="该分类与规则收支方向不一致")
+        if "category" in updates:
+            fields.extend(["category = ?", "account_code = ?"])
+            params.extend([category, _category_rule_account_code(category)])
+
+        if "purposeKey" in updates:
+            purpose = normalize_category_rule_key(updates.get("purposeKey"))
+            counterparty = str(current.get("counterpartyKey") or "")
+            if not counterparty and not purpose:
+                raise HTTPException(status_code=422, detail="对方和业务用途不能同时为空")
+            fields.extend(["purpose_key = ?", "match_pattern = ?"])
+            params.extend([purpose, _category_rule_match_pattern(counterparty, purpose)])
+
+        if "enabled" in updates and updates.get("enabled") is not None:
+            fields.append("enabled = ?")
+            params.append(1 if updates.get("enabled") else 0)
+        if "confidence" in updates and updates.get("confidence") is not None:
+            fields.append("confidence = ?")
+            params.append(max(0.5, min(float(updates["confidence"]), 1.0)))
+        if not fields:
+            return current
+
+        fields.extend(["rule_version = rule_version + 1", "updated_at = ?"])
+        params.extend([_now_iso(), rule_id, company_id])
+        await conn.execute(
+            f"UPDATE bank_category_rules SET {', '.join(fields)} "
+            "WHERE id = ? AND company_id = ?",
+            tuple(params),
+        )
+        await conn.commit()
+        updated = await (
+            await conn.execute(
+                "SELECT * FROM bank_category_rules WHERE company_id = ? AND id = ?",
+                (company_id, rule_id),
+            )
+        ).fetchone()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        await conn.rollback()
+        if "unique" in str(exc).lower() or "duplicate" in str(exc).lower():
+            raise HTTPException(status_code=409, detail="已有相同对方与业务用途的规则") from exc
+        raise
+    finally:
+        await conn.close()
+    result = _serialize_category_rule(updated) if updated else None
+    if result:
+        await log_action(
+            company_id,
+            user_id,
+            "update",
+            "bank_category_rule",
+            rule_id,
+            {"category": result["category"], "enabled": result["enabled"]},
+        )
+    return result
+
+
+async def delete_company_category_rule(
+    company_id: str, rule_id: str, *, user_id: str = ""
+) -> bool:
+    await _ensure_schema()
+    conn = await get_conn()
+    try:
+        cursor = await conn.execute(
+            "DELETE FROM bank_category_rules WHERE company_id = ? AND id = ?",
+            (company_id, rule_id),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+    deleted = bool(cursor.rowcount)
+    if deleted:
+        await log_action(
+            company_id,
+            user_id,
+            "delete",
+            "bank_category_rule",
+            rule_id,
+        )
+    return deleted
+
+
 async def save_company_category_rule(
     company_id: str,
     description: str,
     stmt_amount: Any,
     category: str,
+    *,
+    source_statement_id: str = "",
+    user_id: str = "",
 ) -> Optional[str]:
     """Persist a company-level statement classification rule when user opts in."""
     cat = str(category or "").strip()
-    if not cat or cat in _NON_RULE_CATEGORIES:
+    if not cat or cat in _NON_RULE_CATEGORIES or is_ambiguity_category(cat):
         return None
-    pattern = extract_statement_rule_pattern(description)
-    if not pattern:
+    counterparty = extract_statement_counterparty_key(description)
+    purpose = extract_statement_purpose_key(description)
+    if not counterparty and not purpose:
         return None
     direction = "income" if safe_money(stmt_amount) >= ZERO else "expense"
+    if not _category_rule_direction_allowed(cat, direction):
+        return None
+    pattern = _category_rule_match_pattern(counterparty, purpose)
+    now = _now_iso()
+    confidence = 0.98 if purpose else 0.78
+    amount = abs(safe_money(stmt_amount))
     await _ensure_schema()
     conn = await get_conn()
     try:
         await conn.execute(
-            # SQLite/PG 双方言的 upsert：INSERT OR REPLACE 不是 PG 语法，
-            # 兼容层也不会翻译它，必须显式写 ON CONFLICT 冲突目标。
             "INSERT INTO bank_category_rules "
-            "(company_id, direction, match_pattern, category, updated_at) "
-            "VALUES (?, ?, ?, ?, ?) "
+            "(id, company_id, direction, match_pattern, counterparty_key, purpose_key, "
+            "category, account_code, confidence, source_statement_id, created_by, enabled, "
+            "rule_version, hit_count, last_hit_at, last_hit_statement_id, override_count, "
+            "amount_min, amount_max, amount_hit_count, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 0, NULL, NULL, 0, ?, ?, 1, ?, ?) "
             "ON CONFLICT (company_id, direction, match_pattern) DO UPDATE SET "
-            "category = excluded.category, updated_at = excluded.updated_at",
-            (company_id, direction, pattern, cat, _now_iso()),
+            "counterparty_key = excluded.counterparty_key, purpose_key = excluded.purpose_key, "
+            "category = excluded.category, account_code = excluded.account_code, "
+            "confidence = excluded.confidence, source_statement_id = excluded.source_statement_id, "
+            "created_by = COALESCE(bank_category_rules.created_by, excluded.created_by), "
+            "enabled = 1, rule_version = bank_category_rules.rule_version + 1, "
+            "override_count = bank_category_rules.override_count + "
+            "CASE WHEN bank_category_rules.category != excluded.category THEN 1 ELSE 0 END, "
+            "amount_min = CASE WHEN bank_category_rules.amount_min IS NULL "
+            "OR excluded.amount_min < bank_category_rules.amount_min "
+            "THEN excluded.amount_min ELSE bank_category_rules.amount_min END, "
+            "amount_max = CASE WHEN bank_category_rules.amount_max IS NULL "
+            "OR excluded.amount_max > bank_category_rules.amount_max "
+            "THEN excluded.amount_max ELSE bank_category_rules.amount_max END, "
+            "amount_hit_count = bank_category_rules.amount_hit_count + 1, "
+            "updated_at = excluded.updated_at",
+            (
+                f"bcr-{uuid4().hex}",
+                company_id,
+                direction,
+                pattern,
+                counterparty,
+                purpose,
+                cat,
+                _category_rule_account_code(cat),
+                confidence,
+                source_statement_id or None,
+                user_id or None,
+                amount,
+                amount,
+                now,
+                now,
+            ),
         )
         await conn.commit()
     finally:
         await conn.close()
-    return pattern
+    await log_action(
+        company_id,
+        user_id,
+        "upsert",
+        "bank_category_rule",
+        pattern,
+        {"category": cat, "counterparty": counterparty, "purpose": purpose},
+    )
+    return extract_statement_rule_pattern(description) or purpose
 
 
 def build_balance_reconciliation(
@@ -165,10 +528,18 @@ def build_balance_reconciliation(
     book_bank_balance: Any,
 ) -> Dict[str, Any]:
     """Reconcile statement continuity and the book's 1002 ending balance."""
-    # Bank exports are imported newest-first. Reversing the generated IDs within
-    # each date restores the running-balance order for same-day transactions.
-    ordered = sorted(statements, key=lambda item: str(item.get("id") or ""), reverse=True)
-    ordered.sort(key=lambda item: str(item.get("transaction_date") or ""))
+    # 同一份导出在同一秒内按行号升序排列即真实时序（见 _STATEMENT_ORDER）；
+    # 没有行序的历史行退回 id。旧的"id 倒序"tie-break 在 SQLite 的 uuid4
+    # 路径下是噪声，会把同秒多笔倒着算，期初/期末/连续差额全部失真。
+    ordered = sorted(
+        statements,
+        key=lambda item: (
+            str(item.get("transaction_date") or ""),
+            1 if item.get("source_row_index") is None else 0,
+            item.get("source_row_index") if item.get("source_row_index") is not None else 0,
+            str(item.get("id") or ""),
+        ),
+    )
     if not ordered:
         return {
             "has_data": False,
@@ -296,9 +667,11 @@ async def find_duplicate_bank_entries(
     statement_date: date,
     signed_amount: Decimal,
 ) -> list[Dict[str, Any]]:
-    """找与这笔流水等额同向、日期 ±3 天、且尚未对账的银行存款凭证。
+    """找与这笔流水等额同向、流水当日及之前 3 天内、且尚未对账的银行存款凭证。
 
     命中即说明账上已经记过这笔钱：应当配对而不是新建凭证，否则 1002 会重复计入。
+    晚于流水日的凭证不算重复（那是"先付款、后收票/后补记"，应走往来暂付模型，
+    配上去会让流水所在期间的银行核对永远关不上）。
     """
     from sqlalchemy import select, text
 
@@ -312,10 +685,11 @@ async def find_duplicate_bank_entries(
         .join(JournalLine, JournalLine.journal_entry_id == JournalEntry.id)
         .where(
             JournalEntry.company_id == company_id,
-            JournalEntry.status.in_(("draft", "pending_review", "posted", "reversed")),
+            # reversed 不算重复：红冲后重新入账正是用户想要的路径
+            JournalEntry.status.in_(("draft", "pending_review", "posted")),
             JournalEntry.entry_type == "standard",
             JournalEntry.occurred_on >= statement_date - timedelta(days=3),
-            JournalEntry.occurred_on <= statement_date + timedelta(days=3),
+            JournalEntry.occurred_on <= statement_date,
             JournalLine.company_id == company_id,
             JournalLine.account_code == "1002",
             JournalLine.direction == line_direction,
@@ -359,6 +733,42 @@ def _direction_matches_statement(stmt_amount: Any, direction: str) -> bool:
     return True
 
 
+def _entry_not_after_statement(entry_occur_date: Any, stmt_date: Any) -> bool:
+    """候选凭证日期不得晚于流水日期。
+
+    晚于即"先付款、后收票/后补记"（如 5 月付款、6 月收发票）：应走往来暂付
+    模型（当期挂 122199、收票时冲销），而不是把 5 月流水跨期配到 6 月凭证——
+    那会让两个月的银行核对都关不上。空日期无法判定时放行。
+    """
+    entry_day = str(entry_occur_date or "")[:10]
+    stmt_day = str(stmt_date or "")[:10]
+    if not entry_day or not stmt_day:
+        return True
+    return entry_day <= stmt_day
+
+
+async def _load_reversed_entry_ids(company_id: str) -> set:
+    """已红冲/作废凭证 id 集合。
+
+    红冲不回写 legacy 投影 payload（无 status 键），候选构建只看投影会继续
+    把被冲销凭证当配对候选 → 确认配对必报"已作废或冲销的凭证不能用于新对账"。
+    以核心 journal_entries 的状态为准；legacy 夹具库无此表时返回空集。
+    """
+    conn = await get_conn()
+    try:
+        cursor = await conn.execute(
+            "SELECT id FROM journal_entries WHERE company_id = ? AND status = 'reversed'",
+            (company_id,),
+        )
+        rows = await cursor.fetchall()
+        return {str(row["id"]) for row in rows}
+    except Exception:
+        # legacy 夹具库可能没有 journal_entries 表（纯投影测试环境）
+        return set()
+    finally:
+        await conn.close()
+
+
 def _fallback_classification_for_statement(stmt: Dict[str, Any], confidence: float = 0.3) -> Dict[str, Any]:
     stmt_amount = safe_money(stmt.get("amount"))
     is_income = stmt_amount > ZERO
@@ -371,6 +781,119 @@ def _fallback_classification_for_statement(stmt: Dict[str, Any], confidence: flo
         "confidence": confidence,
         "reason": "无法自动分类，已按流水收支方向生成草稿",
     }
+
+
+def _statement_business_purpose_text(description: Any) -> str:
+    """Remove counterparty and generic bank wording, leaving actual business evidence."""
+    text = re.sub(r"\(对方\s*[:：].*?\)\s*$", "", str(description or ""), flags=re.I)
+    text = _GENERIC_BANK_MEMO_RE.sub("", text)
+    return re.sub(r"[\W_]+", "", text, flags=re.UNICODE)
+
+
+def _needs_business_purpose_confirmation(stmt: Dict[str, Any]) -> bool:
+    """A bank transfer with only a company name and generic memo needs user input."""
+    return len(_statement_business_purpose_text(stmt.get("description"))) < 2
+
+
+def _business_purpose_confirmation_classification(
+    stmt: Dict[str, Any], reason: str = ""
+) -> Dict[str, Any]:
+    result = _fallback_classification_for_statement(stmt, confidence=0.45)
+    date_str = str(stmt.get("transaction_date") or "")[:10]
+    result["title"] = f"待确认业务用途-{date_str}" if date_str else "待确认业务用途"
+    result["reason"] = reason or (
+        "银行摘要只有交易对方和汇兑/往来款等默认备注，无法确定真实业务用途；"
+        "请选择实际分类后再入账"
+    )
+    result["requiresConfirmation"] = True
+    return result
+
+
+def _counterparty_it_industry_evidence(stmt: Dict[str, Any]) -> str:
+    """Extract a generic IT-industry cue from the counterparty name only."""
+    match = re.search(r"\(对方\s*[:：]\s*(.*?)\)\s*$", str(stmt.get("description") or ""))
+    if not match:
+        return ""
+    industry = _COUNTERPARTY_IT_INDUSTRY_RE.search(match.group(1))
+    return industry.group(0) if industry else ""
+
+
+def _industry_inferred_it_classification(
+    stmt: Dict[str, Any], industry: str, model_category: str = ""
+) -> Dict[str, Any]:
+    date_str = str(stmt.get("transaction_date") or "")[:10]
+    source = f"；模型初判为「{model_category}」" if model_category else ""
+    return {
+        "direction": "expense",
+        "category": "信息技术服务费",
+        "accountCode": "5602015",
+        "accountName": "管理费用-信息技术服务费",
+        "title": f"信息技术服务费-{date_str}" if date_str else "信息技术服务费",
+        "confidence": 0.72,
+        "requiresConfirmation": True,
+        "reason": (
+            f"交易对手名称包含「{industry}」行业词，银行摘要缺少更具体业务说明{source}；"
+            "按低置信度信息技术服务费建议，入账前请核对合同或发票"
+        ),
+    }
+
+
+def identify_explicit_it_service_rule(
+    stmt: Dict[str, Any], business_context: str = ""
+) -> Optional[Dict[str, Any]]:
+    """Use explicit API/software/service wording without maintaining vendor allowlists."""
+    amount = safe_money(stmt.get("amount"))
+    description = " ".join(
+        part for part in (
+            str(stmt.get("description") or "").strip(),
+            business_context.strip(),
+        ) if part
+    )
+    if amount >= ZERO or _PREPAYMENT_RE.search(description):
+        return None
+    match = _EXPLICIT_IT_SERVICE_RE.search(description)
+    if not match:
+        return None
+    date_str = str(stmt.get("transaction_date") or "")[:10]
+    return {
+        "type": "new",
+        "category": "信息技术服务费",
+        "title": f"信息技术服务费-{date_str}" if date_str else "信息技术服务费",
+        "confidence": 0.94,
+        "rule": "explicit_it_service_rule",
+        "reason": f"银行摘要明确包含「{match.group(0)}」，按信息技术服务费入账",
+    }
+
+
+def guard_statement_classification(
+    stmt: Dict[str, Any],
+    classification: Dict[str, Any],
+    business_context: str = "",
+) -> Dict[str, Any]:
+    """Reject classifications that require evidence absent from the bank statement."""
+    if business_context.strip():
+        return classification
+    category = str(classification.get("category") or "").strip()
+    description = str(stmt.get("description") or "")
+    needs_confirmation = _needs_business_purpose_confirmation(stmt)
+    industry = _counterparty_it_industry_evidence(stmt) if needs_confirmation else ""
+    if category == "供应商付款" and not _PROCUREMENT_RE.search(description):
+        if industry:
+            return _industry_inferred_it_classification(stmt, industry, category)
+        return _business_purpose_confirmation_classification(
+            stmt,
+            "摘要没有货款、采购款或应付账款等采购证据，不能仅凭公司名称记入应付账款；"
+            "请确认这是采购挂账、服务费用还是其他往来",
+        )
+    if category == "银行及金融手续费" and not _BANK_FEE_RE.search(description):
+        return _business_purpose_confirmation_classification(
+            stmt,
+            "摘要只有普通服务费，没有银行手续费、转账费或账户管理费证据；"
+            "请先确认实际服务内容",
+        )
+    if industry and category in {"往来款", "其他支出", "信息技术服务费"}:
+        return _industry_inferred_it_classification(stmt, industry, category)
+    return classification
 
 
 _DIRECTION_SYNONYMS = {
@@ -646,6 +1169,44 @@ def diagnose_matched_statement_effect(
 
 _schema_ready = False
 
+# 流水排序的唯一定义：同秒多笔只靠日期分不出先后，靠导入时保存的文件行序
+# （同一份银行导出在同一秒内按行号升序排列即真实时序）；没有行序的历史行
+# 退回 id。从 "ORDER BY transaction_date" 改成这个片段的地方必须一起改，
+# 否则列表顺序与余额核对顺序会各说各话。
+_STATEMENT_ORDER = (
+    "transaction_date ASC, source_row_index IS NULL, source_row_index ASC, id ASC"
+)
+
+
+def normalize_bank_reference(value: Any) -> str:
+    """银行流水号归一化；返回空串表示"该行没有可用的引用号"。
+
+    引用号是银行给的交易身份，可以直接判重；但只有能精确表示的才收：
+    JSON 数字超过 2^53 已在浏览器端丢精度（中国银行「记录标识号」25 位就是
+    这种，读出来是 259755500999999978999999978 的垃圾值），宁可当作没有。
+    """
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, float):
+        # 超出 2^53 的浮点已经丢精度，int() 出来的是看似完整的假号码
+        if not value.is_integer() or abs(value) > 2**53 - 1:
+            return ""
+        value = int(value)
+    text_value = str(value).strip().replace(" ", "").replace("\u3000", "")
+    if not text_value:
+        return ""
+    # 科学计数法：精度已不可逆（Excel 存大数的典型形态）
+    if re.search(r"[eE][+-]?\d", text_value):
+        return ""
+    if re.fullmatch(r"\d+\.0+", text_value):
+        text_value = text_value.split(".", 1)[0]
+    if re.fullmatch(r"0+", text_value):
+        # 全零是「客户业务编号」这类占位列，不是身份
+        return ""
+    if len(text_value) > 64:
+        return ""
+    return text_value
+
 
 async def _ensure_schema() -> None:
     """进程级一次性 schema 守卫。
@@ -654,7 +1215,7 @@ async def _ensure_schema() -> None:
     短路（此前每个银行接口都重复跑 DDL 判定 + 全表扫 description_normalized=0；
     新写入行在导入时已带 normalized 描述，补记只针对存量数据）。
     PostgreSQL 下这些 DDL 经 database._translate_postgres 翻译为 no-op，
-    正式 schema 依赖 Alembic 迁移先行。
+    正式 schema 依赖 Alembic 迁移先行（b7e3d1c8a4f2 补引用号与行序）。
     """
     global _schema_ready
     if _schema_ready:
@@ -672,14 +1233,25 @@ async def _ensure_schema() -> None:
             "  statement_id TEXT NOT NULL,"
             "  matched_entry_id TEXT,"
             "  description_normalized INTEGER NOT NULL DEFAULT 0,"
-            "  created_at TEXT NOT NULL"
+            "  created_at TEXT NOT NULL,"
+            "  transaction_reference TEXT,"
+            "  source_row_index INTEGER"
             ")"
         )
         columns = await (await conn.execute("PRAGMA table_info(bank_statements)")).fetchall()
-        if "description_normalized" not in {row["name"] for row in columns}:
+        column_names = {row["name"] for row in columns}
+        if "description_normalized" not in column_names:
             await conn.execute(
                 "ALTER TABLE bank_statements "
                 "ADD COLUMN description_normalized INTEGER NOT NULL DEFAULT 0"
+            )
+        if "transaction_reference" not in column_names:
+            await conn.execute(
+                "ALTER TABLE bank_statements ADD COLUMN transaction_reference TEXT"
+            )
+        if "source_row_index" not in column_names:
+            await conn.execute(
+                "ALTER TABLE bank_statements ADD COLUMN source_row_index INTEGER"
             )
         cursor = await conn.execute(
             "SELECT id, description FROM bank_statements WHERE description_normalized = 0"
@@ -694,6 +1266,12 @@ async def _ensure_schema() -> None:
         )
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_bank_statement ON bank_statements(statement_id)"
+        )
+        # 引用号只做查找加速，不做唯一约束：流水表没有账户列，同公司多账户
+        # 理论上可撞号；且唯一冲突会掀掉整批导入事务（导入只按行捕获业务异常）。
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bank_reference "
+            "ON bank_statements(company_id, transaction_reference)"
         )
         await conn.execute(
             "CREATE TABLE IF NOT EXISTS bank_statement_matches ("
@@ -723,13 +1301,65 @@ async def _ensure_schema() -> None:
         )
         await conn.execute(
             "CREATE TABLE IF NOT EXISTS bank_category_rules ("
+            "  id TEXT,"
             "  company_id TEXT NOT NULL,"
             "  direction TEXT NOT NULL,"
             "  match_pattern TEXT NOT NULL,"
+            "  counterparty_key TEXT NOT NULL DEFAULT '',"
+            "  purpose_key TEXT NOT NULL DEFAULT '',"
             "  category TEXT NOT NULL,"
+            "  account_code TEXT,"
+            "  confidence REAL NOT NULL DEFAULT 0.98,"
+            "  source_statement_id TEXT,"
+            "  created_by TEXT,"
+            "  enabled INTEGER NOT NULL DEFAULT 1,"
+            "  rule_version INTEGER NOT NULL DEFAULT 1,"
+            "  hit_count INTEGER NOT NULL DEFAULT 0,"
+            "  last_hit_at TEXT,"
+            "  last_hit_statement_id TEXT,"
+            "  override_count INTEGER NOT NULL DEFAULT 0,"
+            "  amount_min NUMERIC(20,2),"
+            "  amount_max NUMERIC(20,2),"
+            "  amount_hit_count INTEGER NOT NULL DEFAULT 0,"
+            "  created_at TEXT,"
             "  updated_at TEXT NOT NULL,"
             "  PRIMARY KEY (company_id, direction, match_pattern)"
             ")"
+        )
+        rule_columns = {
+            row["name"]
+            for row in await (await conn.execute("PRAGMA table_info(bank_category_rules)")).fetchall()
+        }
+        for column, definition in _RULE_SCHEMA_COLUMNS.items():
+            if column not in rule_columns:
+                await conn.execute(
+                    f"ALTER TABLE bank_category_rules ADD COLUMN {column} {definition}"
+                )
+        await conn.execute(
+            "UPDATE bank_category_rules SET "
+            "id = 'legacy-' || company_id || '-' || direction || '-' || match_pattern "
+            "WHERE id IS NULL OR id = ''"
+        )
+        await conn.execute(
+            "UPDATE bank_category_rules SET "
+            "counterparty_key = match_pattern "
+            "WHERE counterparty_key IS NULL OR counterparty_key = ''"
+        )
+        await conn.execute(
+            "UPDATE bank_category_rules SET purpose_key = '' "
+            "WHERE purpose_key IS NULL"
+        )
+        await conn.execute(
+            "UPDATE bank_category_rules SET created_at = updated_at "
+            "WHERE created_at IS NULL OR created_at = ''"
+        )
+        await conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_bank_category_rule_id "
+            "ON bank_category_rules(id)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bank_category_rule_lookup "
+            "ON bank_category_rules(company_id, direction, enabled, counterparty_key, purpose_key)"
         )
         # Backfill legacy one-to-one links. The unique entry index intentionally
         # keeps corrupt duplicate legacy links visible to the health checker.
@@ -775,6 +1405,130 @@ async def _ensure_schema() -> None:
 async def ensure_bank_schema() -> None:
     """Public schema guard for reconciliation mutations."""
     await _ensure_schema()
+
+
+async def _load_company_category_rules(company_id: str) -> List[Dict[str, Any]]:
+    conn = await get_conn()
+    try:
+        cursor = await conn.execute(
+            "SELECT * FROM bank_category_rules WHERE company_id = ?",
+            (company_id,),
+        )
+        return [_serialize_category_rule(row) for row in await cursor.fetchall()]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("读取 bank_category_rules 失败，本次跳过企业记忆规则: %s", exc)
+        return []
+    finally:
+        await conn.close()
+
+
+async def _load_closed_bank_months(company_id: str) -> set[str]:
+    """Best-effort read of closed periods for rule-only suggestion guards."""
+    conn = await get_conn()
+    try:
+        cursor = await conn.execute(
+            "SELECT period_start, status FROM accounting_periods WHERE company_id = ?",
+            (company_id,),
+        )
+        return {
+            str(row["period_start"])[:7]
+            for row in await cursor.fetchall()
+            if str(row["status"] or "") == "closed"
+        }
+    except Exception:
+        # Legacy fixture databases may not contain accounting_periods. The
+        # authoritative posting path still enforces the same rule on confirm.
+        return set()
+    finally:
+        await conn.close()
+
+
+def match_company_category_rule(
+    statement: Dict[str, Any],
+    rules: List[Dict[str, Any]],
+    *,
+    closed_months: Optional[set[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return the most specific enabled tenant rule for one statement."""
+    amount = safe_money(statement.get("amount"))
+    direction = "income" if amount >= ZERO else "expense"
+    counterparty = extract_statement_counterparty_key(str(statement.get("description") or ""))
+    purpose = extract_statement_purpose_key(str(statement.get("description") or ""))
+    month = str(statement.get("transaction_date") or "")[:7]
+
+    candidates: list[tuple[int, str, Dict[str, Any]]] = []
+    for rule in rules:
+        if not rule.get("enabled") or str(rule.get("direction") or "") != direction:
+            continue
+        rule_counterparty = str(rule.get("counterpartyKey") or "")
+        rule_purpose = str(rule.get("purposeKey") or "")
+        if rule_counterparty:
+            if not counterparty or rule_counterparty != counterparty:
+                continue
+            if rule_purpose and rule_purpose != purpose:
+                continue
+            specificity = 300 if rule_purpose else 120
+        else:
+            if not purpose or rule_purpose != purpose:
+                continue
+            specificity = 220
+        candidates.append((
+            specificity,
+            str(rule.get("updatedAt") or rule.get("createdAt") or ""),
+            {**rule, "matchKind": "exact" if rule_purpose else "counterparty_only"},
+        ))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    matched = dict(candidates[0][2])
+    reasons: list[str] = []
+    category = str(matched.get("category") or "")
+    if not matched.get("purposeKey"):
+        reasons.append("规则只记住了交易对方，本次业务用途仍需确认")
+    if _REFUND_RE.search(str(statement.get("description") or "")) and matched.get("purposeKey") != "退款":
+        reasons.append("退款/退回业务不能套用普通付款规则")
+    if month and month in (closed_months or set()):
+        reasons.append(f"{month} 已关账，需先确认补记期间")
+    if category in _RULE_DIRECTIONAL_REVIEW_CATEGORIES or is_ambiguity_category(category):
+        reasons.append("该分类需要结合账外事实逐笔确认")
+    try:
+        amount_max = safe_money(matched.get("amountMax"))
+    except Exception:
+        amount_max = ZERO
+    abs_amount = abs(amount)
+    if amount_max > ZERO and abs_amount > amount_max * Decimal("5"):
+        reasons.append(
+            f"本次金额 {abs_amount:.2f} 明显高于历史规则范围 {amount_max:.2f}"
+        )
+    matched["requiresReview"] = bool(reasons)
+    matched["reviewReasons"] = reasons
+    if reasons:
+        matched["confidence"] = min(float(matched.get("confidence") or 0.5), 0.78)
+    return matched
+
+
+async def _record_company_category_rule_hits(
+    company_id: str, hits: List[tuple[Dict[str, Any], str]]
+) -> None:
+    if not hits:
+        return
+    now = _now_iso()
+    conn = await get_conn()
+    try:
+        for rule, statement_id in hits:
+            rule_id = str(rule.get("id") or "")
+            if not rule_id or rule.get("lastHitStatementId") == statement_id:
+                continue
+            await conn.execute(
+                "UPDATE bank_category_rules SET hit_count = hit_count + 1, "
+                "amount_hit_count = amount_hit_count + 1, last_hit_at = ?, "
+                "last_hit_statement_id = ? WHERE company_id = ? AND id = ?",
+                (now, statement_id, company_id, rule_id),
+            )
+        await conn.commit()
+    finally:
+        await conn.close()
 
 
 async def get_matched_entry_ids(company_id: str) -> set[str]:
@@ -828,11 +1582,19 @@ async def import_statements(company_id: str, csv_content: str, statement_id: str
                 desc = normalize_statement_description(row.get("description", ""))
                 amount = safe_money(row.get("amount"))
                 balance = safe_money(row.get("balance"))
+                reference = normalize_bank_reference(row.get("transaction_reference"))
 
-                # Check for duplicates (same date, desc, amount — balance varies by statement)
+                # 判重同 core：有号只认号；复合键只对"入参无号或库中无号"的行生效。
+                # 余额必须进键：交易后余额是逐笔连续值，同日同摘要同金额的多笔手续费
+                # （一秒内连发 3 笔 -4.50）余额互异，属不同交易；漏掉余额会把它们
+                # 折叠成一笔，静默少记。日期截到日，避免带时分秒与纯日期互不相等。
                 cursor = await conn.execute(
-                    "SELECT 1 FROM bank_statements WHERE company_id = ? AND transaction_date = ? AND description = ? AND amount = ? LIMIT 1",
-                    (company_id, txn_date, desc, amount)
+                    "SELECT 1 FROM bank_statements WHERE company_id = ? AND ("
+                    "  (? <> '' AND transaction_reference = ?)"
+                    "  OR (substr(transaction_date, 1, 10) = ? AND description = ? "
+                    "      AND amount = ? AND balance = ? AND (? = '' OR transaction_reference IS NULL))"
+                    ") LIMIT 1",
+                    (company_id, reference, reference, txn_date[:10], desc, amount, balance, reference)
                 )
                 if await cursor.fetchone():
                     skipped += 1
@@ -843,9 +1605,13 @@ async def import_statements(company_id: str, csv_content: str, statement_id: str
 
                 await conn.execute(
                     "INSERT INTO bank_statements "
-                    "(id, company_id, transaction_date, description, amount, balance, statement_id, description_normalized, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)",
-                    (sid, company_id, txn_date, desc, amount, balance, statement_id or sid, now),
+                    "(id, company_id, transaction_date, description, amount, balance, statement_id, "
+                    "description_normalized, created_at, transaction_reference, source_row_index) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+                    (
+                        sid, company_id, txn_date, desc, amount, balance, statement_id or sid, now,
+                        reference or None, None,
+                    ),
                 )
                 imported += 1
             except (ValueError, KeyError):
@@ -884,11 +1650,23 @@ async def import_statements_json(company_id: str, rows: List[Dict[str, Any]], st
                 )
                 amount = safe_money(row.get("amount") or row.get("金额"))
                 balance = safe_money(row.get("balance") or row.get("余额"))
+                reference = normalize_bank_reference(row.get("transaction_reference"))
+                raw_row_index = row.get("source_row_index")
+                try:
+                    source_row_index = int(raw_row_index) if raw_row_index not in (None, "") else None
+                except (TypeError, ValueError):
+                    source_row_index = None
 
-                # Check for duplicates (same date, desc, amount — balance varies by statement)
+                # 判重同 core：有号只认号，复合键只对"入参无号或库中无号"的行生效。
+                # 理由同 CSV 路径：余额互异即不同交易，不看余额会把同日同额的多笔
+                # 手续费折叠成一条。
                 cursor = await conn.execute(
-                    "SELECT 1 FROM bank_statements WHERE company_id = ? AND transaction_date = ? AND description = ? AND amount = ? LIMIT 1",
-                    (company_id, txn_date, desc, amount)
+                    "SELECT 1 FROM bank_statements WHERE company_id = ? AND ("
+                    "  (? <> '' AND transaction_reference = ?)"
+                    "  OR (substr(transaction_date, 1, 10) = ? AND description = ? "
+                    "      AND amount = ? AND balance = ? AND (? = '' OR transaction_reference IS NULL))"
+                    ") LIMIT 1",
+                    (company_id, reference, reference, txn_date[:10], desc, amount, balance, reference)
                 )
                 if await cursor.fetchone():
                     skipped += 1
@@ -899,9 +1677,13 @@ async def import_statements_json(company_id: str, rows: List[Dict[str, Any]], st
 
                 await conn.execute(
                     "INSERT INTO bank_statements "
-                    "(id, company_id, transaction_date, description, amount, balance, statement_id, description_normalized, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)",
-                    (sid, company_id, txn_date, desc, amount, balance, statement_id or sid, now),
+                    "(id, company_id, transaction_date, description, amount, balance, statement_id, "
+                    "description_normalized, created_at, transaction_reference, source_row_index) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+                    (
+                        sid, company_id, txn_date, desc, amount, balance, statement_id or sid, now,
+                        reference or None, source_row_index,
+                    ),
                 )
                 imported += 1
             except (ValueError, KeyError, TypeError) as exc:
@@ -943,8 +1725,9 @@ async def import_statements_core(
     The legacy import helpers above remain for SQLite migration fixtures. All HTTP
     imports use this function so a failed source/audit write rolls back the bank row.
 
-    去重键是「日期 + 摘要 + 金额」，同日同额同摘要的两笔真实交易会被误判为重复。
-    静默跳过等于漏记，所以重复不再吞掉：默认返回 skippedDetails 供用户确认，
+    去重键是「日期 + 摘要 + 金额 + 余额」。同日同额同摘要但交易后余额互异的行
+    （一秒内连发的多笔手续费就是这种）是不同交易，旧键不看余额会把它们折叠成一笔。
+    真正的重复不再静默吞掉：默认返回 skippedDetails 供用户确认，
     带 ``force_duplicates=True`` 才强制导入。
     """
     from services.accounting_core_service import ensure_tenant, record_audit
@@ -968,28 +1751,67 @@ async def import_statements_core(
             )
             signed_amount = safe_money(row.get("amount") if row.get("amount") is not None else row.get("金额"))
             balance = safe_money(row.get("balance") if row.get("balance") is not None else row.get("余额"))
+            reference = normalize_bank_reference(row.get("transaction_reference"))
+            raw_row_index = row.get("source_row_index")
+            try:
+                source_row_index = int(raw_row_index) if raw_row_index not in (None, "") else None
+            except (TypeError, ValueError):
+                source_row_index = None
             duplicate = None
             if not force_duplicates:
+                # 判重三支（引用号存在时它是权威身份）：
+                # 1) 入参有号 → 只认同号；
+                # 2) 复合键回落 → 仅当入参无号，或库中那一行本来就没号（历史数据/
+                #    微信这类无号源）。这样"带号重导"既不会重复入账，也不会把
+                #    两笔号不同的真实交易按指纹合并；
+                # 3) 库中行有号、入参无号 → 仍按复合键，避免无号源重复导入。
+                # 复合键 = 日期(substr 到日) + 摘要 + 金额 + 余额：余额逐笔连续，
+                # 同秒同额的多笔手续费余额互异；日期截到日是因为流水文本可带时分秒
+                # 而历史行只存到日期。
                 duplicate = await session.execute(
                     text(
-                        "SELECT id FROM bank_statements WHERE company_id = :company_id "
-                        "AND transaction_date = :transaction_date AND description = :description "
-                        "AND amount = :amount LIMIT 1"
+                        "SELECT id, transaction_reference, description, amount "
+                        "FROM bank_statements WHERE company_id = :company_id AND ("
+                        "  (:reference <> '' AND transaction_reference = :reference)"
+                        "  OR (substr(transaction_date, 1, 10) = :transaction_date "
+                        "      AND description = :description AND amount = :amount "
+                        "      AND balance = :balance "
+                        "      AND (:reference = '' OR transaction_reference IS NULL))"
+                        ") LIMIT 1"
                     ),
                     {
                         "company_id": company_id,
-                        "transaction_date": txn_date_text,
+                        "reference": reference,
+                        "transaction_date": txn_date_text[:10],
                         "description": desc,
                         "amount": money_text(signed_amount),
+                        "balance": money_text(balance),
                     },
                 )
-            if duplicate is not None and duplicate.first() is not None:
+            matched = duplicate.first() if duplicate is not None else None
+            if matched is not None:
+                matched_reference = str(matched[1] or "")
+                matched_by_reference = bool(reference) and matched_reference == reference
+                if matched_by_reference and (
+                    money_text(money(matched[3])) != money_text(signed_amount)
+                    or normalize_statement_description(str(matched[2] or "")) != desc
+                ):
+                    # 同号却不同内容：多半是银行重导时改了摘要，或者上游把号映射错了，
+                    # 必须让人看见，不能只说"重复"。
+                    reason = f"同交易流水号（{reference}）已存在但金额/摘要不一致，请核对银行流水号"
+                elif matched_by_reference:
+                    reason = f"同交易流水号（{reference}）的流水已存在"
+                else:
+                    reason = "同日期+同摘要+同金额+同余额的流水已存在；如确属两笔真实交易，请使用强制导入"
                 skipped += 1
                 skipped_details.append({
                     "transactionDate": txn_date_text,
                     "description": desc,
                     "amount": money_text(signed_amount),
-                    "reason": "同日期+同摘要+同金额的流水已存在；如确属两笔真实交易，请使用强制导入",
+                    "balance": money_text(balance),
+                    "transactionReference": reference,
+                    "sourceRowIndex": source_row_index,
+                    "reason": reason,
                 })
                 continue
 
@@ -998,9 +1820,9 @@ async def import_statements_core(
                 text(
                     "INSERT INTO bank_statements "
                     "(id, company_id, transaction_date, description, amount, balance, statement_id, "
-                    "description_normalized, created_at) VALUES "
+                    "description_normalized, created_at, transaction_reference, source_row_index) VALUES "
                     "(:id, :company_id, :transaction_date, :description, :amount, :balance, "
-                    ":statement_id, 1, :created_at)"
+                    ":statement_id, 1, :created_at, :transaction_reference, :source_row_index)"
                 ),
                 {
                     "id": sid,
@@ -1011,6 +1833,9 @@ async def import_statements_core(
                     "balance": money_text(balance),
                     "statement_id": batch_id,
                     "created_at": now,
+                    # 无号必须存 NULL：'' 会让「库中无号」的回落到失效
+                    "transaction_reference": reference or None,
+                    "source_row_index": source_row_index,
                 },
             )
             from db.models import SourceTransaction
@@ -1032,6 +1857,8 @@ async def import_statements_core(
                         "statementBatchId": batch_id,
                         "signedAmount": money_text(signed_amount),
                         "balance": money_text(balance),
+                        "transactionReference": reference,
+                        "sourceRowIndex": source_row_index,
                         "original": json.loads(json_dumps(row)),
                     },
                     status="candidate",
@@ -1120,12 +1947,12 @@ async def get_statements(company_id: str, statement_id: Optional[str] = None) ->
     try:
         if statement_id:
             cursor = await conn.execute(
-                "SELECT * FROM bank_statements WHERE company_id = ? AND statement_id = ? ORDER BY transaction_date ASC",
+                f"SELECT * FROM bank_statements WHERE company_id = ? AND statement_id = ? ORDER BY {_STATEMENT_ORDER}",
                 (company_id, statement_id),
             )
         else:
             cursor = await conn.execute(
-                "SELECT * FROM bank_statements WHERE company_id = ? ORDER BY transaction_date ASC",
+                f"SELECT * FROM bank_statements WHERE company_id = ? ORDER BY {_STATEMENT_ORDER}",
                 (company_id,),
             )
         rows = [dict(r) for r in await cursor.fetchall()]
@@ -1184,19 +2011,26 @@ def _build_match_candidates(
     already_matched_ids,
     *,
     allow_advancement: bool,
+    reversed_ids: frozenset | set = frozenset(),
 ) -> List[Dict]:
     """把 entries 行装配成对账候选（auto_match 与 ai_suggest 共用，防口径漂移）。
 
     allow_advancement：股东/员工个人垫付凭证银行效果为零，也允许作为报销流水
     的配对候选（ai_suggest 需要该能力；auto_match 规则匹配不需要）。
     待核销发票（贷2241/借1122）挂账分录不含银行科目，配对金额取票面金额。
+    reversed_ids：已红冲凭证不参与配对（核心状态，投影 payload 无 status 键）。
     """
     entries: List[Dict] = []
     for row in rows:
         try:
             payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
             entry_id = payload.get("id", row["id"])
-            if entry_id in already_matched_ids:
+            if entry_id in already_matched_ids or entry_id in reversed_ids:
+                continue
+            if payload.get("is_archive_only") or payload.get("isArchiveOnly"):
+                # 仅归档不记账的底稿凭证（如"先付款后收票"时发票自动归档）不是可核销
+                # 凭证：voucherLines 带 1002 行但余额核对按同口径排除它，配上去银行
+                # 账永远关不上。候选层不推荐，确认层（bank_settlement_service）再硬拒。
                 continue
 
             voucher = payload.get("voucherLines") or {}
@@ -1275,7 +2109,8 @@ async def auto_match(company_id: str) -> dict:
         await conn.close()
 
 
-    entries = _build_match_candidates(rows, already_matched_ids, allow_advancement=False)
+    reversed_ids = await _load_reversed_entry_ids(company_id)
+    entries = _build_match_candidates(rows, already_matched_ids, allow_advancement=False, reversed_ids=reversed_ids)
 
     suggestions = []
     used_entry_ids = set(already_matched_ids)
@@ -1284,6 +2119,7 @@ async def auto_match(company_id: str) -> dict:
             e for e in entries
             if e.get("id") not in used_entry_ids
             and _direction_matches_statement(stmt["amount"], e.get("direction", "expense"))
+            and _entry_not_after_statement(e.get("occurDate"), stmt.get("transaction_date"))
         ]
         rule_match = _try_rule_match(stmt, available_entries)
         if not rule_match:
@@ -1324,13 +2160,13 @@ async def get_difference_report(company_id: str, month: str) -> dict:
     try:
         cursor = await conn.execute(
             "SELECT * FROM bank_statements WHERE company_id = ? AND (matched_entry_id IS NULL OR matched_entry_id = '') "
-            "AND substr(transaction_date, 1, 7) = ? ORDER BY transaction_date ASC",
+            f"AND substr(transaction_date, 1, 7) = ? ORDER BY {_STATEMENT_ORDER}",
             (company_id, month),
         )
         bank_only = [dict(r) for r in await cursor.fetchall()]
         cursor = await conn.execute(
             "SELECT * FROM bank_statements WHERE company_id = ? "
-            "AND substr(transaction_date, 1, 7) = ? ORDER BY transaction_date ASC, id ASC",
+            f"AND substr(transaction_date, 1, 7) = ? ORDER BY {_STATEMENT_ORDER}",
             (company_id, month),
         )
         month_statements = [dict(r) for r in await cursor.fetchall()]
@@ -1360,6 +2196,7 @@ async def get_difference_report(company_id: str, month: str) -> dict:
     book_only = []
     book_bank_balance = ZERO
     entries_by_id: Dict[str, Dict[str, Any]] = {}
+    parsed_entries: List[Dict[str, Any]] = []
     for row in rows:
         try:
             payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
@@ -1367,11 +2204,29 @@ async def get_difference_report(company_id: str, month: str) -> dict:
             continue
         if not isinstance(payload, dict):
             continue
+        parsed_entries.append(payload)
+
+    # 红冲凭证与原凭证成对抵消，不能再作为“账本无流水”催办。与待办、
+    # 经营报表及结账向导保持同一口径：红字凭证本身和已被红冲的原凭证都退出
+    # 待匹配范围。
+    reversed_entry_ids = {
+        str(payload.get("reversalOf") or "")
+        for payload in parsed_entries
+        if str(payload.get("entryType") or "") == "reversal" or payload.get("isReversal")
+    } - {""}
+
+    for payload in parsed_entries:
         payload_id = str(payload.get("id") or "")
         if payload_id:
             entries_by_id[payload_id] = payload
 
-        if payload.get("voucherStatus") in {"draft", "pending_review", "void"}:
+        voucher_status = str(payload.get("voucherStatus") or "")
+        entry_type = str(payload.get("entryType") or "")
+        if voucher_status in {"draft", "pending_review", "void"}:
+            continue
+        if entry_type == "reversal" or payload.get("isReversal") or voucher_status == "reversed":
+            continue
+        if payload_id and payload_id in reversed_entry_ids:
             continue
 
         voucher = payload.get("voucherLines", {})
@@ -1961,30 +2816,20 @@ async def ai_suggest_matches(
             )
             rows = await cursor.fetchall()
         except Exception as exc:  # noqa: BLE001
-            # 同下方 rules：表缺失只降级为无候选，不能让 ai-suggest 整体 500
+            # entries 投影表缺失只降级为无候选，不能让 ai-suggest 整体 500
             logger.warning("读取 entries 失败，AI 对账候选为空 company=%s: %s", company_id, exc)
             rows = []
-        company_rules = {}
-        try:
-            rule_cursor = await conn.execute(
-                "SELECT direction, match_pattern, category FROM bank_category_rules WHERE company_id = ?",
-                (company_id,),
-            )
-            company_rules = {
-                (str(r["direction"]), str(r["match_pattern"])): str(r["category"])
-                for r in await rule_cursor.fetchall()
-            }
-        except Exception as exc:  # noqa: BLE001
-            # 表缺失（如 Postgres 未跑迁移）只降级为无记忆规则，不能让整个
-            # ai-suggest 500——否则对账建议全灭且前端无提示。
-            logger.warning("读取 bank_category_rules 失败，本次跳过企业记忆规则: %s", exc)
     finally:
         await conn.close()
 
-    entries = _build_match_candidates(rows, already_matched_ids, allow_advancement=True)
+    company_rules = await _load_company_category_rules(company_id)
+    closed_months = await _load_closed_bank_months(company_id)
+    reversed_ids = await _load_reversed_entry_ids(company_id)
+    entries = _build_match_candidates(rows, already_matched_ids, allow_advancement=True, reversed_ids=reversed_ids)
 
     suggestions = []
     used_suggested_entry_ids = set(already_matched_ids)
+    recorded_rule_hits: list[tuple[Dict[str, Any], str]] = []
 
     # B. 一付一退对冲：退款与原付款互相挂钩，双双挂往来不进损益/平台结算
     refund_pairs = _detect_refund_pairs(statements)
@@ -2001,6 +2846,7 @@ async def ai_suggest_matches(
             e for e in entries
             if e.get("id") not in used_suggested_entry_ids
             and _direction_matches_statement(stmt["amount"], e.get("direction", "expense"))
+            and _entry_not_after_statement(e.get("occurDate"), stmt.get("transaction_date"))
         ]
         rule_match = _try_rule_match(stmt, available_entries)
         if rule_match:
@@ -2026,11 +2872,35 @@ async def ai_suggest_matches(
         # C. 企业记忆规则（用户确认过的规则压过系统关键词启发式——否则
         #    「记住此规则」在快规则命中的流水上永远不生效）
         stmt_dir = "income" if safe_money(stmt["amount"]) > ZERO else "expense"
-        stmt_pattern = extract_statement_rule_pattern(str(stmt.get("description") or ""))
-        remembered_category = company_rules.get((stmt_dir, stmt_pattern)) if stmt_pattern else None
-        if remembered_category:
+        remembered_rule = match_company_category_rule(
+            stmt, company_rules, closed_months=closed_months
+        )
+        if remembered_rule:
+            remembered_category = str(remembered_rule.get("category") or "")
+            counterparty = str(remembered_rule.get("counterpartyKey") or "")
+            purpose = str(remembered_rule.get("purposeKey") or "")
+            rule_label = counterparty or purpose
+            if counterparty and purpose:
+                rule_label = f"{counterparty} / {purpose}"
             date_str = str(stmt.get("transaction_date") or "")[:10]
-            reason = f"命中企业记忆规则：「{stmt_pattern}」自动归入{remembered_category}"
+            confidence = float(remembered_rule.get("confidence") or 0.5)
+            requires_review = bool(remembered_rule.get("requiresReview"))
+            review_reasons = list(remembered_rule.get("reviewReasons") or [])
+            match_kind = str(remembered_rule.get("matchKind") or "")
+            if match_kind == "exact":
+                reason = f"命中企业规则：{rule_label}，建议归入{remembered_category}"
+            else:
+                reason = f"企业规则只记住了交易对方「{rule_label}」，本次仍需确认业务用途"
+            if review_reasons:
+                reason = f"{reason}；{'；'.join(review_reasons)}"
+            account_info = lookup_account(remembered_category) or {}
+            account_name = str(account_info.get("accountName") or "")
+            account_code = str(
+                remembered_rule.get("accountCode")
+                or account_info.get("accountCode")
+                or ""
+            )
+            recorded_rule_hits.append((remembered_rule, str(stmt["id"])))
             suggestions.append({
                 "statementId": stmt["id"],
                 "statement": {
@@ -2040,24 +2910,31 @@ async def ai_suggest_matches(
                     "balance": stmt["balance"],
                 },
                 "type": "new",
-                "confidence": 0.98,
+                "confidence": confidence,
                 "rule": "company_memory_rule",
-                "rulePattern": stmt_pattern,
+                "ruleId": remembered_rule.get("id"),
+                "rulePattern": rule_label,
+                "ruleMatch": match_kind,
+                "requiresReview": requires_review,
+                "reviewReasons": review_reasons,
                 "reason": reason,
                 "suggestedEntry": {
-                    "title": f"{remembered_category}-{stmt_pattern[:16]}",
+                    "title": f"{remembered_category}-{rule_label[:16]}",
                     "category": remembered_category,
+                    "accountCode": account_code,
+                    "accountName": account_name,
                     "amount": abs(safe_money(stmt["amount"])),
                     "direction": stmt_dir,
                     "occurDate": date_str,
-                    "confidence": 0.98,
+                    "confidence": confidence,
+                    "requiresConfirmation": requires_review,
                     "reason": reason,
                 },
             })
             continue
 
         # A. 系统关键词快规则（已收窄：退款/验证类不再误中平台结算）
-        fast_rule = identify_statement_fast_rule(stmt)
+        fast_rule = identify_explicit_it_service_rule(stmt) or identify_statement_fast_rule(stmt)
         if fast_rule and fast_rule["rule"] != "wechat_withdrawal":
             suggestions.append({
                 "statementId": stmt["id"],
@@ -2146,6 +3023,7 @@ async def ai_suggest_matches(
                     e for e in cand_entries
                     if _direction_matches_statement(stmt["amount"], e.get("direction", "expense"))
                     and abs(abs(safe_money(e["amount"])) - stmt_amount) < amount_gap
+                    and _entry_not_after_statement(e.get("occurDate"), stmt.get("transaction_date"))
                 ][:10]  # Max 10 candidates for token efficiency
 
                 if candidates:
@@ -2157,6 +3035,7 @@ async def ai_suggest_matches(
                         BANK_MATCH_PROMPT, user_msg,
                         fallback={"matchedEntryId": None, "confidence": 0, "reason": "无法判断"},
                         max_retries=1,
+                        temperature=0,
                         scene="bank_statement",
                         user_id=user_id,
                         company_id=company_id,
@@ -2190,11 +3069,13 @@ async def ai_suggest_matches(
                     fallback=_fallback_classification_for_statement(stmt),
                     max_retries=1,
                     retry_on_parse=True,
+                    temperature=0,
                     scene="bank_statement",
                     user_id=user_id,
                     company_id=company_id,
                 )
                 classify_result = _ensure_classification_direction(stmt, classify_result)
+                classify_result = guard_statement_classification(stmt, classify_result)
 
                 return {
                     "statementId": stmt["id"],
@@ -2263,6 +3144,7 @@ async def ai_suggest_matches(
             else:
                 suggestions.append(res)
 
+    await _record_company_category_rule_hits(company_id, recorded_rule_hits)
     return suggestions
 
 
@@ -2422,9 +3304,19 @@ async def classify_single_statement(
             "confidence": 0.9,
             "reason": "用户补充说明表明该支出用于研发，应优先按研发支出处理",
         }
+    if context:
+        explicit_it_rule = identify_explicit_it_service_rule(stmt, context)
+        if explicit_it_rule:
+            return {
+                "direction": "expense",
+                "category": explicit_it_rule["category"],
+                "title": explicit_it_rule["title"],
+                "confidence": 0.95,
+                "reason": f"用户补充说明明确包含信息技术服务用途：{context}",
+            }
 
     if not context:
-        fast_rule = identify_statement_fast_rule(stmt)
+        fast_rule = identify_explicit_it_service_rule(stmt) or identify_statement_fast_rule(stmt)
         if fast_rule:
             return {
                 "direction": "income" if safe_money(stmt["amount"]) > ZERO else "expense",
@@ -2433,7 +3325,6 @@ async def classify_single_statement(
                 "confidence": fast_rule["confidence"],
                 "reason": fast_rule["reason"],
             }
-
     classify_msg = f"""银行流水：
 - 日期：{stmt['transaction_date']}
 - 摘要：{stmt['description']}
@@ -2456,11 +3347,13 @@ async def classify_single_statement(
                   "confidence": 0.3, "reason": "无法自动分类"},
         max_retries=1,
         retry_on_parse=True,
+        temperature=0,
         scene="bank_statement",
         user_id=user_id,
         company_id=company_id,
     )
-    return _ensure_classification_direction(stmt, classify_result)
+    classify_result = _ensure_classification_direction(stmt, classify_result)
+    return guard_statement_classification(stmt, classify_result, context)
 
 
 async def apply_statement_match(
@@ -2503,7 +3396,7 @@ def _looks_like_payroll_liability(entry_data: Dict[str, Any], description: str) 
     category = str(entry_data.get("category") or "")
     if category in {"社保公积金", "社保", "公积金", "住房公积金"}:
         return True
-    return str(entry_data.get("accountCode") or "") in {"221102", "221104"}
+    return str(entry_data.get("accountCode") or "") in {"221102", "221104", "221105"}
 
 
 async def confirm_suggestion_flow(
@@ -2522,8 +3415,18 @@ async def confirm_suggestion_flow(
     单测/legacy 夹具（session 非会话）走本函数内的 legacy 裸 SQL 路径。原样保留
     HTTPException 错误契约：前端按 detail.code 分流（EXISTING_WECHAT_ENTRIES /
     PAYROLL_LIABILITY_REQUIRES_PAYROLL / SALARY_REQUIRES_PAYROLL / EXISTING_ENTRY_MATCH）。
+
+    注意：assert_bank_reconciliable 只在 AsyncSession 分支调用（单测路径跳过），
+    测试捕获不了它的缺失——7bb56c5 下沉时漏了导入，真实 HTTP 路径每笔确认都在
+    save_entry/对账回写之间炸 NameError，造成"已入账但流水未关联"的幽灵待配对。
+    is_ambiguity_category（category_service）同理：只在勾选"记住此规则"分支调用，
+    漏导入会让首次确认 500、第二次点击因已匹配而"看起来正常"。
     """
+    from services.accounting_core_service import assert_bank_reconciliable
+    from services.category_service import is_ambiguity_category
     from services.entry_service import save_entry
+
+    from services.accounting_core_service import assert_bank_reconciliable
 
     if req.type == "match":
         await ensure_bank_schema()
@@ -2879,6 +3782,10 @@ async def confirm_suggestion_flow(
         finally:
             await conn.close()
 
+        # salary_service 需在两个工资/社保分支之前导入（pyflakes 曾抓到漏导入：
+        # 社保缴纳流水走第一分支时 NameError 500）
+        import services.salary_service as salary_service
+
         if money(stmt["amount"] or ZERO) < ZERO and _looks_like_payroll_liability(entry_data, str(stmt["description"] or "")):
             liability = await salary_service.list_payroll_liability_payment_suggestions(company_id)
             raise HTTPException(status_code=409, detail={
@@ -2977,18 +3884,33 @@ async def confirm_suggestion_flow(
                          {"source": "bank_ai_suggest", "title": entry_data.get("title", "")})
         await sync_core(stmt, [entry_id])
         saved_rule_pattern = None
+        rule_warning = ""
         # 模糊分类组的正确科目取决于账外事实（认缴进度、缴款性质），同一附言
         # 未必每次同科目；沉淀自动规则会把本月的判断错误套用到未来流水。
         if req.rememberRule and not is_ambiguity_category(str(entry_data.get("category") or "")):
-            saved_rule_pattern = await save_company_category_rule(
-                company_id,
-                str(stmt["description"] or ""),
-                stmt["amount"],
-                str(entry_data.get("category") or ""),
-            )
+            try:
+                saved_rule_pattern = await save_company_category_rule(
+                    company_id,
+                    str(stmt["description"] or ""),
+                    stmt["amount"],
+                    str(entry_data.get("category") or ""),
+                    source_statement_id=req.statement_id,
+                    user_id=user_id,
+                )
+            except Exception:
+                # 流水已成功入账和匹配；规则只是后续效率优化，不能在此时
+                # 返回 500 让用户误以为第一次确认失败并重复操作。
+                logger.exception(
+                    "保存银行分类规则失败，已保留成功入账 statement=%s company=%s",
+                    req.statement_id,
+                    company_id,
+                )
+                rule_warning = "流水已入账，但分类规则保存失败，可在流水规则中重试"
         response_data: Dict[str, Any] = {"status": "created", "entryId": entry_id}
         if saved_rule_pattern:
             response_data["savedRulePattern"] = saved_rule_pattern
+        if rule_warning:
+            response_data["ruleWarning"] = rule_warning
         return await respond(response_data)
 
     return await respond({"status": "error", "message": "无效的请求"})

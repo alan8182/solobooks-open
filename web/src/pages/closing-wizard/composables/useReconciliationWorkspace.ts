@@ -16,18 +16,33 @@
 import { computed, h, nextTick, ref, watch, type Ref } from 'vue'
 import { useDialog, useMessage } from 'naive-ui'
 import apiClient from '@/api/client'
-import { updateEntry } from '@/api/record'
+import { previewEntryVoucher, updateEntry } from '@/api/record'
+import { reverseEntry } from '@/api/accounting'
 import { accountingErrorText } from '@/utils/errors'
 import { formatMoney } from '@/utils/format'
 import { sortEntriesByDateDescending } from '@/utils/entrySort'
 import { getRdExpenseTypes, getRdProjects } from '@/api/rd'
-import type { RdExpenseTypeOption, RdProject } from '@/api/types'
+import type { RdExpenseType, RdExpenseTypeOption, RdProject, VoucherPreview } from '@/api/types'
 import {
   buildSuggestedMatchPair,
+  voucherLinesSummary,
   getStatementMatchedEntryIds,
   getMatchedEntryIdSets,
   isReconciledEntry,
   isNonBankSettledEntry,
+  isReversalLikeEntry,
+  canResetEntryDisposition,
+  isLiveInvoiceEntry,
+  invoiceDedupKey,
+  isPreferredInvoiceEntry,
+  invoiceRowStatus,
+  invoiceNeedsAttention,
+  DISPOSITION_EXCLUDED_CATEGORIES,
+  RD_EXPENSE_CATEGORY,
+  dispositionCategoryGroups,
+  dispositionCategoryOf,
+  hasEffectiveRdProjects,
+  isEffectiveRdProject,
 } from '@/utils/closingWizard'
 import { getEntryNaturePresentation } from '@/utils/entryNature'
 import { accountForCategory, getAmbiguityGroup } from '@/utils/accounting'
@@ -66,6 +81,10 @@ const showInvoiceDetails = ref(false)
 const selectedInvoiceIds = ref<string[]>([])
 const selectedBank = ref<string | null>(null)
 const matchedPairs = ref<any[]>([])
+// 真正持久化的配对（流水 matched_entry_id 已落库）。建议对（persisted=false，
+// 待用户点确认配对）不得混进"已认领并完成"列表——否则用户点撤销只是本地
+// 忽略，刷新后 ai-suggest 重新建议，看起来像"撤销无效又回来了"。
+const persistedMatchedPairs = computed(() => matchedPairs.value.filter((p: any) => p.persisted))
 const aiSuggestions = ref<any[]>([])
 const reconciliationHealth = ref<any | null>(null)
 const reconciliationHealthLoading = ref(false)
@@ -82,28 +101,41 @@ function filterUnmatchedData() {
     )
   )
 
-  // All invoices for current month (with linked/confirmed status split)
+  // 月度发票：只保留活凭证（冲销凭证与被冲销原凭证退出），并按发票号/指纹去重，
+  // 避免一次“冲销重记”把同一张发票显示成两行。
   const { linkedEntryIds, confirmedEntryIds } = getMatchedEntryIdSets(rawStatements.value, entryStore.activeEntries)
-  invoicesList.value = entryStore.activeEntries.filter((e) => {
+  const rawInvoices = entryStore.activeEntries.filter((e) => {
     const isInvoice = (e as any).source === 'invoice_import' || !!(e as any).invoiceNumber
     const isInMonth = entryPeriod(e) === targetMonth.value
-    return isInvoice && isInMonth
-  }).map(e => ({
-    id: e.id,
-    title: e.title,
-    date: e.occurDate,
-    amount: e.amount,
-    direction: e.direction,
-    category: (e as any).category || '',
-    billingStatus: (e as any).billingStatus,
-    paymentStatus: (e as any).paymentStatus || '',
-    voucherStatus: (e as any).voucherStatus || '',
-    voucherRef: (e as any).voucherRef || (e as any).voucher_no || '',
-    payer: (e as any).payer || 'company_account',
-    is_archive_only: (e as any).is_archive_only || (e as any).isArchiveOnly || false,
-    // billingStatus='reconciled' 由后端在报销垫付核销时写入（流水指向 reim- 账目，原发票账目同步结清），视为已对上
-    status: confirmedEntryIds.has(e.id) || e.billingStatus === 'reconciled' ? 'matched' : linkedEntryIds.has(e.id) ? 'pending_confirmation' : 'unmatched'
-  }))
+    return isInvoice && isInMonth && isLiveInvoiceEntry(e as any)
+  })
+  const byKey = new Map<string, any>()
+  for (const entry of rawInvoices) {
+    const key = invoiceDedupKey(entry as any)
+    const current = byKey.get(key)
+    if (!current || isPreferredInvoiceEntry(entry as any, current as any)) byKey.set(key, entry)
+  }
+  invoicesList.value = [...byKey.values()].map(e => {
+    const row: any = {
+      id: e.id,
+      title: e.title,
+      date: e.occurDate,
+      amount: e.amount,
+      direction: e.direction,
+      category: (e as any).category || '',
+      billingStatus: (e as any).billingStatus,
+      paymentStatus: (e as any).paymentStatus || '',
+      voucherStatus: (e as any).voucherStatus || '',
+      voucherRef: (e as any).voucherRef || (e as any).voucher_no || '',
+      payer: (e as any).payer || 'company_account',
+      is_archive_only: (e as any).is_archive_only || (e as any).isArchiveOnly || false,
+      invoiceNumber: (e as any).invoiceNumber || '',
+      // billingStatus='reconciled' 由后端在报销垫付核销时写入（流水指向 reim- 账目，原发票账目同步结清），视为已对上
+      status: confirmedEntryIds.has(e.id) || e.billingStatus === 'reconciled' ? 'matched' : linkedEntryIds.has(e.id) ? 'pending_confirmation' : 'unmatched',
+    }
+    row.rowStatus = invoiceRowStatus(row)
+    return row
+  })
 }
 
 
@@ -166,6 +198,67 @@ async function loadReconciliationHealth() {
     reconciliationHealthLoading.value = false
   }
 }
+// 撤销认可入账创建的凭证（source=bank_import）：草稿删除、已过账红冲。
+// 发票/工资等其他来源的凭证不动。返回失败的凭证标题列表。
+async function removeBankCreatedEntries(bankCreated: any[]): Promise<string[]> {
+  const failed: string[] = []
+  for (const e of bankCreated) {
+    try {
+      if ((e.voucherStatus || e.status) === 'posted') {
+        await reverseEntry(String(e.id), '对账撤销入账')
+      } else {
+        await apiClient.delete(`/api/record/entries/${e.id}`)
+      }
+    } catch (err: any) {
+      // 快照状态可能过期：DELETE 撞"已过账不可删"（409）时回退红冲，
+      // 不要把这种可自动恢复的失败抛给用户
+      const code = String(err?.response?.data?.detail?.code || err?.response?.data?.code || '')
+      if (err?.response?.status === 409 || code.includes('POSTED')) {
+        try {
+          await reverseEntry(String(e.id), '对账撤销入账')
+          continue
+        } catch {
+          /* 红冲也失败则计入 failed */
+        }
+      }
+      failed.push(e.title || String(e.id))
+    }
+  }
+  return failed
+}
+
+// match 型待处理行上"可撤销原入账"的凭证：建议指向的账目里属于认可入账产物的
+// （撤销后行回到全新待处理，换分类/详细记账全可用；否则只能确认配对或无视建议）
+function matchUndoableEntries(stmt: any): any[] {
+  const sug = getAiSuggestion(stmt.id)
+  if (!sug || sug.type !== 'match') return []
+  const ids = (sug.matchedEntryIds || [sug.matchedEntryId].filter(Boolean)).map(String)
+  const byId = new Map(entryStore.activeEntries.map((e: any) => [String(e.id), e]))
+  return ids
+    .map((entryId: string) => byId.get(entryId))
+    .filter((e: any) => e && String(e.source || '') === 'bank_import')
+}
+
+async function undoMatchEntry(stmt: any) {
+  const undoable = matchUndoableEntries(stmt)
+  if (!undoable.length) return
+  dialog.warning({
+    title: '撤销原入账',
+    content: `账上已有「${undoable[0].title || '未命名'}」${undoable.length > 1 ? `等 ${undoable.length} 笔` : ''}（此前认可入账产生）。撤销入账后该流水回到全新待处理状态，可重新选择分类入账；保留则可点「确认配对」直接对上。`,
+    positiveText: '撤销原入账，重新选择分类',
+    negativeText: '保留在账上',
+    onPositiveClick: async () => {
+      const failed = await removeBankCreatedEntries(undoable)
+      if (failed.length) {
+        message.warning(`部分凭证未能撤销（已过账请到账目页冲销）：${failed.join('、')}`)
+      } else {
+        message.success('原入账已撤销，该流水已回到待处理，可重新选择分类入账')
+      }
+      await reloadAll()
+    },
+  })
+}
+
 // Split / delete a pair
 async function deletePair(id: string) {
   const pair = matchedPairs.value.find(p => p.id === id)
@@ -182,11 +275,50 @@ async function deletePair(id: string) {
         matched_entry_id: '',
         matched_entry_ids: [],
       })
-      message.info('对账关联已取消')
-      await reloadAll()
     } catch (err) {
       message.error(accountingErrorText(err))
+      return
     }
+    // 取消关联只解链不删原凭证（仅微信结算凭证会被后端一并删除）。不说明这一点，
+    // 用户会困惑"刚认可入账的流水怎么又变回未入账"，再次认可入账还会撞防重复弹窗
+    const originalIds: string[] = pair.matchedEntryIds || [pair.matchedEntryId].filter(Boolean)
+    const entriesById = new Map((pair.entries || []).map((e: any) => [String(e.id), e]))
+    const hadSettlement = originalIds.some((entryId) => String(entryId).startsWith('bank-settlement-'))
+    // 认可入账创建的凭证（source=bank_import）支持一键"撤销入账"：
+    // 草稿删除、已过账红冲，之后该流水回到全新待处理状态（换分类/详细记账全可用）。
+    // 发票/工资等其他来源的凭证不动，只解链。
+    const bankCreated: any[] = originalIds
+      .map((entryId) => entriesById.get(String(entryId)))
+      .filter((e: any) => e && String(e.source || '') === 'bank_import')
+
+    if (!bankCreated.length) {
+      message.info(
+        hadSettlement
+          ? '对账关联已取消；原账目仍保留在账上，微信结算凭证已一并删除'
+          : '对账关联已取消；原凭证仍保留在账上，可重新配对，或到凭证页删除',
+      )
+      await reloadAll()
+      return
+    }
+
+    dialog.warning({
+      title: '对账关联已取消',
+      content: `原入账凭证「${bankCreated[0].title || '未命名'}」${bankCreated.length > 1 ? `等 ${bankCreated.length} 笔` : ''}仍在账上。撤销入账后该流水回到待处理，可重新选择分类入账；保留则可重新配对。`,
+      positiveText: '撤销原入账，重新选择分类',
+      negativeText: '保留在账上',
+      onPositiveClick: async () => {
+        const failed = await removeBankCreatedEntries(bankCreated)
+        if (failed.length) {
+          message.warning(`部分凭证未能撤销（已过账请到账目页冲销）：${failed.join('、')}`)
+        } else {
+          message.success('原入账已撤销，该流水已回到待处理，可重新选择分类入账')
+        }
+        await reloadAll()
+      },
+      onNegativeClick: async () => {
+        await reloadAll()
+      },
+    })
   }
 }
 
@@ -225,12 +357,15 @@ function isItemAutoMatched(row: any) {
 
 const unmatchedInvoices = computed(() => {
   try {
-    return invoicesList.value
+    return invoicesList.value.filter((inv: any) => invoiceNeedsAttention(inv))
   } catch (err) {
     console.error('unmatchedInvoices computed error:', err)
     return []
   }
 })
+
+/** 本月活发票行（已去重）：表格展示用，包含已核销/已报销的历史状态。 */
+const monthInvoiceRows = computed(() => invoicesList.value)
 
 function getEntryMonth(entry: any) {
   return entry.date ? String(entry.date).substring(0, 7) : ''
@@ -403,10 +538,21 @@ const reconciliationStats = computed(() => {
     const unmatchedIncome = unmatchedItems.filter(s => s.amount > 0)
     const unmatchedExpense = unmatchedItems.filter(s => s.amount < 0)
 
-    return { total, matched, unmatched, rate, unmatchedIncome, unmatchedExpense }
+    // 已关联流水但核销凭证仍是草稿：第二步口径是"已完成"，第三步银行核对却会拦
+    // （核销凭证尚未过账 → 账面银行存款与银行期末余额对不上），在此提前亮出来
+    const linkedUnposted = targetMonthStatements.filter((s) => {
+      const matchedEntryIds = getStatementMatchedEntryIds(s)
+      if (matchedEntryIds.length === 0) return false
+      return matchedEntryIds.some((entryId) => {
+        const entry = entriesById.get(entryId) as any
+        return entry && (entry.status === 'draft' || entry.voucherStatus === 'draft')
+      })
+    })
+
+    return { total, matched, unmatched, rate, unmatchedIncome, unmatchedExpense, linkedUnposted }
   } catch (err) {
     console.error('reconciliationStats computed error:', err)
-    return { total: 0, matched: 0, unmatched: 0, rate: 0, unmatchedIncome: [], unmatchedExpense: [] }
+    return { total: 0, matched: 0, unmatched: 0, rate: 0, unmatchedIncome: [], unmatchedExpense: [], linkedUnposted: [] }
   }
 })
 
@@ -471,6 +617,7 @@ const CATEGORY_OPTIONS_RAW = [
   // 工资/社保流水走工资模块核销（应付职工薪酬），不直接记费用；与后端 account_mapper 对齐
   { label: '工资发放', value: 'expense|工资发放|221101|应付职工薪酬-工资' },
   { label: '社保公积金', value: 'expense|社保公积金|221102|应付职工薪酬-单位社保' },
+  { label: '住房公积金', value: 'expense|社保公积金|221105|应付职工薪酬-住房公积金' },
   { label: '── 费用支出 ──', value: '__header_expense__', disabled: true },
   { label: '差旅费', value: 'expense|差旅费|5602006|管理费用-差旅费' },
   { label: '办公费', value: 'expense|办公费|5602004|管理费用-办公费' },
@@ -539,8 +686,10 @@ function filterCategory(pattern: string, option: any): boolean {
 
 // 下拉待选项：分类名靠左为主，科目代码·名称靠右弱化，字号/行高分层不挤
 // render-option 传入的是 { option, selected, node }，选项本身在 info.option
-function renderCategoryOption(info: any) {
-  const opt = info?.option
+// 账目分类选项双栏渲染（名称居左、科目代码·名称居右）。必须挂在 render-label 上——
+// render-option 返回自绘节点会整体替换 naive-ui 的选项元素，点击选中事件随之丢失
+// （1b7f604 起"确认账目分类"下拉看得见点不着即此因）
+function renderCategoryLabel(opt: any) {
   if (!opt || opt.disabled) return opt?.label ?? ''
   const parts = String(opt.value || '').split('|')
   const code = parts[2]
@@ -556,11 +705,22 @@ function renderCategoryOption(info: any) {
 
 const rdProjects = ref<RdProject[]>([])
 const rdExpenseTypes = ref<RdExpenseTypeOption[]>([])
+/**
+ * 与后端 _add_lines 的校验口径对齐：状态可用 **且** 项目周期覆盖目标月份。
+ * 后端在记账日期早于 start_date 或晚于 end_date 时抛 RD_PROJECT_DATE_MISMATCH，
+ * 这里提前按月收窄，避免用户在下拉里选到一个点确认才报错的项目。
+ */
+const effectiveRdProjects = computed(() => rdProjects.value
+  .filter(project => isEffectiveRdProject(project, targetMonth.value)))
 const rdProjectOptions = computed(() => rdProjects.value
   .filter(project => ['active', 'completed'].includes(project.status))
   .map(project => ({ label: `${project.code} · ${project.name}`, value: project.id })))
+const effectiveRdProjectOptions = computed(() => effectiveRdProjects.value
+  .map(project => ({ label: `${project.code} · ${project.name}`, value: project.id })))
 const rdExpenseTypeOptions = computed(() => rdExpenseTypes.value
   .map(item => ({ label: item.label, value: item.value })))
+/** 账号内有覆盖本月的有效研发项目时，结账第二步常驻「研发项目支出」选项。 */
+const rdCategoryEnabled = computed(() => hasEffectiveRdProjects(rdProjects.value, targetMonth.value))
 
 async function loadRdOptions() {
   try {
@@ -619,6 +779,17 @@ const editVoucherForm = ref({
   rdAllocationBasis: '',
 })
 const editVoucherSaving = ref(false)
+// 改凭证弹窗的当前目标：过账弹层走 currentVoucherEntry，待确认卡片直接传 entry
+const editVoucherTargetEntry = ref<any>(null)
+// 「详细记账」：业务说明 → AI 重推分类；科目预览与第二步同一口径
+const editVoucherBusinessContext = ref('')
+const editVoucherAiLoading = ref(false)
+const editVoucherPreview = ref<{
+  loading: boolean
+  preview?: VoucherPreview
+  error?: string
+  errorCode?: string
+}>({ loading: false })
 
 function defaultCategoryValue(stmt: any) {
   return stmt.amount >= 0
@@ -661,9 +832,20 @@ function suggestionAccountPreview(stmt: any, categoryOverride?: string) {
   return acct ? { code: acct.code, name: acct.name } : null
 }
 
-// ── 模糊分类候选：正确科目取决于账外事实（认缴进度、缴款性质），流水层面不可判定 ──
-// 低置信且命中模糊组时展开候选 chips 交用户点选，认可入账以所选分类为准。
+// ── 模糊分类候选：正确科目通常取决于账外事实（认缴进度、缴款性质） ──
+// 展开规则：附言含糊（如纯「投资款」）时恒展示候选 chips——LLM 置信度会波动，
+// 高置信只说明关键词命中，判定不了账外事实；附言自带决断词且高置信时
+// （「实缴出资款」坐实股东投入、「溢价/资本公积」坐实资本公积，与后端
+// bank_ai_prompts 规则 8 同口径）候选是噪音，不再展开。
+// 认可入账以所选分类为准，默认选中建议项。
 const rowCategoryChoice = ref<Record<string, string>>({})
+
+// 各分类的附言决断词：命中的账外事实已写在附言里，无需再选
+const DECISIVE_OWNER_REMARK: Record<string, RegExp> = {
+  股东投入: /出资|实缴|实收/,
+  资本公积: /溢价|资本公积/,
+  股东垫付: /垫付|代付/,
+}
 
 // 候选须与流水方向相容：收入类候选不进付款行、费用类候选不进收款行；
 // owner_transfer（权益/资本类）只伴随收款流水出现
@@ -682,13 +864,23 @@ function categoryDirectionCompatible(stmt: any, cat: string): boolean {
 function ambiguityGroupOf(stmt: any): string[] {
   const sug = getAiSuggestion(stmt.id)
   if (!sug || sug.type !== 'new' || isFallbackSuggestion(stmt)) return []
-  if (Number(sug.confidence || 0) >= 0.95) return []
-  return getAmbiguityGroup(sug.suggestedEntry?.category).filter((cat) => categoryDirectionCompatible(stmt, cat))
+  const category = sug.suggestedEntry?.category
+  const group = getAmbiguityGroup(category).filter((cat) => categoryDirectionCompatible(stmt, cat))
+  if (!group.length) return []
+  if (Number(sug.confidence || 0) >= 0.95) {
+    const decisive = DECISIVE_OWNER_REMARK[category]
+    const remark = `${stmt.description || ''}${sug.suggestedEntry?.title || ''}`
+    if (decisive && decisive.test(remark)) return []
+  }
+  return group
 }
 
 // 仍未定论的模糊行：组内 chips 都没有点选过。点选后视为用户已决断，
 // 恢复批量确认资格；点选组外分类不走这里（调整科目下拉会直接入账）。
+// 高置信度（≥0.95）建议视为 AI 已决断，候选 chips 仅作备选展示，不拦批量。
 function isAmbiguityActive(stmt: any): boolean {
+  const sug = getAiSuggestion(stmt.id)
+  if (!sug || Number(sug.confidence || 0) >= 0.95) return false
   const group = ambiguityGroupOf(stmt)
   if (!group.length) return false
   const chosen = rowCategoryChoice.value[stmt.id]
@@ -861,19 +1053,99 @@ async function handlePairCategorySave() {
 function openEditVoucher() {
   const entry = currentVoucherEntry.value
   if (!entry) return
+  openPendingEntryEdit(entry)
+}
+
+// 待确认单据卡片的「修改/详细记账」入口：与过账弹层共用改凭证弹窗与保存逻辑
+function openPendingEntryEdit(entry: any) {
+  if (!entry) return
+  editVoucherTargetEntry.value = entry
   const rdDetail = rdDetailFromEntry(entry)
+  // 从第二步进入时带上正在看的分类（含 AI 建议），弹窗与卡片同口径
+  const pendingCategoryValue = dispositionCategorySelected.value[String(entry.id)]
   editVoucherForm.value = {
     title: entry.title || '',
-    categoryValue: categoryValueFromEntry(entry, null),
+    categoryValue: pendingCategoryValue || categoryValueFromEntry(entry, null),
     rdProjectId: rdDetail?.projectId || '',
     rdExpenseType: rdDetail?.expenseType || '',
     rdAllocationBasis: rdDetail?.allocationBasis || '',
   }
+  editVoucherBusinessContext.value = ''
+  editVoucherPreview.value = { loading: false }
   showEditVoucherDialog.value = true
+  void loadEditVoucherPreview(entry)
+}
+
+/** 弹窗内的科目预览：分类一改就重算，保存前先让人看见将落哪个科目 */
+async function loadEditVoucherPreview(entry: any) {
+  const category = dispositionCategoryOf(editVoucherForm.value.categoryValue)
+  editVoucherPreview.value = { loading: true }
+  // 研发分类的预览必须带上弹窗里刚填的项目/类别，否则后端按
+  // RD_DETAIL_REQUIRED 拒绝，用户会误以为这个分类不可用。
+  const rdFields = category === RD_EXPENSE_CATEGORY && editVoucherForm.value.rdProjectId && editVoucherForm.value.rdExpenseType
+    ? {
+        rdProjectId: editVoucherForm.value.rdProjectId,
+        rdExpenseType: editVoucherForm.value.rdExpenseType,
+        rdOriginalAmount: String(Math.abs(Number(entry?.amount) || 0)),
+        rdAllocationMethod: 'direct',
+        ...(editVoucherForm.value.rdAllocationBasis
+          ? { rdAllocationBasis: editVoucherForm.value.rdAllocationBasis }
+          : {}),
+      }
+    : {}
+  try {
+    const preview = await previewEntryVoucher(
+      String(entry.id),
+      dispositionPayload(dispositionChoice.value[String(entry.id)], category, rdFields),
+    )
+    editVoucherPreview.value = { loading: false, preview }
+  } catch (err: any) {
+    editVoucherPreview.value = {
+      loading: false,
+      error: apiErrorMessage(err, '暂时无法预览科目'),
+      errorCode: String(err?.response?.data?.detail?.code || ''),
+    }
+  }
+}
+
+/** 业务说明 → AI 重新建议分类（不落库），回填到弹窗的分类选择 */
+async function refreshEditVoucherAi() {
+  const entry = editVoucherTargetEntry.value || currentVoucherEntry.value
+  if (!entry) return
+  const context = editVoucherBusinessContext.value.trim()
+  if (!context) {
+    message.warning('请先用一句话描述这笔业务')
+    return
+  }
+  editVoucherAiLoading.value = true
+  try {
+    const res: any = await apiClient.post(
+      `/api/invoice/classify-entry/${entry.id}`,
+      { business_context: context },
+      { timeout: 60000 },
+    )
+    const value = dispositionCategoryValue(
+      entry.direction === 'income' ? 'income' : 'expense',
+      String(res?.category || ''),
+    )
+    if (!value) {
+      message.warning('AI 没给出可用的科目建议，请直接选择分类')
+      return
+    }
+    editVoucherForm.value = { ...editVoucherForm.value, categoryValue: value }
+    message.success(
+      res?.reason ? `AI 建议：${res.category}（${res.reason}）` : `AI 建议：${res.category}`,
+    )
+    await loadEditVoucherPreview(entry)
+  } catch (err: any) {
+    message.error(apiErrorMessage(err, 'AI 建议失败'))
+  } finally {
+    editVoucherAiLoading.value = false
+  }
 }
 
 async function saveEditVoucher() {
-  const entry = currentVoucherEntry.value
+  const entry = editVoucherTargetEntry.value || currentVoucherEntry.value
   const f = editVoucherForm.value
   if (!entry || !f.title.trim() || !f.categoryValue || f.categoryValue.startsWith('__')) {
     message.warning('请填写标题并选择科目分类')
@@ -884,29 +1156,79 @@ async function saveEditVoucher() {
     message.warning('研发费用必须选择研发项目和费用类别')
     return
   }
+  const targetId = String(entry.id)
+  const isPosted = String(entry.voucherStatus || entry.status || '') === 'posted'
+  const disposition = dispositionChoice.value[targetId]
+  // 分录被人工调整过：改分类/付款方式会按规则重生成，必须先让用户确认覆盖
+  const warnings = editVoucherPreview.value.preview?.warnings || []
+  let confirmRegenerate = false
+  if (warnings.length) {
+    confirmRegenerate = await new Promise<boolean>((resolve) => {
+      dialog.warning({
+        title: '分录将被重新生成',
+        content: warnings.map((item) => item.message).join('；'),
+        positiveText: '继续保存',
+        negativeText: '取消',
+        onPositiveClick: () => resolve(true),
+        onNegativeClick: () => resolve(false),
+        onClose: () => resolve(false),
+        onMaskClick: () => resolve(false),
+      })
+    })
+    if (!confirmRegenerate) return
+  }
   editVoucherSaving.value = true
   try {
-    await apiClient.patch(`/api/record/entries/${entry.id}`, {
-      title: f.title.trim(),
-      direction,
+    // 发票挂账语义保护：invoice_import 且未设置付款状态的凭证，重算分录时
+    // 贷方必须保持 2241 挂账（paymentStatus=unpaid），不能随 company_account
+    // 默认回落成贷 1002"银行直付"——那正是历史上"公户没扣款却挂贷银行"的来源。
+    // 第二步已选了付款方式时以用户选择为准，不再套这层兜底。
+    const isInvoiceEntry =
+      String(entry.source || '') === 'invoice_import' || !!entry.invoiceNumber
+    const payer = String(disposition?.payer || entry.payer || 'company_account')
+    const invoicePendingGuard =
+      !disposition && !isPosted && isInvoiceEntry && payer === 'company_account' && !entry.paymentStatus
+        ? { paymentStatus: 'unpaid' as const }
+        : {}
+    const payload: Record<string, any> = {
       category,
-      accountCode,
-      accountName,
+      ...dispositionPayload(disposition),
+      ...invoicePendingGuard,
       ...(category === '研发支出-费用化支出' ? {
         rdProjectId: f.rdProjectId,
         rdExpenseType: f.rdExpenseType,
         rdAllocationBasis: f.rdAllocationBasis || undefined,
       } : {}),
-    })
+    }
+    if (isPosted) {
+      // 已过账凭证只能红冲重记：标题/方向/自定义科目属于权威层，发过去只会 409
+      payload.autoReverseRepost = true
+    } else {
+      payload.title = f.title.trim()
+      payload.direction = direction
+      payload.accountCode = accountCode
+      payload.accountName = accountName
+    }
+    if (confirmRegenerate) payload.confirmRegenerateVoucher = true
+    const res: any = await apiClient.patch(`/api/record/entries/${entry.id}`, payload)
     await entryStore.fetchEntries()
     showEditVoucherDialog.value = false
-    message.success(`已更新分类：${category}`)
-    openVoucherModal(entry.id)
+    editVoucherTargetEntry.value = null
+    if (disposition) clearDispositionState(targetId)
+    const summary = voucherLinesSummary(res?.entry?.voucherLines)
+    message.success(summary ? `已更新：${summary}` : `已更新分类：${category}`)
+    if (editVoucherTargetEntryWasVoucherModal(entry)) {
+      openVoucherModal(entry.id)
+    }
   } catch (err: any) {
     message.error(apiErrorMessage(err, '修改失败'))
   } finally {
     editVoucherSaving.value = false
   }
+}
+
+function editVoucherTargetEntryWasVoucherModal(entry: any): boolean {
+  return String(entry.id) === String(currentVoucherEntry.value?.id || '')
 }
 
 async function refreshManualAiSuggestion() {
@@ -1041,7 +1363,7 @@ async function handleManualClassify() {
 const highConfidenceStatements = computed(() => {
   return unmatchedStatements.value.filter((stmt: any) => {
     const sug = getAiSuggestion(stmt.id)
-    return sug && sug.confidence >= 0.95
+    return sug && !sug.requiresReview && sug.confidence >= 0.95
   })
 })
 
@@ -1052,6 +1374,7 @@ const rememberRuleOnConfirm = ref(true)
 function isSelectableForBatch(stmt: any): boolean {
   const sug = getAiSuggestion(stmt.id)
   if (!sug) return false
+  if (sug.requiresReview) return false
   if (isFallbackSuggestion(stmt)) return false
   if (sug.type === 'new' && sug.suggestedEntry?.category === '研发支出-费用化支出') return false
   // 模糊分类行必须逐笔决断（点选候选后才恢复批量资格），不能混进批量静默入账
@@ -1063,15 +1386,19 @@ function isNeedsAttentionStatement(stmt: any): boolean {
   if (findMatchingInvoiceForStatement(stmt)) return false
   const sug = getAiSuggestion(stmt.id)
   if (!sug) return true
-  return isFallbackSuggestion(stmt)
+  return isFallbackSuggestion(stmt) || Boolean(sug.requiresReview)
 }
 
 function suggestionBadgeLabel(stmt: any): string {
   if (isFallbackSuggestion(stmt)) return '待人工指定'
   const sug = getAiSuggestion(stmt.id)
   if (!sug) return '待指定'
-  if (sug.rule === 'company_memory_rule') return '记忆规则 98%'
-  if (sug.rule) return '系统规则 100%'
+  if (sug.requiresReview) return '规则待复核'
+  // 规则类建议展示真实置信度：写死 100% 会误导用户以为行已被完全决断，
+  // 而低置信(<0.95)的模糊行勾选框其实被禁用、需点候选 chip 逐笔确认
+  const ruleConf = `${Math.round(Number(sug.confidence || 0) * 100)}%`
+  if (sug.rule === 'company_memory_rule') return `记忆规则 ${ruleConf}`
+  if (sug.rule) return `系统规则 ${ruleConf}`
   const conf = Number(sug.confidence || 0)
   if (conf >= 0.95) return '高置信度'
   return '推荐依据'
@@ -1189,6 +1516,17 @@ async function confirmSuggested(
 }
 
 const batchConfirming = ref(false)
+function shouldRememberSuggestion(sug: any): boolean {
+  const category = String(sug?.suggestedEntry?.category || '')
+  return Boolean(
+    rememberRuleOnConfirm.value
+    && sug?.type === 'new'
+    && sug.rule !== 'refund_pair'
+    && !sug.requiresReview
+    && !getAmbiguityGroup(category).length
+  )
+}
+
 async function handleBatchConfirmRules() {
   const items = batchTargetStatements.value
     .map((stmt: any) => ({ stmt, sug: getAiSuggestion(stmt.id) }))
@@ -1201,7 +1539,9 @@ async function handleBatchConfirmRules() {
     // 串行执行：跨期补记弹窗共用同一个 resolver，并发会互相覆盖
     for (const { stmt, sug } of items) {
       try {
-        await confirmSuggested(stmt, sug)
+        const rememberRule = shouldRememberSuggestion(sug)
+        const res: any = await confirmSuggested(stmt, sug, { rememberRule })
+        if (res?.ruleWarning) message.warning(res.ruleWarning)
         confirmed += 1
       } catch (err: any) {
         if (isBackfillCancelled(err)) {
@@ -1278,13 +1618,10 @@ async function handleAcceptSuggested(stmt: any) {
   const sug = effectiveSuggestion(stmt)
   if (!sug) return
   quickSubmittingId.value = stmt.id
-  const finalCategory = sug.suggestedEntry?.category || ''
-  // 模糊组分类的正确科目随账外事实变化，不沉淀自动规则（后端同款护栏兜底）
+  // 模糊组、退款配对和需复核建议都不能沉淀为自动规则。
   const shouldRemember = Boolean(
-    rememberRuleOnConfirm.value
-    && sug.type === 'new'
+    shouldRememberSuggestion(sug)
     && !isFallbackSuggestion(stmt)
-    && !getAmbiguityGroup(finalCategory).length
   )
   try {
     const res: any = await confirmSuggested(stmt, sug, { rememberRule: shouldRemember })
@@ -1296,6 +1633,7 @@ async function handleAcceptSuggested(stmt: any) {
     } else {
       message.success(`已确认入账并对账：「${stmt.description}」→ ${suggestedEntry.category}`)
     }
+    if (res?.ruleWarning) message.warning(res.ruleWarning)
     await reloadAll()
   } catch (err: any) {
     if (isBackfillCancelled(err)) return
@@ -1405,26 +1743,399 @@ function handleEntryPaid(entry: any) {
   message.info(statementCandidateText(candidate))
 }
 
-/** 确认单据去向（未付款/老板垫付/员工垫付/预存扣除/老板代收/平台未提现/冲前期预收等；若已过账则后台自动冲销重记） */
-async function confirmEntryDisposition(entry: any, choice: { payer?: string; paymentStatus?: 'unpaid'; label: string }) {
+/** ── 待确认款项两步流：第一步选"谁付的钱"，第二步确认"算什么支出" ── */
+type DispositionChoice = { payer?: string; paymentStatus?: 'unpaid'; label: string }
+type DispositionPreviewState = {
+  loading: boolean
+  /** 过期响应守卫：连点换分类时只认最后一次请求 */
+  requestId: number
+  category: string
+  preview?: VoucherPreview
+  error?: string
+  errorCode?: string
+}
+
+const expandedDispositionEntryId = ref<string | null>(null)
+const dispositionChoice = ref<Record<string, DispositionChoice>>({})
+const dispositionRecommendation = ref<Record<string, { category: string; reason: string } | 'loading' | 'none'>>({})
+const dispositionCategorySelected = ref<Record<string, string>>({})
+const dispositionResettingId = ref<string | null>(null)
+const dispositionManualCategory = ref<Record<string, boolean>>({})
+const dispositionPreview = ref<Record<string, DispositionPreviewState>>({})
+const dispositionSubmittingId = ref<string | null>(null)
+
+/**
+ * 第二步卡片内就地归集的研发明细（分类选「研发支出-费用化支出」时出现）。
+ * 与「详细记账」弹窗共用后端字段，只是省掉一次弹窗跳转。
+ */
+type DispositionRdChoice = {
+  projectId: string
+  expenseType: RdExpenseType | ''
+  allocationBasis: string
+}
+const dispositionRdChoice = ref<Record<string, DispositionRdChoice>>({})
+
+function emptyRdChoice(): DispositionRdChoice {
+  return { projectId: '', expenseType: '', allocationBasis: '' }
+}
+
+/** 兜底一份空白研发明细，避免模板里对未初始化的 entry 做非空断言。 */
+function rdChoiceOf(entry: any): DispositionRdChoice {
+  return dispositionRdChoice.value[String(entry?.id)] || emptyRdChoice()
+}
+
+/**
+ * 分类名 → CATEGORY_OPTIONS 的选项值；第二步不收的分类（工资/社保/平台结算）返回空。
+ * 研发支出现在可以内联归集，但只在账号内有覆盖本月的有效项目时开放——
+ * 否则会引导用户选中一个补不齐明细的分类。
+ */
+function dispositionCategoryValue(direction: string, category: string): string {
+  if (!category || DISPOSITION_EXCLUDED_CATEGORIES.has(category)) return ''
+  if (category === RD_EXPENSE_CATEGORY && !rdCategoryEnabled.value) return ''
+  return (
+    CATEGORY_OPTIONS.value.find(
+      (opt: any) => !opt.disabled && String(opt.value).startsWith(`${direction}|${category}|`),
+    )?.value || ''
+  )
+}
+
+/** 研发明细只在分类确实是研发支出、且三项必填齐全时透传，避免污染其他分类的请求。 */
+function dispositionRdPayload(
+  entry: any,
+  category?: string,
+): Record<string, string> {
+  // 内联归集只对草稿开放：已过账凭证的研发明细必须在「详细记账」里显式确认，
+  // 这里重算一份 rdOriginalAmount/分摊方法反而会和原凭证的归集口径打架。
+  if (String(category || '') !== RD_EXPENSE_CATEGORY || !dispositionRdEnabled(entry)) return {}
+  const id = String(entry.id)
+  const rd = dispositionRdChoice.value[id]
+  if (!rd?.projectId || !rd.expenseType) return {}
+  return {
+    rdProjectId: rd.projectId,
+    rdExpenseType: rd.expenseType,
+    // 卡片内只做 100% 直归；共用费用按比例分摊走「详细记账」弹窗，
+    // 那里才有金额拆分与分摊方法选择。
+    rdOriginalAmount: String(Math.abs(Number(entry.amount) || 0)),
+    rdAllocationMethod: 'direct',
+    ...(rd.allocationBasis ? { rdAllocationBasis: rd.allocationBasis } : {}),
+  }
+}
+
+function dispositionPayload(
+  choice?: DispositionChoice,
+  category?: string,
+  rdFields: Record<string, string> = {},
+): Record<string, string> {
+  return {
+    ...(choice?.payer ? { payer: choice.payer } : {}),
+    ...(choice?.paymentStatus ? { paymentStatus: choice.paymentStatus } : {}),
+    ...(category ? { category } : {}),
+    ...rdFields,
+  }
+}
+
+/** 研发归集是否已补齐必填项（项目 + 费用类别）。分摊依据仅共用费用时才必填。 */
+function dispositionRdMissing(entry: any): boolean {
+  if (dispositionCategoryOf(dispositionCategorySelected.value[String(entry.id)] || '') !== RD_EXPENSE_CATEGORY) {
+    return false
+  }
+  const rd = dispositionRdChoice.value[String(entry.id)]
+  return !(rd?.projectId && rd.expenseType)
+}
+
+function isPostedEntry(entry: any): boolean {
+  return String(entry?.voucherStatus || entry?.status || '') === 'posted'
+}
+
+/**
+ * 卡片内联研发归集的开放条件：账号内有覆盖本月的有效项目，且凭证未过账。
+ * 已过账凭证带研发明细会走 update_draft 的冲销重记分支，而 rdProjectId 不在
+ * POSTED_PROJECTION_FIELDS 白名单里，后端必然 409——与其点了才报错，不如不给选项。
+ */
+function dispositionRdEnabled(entry: any): boolean {
+  return rdCategoryEnabled.value && !isPostedEntry(entry)
+}
+
+/** 单项目账套默认直归：选中分类即预填项目，少一次点击。 */
+function defaultDispositionRdChoice(entry: any): DispositionRdChoice {
+  const existing = rdDetailFromEntry(entry)
+  const fromEntry: DispositionRdChoice = {
+    projectId: String(existing?.projectId || ''),
+    expenseType: (existing?.expenseType || '') as RdExpenseType | '',
+    allocationBasis: String(existing?.allocationBasis || ''),
+  }
+  if (fromEntry.projectId && fromEntry.expenseType) return fromEntry
+  const only = effectiveRdProjectOptions.value
+  return {
+    ...fromEntry,
+    projectId: fromEntry.projectId || (only.length === 1 ? String(only[0].value) : ''),
+  }
+}
+
+function ensureDispositionRdChoice(entry: any, reset = false) {
+  const id = String(entry.id)
+  if (!reset && dispositionRdChoice.value[id]) return
+  dispositionRdChoice.value = { ...dispositionRdChoice.value, [id]: defaultDispositionRdChoice(entry) }
+}
+
+function setDispositionRdField(
+  entry: any,
+  field: keyof DispositionRdChoice,
+  value: string,
+) {
+  const id = String(entry.id)
+  ensureDispositionRdChoice(entry)
+  dispositionRdChoice.value = {
+    ...dispositionRdChoice.value,
+    [id]: { ...dispositionRdChoice.value[id], [field]: value },
+  }
+  void loadDispositionPreview(entry)
+}
+
+/**
+ * 第二步科目预览：与「认可入账」共用后端规则，所见即所记。
+ * 预览失败不阻塞流程（页面退化为分类名 + 科目代码），但保留错误原因。
+ */
+async function loadDispositionPreview(entry: any, category?: string) {
+  const id = String(entry.id)
+  const choice = dispositionChoice.value[id]
+  const targetValue = String(category || dispositionCategorySelected.value[id] || '')
+  const targetCategory = dispositionCategoryOf(targetValue) || String(entry.category || '')
+  if (targetCategory === RD_EXPENSE_CATEGORY) ensureDispositionRdChoice(entry)
+  const requestId = (dispositionPreview.value[id]?.requestId || 0) + 1
+  dispositionPreview.value = {
+    ...dispositionPreview.value,
+    [id]: { loading: true, requestId, category: targetCategory },
+  }
   try {
-    const { label, ...payload } = choice
-    await updateEntry(entry.id, { ...payload, autoReverseRepost: true })
-    message.success(`已确认：${label}`)
+    const preview = await previewEntryVoucher(
+      id,
+      dispositionPayload(choice, targetCategory, dispositionRdPayload(entry, targetCategory)),
+    )
+    const state = dispositionPreview.value[id]
+    if (!state || state.requestId !== requestId) return
+    dispositionPreview.value = {
+      ...dispositionPreview.value,
+      [id]: { loading: false, requestId, category: preview.category, preview },
+    }
+  } catch (err: any) {
+    const state = dispositionPreview.value[id]
+    if (!state || state.requestId !== requestId) return
+    dispositionPreview.value = {
+      ...dispositionPreview.value,
+      [id]: {
+        loading: false,
+        requestId,
+        category: targetCategory,
+        error: apiErrorMessage(err, '暂时无法预览科目'),
+        errorCode: String(err?.response?.data?.detail?.code || ''),
+      },
+    }
+  }
+}
+
+/**
+ * 第一步：记录资金来源选择并就地展开第二步（不落库）。
+ * 只有点「认可入账」才发 PATCH——否则单据会立刻被当成已确认、从待确认列表消失。
+ */
+function beginDisposition(entry: any, choice: DispositionChoice) {
+  const id = String(entry.id)
+  dispositionChoice.value = { ...dispositionChoice.value, [id]: choice }
+  expandedDispositionEntryId.value = id
+  if (!dispositionCategorySelected.value[id]) {
+    dispositionCategorySelected.value = {
+      ...dispositionCategorySelected.value,
+      [id]: dispositionCategoryValue(
+        entry.direction === 'income' ? 'income' : 'expense',
+        String(entry.category || ''),
+      ),
+    }
+  }
+  void loadDispositionPreview(entry)
+  void loadDispositionRecommendation(entry)
+}
+
+/** AI 建议：复用 classify-entry（不落库）；每张单据只问一次，失败静默保留当前分类 */
+async function loadDispositionRecommendation(entry: any) {
+  const id = String(entry.id)
+  if (id in dispositionRecommendation.value) return
+  dispositionRecommendation.value = { ...dispositionRecommendation.value, [id]: 'loading' }
+  try {
+    const res: any = await apiClient.post(`/api/invoice/classify-entry/${id}`, {})
+    const category = String(res?.category || '')
+    const value = dispositionCategoryValue(
+      entry.direction === 'income' ? 'income' : 'expense',
+      category,
+    )
+    if (!value) {
+      dispositionRecommendation.value = { ...dispositionRecommendation.value, [id]: 'none' }
+      return
+    }
+    dispositionRecommendation.value = {
+      ...dispositionRecommendation.value,
+      [id]: { category, reason: String(res?.reason || '') },
+    }
+    // 用户已手动换过分类就不再被 AI 覆盖
+    if (!dispositionManualCategory.value[id]) {
+      dispositionCategorySelected.value = { ...dispositionCategorySelected.value, [id]: value }
+      void loadDispositionPreview(entry, value)
+    }
+  } catch {
+    dispositionRecommendation.value = { ...dispositionRecommendation.value, [id]: 'none' }
+  }
+}
+
+function dispositionRecommendedValue(entry: any): string {
+  const rec = dispositionRecommendation.value[String(entry.id)]
+  if (!rec || rec === 'loading' || rec === 'none' || !rec.category) return ''
+  return dispositionCategoryValue(
+    entry.direction === 'income' ? 'income' : 'expense',
+    rec.category,
+  )
+}
+
+function dispositionRecommendationReason(entry: any): string {
+  const rec = dispositionRecommendation.value[String(entry.id)]
+  return rec && rec !== 'loading' && rec !== 'none' ? rec.reason : ''
+}
+
+/** 第二步预览结果（模板用，避免在模板里写非空断言） */
+function dispositionPreviewOf(entry: any): VoucherPreview | null {
+  return dispositionPreview.value[String(entry.id)]?.preview || null
+}
+
+function dispositionPreviewDebitLines(entry: any) {
+  return dispositionPreviewOf(entry)?.debit || []
+}
+
+function dispositionPreviewCreditLines(entry: any) {
+  return dispositionPreviewOf(entry)?.credit || []
+}
+
+/** 第二步换分类的 NSelect 分组选项（naive-ui 需要 type/children 形状） */
+function dispositionCategorySelectGroups(entry: any) {
+  const direction: 'income' | 'expense' = entry?.direction === 'income' ? 'income' : 'expense'
+  return dispositionCategoryGroups(CATEGORY_OPTIONS.value, direction, dispositionRdEnabled(entry)).map((group, index) => ({
+    type: 'group' as const,
+    key: `disposition-group-${index}-${group.label}`,
+    label: group.label,
+    children: group.options.map((opt) => ({ label: opt.label, value: opt.value })),
+  }))
+}
+
+/** 第二步换分类：重新预览（不落库） */
+function setDispositionCategory(entry: any, value: string) {
+  const id = String(entry.id)
+  dispositionCategorySelected.value = { ...dispositionCategorySelected.value, [id]: value }
+  dispositionManualCategory.value = { ...dispositionManualCategory.value, [id]: true }
+  // 切换到研发分类时补一份可编辑的研发明细；切走则保留已填内容以便切回
+  if (dispositionCategoryOf(value) === RD_EXPENSE_CATEGORY) ensureDispositionRdChoice(entry)
+  void loadDispositionPreview(entry, value)
+}
+
+function clearDispositionState(id: string) {
+  if (expandedDispositionEntryId.value === id) expandedDispositionEntryId.value = null
+  delete dispositionChoice.value[id]
+  delete dispositionRecommendation.value[id]
+  delete dispositionCategorySelected.value[id]
+  delete dispositionManualCategory.value[id]
+  delete dispositionPreview.value[id]
+  delete dispositionRdChoice.value[id]
+}
+
+/** 第二步确认：一次 PATCH 同时落资金来源与科目，成功后单据离开待确认列表 */
+async function acceptPendingDisposition(entry: any) {
+  const id = String(entry.id)
+  const choice = dispositionChoice.value[id]
+  if (!choice) return
+  const category = dispositionCategoryOf(dispositionCategorySelected.value[id] || '')
+  if (!category) {
+    // 分类下拉里选不到研发（账号内没有覆盖本月的有效项目）时，才转「详细记账」
+    if (
+      String(entry.category || '') === RD_EXPENSE_CATEGORY
+      || dispositionPreview.value[id]?.errorCode === 'RD_DETAIL_REQUIRED'
+    ) {
+      message.info('这类支出需要补研发项目与费用类别，请用「详细记账」确认')
+      openPendingEntryEdit(entry)
+      return
+    }
+    message.warning('请先选择这笔算什么支出/收入')
+    return
+  }
+  if (DISPOSITION_EXCLUDED_CATEGORIES.has(category)) {
+    message.warning('这个分类需要补充明细，请用「详细记账」确认')
+    openPendingEntryEdit(entry)
+    return
+  }
+  // 研发分类已常驻，但明细没补齐时不能落账——后端会以 RD_DETAIL_REQUIRED 422 拦下
+  if (category === RD_EXPENSE_CATEGORY && dispositionRdMissing(entry)) {
+    message.warning('请先选择研发项目和费用类别')
+    return
+  }
+  const warnings = dispositionPreview.value[id]?.preview?.warnings || []
+  let confirmRegenerate = false
+  if (warnings.length) {
+    confirmRegenerate = await new Promise<boolean>((resolve) => {
+      dialog.warning({
+        title: '分录将被重新生成',
+        content: warnings.map((item) => item.message).join('；'),
+        positiveText: '继续入账',
+        negativeText: '取消',
+        onPositiveClick: () => resolve(true),
+        onNegativeClick: () => resolve(false),
+        onClose: () => resolve(false),
+        onMaskClick: () => resolve(false),
+      })
+    })
+    if (!confirmRegenerate) return
+  }
+  dispositionSubmittingId.value = id
+  try {
+    // 已过账凭证只能红冲重记；研发明细属于权威字段，不在投影白名单内，
+    // 后端对已过账凭证会以 409 拒绝，所以内联归集只对草稿开放（见卡片 UI）。
+    const res: any = await updateEntry(entry.id, {
+      ...dispositionPayload(choice, category, dispositionRdPayload(entry, category)),
+      autoReverseRepost: true,
+      ...(confirmRegenerate ? { confirmRegenerateVoucher: true } : {}),
+    })
+    // 去向+科目重算会重建分录（如老板垫付 → 贷 2241 其他应付款），
+    // 把结果摆到明面上，老板不用打开凭证也能确认科目符合预期
+    const summary = voucherLinesSummary(res?.entry?.voucherLines)
+    message.success(summary ? `已确认：${choice.label}（${summary}）` : `已确认：${choice.label}`)
+    clearDispositionState(id)
     await reloadAll()
   } catch (err: any) {
     message.error(apiErrorMessage(err, '确认失败'))
+  } finally {
+    dispositionSubmittingId.value = null
   }
+}
+
+function cancelDisposition(entry: any) {
+  clearDispositionState(String(entry.id))
 }
 
 /** 撤销去向确认：单据重新回到待确认列表 */
 async function resetEntryDisposition(entry: any) {
+  const id = String(entry?.id || '')
+  if (!id || dispositionResettingId.value) return
+  if (!canResetEntryDisposition(entry)) {
+    message.warning(
+      isReversalLikeEntry(entry)
+        ? '冲销凭证不能重新选择'
+        : '已过账记录请先撤销对应核销或按凭证冲销流程处理',
+    )
+    return
+  }
+  dispositionResettingId.value = id
   try {
-    await updateEntry(entry.id, { paymentStatus: null, payer: 'company_account', autoReverseRepost: true })
+    await updateEntry(entry.id, { paymentStatus: null, payer: 'company_account' })
     message.success('已恢复为待确认状态')
     await reloadAll()
   } catch (err: any) {
     message.error(apiErrorMessage(err, '恢复失败'))
+  } finally {
+    dispositionResettingId.value = null
   }
 }
 
@@ -1461,6 +2172,10 @@ const pendingEntryList = computed(() =>
   unmatchedEntries.value.filter((entry: any) => {
     const isInvoice = entry.source === 'invoice_import' || !!entry.invoiceNumber
     if (isInvoice) return true
+    // 银行导入的账目本身就是公户流水，去向已确定，应走「待处理银行流水」的关联疑似流水，
+    // 不需要在这里再问谁付的钱（否则误选老板垫付会把公户付款改记成股东垫付，流水再认领会重复入账）
+    const isBankImport = entry.source === 'bank_import' || String(entry.id || '').startsWith('bank-')
+    if (isBankImport) return false
     if (entry.direction === 'owner_transfer') return false
     const cat = String(entry.category || '').trim()
     const title = String(entry.title || '').trim()
@@ -1487,7 +2202,12 @@ const confirmedExceptionEntries = computed(() => {
       const month = e.occurDate ? e.occurDate.substring(0, 7) : ''
       const isCurrentMonth = month === targetMonth.value
       const isNotArchiveOnly = !((e as any).is_archive_only || (e as any).isArchiveOnly)
-      return isCurrentMonth && isNotArchiveOnly && isNonBankSettledEntry(e as any)
+      return (
+        isCurrentMonth
+        && isNotArchiveOnly
+        && !isReversalLikeEntry(e as any)
+        && isNonBankSettledEntry(e as any)
+      )
     }).map((e) => ({
       id: e.id,
       title: e.title,
@@ -1499,6 +2219,10 @@ const confirmedExceptionEntries = computed(() => {
       payer: (e as any).payer || 'company_account',
       paymentStatus: (e as any).paymentStatus || '',
       invoiceNumber: (e as any).invoiceNumber || '',
+      status: (e as any).status || '',
+      voucherStatus: (e as any).voucherStatus || '',
+      entryType: (e as any).entryType || (e as any).entry_type || '',
+      reversalOf: (e as any).reversalOf || '',
     }))
   } catch (err) {
     console.error('confirmedExceptionEntries computed error:', err)
@@ -1585,7 +2309,7 @@ const bossExpenseOptions = [
   { label: '信息服务 / 云服务器 / 软件', value: '信息技术服务费' },
   { label: '请客吃饭 / 商务招待', value: '业务招待费' },
   { label: '打车交通 / 差旅住宿', value: '差旅费' },
-  { label: '研发项目支出（需选项目）', value: '研发支出-费用化支出' },
+  { label: '研发项目支出（需补项目 →）', value: '研发支出-费用化支出' },
   { label: '采购款 / 原材料', value: '原材料采购' },
   { label: '房租 / 物业 / 水电通讯', value: '租金物业' },
   { label: '员工报销款 / 往来备用金', value: '其他应收款' },
@@ -1615,6 +2339,7 @@ const bossIncomeOptions = [
   selectedInvoiceIds,
   selectedBank,
   matchedPairs,
+  persistedMatchedPairs,
   aiSuggestions,
   reconciliationHealth,
   reconciliationHealthLoading,
@@ -1624,9 +2349,12 @@ const bossIncomeOptions = [
   emptyReconciliationHealth,
   loadReconciliationHealth,
   deletePair,
+  matchUndoableEntries,
+  undoMatchEntry,
   isDirectionCompatible,
   safeFloat,
   isItemAutoMatched,
+  monthInvoiceRows,
   unmatchedInvoices,
   getEntryMonth,
   getStatementMonth,
@@ -1649,7 +2377,7 @@ const bossIncomeOptions = [
   refreshCategoryOptions,
   categoryValueNatureLabel,
   filterCategory,
-  renderCategoryOption,
+  renderCategoryLabel,
   rdProjects,
   rdExpenseTypes,
   rdProjectOptions,
@@ -1670,6 +2398,7 @@ const bossIncomeOptions = [
   showEditVoucherDialog,
   editVoucherForm,
   editVoucherSaving,
+  editVoucherTargetEntry,
   defaultCategoryValue,
   cleanStatementTitle,
   categoryValueFromSuggestion,
@@ -1693,6 +2422,7 @@ const bossIncomeOptions = [
   openPairCategoryDialog,
   handlePairCategorySave,
   openEditVoucher,
+  openPendingEntryEdit,
   saveEditVoucher,
   refreshManualAiSuggestion,
   handleManualClassify,
@@ -1722,8 +2452,39 @@ const bossIncomeOptions = [
   findStatementCandidateForEntry,
   statementCandidateText,
   handleEntryPaid,
-  confirmEntryDisposition,
+  beginDisposition,
+  acceptPendingDisposition,
+  cancelDisposition,
+  setDispositionCategory,
+  dispositionRecommendedValue,
+  dispositionRecommendationReason,
+  dispositionPreviewOf,
+  dispositionPreviewDebitLines,
+  dispositionPreviewCreditLines,
+  dispositionCategorySelectGroups,
+  expandedDispositionEntryId,
+  dispositionChoice,
+  dispositionRecommendation,
+  dispositionCategorySelected,
+  dispositionPreview,
+  dispositionSubmittingId,
+  dispositionCategoryGroups,
+  dispositionRdChoice,
+  dispositionRdEnabled,
+  dispositionRdMissing,
+  rdChoiceOf,
+  setDispositionRdField,
+  rdCategoryEnabled,
+  effectiveRdProjectOptions,
+  effectiveRdProjects,
+  editVoucherBusinessContext,
+  editVoucherAiLoading,
+  editVoucherPreview,
+  refreshEditVoucherAi,
+  loadEditVoucherPreview,
   resetEntryDisposition,
+  canResetEntryDisposition,
+  dispositionResettingId,
   employeePayerOptions,
   SYSTEM_MANUAL_CATEGORIES,
   pendingEntryList,

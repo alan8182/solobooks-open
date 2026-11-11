@@ -3,7 +3,7 @@
     "solobooks": {
       "url": "https://solobooks.cn/mcp",
       "headers": {
-        "Authorization": "Bearer sbk_替换为你在梭罗记账后台生成的PAT令牌"
+        "Authorization": "Bearer ${SOLOBOOKS_ACCOUNTING_TOKEN}"
       }
     }
   }

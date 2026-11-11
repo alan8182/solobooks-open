@@ -1,11 +1,10 @@
 <!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue'
-import { useRoute } from 'vue-router'
 import { accountingErrorText } from '@/utils/errors'
 import {
   NButton, NTag, NSpace, useMessage, NInput, NSpin, NSelect, NModal, NFormItem,
-  NAlert, NInputNumber, NSwitch, NTabs, NTab,
+  NAlert, NInputNumber, NSwitch,
 } from 'naive-ui'
 import LegacyImportTab from './legacy-import.vue'
 import * as XLSX from 'xlsx'
@@ -17,9 +16,25 @@ import { SoloFieldHelp } from '@/components/ui'
 import {
   exportOpeningTemplate,
   parseOpeningWorkbook,
+  isProfitLossCode,
+  suggestMappingTarget,
+  checkOpeningPeriod,
+  describeExpectedPeriod,
+  expectedOpeningPeriod,
   type FixedAssetImportItem,
+  type OpeningPeriodCheck,
+  type ParseOpeningResult,
+  type StatementPeriod,
   type UnmatchedOpeningRow,
 } from '@/utils/openingBalanceImport'
+import { loadOpeningMapping, saveOpeningMapping, pickConfirmedMappings } from '@/utils/openingMapping'
+import { openingCutoffOptions, resolveOpeningPeriod } from '@/utils/openingPeriod'
+import { mergeOpeningRows, mergeYtdRows } from '@/utils/openingMerge'
+import {
+  loadTaxOpeningMemory,
+  saveTaxOpeningMemory,
+  type TaxOpeningMemory,
+} from '@/utils/taxOpeningMemory'
 
 interface BalanceItem {
   id?: string
@@ -29,15 +44,11 @@ interface BalanceItem {
   debit_balance: number
   credit_balance: number
   partner_name?: string
+  /** 原文件科目编码（1122001 这类），仅展示核对用 */
+  originalCode?: string
   fiscal_year?: number
   voucherStatus?: string | null
   voucherRef?: string | null
-}
-
-interface TaxOpeningMemory {
-  priorYearLoss: number
-  prepaidCitTax: number
-  migrationNote: string
 }
 
 type CategoryFilter = 'all' | 'asset' | 'liability' | 'equity'
@@ -52,30 +63,23 @@ const loading = ref(false)
 const saving = ref(false)
 const items = ref<BalanceItem[]>([])
 const ytdItems = ref<BalanceItem[]>([])
+// 年初（1 月 1 日）余额快照：只随导入更新、随保存落库，供报表「年初余额」列使用
+const yearStartItems = ref<{ account_code: string; account_name?: string; partner_name?: string; debit_balance: number; credit_balance: number }[]>([])
 const fixedAssets = ref<FixedAssetImportItem[]>([])
 const fiscalYear = ref(new Date().getFullYear())
 const startMonth = ref('01')
 const voucherNo = ref<string | null>(null)
 const serverLocked = ref(false)
 
-const route = useRoute()
-const mainTab = ref<'opening' | 'legacy'>((route.query.tab as string) === 'legacy' ? 'legacy' : 'opening')
+// 旧账导入入口先隐藏（?tab=legacy 也不再切换），等真实导出格式补齐后再开放
+const mainTab = ref<'opening' | 'legacy'>('opening')
 
-watch(() => route.query.tab, (tab) => {
-  if (tab === 'legacy') mainTab.value = 'legacy'
-  else if (tab === 'opening') mainTab.value = 'opening'
-})
-
-watch(mainTab, (tab) => {
-  if (tab === 'opening') {
-    checkPendingImportFromSession()
-  }
-})
-
-function onLegacyImported() {
+// 不再监听 mainTab：切 Tab 的 watcher 会在 load() 之前把草稿叠到旧表上，
+// 随后的 load() 又把整张表覆盖回服务端数据——「带入期初设置细调」等于没生效。
+async function onLegacyImported() {
   mainTab.value = 'opening'
-  checkPendingImportFromSession()
-  load()
+  await load()
+  await checkPendingImportFromSession()
 }
 
 // 筛选与视图状态
@@ -95,8 +99,9 @@ const code = ref('')
 const bizId = ref('')
 const sendingCode = ref(false)
 
+// 只认 posted：冲销后的凭证是审计墓碑，页面必须解锁让用户重新导入
 const isLocked = computed(() =>
-  serverLocked.value || items.value.some(i => ['posted', 'reversed'].includes(i.voucherStatus || ''))
+  serverLocked.value || items.value.some(i => (i.voucherStatus || '') === 'posted')
 )
 
 const startPeriod = computed(() => `${fiscalYear.value}-${startMonth.value}`)
@@ -110,32 +115,16 @@ const taxMemory = ref<TaxOpeningMemory>({
   migrationNote: '',
 })
 
-function getTaxMemoryStorageKey(year: number) {
-  return `solo_tax_opening_memory_${year}`
-}
-
 function loadLocalTaxMemoryFallback(year: number) {
-  try {
-    const raw = localStorage.getItem(getTaxMemoryStorageKey(year))
-    if (raw) {
-      const parsed = JSON.parse(raw)
-      taxMemory.value = {
-        priorYearLoss: Number(parsed.priorYearLoss) || 0,
-        prepaidCitTax: Number(parsed.prepaidCitTax) || 0,
-        migrationNote: String(parsed.migrationNote || ''),
-      }
-    }
-  } catch {
-    // 忽略本地存储格式异常
+  // 读写统一走 utils/taxOpeningMemory.ts，键名按账套+年度隔离，防串账套
+  const memory = loadTaxOpeningMemory(authStore.currentCompanyId, year)
+  if (memory) {
+    taxMemory.value = memory
   }
 }
 
 function saveLocalTaxMemory(year: number) {
-  try {
-    localStorage.setItem(getTaxMemoryStorageKey(year), JSON.stringify(taxMemory.value))
-  } catch {
-    // 忽略异常
-  }
+  saveTaxOpeningMemory(authStore.currentCompanyId, year, taxMemory.value)
 }
 
 watch(startMonth, (m) => {
@@ -144,20 +133,12 @@ watch(startMonth, (m) => {
   }
 })
 
-const expenseRevenueCodes = new Set([
-  '5001', '5051', '5111', '5301', '5401', '5401001', '5401002', '5402', '5403',
-  '5601', '5601001', '5601006', '5601011', '5601015', '5601016',
-  '5602', '5602001', '5602002', '5602004', '5602005', '5602006', '5602007',
-  '5602011', '5602013', '5602014', '5602015', '5602999',
-  '5603', '5603001', '5603002', '5603003', '5603004', '5603005',
-  '5711', '5801', '4301',
-])
-
 // 支持挂接往来客商辅助核算的科目（1221 已容器化，往来类一律用末级子科目）
+// 往来科目前缀白名单与后端 core/chart_policy.PARTNER_ACCOUNT_PREFIXES 同口径。
+// 曾经这里是精确 Set.has 且列了 1121/2201（后端没有）、漏了 1221 前缀，
+// 导致子级往来码（1122001）不显示客商输入框——两边漂移过。
 const partnerAccountCodes = new Set([
-  '1121', '1122', '1123',
-  '122101', '122102', '122103',
-  '2201', '2202', '2203', '2241',
+  '1122', '1123', '2202', '2203', '1221', '2241',
 ])
 
 // 贷方余额性质科目（备抵资产 + 负债 + 权益 + 收入类）
@@ -173,11 +154,16 @@ function isCreditNormal(code: string): boolean {
 }
 
 function supportsPartner(code: string): boolean {
-  return partnerAccountCodes.has(code)
+  const text = String(code || '').trim()
+  if (!text) return false
+  for (const prefix of partnerAccountCodes) {
+    if (text.startsWith(prefix)) return true
+  }
+  return false
 }
 
 function isBalanceAccount(code: string): boolean {
-  return !expenseRevenueCodes.has(code) && !code.startsWith('5')
+  return !isProfitLossCode(code)
 }
 
 function getAccountCategory(code: string): CategoryFilter {
@@ -343,6 +329,42 @@ const importModalVisible = ref(false)
 const lastWorkbook = ref<XLSX.WorkBook | null>(null)
 const unmatchedRows = ref<UnmatchedOpeningRow[]>([])
 const mappingOverrides = ref<Record<string, string>>({})
+// 导入表期间校验：期间不符时不写入表格，先在弹窗里让用户确认或重导
+const statementPeriod = ref<StatementPeriod | null>(null)
+const periodCheck = ref<OpeningPeriodCheck | null>(null)
+const cutoffMonth = ref('')
+// 通过期间校验的导入绑定到的建账年月：保存前再比一次，建账月被改过就要求重导，
+// 否则会拿「截至 5 月」的表按 7 月建账保存，6 月损益静默漏记。
+const appliedPeriod = ref<{ fiscalYear: number; startMonth: string } | null>(null)
+
+const expectedPeriodLabel = computed(() =>
+  describeExpectedPeriod(expectedOpeningPeriod(fiscalYear.value, startMonth.value)),
+)
+
+function defaultCutoffMonth(): string {
+  const expected = expectedOpeningPeriod(fiscalYear.value, startMonth.value)
+  return `${expected.endYear}-${String(expected.endMonth).padStart(2, '0')}`
+}
+
+/** 兜底下拉的选项：建账年 1 月 ~ 启动月（年初建账则为上年全年） */
+const cutoffOptions = computed(() =>
+  openingCutoffOptions(fiscalYear.value, startMonth.value).map(value => ({ label: value, value })),
+)
+
+// 未匹配的资产负债科目让「文件本身是平的」变成「页面不平」。
+// 差额能被它们解释时必须说清，否则用户会以为导入的数据有问题。
+const unmatchedBalanceImpact = computed(() => {
+  const rows = unmatchedRows.value.filter(r => r.affects_balance !== false)
+  const debit = rows.reduce((s, r) => s + (Number(r.debit) || 0), 0)
+  const credit = rows.reduce((s, r) => s + (Number(r.credit) || 0), 0)
+  return { count: rows.length, net: Math.round((credit - debit) * 100) / 100 }
+})
+const diffExplainedByUnmatched = computed(
+  () =>
+    !isBalanced.value &&
+    unmatchedBalanceImpact.value.count > 0 &&
+    Math.abs(balanceDiff.value - unmatchedBalanceImpact.value.net) <= 0.01,
+)
 
 const leafAccountOptions = computed(() => {
   const all = [...items.value, ...ytdItems.value]
@@ -378,41 +400,23 @@ function handleDownloadTemplate() {
 }
 
 function applyImportResult(parseResult: any) {
-  // 1. 写入资产负债期初明细
-  const balanceMap = new Map(parseResult.items.map((i: any) => [i.account_code, i]))
-  items.value = items.value.map(item => {
-    const parsed: any = balanceMap.get(item.account_code)
-    if (parsed && (parsed.debit_balance > 0 || parsed.credit_balance > 0)) {
-      return {
-        ...item,
-        debit_balance: parsed.debit_balance,
-        credit_balance: parsed.credit_balance,
-        partner_name: parsed.partner_name || item.partner_name || '',
-      }
-    }
-    return item
-  })
+  // 1. 写入资产负债期初明细（合并规则见 utils/openingMerge：
+  // 带客商的行按「科目+客商」拆开，账龄才能按往来单位分开）
+  items.value = mergeOpeningRows(items.value, parseResult.items || [])
 
   // 2. 写入年中损益本年累计发生额
-  let ytdMatched = 0
-  const ytdMap = new Map(parseResult.ytdItems.map((i: any) => [i.account_code, i]))
-  ytdItems.value = ytdItems.value.map(item => {
-    const parsed: any = ytdMap.get(item.account_code)
-    if (parsed && (parsed.debit_balance > 0 || parsed.credit_balance > 0)) {
-      ytdMatched++
-      return {
-        ...item,
-        debit_balance: parsed.debit_balance,
-        credit_balance: parsed.credit_balance,
-      }
-    }
-    return item
-  })
+  const ytd = mergeYtdRows(ytdItems.value, parseResult.ytdItems || [])
+  ytdItems.value = ytd.rows
+  const ytdMatched = ytd.matchedCount
 
   // 3. 写入固定资产期初卡片
   if (parseResult.fixedAssets && parseResult.fixedAssets.length > 0) {
     fixedAssets.value = parseResult.fixedAssets
   }
+
+  // 4. 年初余额快照：解析不出来就清空。宁可报表年初列留空（导出会被拦下），
+  // 也不能沿用上一次导入的年初数——那份数对应的是另一张表。
+  yearStartItems.value = Array.isArray(parseResult.yearStartItems) ? parseResult.yearStartItems : []
 
   unmatchedRows.value = parseResult.unmatchedRows || []
 
@@ -435,6 +439,8 @@ function reapplyMapping() {
     const allAccounts = [...balanceItems.value, ...ytdItems.value]
     const parseResult = parseOpeningWorkbook(lastWorkbook.value, allAccounts, mappingOverrides.value)
     applyImportResult(parseResult)
+    // 用户确认过的映射按账套持久化，下次导入同格式文件自动套用
+    saveOpeningMapping(authStore.currentCompanyId, { ...mappingOverrides.value })
     if (parseResult.isBalanced) {
       message.success(`映射已更新，成功匹配 ${parseResult.matchedCount} 个科目，借贷双方已平衡`)
     } else {
@@ -444,6 +450,55 @@ function reapplyMapping() {
     message.error(accountingErrorText(err))
   } finally {
     loading.value = false
+  }
+}
+
+// 映射预填：按账套持久化的历史映射优先，其余按名称关键词给建议（确认后才生效）
+function buildPrefilledMappings(
+  parseResult: ParseOpeningResult,
+  allAccounts: { account_code: string; account_name?: string }[],
+): Record<string, string> {
+  const persisted = loadOpeningMapping(authStore.currentCompanyId)
+  const prefilled: Record<string, string> = {}
+  for (const row of parseResult.unmatchedRows || []) {
+    const key = row.originalCode || row.originalName
+    if (!key) continue
+    // 读的键要与写的一致：saveOpeningMapping 存的是 key(=originalCode||originalName)，
+    // 此前读 persisted[row.originalCode]，originalCode 为空的行永远读不回历史映射。
+    const saved = persisted[key]
+    if (saved) {
+      prefilled[key] = saved
+      continue
+    }
+    const direction = row.debit > 0 ? 'debit' : row.credit > 0 ? 'credit' : undefined
+    const suggestion = suggestMappingTarget(row.originalCode, row.originalName, allAccounts, direction)
+    if (suggestion) prefilled[key] = suggestion
+  }
+  return prefilled
+}
+
+/** 解析结果已通过期间校验后，预填映射并写入表格 */
+function applyWorkbook(workbook: XLSX.WorkBook, parsed?: ParseOpeningResult) {
+  const allAccounts = [...balanceItems.value, ...ytdItems.value]
+  const parseResult = parsed ?? parseOpeningWorkbook(workbook, allAccounts)
+  mappingOverrides.value = buildPrefilledMappings(parseResult, allAccounts)
+  // 上次已确认的映射直接套用；按名称猜的建议值不自动生效，仍留在映射面板等用户确认
+  const confirmed = pickConfirmedMappings(
+    mappingOverrides.value,
+    loadOpeningMapping(authStore.currentCompanyId),
+  )
+  const effective =
+    Object.keys(confirmed).length > 0
+      ? parseOpeningWorkbook(workbook, allAccounts, confirmed)
+      : parseResult
+  applyImportResult(effective)
+  appliedPeriod.value = { fiscalYear: fiscalYear.value, startMonth: startMonth.value }
+  importModalVisible.value = true
+
+  if (effective.isBalanced) {
+    message.success(`成功导入 ${effective.matchedCount} 个科目，借贷双方已平衡`)
+  } else {
+    message.warning(`导入完成，尚有借贷差额 ¥${Math.abs(effective.totalDebit - effective.totalCredit).toFixed(2)}，请核对调整`)
   }
 }
 
@@ -458,22 +513,48 @@ async function onFileSelected(e: Event) {
     const data = await file.arrayBuffer()
     const workbook = XLSX.read(data, { type: 'array' })
     lastWorkbook.value = workbook
-    mappingOverrides.value = {}
     const allAccounts = [...balanceItems.value, ...ytdItems.value]
     const parseResult = parseOpeningWorkbook(workbook, allAccounts)
-    applyImportResult(parseResult)
-    importModalVisible.value = true
+    const period = parseResult.period ?? null
+    statementPeriod.value = period
+    cutoffMonth.value = defaultCutoffMonth()
+    const check = checkOpeningPeriod(period, fiscalYear.value, startMonth.value)
+    periodCheck.value = check
 
-    if (parseResult.isBalanced) {
-      message.success(`成功导入 ${parseResult.matchedCount} 个科目，借贷双方已平衡`)
-    } else {
-      message.warning(`导入完成，尚有借贷差额 ¥${Math.abs(parseResult.totalDebit - parseResult.totalCredit).toFixed(2)}，请核对调整`)
+    if (!check.ok) {
+      // 期间不符不写表格：写进去的是一屏「看起来已经导好」的错数。
+      importSummary.value = null
+      unmatchedRows.value = []
+      importModalVisible.value = true
+      message.warning('这份科目余额表的期间与账套建账期间不一致，请先确认期间')
+      return
     }
+
+    applyWorkbook(workbook, parseResult)
   } catch (err) {
     message.error(accountingErrorText(err))
   } finally {
     loading.value = false
   }
+}
+
+/** 兜底：表头识别不到期间时，用户手选截止月后重新校验并应用 */
+function applyCutoffSelection() {
+  // 表头已识别出期间就不允许手选覆盖：1-9 月的表选成 7 月会让错月份的数据通过
+  if (!lastWorkbook.value || !cutoffMonth.value || statementPeriod.value) return
+  const [year, month] = cutoffMonth.value.split('-').map(Number)
+  const assumed: StatementPeriod = {
+    startYear: year,
+    startMonth: 1,
+    endYear: year,
+    endMonth: month,
+    label: `手动选择截止 ${cutoffMonth.value}`,
+  }
+  const check = checkOpeningPeriod(assumed, fiscalYear.value, startMonth.value)
+  periodCheck.value = check
+  if (!check.ok) return
+  statementPeriod.value = assumed
+  applyWorkbook(lastWorkbook.value)
 }
 
 function normalizeRowNumbers(rawList: any[]): BalanceItem[] {
@@ -485,63 +566,55 @@ function normalizeRowNumbers(rawList: any[]): BalanceItem[] {
   }))
 }
 
-function checkPendingImportFromSession() {
+function pendingRows(list: any[]): Array<{
+  account_code: string
+  account_name: string
+  debit_balance: number
+  credit_balance: number
+  partner_name: string
+}> {
+  return (list || []).map((i: any) => ({
+    account_code: String(i.accountCode || i.account_code || ''),
+    account_name: String(i.accountName || i.account_name || ''),
+    debit_balance: parseFloat(String(i.debitBalance ?? i.debit_balance ?? 0)) || 0,
+    credit_balance: parseFloat(String(i.creditBalance ?? i.credit_balance ?? 0)) || 0,
+    partner_name: String(i.partnerName || i.partner_name || ''),
+  }))
+}
+
+async function checkPendingImportFromSession() {
   try {
     const raw = sessionStorage.getItem('solobooks:pending_opening_import')
     if (!raw) return
     sessionStorage.removeItem('solobooks:pending_opening_import')
     const parsed = JSON.parse(raw)
-    if (parsed && Array.isArray(parsed.items)) {
-      if (parsed.fiscalYear && typeof parsed.fiscalYear === 'number') {
-        fiscalYear.value = parsed.fiscalYear
-      }
-      if (parsed.startPeriod && typeof parsed.startPeriod === 'string' && parsed.startPeriod.includes('-')) {
-        const parts = parsed.startPeriod.split('-')
-        if (parts[1]) startMonth.value = parts[1].padStart(2, '0')
-      }
-      const balanceMap = new Map(parsed.items.map((i: any) => [String(i.accountCode || i.account_code || ''), i]))
-      items.value = items.value.map(item => {
-        const p: any = balanceMap.get(item.account_code)
-        if (p) {
-          const d = parseFloat(String(p.debitBalance ?? p.debit_balance ?? 0)) || 0
-          const c = parseFloat(String(p.creditBalance ?? p.credit_balance ?? 0)) || 0
-          if (d > 0 || c > 0) {
-            return {
-              ...item,
-              debit_balance: d,
-              credit_balance: c,
-              partner_name: p.partnerName || p.partner_name || item.partner_name || '',
-            }
-          }
-        }
-        return item
-      })
-      if (Array.isArray(parsed.ytdItems)) {
-        const ytdMap = new Map(parsed.ytdItems.map((i: any) => [String(i.accountCode || i.account_code || ''), i]))
-        ytdItems.value = ytdItems.value.map(item => {
-          const p: any = ytdMap.get(item.account_code)
-          if (p) {
-            const d = parseFloat(String(p.debitBalance ?? p.debit_balance ?? 0)) || 0
-            const c = parseFloat(String(p.creditBalance ?? p.credit_balance ?? 0)) || 0
-            if (d > 0 || c > 0) {
-              return {
-                ...item,
-                debit_balance: d,
-                credit_balance: c,
-              }
-            }
-          }
-          return item
-        })
-      }
-      message.success('已载入从旧账导入带入的期初余额，请核对并试算平衡')
+    if (!parsed || !Array.isArray(parsed.items)) return
+    // 草稿属于另一个年度时先切年度重拉，否则会叠加到上一年的表上
+    if (
+      parsed.fiscalYear &&
+      typeof parsed.fiscalYear === 'number' &&
+      parsed.fiscalYear !== fiscalYear.value
+    ) {
+      fiscalYear.value = parsed.fiscalYear
+      await load()
     }
+    if (parsed.startPeriod && typeof parsed.startPeriod === 'string' && parsed.startPeriod.includes('-')) {
+      const parts = parsed.startPeriod.split('-')
+      if (parts[1]) startMonth.value = parts[1].padStart(2, '0')
+    }
+    // 与 Excel 导入共用合并规则：同科目多客商各自成行，按科目 Map 会只留最后一条。
+    items.value = mergeOpeningRows(items.value, pendingRows(parsed.items))
+    if (Array.isArray(parsed.ytdItems)) {
+      ytdItems.value = mergeYtdRows(ytdItems.value, pendingRows(parsed.ytdItems)).rows
+    }
+    message.success('已载入从旧账导入带入的期初余额，请核对并试算平衡')
   } catch (e) {
     console.error('Failed to load pending opening import', e)
   }
 }
 
 async function load() {
+  appliedPeriod.value = null
   loading.value = true
   try {
     const data: any = await apiClient.get('/api/opening/balances', {
@@ -549,17 +622,14 @@ async function load() {
     })
     items.value = normalizeRowNumbers(data.items || [])
     ytdItems.value = normalizeRowNumbers(data.ytd_items || [])
+    yearStartItems.value = normalizeRowNumbers(data.year_start_items || [])
     serverLocked.value = Boolean(data.is_locked)
     voucherNo.value = data.voucher_no || items.value.find(i => i.voucherRef)?.voucherRef || null
 
-    if (typeof data.start_period === 'string' && data.start_period.includes('-')) {
-      const parts = data.start_period.split('-')
-      if (parts[1]) {
-        startMonth.value = parts[1].padStart(2, '0')
-      }
-    } else {
-      startMonth.value = '01'
-    }
+    // 已保存的建账时间优先；没保存过就跟公司信息里的启用日期对齐，不要一律落到 1 月。
+    // start_period 在没保存时是后端兜底的 "{year}-01"，不能当作用户选择。
+    const savedPeriod = data.start_period_saved ? data.start_period : null
+    startMonth.value = resolveOpeningPeriod(savedPeriod, companyStartDate(), fiscalYear.value).month
 
     if (Array.isArray(data.fixed_assets)) {
       fixedAssets.value = data.fixed_assets.map((fa: any) => ({
@@ -594,48 +664,6 @@ async function load() {
       loadLocalTaxMemoryFallback(fiscalYear.value)
     }
 
-    // 若从 AI 会计对话确认卡点击「去期初工作台细调」跳转而来，自动合并 AI 草稿
-    if (!serverLocked.value) {
-      try {
-        const rawDraft = sessionStorage.getItem('solobooks:ai_opening_draft')
-        if (rawDraft) {
-          sessionStorage.removeItem('solobooks:ai_opening_draft')
-          const draft = JSON.parse(rawDraft)
-          if (typeof draft.startPeriod === 'string' && draft.startPeriod.includes('-')) {
-            const p = draft.startPeriod.split('-')
-            if (p[1]) startMonth.value = p[1].padStart(2, '0')
-          }
-          if (Array.isArray(draft.items) && draft.items.length > 0) {
-            const draftMap = new Map(draft.items.map((i: any) => [String(i.account_code), i]))
-            items.value = items.value.map((item) => {
-              const matched: any = draftMap.get(item.account_code)
-              if (!matched) return item
-              return {
-                ...item,
-                debit_balance: parseFloat(String(matched.debit_balance ?? 0)) || 0,
-                credit_balance: parseFloat(String(matched.credit_balance ?? 0)) || 0,
-                partner_name: String(matched.partner_name || item.partner_name || ''),
-              }
-            })
-          }
-          if (Array.isArray(draft.ytdItems) && draft.ytdItems.length > 0) {
-            const ytdMap = new Map(draft.ytdItems.map((i: any) => [String(i.account_code), i]))
-            ytdItems.value = ytdItems.value.map((item) => {
-              const matched: any = ytdMap.get(item.account_code)
-              if (!matched) return item
-              return {
-                ...item,
-                debit_balance: parseFloat(String(matched.debit_balance ?? 0)) || 0,
-                credit_balance: parseFloat(String(matched.credit_balance ?? 0)) || 0,
-              }
-            })
-          }
-          message.info('已带入 AI 会计整理的期初余额草稿，请核对配平后保存')
-        }
-      } catch {
-        /* ignore */
-      }
-    }
   } catch {
     message.error('加载期初余额失败')
   } finally {
@@ -650,6 +678,14 @@ function openSaveModal() {
   }
   if (isLocked.value) {
     message.warning('期初凭证已过账锁定；如需调整，请先点击「冲销并重设期初」')
+    return
+  }
+  if (
+    appliedPeriod.value &&
+    (appliedPeriod.value.fiscalYear !== fiscalYear.value ||
+      appliedPeriod.value.startMonth !== startMonth.value)
+  ) {
+    message.warning('建账年月已变更，这份余额表的期间不再匹配，请重新导入余额表后再生成期初凭证')
     return
   }
   saveLocalTaxMemory(fiscalYear.value)
@@ -733,6 +769,17 @@ async function confirmStepUpAction() {
               credit_balance: Number(yi.credit_balance) || 0,
             }))
           : undefined,
+        // 年初快照随期初凭证一起存，报表「年初余额」列用它（年中建账时
+        // 期初余额 ≠ 年初余额，不能混用）
+        year_start_items: yearStartItems.value.length
+          ? yearStartItems.value.map(yi => ({
+              account_code: yi.account_code,
+              account_name: yi.account_name,
+              partner_name: yi.partner_name || '',
+              debit_balance: Number(yi.debit_balance) || 0,
+              credit_balance: Number(yi.credit_balance) || 0,
+            }))
+          : undefined,
         tax_memory: {
           prior_year_loss: Number(taxMemory.value.priorYearLoss) || 0,
           prepaid_cit_tax: Number(taxMemory.value.prepaidCitTax) || 0,
@@ -775,19 +822,31 @@ const monthOptions = Array.from({ length: 12 }, (_, idx) => {
   }
 })
 
-onMounted(async () => {
-  // 启用日期在未来的账套，期初属于启用年而不是今年。
-  // 后端 readiness 按 max(今年, 启用年) 判定，这里必须同源，否则录完了也判不到。
+/** 公司信息里的启用日期（账套从这天开始记账），是建账时间的默认值 */
+function companyStartDate(): string {
   const company = authStore.companies.find(
     (item) => item.company_id === authStore.currentCompanyId,
   )
-  const startYear = Number(String(company?.startDate || '').slice(0, 4))
-  if (Number.isFinite(startYear) && startYear > fiscalYear.value) {
+  return String(company?.startDate || '')
+}
+
+// 账套相关初始化：首次 mount 与切换账套后都要走一遍
+async function bootstrapOpeningPage() {
+  fiscalYear.value = new Date().getFullYear()
+  // 默认停在账套的启用年月（公司信息里的启用日期），之后仍可手动改。
+  // 启用年在未来时后端 readiness 也按 max(今年, 启用年) 判定，这里必须同源，
+  // 否则录完了也判不到；年份不在下拉范围内（很早以前建账）就保持今年。
+  const { year: startYear } = resolveOpeningPeriod(null, companyStartDate())
+  if (startYear && yearOptions.some(o => o.value === startYear)) {
     fiscalYear.value = startYear
   }
 
   await load()
-  checkPendingImportFromSession()
+  await checkPendingImportFromSession()
+}
+
+onMounted(async () => {
+  await bootstrapOpeningPage()
   try {
     const profile: any = await getAuthMe()
     phone.value = profile?.user?.phone || ''
@@ -795,18 +854,23 @@ onMounted(async () => {
     // 绑定手机号会在提交时由后端再次校验
   }
 })
+
+// 本页被 KeepAlive 缓存，切换账套不会重新 mount：必须重取新账套的期初数据与
+// 税务备忘；并收起二次验证弹窗，避免把旧账套的表单提交进新账套上下文
+watch(
+  () => authStore.currentCompanyId,
+  (next, prev) => {
+    if (next === prev) return
+    stepUpVisible.value = false
+    void bootstrapOpeningPage()
+  },
+)
 </script>
 
 <template>
   <div class="opening-page">
-    <div class="opening-mode-bar">
-      <NTabs v-model:value="mainTab" type="segment" class="mode-tabs">
-        <NTab name="opening">期初余额试算与建账</NTab>
-        <NTab name="legacy">旧软件账目迁移（用友 / 金蝶 / 柠檬云）</NTab>
-      </NTabs>
-    </div>
-
-    <div v-show="mainTab === 'legacy'" class="legacy-tab-pane">
+    <!-- 旧账导入入口暂不开放：真实导出文件的表头/凭证格式还没补齐 -->
+    <div v-if="mainTab === 'legacy'" class="legacy-tab-pane">
       <LegacyImportTab embedded @imported="onLegacyImported" />
     </div>
 
@@ -837,6 +901,9 @@ onMounted(async () => {
           </div>
           <p class="subtitle">
             将原账套或手工账的科目余额迁入系统，借贷试算平衡后生成不可篡改的系统期初凭证（《小企业会计准则》）。
+          </p>
+          <p class="subtitle period-hint">
+            导入的余额表期间应为 {{ expectedPeriodLabel }}：资产负债取期末余额，损益取本年累计发生额。
           </p>
         </div>
       </div>
@@ -962,6 +1029,22 @@ onMounted(async () => {
         <span v-else class="verdict-badge badge-unbalanced">
           <i class="ri-error-warning-line" />
           借贷未平 · 差额 ¥{{ formatCurrency(Math.abs(balanceDiff)) }}
+        </span>
+      </div>
+
+      <div
+        v-if="!isLocked && !isBalanced && unmatchedBalanceImpact.count > 0"
+        class="unmatched-impact-hint"
+        :class="{ 'is-exact': diffExplainedByUnmatched }"
+      >
+        <i class="ri-links-line" />
+        <span v-if="diffExplainedByUnmatched">
+          差额全部来自 {{ unmatchedBalanceImpact.count }} 个未匹配的资产/负债科目（合计
+          ¥{{ formatCurrency(Math.abs(unmatchedBalanceImpact.net)) }}）。在导入结果弹窗下方完成映射后即可配平，源文件本身是平的。
+        </span>
+        <span v-else>
+          有 {{ unmatchedBalanceImpact.count }} 个未匹配的资产/负债科目（合计
+          ¥{{ formatCurrency(Math.abs(unmatchedBalanceImpact.net)) }}）未计入合计，其余差额仍需手工核对。
         </span>
       </div>
     </div>
@@ -1192,7 +1275,7 @@ onMounted(async () => {
               </button>
             </div>
             <span class="rule-hint">
-              <i class="ri-sparkling-line" />
+              <i class="ri-information-line" />
               年中建账保存时，系统自动将 1-{{ Math.max(1, startMonthNum - 1) }} 月累计损益差额配平至「3103 本年利润」
             </span>
           </template>
@@ -1217,10 +1300,13 @@ onMounted(async () => {
             <tbody v-if="filteredBalanceItems.length > 0">
               <tr
                 v-for="item in filteredBalanceItems"
-                :key="item.account_code"
+                :key="item.account_code + '|' + (item.partner_name || '')"
                 :class="{ 'row-filled': (item.debit_balance || 0) > 0 || (item.credit_balance || 0) > 0 }"
               >
-                <td class="col-code">{{ item.account_code }}</td>
+                <td class="col-code">
+                  <span>{{ item.account_code }}</span>
+                  <span v-if="item.originalCode" class="col-code-orig">原 {{ item.originalCode }}</span>
+                </td>
                 <td class="col-name">
                   <span class="acct-name-text">{{ item.account_name || item.account_code }}</span>
                   <span class="acct-cat-tag">{{ getAccountCategoryLabel(item.account_code) }}</span>
@@ -1307,7 +1393,10 @@ onMounted(async () => {
                 :key="item.account_code"
                 :class="{ 'row-filled': (item.debit_balance || 0) > 0 || (item.credit_balance || 0) > 0 }"
               >
-                <td class="col-code">{{ item.account_code }}</td>
+                <td class="col-code">
+                  <span>{{ item.account_code }}</span>
+                  <span v-if="item.originalCode" class="col-code-orig">原 {{ item.originalCode }}</span>
+                </td>
                 <td class="col-name">
                   <span class="acct-name-text">{{ item.account_name || item.account_code }}</span>
                   <span class="acct-cat-tag">{{ getAccountCategoryLabel(item.account_code) }}</span>
@@ -1374,12 +1463,35 @@ onMounted(async () => {
     <NModal
       v-model:show="importModalVisible"
       preset="card"
-      title="Excel 科目余额表导入结果"
+      :title="periodCheck && !periodCheck.ok ? '导入期间需要确认' : 'Excel 科目余额表导入结果'"
       style="max-width: 520px"
     >
-      <div v-if="importSummary" class="import-report-content">
+      <!-- 期间不符：先确认期间，金额不写入表格 -->
+      <div v-if="periodCheck && !periodCheck.ok" class="import-period-gate">
+        <NAlert type="error" :bordered="false">
+          {{ periodCheck.message }}
+        </NAlert>
+        <div class="period-meta">
+          <span v-if="statementPeriod">已识别表格期间：<strong>{{ statementPeriod.label }}</strong></span>
+          <span v-else>未能从表头识别期间。</span>
+        </div>
+        <!-- 表头已识别出期间时不给下拉：否则 1-9 月的表能手选 7 月绕过校验 -->
+        <div v-if="!statementPeriod" class="period-cutoff-row">
+          <span>这份表截止到：</span>
+          <NSelect v-model:value="cutoffMonth" :options="cutoffOptions" size="small" style="width: 130px;" />
+          <NButton size="small" type="primary" secondary @click="applyCutoffSelection">
+            按所选月份重新校验
+          </NButton>
+        </div>
+        <p v-else class="period-help">请重新导出期间相符的科目余额表，或换一份表。</p>
+        <p class="period-help">
+          建账期间 {{ startPeriod }} 需要 {{ expectedPeriodLabel }} 的科目余额表：资产负债取期末余额，损益取本年累计发生额。
+        </p>
+      </div>
+
+      <div v-else-if="importSummary" class="import-report-content">
         <NAlert :type="importSummary.isBalanced ? 'success' : 'warning'" :bordered="false">
-          {{ importSummary.isBalanced ? '导入成功且借贷已平衡！核对无误后即可生成期初凭证。' : '数据已填入，但资产负债期初尚有借贷差额，请在表格中核对调整。' }}
+          {{ importSummary.isBalanced ? '导入成功且借贷已平衡！核对无误后即可生成期初凭证。' : '数据已填入，但资产负债期初尚有借贷差额：先确认下方映射并重新计算，平衡后才能完成核对；也可关闭本窗后在表格中手工调整。' }}
         </NAlert>
 
         <div class="import-stats-box">
@@ -1407,6 +1519,13 @@ onMounted(async () => {
             <span>未平差额：</span>
             <strong class="text-expense">¥ {{ formatCurrency(Math.abs(importSummary.totalDebit - importSummary.totalCredit)) }}</strong>
           </div>
+          <div v-if="!importSummary.isBalanced && unmatchedBalanceImpact.count > 0" class="stat-line">
+            <span>其中未匹配的资产/负债科目：</span>
+            <strong class="text-expense">
+              {{ unmatchedBalanceImpact.count }} 项 · ¥ {{ formatCurrency(Math.abs(unmatchedBalanceImpact.net)) }}
+              {{ diffExplainedByUnmatched ? '（差额全部由此产生）' : '' }}
+            </strong>
+          </div>
         </div>
 
         <div v-if="importSummary.warnings.length" class="warnings-box">
@@ -1421,7 +1540,7 @@ onMounted(async () => {
         <div v-if="unmatchedRows.length > 0" class="mapping-box">
           <div class="mapping-box-header">
             <span class="warning-title">未匹配科目映射（{{ unmatchedRows.length }} 项）：</span>
-            <span class="mapping-tip">可为来源科目指定本账套对应科目并重新计算</span>
+            <span class="mapping-tip">带建议的映射已预填，请逐项确认后重新计算；无建议项需手动指定</span>
           </div>
           <div class="mapping-list">
             <div
@@ -1454,8 +1573,18 @@ onMounted(async () => {
         </div>
       </div>
       <template #footer>
-        <NSpace justify="end">
-          <NButton type="primary" @click="importModalVisible = false">完成核对</NButton>
+        <NSpace justify="end" align="center">
+          <template v-if="periodCheck && !periodCheck.ok">
+            <NButton @click="importModalVisible = false">放弃本次导入</NButton>
+          </template>
+          <template v-else>
+            <span v-if="importSummary && !importSummary.isBalanced" class="mapping-tip">
+              尚有借贷差额，平衡后才能完成核对
+            </span>
+            <NButton type="primary" :disabled="!importSummary?.isBalanced" @click="importModalVisible = false">
+              完成核对
+            </NButton>
+          </template>
         </NSpace>
       </template>
     </NModal>
@@ -1504,22 +1633,13 @@ onMounted(async () => {
 
 <style scoped>
 .opening-page {
-  max-width: 1200px;
+  max-width: var(--page-width);
   margin: 0 auto;
   padding-bottom: 40px;
   width: 100%;
   box-sizing: border-box;
 }
 
-.opening-mode-bar {
-  margin-bottom: 20px;
-  display: flex;
-  justify-content: flex-start;
-}
-.mode-tabs {
-  width: auto;
-  min-width: 360px;
-}
 .legacy-tab-pane {
   animation: fadeIn 0.15s ease-in-out;
 }
@@ -1669,6 +1789,22 @@ onMounted(async () => {
 .badge-unbalanced {
   background: #fbeeee;
   color: #bd3d3d;
+}
+.unmatched-impact-hint {
+  flex-basis: 100%;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: #f6f7f9;
+  color: #586474;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.unmatched-impact-hint.is-exact {
+  background: rgba(22, 93, 255, 0.06);
+  color: #165dff;
 }
 .badge-empty {
   background: #f1f4f8;
@@ -1987,6 +2123,13 @@ onMounted(async () => {
   font-weight: 500;
   color: #586474;
 }
+.col-code-orig {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  font-weight: 400;
+  color: #98a2b3;
+}
 .col-name {
   min-width: 200px;
 }
@@ -2072,7 +2215,34 @@ onMounted(async () => {
   margin: 4px 0 16px;
 }
 
+.subtitle.period-hint {
+  color: #636e7c;
+  font-size: 12px;
+  margin-top: 2px;
+}
+
 /* 导入结果弹窗 */
+.import-period-gate {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  font-size: 13px;
+}
+.period-meta {
+  color: #586474;
+}
+.period-cutoff-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.period-help {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #636e7c;
+}
 .import-report-content {
   display: flex;
   flex-direction: column;

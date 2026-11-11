@@ -100,8 +100,13 @@ function handleApply() {
       <NFormItem label="本期应发工资">
         <span class="calc-static">{{ formatMoney(currentGross) }}</span>
       </NFormItem>
-      <NFormItem label="本期个人社保">
-        <span class="calc-static">{{ formatMoney(Number(target?.personal_social_security || 0)) }}</span>
+      <NFormItem label="本期社保公积金">
+        <span class="calc-static">
+          {{ formatMoney(Number(target?.personal_social_security || 0)) }}
+          <small v-if="target?.personal_social_insurance !== undefined" class="calc-sub">
+            （社保 {{ formatMoney(Number(target?.personal_social_insurance || 0)) }} + 公积金 {{ formatMoney(Number(target?.personal_housing_fund || 0)) }}）
+          </small>
+        </span>
       </NFormItem>
       <NFormItem label="专项附加/月">
         <NInputNumber v-model:value="taxForm.specialAdditional" :min="0" :precision="2" :step="500" style="width: 100%" @update:value="runTaxPreview">
@@ -195,6 +200,12 @@ function handleApply() {
   font-size: 14px;
   font-weight: 600;
   color: var(--solo-text-primary);
+}
+.calc-sub {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--solo-text-muted);
+  margin-left: 6px;
 }
 .tax-breakdown {
   margin-top: 14px;

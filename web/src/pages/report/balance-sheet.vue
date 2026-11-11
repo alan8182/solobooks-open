@@ -369,6 +369,14 @@ onMounted(load)
         <template v-else>
           <NCard :bordered="false" class="report-card mb-4">
             <ProStatementHeader title="资产负债表" :period-text="statementDateText" />
+            <div v-if="result.standard && result.standard.openingKnown === false" class="std-balance-note">
+              <i class="ri-error-warning-line" />
+              <span>
+                年初数未导入：本年不是 1 月建账，账套里只有建账时点的期初余额，
+                推不出 1 月 1 日的年初数。请到「期初工作台」重新导入含
+                「年初余额」或「本年累计发生额」列的科目余额表。
+              </span>
+            </div>
             <div v-if="result.standard && !result.standard.balanced" class="std-balance-note">
               <i class="ri-error-warning-line" />
               <span>
@@ -382,12 +390,13 @@ onMounted(load)
                   <tr>
                     <th class="std-item-col">资产</th>
                     <th class="std-rowno-col">行次</th>
-                    <th class="std-amt-col">年初余额</th>
+                    <!-- 列序与税务局会小企01表模板一致：先期末、后年初（导出模板 D=期末、E=年初） -->
                     <th class="std-amt-col">期末余额</th>
+                    <th class="std-amt-col">年初余额</th>
                     <th class="std-item-col std-item-col-right">负债和所有者权益</th>
                     <th class="std-rowno-col">行次</th>
-                    <th class="std-amt-col">年初余额</th>
                     <th class="std-amt-col">期末余额</th>
+                    <th class="std-amt-col">年初余额</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -396,14 +405,14 @@ onMounted(load)
                       <span :class="{ 'account-link': Boolean(pair.left?.accountCode) }">{{ pair.left ? pair.left.name : '' }}</span>
                     </td>
                     <td class="std-rowno">{{ pair.left?.rowNo || '' }}</td>
-                    <td class="amount-cell">{{ pair.left ? formatAmountPlain(pair.left.openingAmount) : '' }}</td>
                     <td class="amount-cell">{{ pair.left ? formatAmountPlain(pair.left.currentAmount) : '' }}</td>
+                    <td class="amount-cell">{{ pair.left ? formatAmountPlain(pair.left.openingAmount) : '' }}</td>
                     <td class="std-item" :class="pair.right ? stdCellClass(pair.right) : ''" :style="pair.right?.level ? { paddingLeft: '18px' } : undefined" @click="pair.right && stdClick(pair.right)">
                       <span :class="{ 'account-link': Boolean(pair.right?.accountCode) }">{{ pair.right ? pair.right.name : '' }}</span>
                     </td>
                     <td class="std-rowno">{{ pair.right?.rowNo || '' }}</td>
-                    <td class="amount-cell">{{ pair.right ? formatAmountPlain(pair.right.openingAmount) : '' }}</td>
                     <td class="amount-cell">{{ pair.right ? formatAmountPlain(pair.right.currentAmount) : '' }}</td>
+                    <td class="amount-cell">{{ pair.right ? formatAmountPlain(pair.right.openingAmount) : '' }}</td>
                   </tr>
                 </tbody>
               </table>
@@ -661,12 +670,21 @@ onMounted(load)
   overflow-x: auto;
 }
 
+/* 会小企01表是固定 8 列的双栏版式：fixed 布局让两个名称列吃掉剩余宽度，
+   行次/金额列定宽，整表按容器自适应，不再因为单元格内边距把右侧挤出可视区 */
 .std-table {
-  min-width: 860px;
+  table-layout: fixed;
+  min-width: 720px;
+}
+
+.std-table th,
+.std-table td {
+  padding-left: 10px;
+  padding-right: 10px;
 }
 
 .std-item-col {
-  min-width: 190px;
+  width: auto;
 }
 
 .std-item-col-right {
@@ -683,11 +701,15 @@ onMounted(load)
 
 .std-amt-col {
   text-align: right;
-  width: 110px;
+  width: 104px;
 }
 
 .std-item {
-  white-space: nowrap;
+  /* 科目名允许换行：像「负债和所有者权益（或股东权益）总计」这类长行次名
+     在 fixed 布局下不能截断，否则报表正文丢字 */
+  white-space: normal;
+  line-height: 1.4;
+  word-break: break-word;
 }
 
 .std-item.std-leaf {

@@ -37,6 +37,17 @@ DEPARTMENT_PROJECT_ACCOUNT_PREFIXES = ("5001", "5051", "5401", "5402", "5601", "
 DEFAULT_QUANTITY_ACCOUNT_CODES = frozenset({"1403", "1405", "1408"})
 
 
+# 股东/员工垫付的对手方只可能落在这些往来科目上：2241 其他应付款（含未来
+# 可能新增的 224101 子级）与 122102/122103 其他应收款。1122/2202/122199 的
+# 对手方是客户/供应商，不能被「付款人=老板」误挂成个人。
+PERSON_ADVANCE_ACCOUNT_CODES = frozenset({"2241", "122102", "122103"})
+
+
+def is_person_advance_account(code: str) -> bool:
+    value = str(code or "")
+    return value.startswith("2241") or value in PERSON_ADVANCE_ACCOUNT_CODES
+
+
 def auxiliary_kinds_for_account(code: str) -> frozenset[str]:
     """该科目允许挂哪些辅助核算维度。空集 = 不挂。"""
     value = str(code or "")

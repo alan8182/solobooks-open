@@ -4721,6 +4721,16 @@ export interface components {
       /** Stepuptoken */
       stepUpToken: string;
     };
+    /** ClosePeriodRequest */
+    ClosePeriodRequest: {
+      /**
+       * Expectedsnapshothash
+       * @minLength 64
+       * @maxLength 64
+       * @pattern ^[0-9a-f]{64}$
+       */
+      expectedSnapshotHash: string;
+    };
     /**
      * PhoneBindRequest
      * @description 登录后绑定手机号请求。
@@ -12470,12 +12480,17 @@ export interface operations {
   /** Close Period Route */
   close_period_route_api_periods__month__close_post: {
     parameters: {
-      header?: {
-        "Idempotency-Key"?: string | null;
+      header: {
+        "Idempotency-Key": string;
         authorization?: string | null;
       };
       path: {
         month: string;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["ClosePeriodRequest"];
       };
     };
     responses: {

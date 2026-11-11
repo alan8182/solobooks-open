@@ -51,8 +51,26 @@ class TestHealth:
 
 
 class TestAuthoritativeAccountingApi:
+    """绝对值报表断言必须跑在专属账套上。
+
+    ``c1`` 是全测试会话共享的开发兜底账套：任何在它上面过账的用例（如
+    test_rd_accounting 的工资计提）都会让这里的「空账期 / 合计金额」断言翻车。
+    本类改用独立 company_id，与其它文件互不污染。
+    """
+
     month = "2031-06"
     next_month = "2031-07"
+    company_id = "c-api-authoritative"
+
+    @pytest.fixture
+    def auth_headers(self):
+        """本类专属身份：指向独立账套，避免共享 c1 的跨文件残留。"""
+        from services.token_service import create_access_token
+
+        token = create_access_token(
+            {"sub": "u-api-authoritative", "company_id": self.company_id}
+        )
+        return {"Authorization": f"Bearer {token}"}
 
     @staticmethod
     def _row_value(data, key, column):
@@ -159,7 +177,7 @@ class TestAuthoritativeAccountingApi:
         assert cash["balanceSheetCashBalanced"] is True
 
         # 从业人数改为名册派生：清空历史字段，仅保留"限制行业未确认"的初始态
-        _update_company_payload("c1", {}, remove=("restrictedIndustry", "employeeCount"))
+        _update_company_payload(self.company_id, {}, remove=("restrictedIndustry", "employeeCount"))
         cit = client.post(
             "/api/report/cit-assist",
             json={"period": "2031-Q2", "periodType": "quarter"},
@@ -188,7 +206,7 @@ class TestAuthoritativeAccountingApi:
         assert cit_data["beginnerReady"] is False
 
         # 确认非限制行业后即可判定；请求体里的人数不再覆盖名册派生值
-        _update_company_payload("c1", {"restrictedIndustry": False})
+        _update_company_payload(self.company_id, {"restrictedIndustry": False})
         eligible_cit = client.post(
             "/api/report/cit-assist",
             json={
@@ -286,9 +304,59 @@ class TestAuthoritativeAccountingApi:
 
         checks = client.get("/api/periods/2032-07/close-checks", headers=auth_headers)
         assert checks.status_code == 200, checks.text
-        actual = next(item for item in checks.json()["checks"] if item["code"] == "BOOK_TO_ACTUAL")
+        snapshot = checks.json()
+        assert snapshot["schemaVersion"] == "closing.v1"
+        assert len(snapshot["snapshotHash"]) == 64
+        assert snapshot["periodVersion"] >= 1
+        actual = next(item for item in snapshot["checks"] if item["code"] == "BOOK_TO_ACTUAL")
         assert actual["status"] == "blocking"
         assert actual["unreconciledBankCount"] >= 1
+        bank_finding = next(
+            item
+            for item in snapshot["findings"]
+            if item["checkCode"] == "BOOK_TO_ACTUAL"
+            and item["allowedRepairs"]
+        )
+        assert bank_finding["findingId"].startswith("clf_")
+        assert bank_finding["authoritativeIds"]["statementIds"]
+
+    def test_close_requires_preview_snapshot_hash(self, client, auth_headers):
+        from services.token_service import create_access_token
+
+        headers = {
+            "Authorization": f"Bearer {create_access_token({'sub': 'u-close-validation', 'company_id': 'c-close-validation'})}",
+            "Idempotency-Key": "close-missing-hash",
+        }
+        missing = client.post(
+            "/api/periods/2099-12/close",
+            json={},
+            headers=headers,
+        )
+        assert missing.status_code == 422
+
+        empty = client.post(
+            "/api/periods/2099-12/close",
+            json={"expectedSnapshotHash": ""},
+            headers={**headers, "Idempotency-Key": "close-empty-hash"},
+        )
+        assert empty.status_code == 422
+
+    def test_close_rejects_stale_snapshot_before_writes(self, client, auth_headers):
+        from services.token_service import create_access_token
+
+        headers = {
+            "Authorization": f"Bearer {create_access_token({'sub': 'u-close-stale', 'company_id': 'c-close-stale'})}",
+            "Idempotency-Key": "close-stale-hash",
+        }
+        stale = client.post(
+            "/api/periods/2099-12/close",
+            json={"expectedSnapshotHash": "0" * 64},
+            headers=headers,
+        )
+        assert stale.status_code == 409, stale.text
+        detail = stale.json()["detail"]
+        assert detail["code"] == "CLOSING_SNAPSHOT_STALE"
+        assert "latestSnapshot" in detail["context"]
 
 
     def test_wechat_settlement_http_confirm_updates_original_entries_without_new_income(self, client, auth_headers):
@@ -339,6 +407,124 @@ class TestAuthoritativeAccountingApi:
         difference = client.get('/api/bank/difference?month=2034-07', headers=auth_headers).json()
         assert not difference["balance_reconciliation"]["fully_reconciled"]
         assert any(issue["type"] == "unposted_match" for issue in difference["matched_effect_issues"])
+
+    def test_bank_confirm_new_entry_links_statement_via_http(self, client, auth_headers):
+        """HTTP 真实会话（AsyncSession 分支）的 type=new 确认必须在 save_entry 后
+        完成对账回写。曾因 confirm_suggestion_flow 缺 assert_bank_reconciliable
+        导入而每笔 500——凭证已建但流水未关联，前端呈现"幽灵确认配对"。"""
+        bank = client.post('/api/bank/import-json', json={"statement_id": "confirm-new-http", "rows": [{
+            "transaction_date": "2033-03-01", "description": "客户技术服务费到账", "amount": 12000,
+        }]}, headers=auth_headers)
+        assert bank.status_code == 200, bank.text
+        statement = client.get('/api/bank/statements?statement_id=confirm-new-http',
+                               headers=auth_headers).json()["items"][0]
+        ok = client.post('/api/bank/confirm-suggestion', json={
+            "statement_id": statement["id"], "type": "new", "new_entry": {
+                "title": "3月技术服务费", "amount": 12000, "direction": "income",
+                "category": "主营业务收入", "occurDate": "2033-03-01",
+            },
+        }, headers=auth_headers)
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["status"] == "created"
+        after = client.get('/api/bank/statements?statement_id=confirm-new-http',
+                           headers=auth_headers).json()["items"][0]
+        assert after["matched_entry_id"] == ok.json()["entryId"]
+
+    def test_cross_period_future_voucher_never_blocks_or_matches(self, client, auth_headers):
+        """先付款、后收票（5 月付款 / 6 月发票草稿）：晚于流水日的等额凭证
+        既不算重复（旧逻辑会 409 弹"直接配对"），也不得被规则匹配跨期配对
+        （Tier1 允许 ±5 天，6/2 对 5/31 会高置信推荐）——应正常按往来暂付入账。"""
+        import asyncio
+
+        from services.entry_service import save_entry
+
+        bank = client.post('/api/bank/import-json', json={"statement_id": "cross-period-may", "rows": [{
+            "transaction_date": "2033-05-31", "description": "技术服务费付款", "amount": -500,
+        }]}, headers=auth_headers)
+        assert bank.status_code == 200, bank.text
+        statement = client.get('/api/bank/statements?statement_id=cross-period-may',
+                               headers=auth_headers).json()["items"][0]
+
+        async def _seed_future_invoice_voucher():
+            await save_entry({
+                "id": "june-invoice-draft", "title": "发票-技术服务费(6月)",
+                "category": "其他支出", "amount": 500, "direction": "expense",
+                "occurDate": "2033-06-02", "source": "invoice_import",
+            }, user_id="u-api-authoritative", company_id=self.company_id)
+        asyncio.run(_seed_future_invoice_voucher())
+
+        ok = client.post('/api/bank/confirm-suggestion', json={
+            "statement_id": statement["id"], "type": "new", "new_entry": {
+                "title": "技术服务暂付款", "amount": 500, "direction": "expense",
+                "category": "往来款", "occurDate": "2033-05-31",
+            },
+        }, headers=auth_headers)
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["status"] == "created"
+        after = client.get('/api/bank/statements?statement_id=cross-period-may',
+                           headers=auth_headers).json()["items"][0]
+        assert after["matched_entry_id"] == ok.json()["entryId"]
+
+        # 规则匹配（Tier1 ±5 天）不得把 5 月流水配到 6 月凭证上
+        async def _run_auto_match():
+            from services.bank_service import auto_match
+            return await auto_match(self.company_id)
+        result = asyncio.run(_run_auto_match())
+        matched_ids = {s["matchedEntryId"] for s in result.get("suggestions", [])}
+        assert "june-invoice-draft" not in matched_ids
+
+    def test_reversed_entry_never_blocks_rebooking(self, client, auth_headers):
+        """用户旅程回归：认可入账 → 取消关联 → 红冲原入账 →
+        AI 建议不得再指向已红冲凭证（确认配对会报 INVALID_MATCH）、
+        重新认可入账不得撞防重复（reversed 的银行效果已对冲）。"""
+        import asyncio
+
+        bank = client.post('/api/bank/import-json', json={"statement_id": "reversed-journey", "rows": [{
+            "transaction_date": "2033-04-06", "description": "微信支付认证0810", "amount": 0.01,
+        }]}, headers=auth_headers)
+        assert bank.status_code == 200, bank.text
+        statement = client.get('/api/bank/statements?statement_id=reversed-journey',
+                               headers=auth_headers).json()["items"][0]
+
+        ok1 = client.post('/api/bank/confirm-suggestion', json={
+            "statement_id": statement["id"], "type": "new", "new_entry": {
+                "title": "微额验证款-2033-04-06", "amount": 0.01, "direction": "income",
+                "category": "营业外收入", "occurDate": "2033-04-06",
+            },
+        }, headers=auth_headers)
+        assert ok1.status_code == 200, ok1.text
+        entry_id = ok1.json()["entryId"]
+
+        unlink = client.post('/api/bank/confirm-suggestion', json={
+            "statement_id": statement["id"], "type": "match",
+            "matched_entry_id": "", "matched_entry_ids": [],
+        }, headers=auth_headers)
+        assert unlink.status_code == 200, unlink.text
+
+        # 认可入账产物是草稿：先过账（模拟用户在逐笔过账/账目页的操作），再红冲
+        posted = client.post(f'/api/record/entries/{entry_id}/post', json={}, headers=auth_headers)
+        assert posted.status_code == 200, posted.text
+        reverse = client.post(f'/api/record/entries/{entry_id}/reverse',
+                              json={"reason": "对账撤销入账"}, headers=auth_headers)
+        assert reverse.status_code == 200, reverse.text
+
+        suggest = client.post('/api/bank/ai-suggest', json={"month": "2033-04"}, headers=auth_headers)
+        assert suggest.status_code == 200, suggest.text
+        match_targets = {
+            s.get("matchedEntryId")
+            for s in suggest.json().get("suggestions", [])
+            if s.get("statementId") == statement["id"] and s.get("type") == "match"
+        }
+        assert entry_id not in match_targets
+
+        ok2 = client.post('/api/bank/confirm-suggestion', json={
+            "statement_id": statement["id"], "type": "new", "new_entry": {
+                "title": "微额验证款-2033-04-06", "amount": 0.01, "direction": "income",
+                "category": "营业外收入", "occurDate": "2033-04-06",
+            },
+        }, headers=auth_headers)
+        assert ok2.status_code == 200, ok2.text
+        assert ok2.json()["status"] == "created"
 
 
 class TestInvoice:
@@ -810,6 +996,56 @@ class TestBankReconciliation:
         assert confirmed_payload["paymentDate"] == "2026-06-11"
 
     @pytest.mark.asyncio
+    async def test_confirm_with_remember_rule_saves_pattern(self, temp_bank_db):
+        """勾选"记住此规则"的确认必须成功并落记忆规则。曾因
+        confirm_suggestion_flow 缺 is_ambiguity_category 导入（category_service）
+        而 NameError 500：首次确认实际已入账但响应失败，第二次点击因已匹配
+        "看起来正常"。legacy 路径直接命中该行，不用 AsyncSession（SQLite 单写者
+        会让"会话事务 + get_conn 再写 bank_category_rules"死锁，PG 无此问题）。"""
+        from deps.auth import AuthContext
+        from routers.bank import ConfirmSuggestionRequest, confirm_suggestion
+        from services.bank_service import import_statements_json
+        from services.database import get_conn
+
+        company_id = "c-bank-remember"
+        await import_statements_json(company_id, [{
+            "transaction_date": "2033-05-01",
+            "description": "杭州某供应商服务费",
+            "amount": -66,
+            "balance": 9934,
+        }], "remember-batch-1")
+
+        stmt = await self._statement_row("remember-batch-1")
+        response = await confirm_suggestion(
+            ConfirmSuggestionRequest(
+                statement_id=stmt["id"],
+                type="new",
+                rememberRule=True,
+                new_entry={
+                    "title": "供应商服务费",
+                    "amount": 66,
+                    "direction": "expense",
+                    "category": "供应商付款",
+                    "occurDate": "2033-05-01",
+                },
+            ),
+            AuthContext(user_id="u-bank-test", company_id=company_id),
+        )
+        assert response["status"] == "created", response
+        assert response.get("savedRulePattern")
+
+        conn = await get_conn()
+        try:
+            cursor = await conn.execute(
+                "SELECT category FROM bank_category_rules WHERE company_id = ?",
+                (company_id,),
+            )
+            row = await cursor.fetchone()
+            assert row is not None and row["category"] == "供应商付款"
+        finally:
+            await conn.close()
+
+    @pytest.mark.asyncio
     async def test_cross_month_match_uses_bank_date_for_bank_balance(self, temp_bank_db):
         from deps.auth import AuthContext
         from routers.bank import ConfirmSuggestionRequest, confirm_suggestion
@@ -849,6 +1085,57 @@ class TestBankReconciliation:
         payload = await self._entry_payload(entry_id)
         assert payload["occurDate"] == "2026-06-02"
         assert payload["paymentDate"] == "2026-05-31"
+
+    @pytest.mark.asyncio
+    async def test_difference_report_excludes_reversal_pairs_from_book_only(self, temp_bank_db):
+        from services.bank_service import get_difference_report
+
+        company_id = "c-bank-reversal-pair"
+        await self._insert_entry(company_id, {
+            "id": "normal-bank-entry",
+            "direction": "income",
+            "amount": 10,
+            "title": "正常银行入账",
+            "occurDate": "2026-08-10",
+            "voucherStatus": "posted",
+            "voucherLines": {
+                "debit": [{"accountCode": "1002", "accountName": "银行存款", "amount": 10}],
+                "credit": [{"accountCode": "5001", "accountName": "主营业务收入", "amount": 10}],
+            },
+        })
+        await self._insert_entry(company_id, {
+            "id": "reversed-bank-entry",
+            "direction": "income",
+            "amount": 5.95,
+            "title": "微信支付结算到账",
+            "occurDate": "2026-08-08",
+            "voucherStatus": "reversed",
+            "voucherLines": {
+                "debit": [{"accountCode": "1002", "accountName": "银行存款", "amount": 5.95}],
+                "credit": [{"accountCode": "1012001", "accountName": "微信支付待结算", "amount": 5.95}],
+            },
+        })
+        await self._insert_entry(company_id, {
+            "id": "bank-entry-reversal",
+            "reversalOf": "reversed-bank-entry",
+            "isReversal": True,
+            "entryType": "reversal",
+            "direction": "income",
+            "amount": -5.95,
+            "title": "冲销：微信支付结算到账",
+            "occurDate": "2026-08-08",
+            "voucherStatus": "posted",
+            "voucherLines": {
+                "debit": [{"accountCode": "1012001", "accountName": "微信支付待结算", "amount": 5.95}],
+                "credit": [{"accountCode": "1002", "accountName": "银行存款", "amount": 5.95}],
+            },
+        })
+
+        report = await get_difference_report(company_id, "2026-08")
+
+        assert [item["title"] for item in report["book_only"]] == ["正常银行入账"]
+        assert report["book_only_count"] == 1
+        assert report["balance_reconciliation"]["book_bank_balance"] == 10
 
     @pytest.mark.asyncio
     async def test_business_context_can_override_technical_service_to_r_and_d(self, temp_bank_db):
@@ -911,6 +1198,92 @@ class TestBankReconciliation:
         assert suggestions[0]["type"] == "new"
         assert suggestions[0]["suggestedEntry"]["direction"] == "income"
         assert suggestions[0]["suggestedEntry"]["accountCode"] == "5051"
+
+    @pytest.mark.asyncio
+    async def test_generic_wanglai_runs_llm_then_applies_industry_fallback(
+        self, temp_bank_db, monkeypatch
+    ):
+        """通用往来款应调用 LLM，模型未识别行业词时再由通用语义护栏补正。"""
+        from services import llm
+        from services.bank_service import ai_suggest_matches, import_statements_json
+
+        company_id = "c-bank-generic-wanglai-it"
+        await import_statements_json(company_id, [{
+            "transaction_date": "2026-05-31",
+            "description": "汇兑 | 附言: 往来款 (对方: 任意人工智能技术有限公司)",
+            "amount": -500,
+            "balance": 1000,
+        }], "bank-generic-wanglai-it")
+
+        calls = []
+
+        def fake_safe_chat_text_json(system_prompt, user_message, fallback, **kwargs):
+            calls.append(user_message)
+            return {
+                "direction": "expense",
+                "category": "往来款",
+                "accountCode": "122199",
+                "accountName": "其他应收款-待收款项",
+                "title": "往来暂付款",
+                "confidence": 0.35,
+                "reason": "银行摘要只写往来款",
+            }
+
+        monkeypatch.setattr(llm, "safe_chat_text_json", fake_safe_chat_text_json)
+
+        suggestions = await ai_suggest_matches(company_id, month="2026-05")
+
+        assert len(calls) == 1
+        assert "任意人工智能技术有限公司" in calls[0]
+        suggestion = suggestions[0]
+        assert "rule" not in suggestion
+        assert suggestion["suggestedEntry"]["category"] == "信息技术服务费"
+        assert suggestion["suggestedEntry"]["accountCode"] == "5602015"
+        assert suggestion["confidence"] == 0.72
+        assert suggestion["suggestedEntry"]["requiresConfirmation"] is True
+        assert "人工智能" in suggestion["reason"]
+        assert "往来款" in suggestion["reason"]
+
+    @pytest.mark.asyncio
+    async def test_generic_wanglai_llm_supplier_result_is_still_guarded(
+        self, temp_bank_db, monkeypatch
+    ):
+        """模型即使误判应付账款，没有采购证据也必须降为待确认。"""
+        from services import llm
+        from services.bank_service import ai_suggest_matches, import_statements_json
+
+        company_id = "c-bank-generic-wanglai-supplier-guard"
+        await import_statements_json(company_id, [{
+            "transaction_date": "2026-05-31",
+            "description": "汇兑 | 附言: 往来款 (对方: 任意科技有限公司)",
+            "amount": -500,
+            "balance": 1000,
+        }], "bank-generic-wanglai-supplier-guard")
+
+        calls = []
+
+        def fake_safe_chat_text_json(system_prompt, user_message, fallback, **kwargs):
+            calls.append(user_message)
+            return {
+                "direction": "expense",
+                "category": "供应商付款",
+                "accountCode": "2202",
+                "accountName": "应付账款",
+                "title": "供应商付款",
+                "confidence": 0.92,
+                "reason": "根据公司名称推测供应商付款",
+            }
+
+        monkeypatch.setattr(llm, "safe_chat_text_json", fake_safe_chat_text_json)
+
+        suggestions = await ai_suggest_matches(company_id, month="2026-05")
+
+        assert len(calls) == 1
+        suggested_entry = suggestions[0]["suggestedEntry"]
+        assert suggested_entry["category"] == "其他支出"
+        assert suggested_entry["accountCode"] == "5602999"
+        assert suggested_entry["confidence"] == 0.45
+        assert suggested_entry["requiresConfirmation"] is True
 
     @pytest.mark.asyncio
     async def test_classify_single_statement_infers_missing_direction_and_keeps_category(
@@ -1876,6 +2249,17 @@ class TestBankReconciliation:
 
 
 class TestWechatBill:
+    @pytest.fixture(autouse=True)
+    def _default_vat_config(self, monkeypatch):
+        """微信导入直调 service 的用例不打真库读公司档案，统一用缺省小规模 1% 口径。"""
+        from services import wechat_bill_service
+        from services.vat_service import VatConfig
+
+        async def fake_vat_config(company_id):
+            return VatConfig()
+
+        monkeypatch.setattr(wechat_bill_service, "get_vat_config_by_id", fake_vat_config)
+
     @pytest.mark.asyncio
     async def test_cross_batch_full_refund_closes_unsettled_historical_order(self, monkeypatch):
         from services import wechat_bill_service
@@ -2143,10 +2527,25 @@ class TestWechatBill:
         refund_entry = next(e for e in saved_batches[0] if e.get("remark") == "微信退款冲销")
         assert refund_entry["amount"] == -30
         assert refund_entry["direction"] == "income"
+        # 退款红冲：税额随收入镜像记借方（30 / 1.01 = 29.70，税 0.30）
+        refund_debits = {line["accountCode"]: line["amount"] for line in refund_entry["voucherLines"]["debit"]}
+        assert refund_debits["5001"] == Decimal("29.70")
+        assert refund_debits["2221026"] == Decimal("0.30")
+        assert [line["accountCode"] for line in refund_entry["voucherLines"]["credit"]] == ["1012001"]
+        assert refund_entry["vatSeparated"] is True
+        assert refund_entry["vatAmount"] == Decimal("-0.30")
+        assert refund_entry["amountExcludingTax"] == Decimal("-29.70")
 
         revenue_entry = saved_batches[0][0]
         assert revenue_entry["voucherLines"]["debit"][0]["accountCode"] == "1012001"
-        assert revenue_entry["voucherLines"]["credit"][0]["accountCode"] == "5001"
+        # 价税分离：贷 5001 不含税 + 贷 2221026 应交增值税（100 / 1.01 = 99.01）
+        revenue_credits = {line["accountCode"]: line["amount"] for line in revenue_entry["voucherLines"]["credit"]}
+        assert revenue_credits["5001"] == Decimal("99.01")
+        assert revenue_credits["2221026"] == Decimal("0.99")
+        assert sum(revenue_credits.values()) == revenue_entry["voucherLines"]["debit"][0]["amount"]
+        assert revenue_entry["vatSeparated"] is True
+        assert revenue_entry["vatAmount"] == Decimal("0.99")
+        assert revenue_entry["amountExcludingTax"] == Decimal("99.01")
 
         fee_entry = saved_batches[0][1]
         assert fee_entry["voucherLines"]["debit"][0]["accountCode"] == "5603002"
@@ -2366,3 +2765,127 @@ class TestBankBatchDeleteApi:
     def test_batch_delete_validates_ids(self, client, auth_headers):
         response = client.post("/api/bank/statements/batch-delete", json={"ids": []}, headers=auth_headers)
         assert response.status_code == 422
+
+
+class TestVoucherPreviewApi:
+    """结账向导第二步：付款方式/分类 → 借贷预览（只读）。"""
+
+    def test_preview_requires_auth(self, client):
+        response = client.post(
+            "/api/record/entries/whatever/voucher-preview",
+            json={"payer": "boss_personal"},
+        )
+        assert response.status_code == 401
+
+    def test_preview_returns_balanced_lines_without_persisting(self, client, auth_headers):
+        entry_id = "preview-api-2031"
+        created = client.post(
+            "/api/record/confirm",
+            json={
+                "id": entry_id,
+                "direction": "expense",
+                "amount": "481.33",
+                "category": "业务招待费",
+                "title": "腾讯云服务器",
+                "occurDate": "2031-09-18",
+                "sourceType": "integration_test",
+                "dedupFingerprint": entry_id,
+            },
+            headers={**auth_headers, "Idempotency-Key": f"confirm:{entry_id}"},
+        )
+        assert created.status_code == 200, created.text
+
+        response = client.post(
+            f"/api/record/entries/{entry_id}/voucher-preview",
+            json={"payer": "boss_personal", "category": "信息技术服务费"},
+            headers=auth_headers,
+        )
+        assert response.status_code == 200, response.text
+        data = response.json()
+        assert data["category"] == "信息技术服务费"
+        assert data["payer"] == "boss_personal"
+        assert data["debit"][0]["accountCode"] == "5602015"
+        assert data["credit"][0]["accountCode"] == "2241"
+        assert data["credit"][0]["partnerName"] == "股东"
+
+        # 只读：预览结束后凭证仍是原样
+        entries = client.get("/api/record/entries", headers=auth_headers).json()["entries"]
+        entry = next(item for item in entries if item["id"] == entry_id)
+        assert entry["category"] == "业务招待费"
+
+    def test_preview_accepts_rd_detail_so_card_inline_allocation_can_confirm(self, client, auth_headers):
+        """研发分类的预览必须收 rdProjectId/rdExpenseType，否则卡片内选它必 422。
+
+        回归：预览接口曾经只透传 payer/paymentStatus/category，用户在结账第二步
+        选中「研发支出-费用化支出」后预览直接 RD_DETAIL_REQUIRED，看上去像分类不可用，
+        但同一份明细落到 PATCH 却能通过——所见与所记不一致。
+        """
+        project = client.post(
+            "/api/rd/projects",
+            headers=auth_headers,
+            json={
+                "code": "RD-" + uuid.uuid4().hex[:8],
+                "name": "预览研发项目",
+                "startDate": "2031-01-01",
+                "endDate": "2031-12-31",
+                "status": "active",
+                "initiationDocumentStatus": "complete",
+            },
+        ).json()
+        entry_id = "preview-rd-2031"
+        created = client.post(
+            "/api/record/confirm",
+            json={
+                "id": entry_id,
+                "direction": "expense",
+                "amount": "481.33",
+                "category": "其他支出",
+                "title": "腾讯云计算服务费",
+                "occurDate": "2031-09-18",
+                "sourceType": "integration_test",
+                "dedupFingerprint": entry_id,
+            },
+            headers={**auth_headers, "Idempotency-Key": f"confirm:{entry_id}"},
+        )
+        assert created.status_code == 200, created.text
+
+        # 不带研发明细：预览明确拒绝，前端据此提示「先选项目和费用类别」
+        missing = client.post(
+            f"/api/record/entries/{entry_id}/voucher-preview",
+            json={"payer": "boss_personal", "category": "研发支出-费用化支出"},
+            headers=auth_headers,
+        )
+        assert missing.status_code == 422
+        assert missing.json()["detail"]["code"] == "RD_DETAIL_REQUIRED"
+
+        # 带上研发明细：预览返回 4301 明细科目，与落账同一套规则
+        preview = client.post(
+            f"/api/record/entries/{entry_id}/voucher-preview",
+            json={
+                "payer": "boss_personal",
+                "category": "研发支出-费用化支出",
+                "rdProjectId": project["id"],
+                "rdExpenseType": "direct_input",
+                "rdOriginalAmount": "481.33",
+                "rdAllocationMethod": "direct",
+            },
+            headers=auth_headers,
+        )
+        assert preview.status_code == 200, preview.text
+        data = preview.json()
+        assert data["debit"][0]["accountCode"] == "430100102"
+        assert "直接投入" in data["debit"][0]["accountName"]
+        assert data["credit"][0]["accountCode"] == "2241"
+
+        # 预览只读：凭证分类没有被动过
+        entries = client.get("/api/record/entries", headers=auth_headers).json()["entries"]
+        entry = next(item for item in entries if item["id"] == entry_id)
+        assert entry["category"] == "其他支出"
+
+    def test_preview_rejects_unknown_entry(self, client, auth_headers):
+        response = client.post(
+            "/api/record/entries/does-not-exist/voucher-preview",
+            json={"payer": "boss_personal"},
+            headers=auth_headers,
+        )
+        assert response.status_code == 404

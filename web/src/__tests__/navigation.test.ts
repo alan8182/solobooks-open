@@ -17,16 +17,20 @@ describe('sidebar navigation structure', () => {
       '/',
       '/copilot',
       '/todos',
-      '/private-expenses',
       '/ledger',
       '/invoices',
       '/bank',
       '/closing-wizard',
       '/tax-filing',
       '/reports',
+      // 工资薪金不再占顶层独立导航：老板视图由「月度结账（/closing-wizard）」核对确认，
+      // 会计视图收敛于「专项核算 -> 薪酬管理」。
       // 项目利润不再占导航位：入口收敛到「经营报表」页的项目利润卡片，
       // 路由 /aggregation/report 保留（卡片跳转与旧链接不受影响）。
+      // 小私账不再占顶层独立导航：老板视图下由「资金流水（/bank）」统领公户与私账双 Tab，
+      // 会计视图下收敛于「专项核算 -> 老板私账」。
     ])
+    expect(topLevelPaths).not.toContain('/mine/salary')
     expect(topLevelPaths).not.toContain('/aggregation/report')
     expect(topLevelPaths).not.toContain('/record/text')
   })
@@ -57,6 +61,7 @@ describe('sidebar navigation structure', () => {
     expect(settings?.children?.map((item) => item.path)).toEqual([
       // 税费种认定：税局口径的配置
       '/tax-registration',
+      '/mine/audit-share',
       '/mine/accounts',
       '/mine/contacts',
       '/mine/opening',
@@ -100,8 +105,38 @@ describe('sidebar navigation structure', () => {
     expect(router.resolve('/todos').meta.workspace).toBeUndefined()
     expect(router.resolve('/reports').meta.workspace).toBeUndefined()
     expect(router.resolve('/closing-wizard').meta.workspace).toBeUndefined()
+    expect(router.resolve('/mine/salary').meta.workspace).toBeUndefined()
     expect(router.resolve('/tax-filing').meta.workspace).toBeUndefined()
     expect(router.resolve('/aggregation/report').meta.workspace).toBeUndefined()
+    expect(router.resolve('/bank').meta.workspace).toBeUndefined()
+    expect(router.resolve('/private-expenses').meta.workspace).toBeUndefined()
+    expect(router.resolve('/mine/audit-share').meta.workspace).toBeUndefined()
+  })
+
+  it('exposes /bank as 资金流水 in boss view and maintains exactly 7 primary items in boss view (salary folded into closing-wizard)', () => {
+    const bankItem = NAV_ITEMS.find((item) => item.path === '/bank')
+    expect(bankItem).toBeDefined()
+    expect(bankItem?.label).toBe('银行流水')
+    expect(bankItem?.bossLabel).toBe('资金流水')
+    expect(bankItem?.bossGroup).toBe('每天')
+
+    // 工资薪金已从老板视图顶层菜单移除（操作收敛到月度结账向导），会计端仍在专项核算中
+    const salaryBossItem = NAV_ITEMS.find((item) => item.path === '/mine/salary' && (!item.workspace || item.workspace.includes('boss')))
+    expect(salaryBossItem).toBeUndefined()
+
+    // 老板视图侧边栏主菜单保持 7 项（极简无负担：每月 2 + 每天 4 + 复盘 1）
+    const bossVisibleItems = NAV_ITEMS.filter((item) => !item.workspace || item.workspace.includes('boss'))
+    const bossMainItems = bossVisibleItems.filter((item) => item.label !== '设置' && item.bossGroup !== '设置')
+    expect(bossMainItems.map((item) => item.path)).toEqual([
+      '/',
+      '/copilot',
+      '/todos',
+      '/bank',
+      '/closing-wizard',
+      '/tax-filing',
+      '/reports',
+    ])
+    expect(bossMainItems).toHaveLength(7)
   })
 })
 
@@ -162,9 +197,15 @@ describe('auth redirect guard rules', () => {
 
 describe('wide table and report container responsive width rules', () => {
   it('ensures report-container is expanded beyond the legacy 920px bottleneck', async () => {
-    // ponytail: ensures multi-column financial tables have sufficient breathing room (1200px+)
+    // ponytail: ensures multi-column financial tables have sufficient breathing room (1200px+).
+    // 宽度真值在 variables.css 的 --page-width 三档变量里（layout.css 注释有分档说明），
+    // reports.css 只引用变量，所以这里同时断言变量定义与引用，防止任何一侧被改丢。
     const fs = await import('node:fs')
     const path = await import('node:path')
+    const variablesCss = fs.readFileSync(
+      path.resolve(__dirname, '../assets/styles/variables.css'),
+      'utf-8',
+    )
     const reportsCss = fs.readFileSync(
       path.resolve(__dirname, '../assets/styles/reports.css'),
       'utf-8',
@@ -174,7 +215,8 @@ describe('wide table and report container responsive width rules', () => {
       'utf-8',
     )
 
-    expect(reportsCss).toContain('max-width: 1240px;')
+    expect(variablesCss).toContain('--page-width: 1240px;')
+    expect(reportsCss).toContain('max-width: var(--page-width);')
     expect(reportsCss).not.toMatch(/\.report-container\s*\{\s*max-width:\s*920px;/)
     expect(closingWizardCss).toContain('.closing-wizard--wide')
     expect(closingWizardCss).toContain('max-width: 1240px;')

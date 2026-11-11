@@ -74,10 +74,10 @@ describe('AI 连接中心页面', () => {
     expect(wrapper.find('.inject-warn').exists()).toBe(true)
   })
 
-  it('工具清单只列名字，24 个全部渲染', async () => {
+  it('工具清单只列名字，27 个全部渲染', async () => {
     const wrapper = await mountPage()
     const chips = wrapper.findAll('.tool-chips code')
-    expect(chips).toHaveLength(24)
+    expect(chips).toHaveLength(27)
     expect(chips.map((c) => c.text())).toContain('propose_voucher')
   })
 })

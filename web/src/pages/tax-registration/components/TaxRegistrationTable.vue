@@ -31,7 +31,6 @@ const props = defineProps<{
   rows: TaxRegistrationRow[]
   loading: boolean
   showInactive: boolean
-  filingEntryHint: string
   saving: boolean
 }>()
 
@@ -282,7 +281,6 @@ const columns = computed<DataTableColumns<TaxRegistrationRow>>(() => [
       <div class="card-head">
         <div class="card-head-left">
           <span class="card-title">认定明细</span>
-          <span class="card-sub">{{ filingEntryHint }}</span>
         </div>
         <NSpace align="center" :size="10">
           <span class="switch-label">含已停用</span>

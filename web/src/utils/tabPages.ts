@@ -54,11 +54,15 @@ const TITLE_INDEX: Map<string, TabTitleEntry> = (() => {
   const index = new Map<string, TabTitleEntry>()
   const walk = (items: NavItem[]) => {
     for (const item of items) {
-      if (item.path) index.set(item.path, { label: item.label, bossLabel: item.bossLabel })
+      if (item.path) {
+        const existing = index.get(item.path)
+        index.set(item.path, { label: item.label, bossLabel: item.bossLabel ?? existing?.bossLabel })
+      }
       if (item.children?.length) {
         for (const child of item.children) {
           if (!child.path) continue
-          const bossLabel = (child as { bossLabel?: string }).bossLabel
+          const existing = index.get(child.path)
+          const bossLabel = child.bossLabel ?? existing?.bossLabel
           index.set(child.path, { label: child.label, bossLabel })
         }
       }

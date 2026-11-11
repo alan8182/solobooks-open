@@ -7,11 +7,13 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 from decimal import Decimal
 from urllib.parse import quote
-from fastapi import APIRouter, Depends, HTTPException, Response
+import base64
+from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
 from pydantic import BaseModel, Field
 
 from deps.auth import AuthContext, require_auth
 import services.salary_service as service
+from services.zhipu_ocr import resolve_receipt_image_mime, validate_receipt_image_bytes
 
 router = APIRouter(prefix="/api/salary", tags=["salary"], dependencies=[Depends(require_auth)])
 
@@ -48,6 +50,10 @@ class RecordUpdateItem(BaseModel):
     personal_social_security: Decimal
     personal_tax: Decimal
     company_social_security: Decimal
+    personal_social_insurance: Optional[Decimal] = Field(default=None, ge=0)
+    personal_housing_fund: Optional[Decimal] = Field(default=None, ge=0)
+    company_social_insurance: Optional[Decimal] = Field(default=None, ge=0)
+    company_housing_fund: Optional[Decimal] = Field(default=None, ge=0)
 
 class SheetRecordsUpdate(BaseModel):
     records: List[RecordUpdateItem]
@@ -186,6 +192,34 @@ async def preview_tax(req: TaxPreviewRequest, ctx: AuthContext = Depends(require
         raise HTTPException(status_code=400, detail=str(e))
 
 
+class TaxPreviewBatchItem(BaseModel):
+    employeeId: str = Field(..., min_length=1)
+    gross: Decimal = Field(default=Decimal("0"), ge=0)
+    withheld: Decimal = Field(default=Decimal("0"), ge=0)
+    specialAdditional: Optional[Decimal] = Field(default=None, ge=0)
+    otherDeduction: Decimal = Field(default=Decimal("0"), ge=0)
+
+
+class TaxPreviewBatchRequest(BaseModel):
+    month: str = Field(..., pattern=r"^\d{4}-\d{2}$")
+    items: List[TaxPreviewBatchItem]
+
+
+@router.post("/tax/preview-batch")
+async def preview_tax_batch(req: TaxPreviewBatchRequest, ctx: AuthContext = Depends(require_auth)):
+    """批量试算整张工资表员工在指定月份应预扣的个税。"""
+    from services.salary_iit_service import preview_sheet_individual_income_tax
+
+    try:
+        return await preview_sheet_individual_income_tax(
+            ctx.company_id,
+            req.month,
+            [item.model_dump() for item in req.items],
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 
 @router.put("/rates")
 async def put_rates(
@@ -207,6 +241,34 @@ async def put_rates(
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
     return result
+
+
+@router.post("/rates/parse-screenshot")
+async def parse_rates_screenshot(
+    file: UploadFile = File(...),
+    ctx: AuthContext = Depends(require_auth),
+):
+    """上传或粘贴税务局社保核定表/明细截图 → 多模态视觉大模型提取费率。"""
+    content = await file.read()
+    mime = resolve_receipt_image_mime(file.content_type, file.filename)
+    try:
+        validate_receipt_image_bytes(content, mime)
+    except ValueError as exc:
+        message = str(exc)
+        raise HTTPException(
+            status_code=413 if ("超过" in message or "最大" in message) else 415,
+            detail=message,
+        ) from exc
+
+    data_url = f"data:{mime};base64,{base64.b64encode(content).decode('ascii')}"
+    try:
+        return await service.parse_tax_rates_screenshot(
+            data_url,
+            user_id=ctx.user_id,
+            company_id=ctx.company_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"截图识别失败：{exc}") from exc
 
 
 @router.put("/sheets/{month}/records")

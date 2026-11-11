@@ -370,6 +370,10 @@ async def _seed_owner_payroll(
         [
             {
                 **record,
+                "personal_social_insurance": str(amounts["personal_social"]),
+                "company_social_insurance": str(amounts["company_social"]),
+                "personal_housing_fund": str(amounts["personal_hf"]),
+                "company_housing_fund": str(amounts["company_hf"]),
                 "personal_social_security": str(amounts["personal_total"]),
                 "company_social_security": str(amounts["company_total"]),
                 "personal_tax": "0.00",
@@ -910,7 +914,7 @@ async def _recompute_balances(company_id: str) -> None:
     try:
         cursor = await conn.execute(
             "SELECT id, amount FROM bank_statements WHERE company_id = ? "
-            "ORDER BY transaction_date, id",
+            "ORDER BY transaction_date, source_row_index IS NULL, source_row_index, id",
             (company_id,),
         )
         balance = Decimal("0")

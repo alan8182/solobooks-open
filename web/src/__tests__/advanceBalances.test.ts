@@ -8,7 +8,6 @@ import { mount } from '@vue/test-utils'
 import { nextTick } from 'vue'
 import AdvanceBalances from '@/pages/report/advance-balances.vue'
 import apiClient from '@/api/client'
-import router from '@/router'
 
 vi.mock('@/api/client', () => ({
   default: {

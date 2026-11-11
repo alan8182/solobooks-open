@@ -533,7 +533,7 @@ onMounted(async () => {
 
 <style scoped>
 .agg-dim-page {
-  max-width: 1080px;
+  max-width: var(--page-width);
   margin: 0 auto;
 }
 .page-header {

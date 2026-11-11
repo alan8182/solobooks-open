@@ -65,7 +65,7 @@
 
 1. 登录 [WorkBuddy 开放平台控制台](https://open.workbuddy.cn)；
 2. 进入 **资产管理 → 连接器 → 创建连接器**；
-3. 参照本仓库提供的元数据定义文件 [`deploy/workbuddy/connector-meta.json`](file:///Users/ecarx/Documents/solobooks/deploy/workbuddy/connector-meta.json) 填写基础资料（或直接导入资料包）：
+3. 参照本仓库提供的元数据定义文件 [`deploy/workbuddy/connector-meta.json`](../deploy/workbuddy/connector-meta.json) 填写基础资料（或直接导入资料包）：
    - **标识符 (source)**：`solobooks-accounting`
    - **中文名称 (name_zh)**：`梭罗记账`
    - **英文名称 (name_en)**：`SoloBooks`
@@ -75,7 +75,22 @@
    - **通信协议**：`MCP (Model Context Protocol)`
    - **服务地址**：`https://solobooks.cn/mcp`
    - **鉴权类型**：`Bearer Token`（提示用户输入 `sbk_...` 格式个人令牌）
-4. 勾选关联技能：导入本仓库 [`skills/solobooks-tax-filing`](file:///Users/ecarx/Documents/solobooks/skills/solobooks-tax-filing)（半自动纳税申报伴侣）；
+
+   > **平台格式审核硬性要求（2026-10-25 审核退回后补充，三处必须一致）**：
+   > 1. `connector-meta.json` 必须声明 `"auth_mode": "token"`（用户自填凭证）与
+   >    `"minWorkbuddyVersion": "4.23.0"`；缺省 auth_mode 会被平台按「无需认证」处理，
+   >    用户连接时不会出现凭证填写表单。
+   > 2. 包内 `mcp.json` 的凭证必须用 `${变量名}` 占位符
+   >    （如 `"Authorization": "Bearer ${SOLOBOOKS_ACCOUNTING_TOKEN}"`，变量名仅限大写字母、
+   >    数字、下划线），不能写中文替换提示文字——平台只替换 `${...}` 占位符，
+   >    其余内容会原样发给服务端导致认证失败。
+   > 3. 包根目录（与 `connector-meta.json` 同级）必须有 `token-schema.json`
+   >    （含 `title` / `description` / `fields`），`fields[].key` 必须与 `mcp.json`
+   >    中 `${...}` 的变量名完全一致，平台据此生成用户填写凭证的表单。
+   >
+   > 上架包内 `mcp.json` 由平台读取并替换占位符；方式一手动本地配置请使用
+   > `deploy/workbuddy/mcp.json.template`（该文件用于用户手填真实令牌，不走平台替换机制）。
+4. 勾选关联技能：导入本仓库 [`skills/solobooks-tax-filing`](../skills/solobooks-tax-filing)（半自动纳税申报伴侣）；
 5. 提交平台审核，审核通过后状态变为“已启用”。
 
 ---

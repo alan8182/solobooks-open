@@ -902,7 +902,7 @@ watch(reportKind, async () => {
 </template>
 
 <style scoped>
-.agg-line-rules { max-width: 1320px; margin: 0 auto; }
+.agg-line-rules { max-width: var(--page-width); margin: 0 auto; }
 .page-header { display: flex; justify-content: space-between; gap: 20px; align-items: flex-start; margin-bottom: 20px; }
 .page-header h2 { margin: 0; font-size: 22px; }
 .page-header p { margin: 5px 0 0; color: var(--solo-text-secondary); font-size: 13px; }

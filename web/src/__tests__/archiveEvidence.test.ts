@@ -11,7 +11,7 @@ describe('archiveEvidence helper', () => {
     const tip = getEvidenceTip({
       category: '其他应付款-老板垫付',
       summary: '老板垫付购买办公电脑',
-      amount: '5999.00',
+      amount: 5999,
       docType: 'has_invoice',
     })
     expect(tip).not.toBeNull()
@@ -25,7 +25,7 @@ describe('archiveEvidence helper', () => {
     const tip = getEvidenceTip({
       category: '管理费用-差旅费',
       summary: '张三出差深圳差旅费报销',
-      amount: '1280.00',
+      amount: 1280,
       docType: 'has_invoice',
     })
     expect(tip).not.toBeNull()
@@ -39,7 +39,7 @@ describe('archiveEvidence helper', () => {
     const tip = getEvidenceTip({
       category: '主营业务成本-技术外包',
       summary: '小程序前端UI外包开发',
-      amount: '15000.00',
+      amount: 15000,
       docType: 'has_invoice',
     })
     expect(tip).not.toBeNull()
@@ -53,7 +53,7 @@ describe('archiveEvidence helper', () => {
     const tip = getEvidenceTip({
       category: '管理费用-办公费',
       summary: '门市换锁修门',
-      amount: '160.00',
+      amount: 160,
       docType: 'no_document',
     })
     expect(tip).not.toBeNull()
@@ -66,7 +66,7 @@ describe('archiveEvidence helper', () => {
     const tip = getEvidenceTip({
       category: '管理费用-其他',
       summary: '展会临时场地租赁',
-      amount: '8000.00',
+      amount: 8000,
       docType: 'no_document',
     })
     expect(tip).not.toBeNull()
@@ -79,7 +79,7 @@ describe('archiveEvidence helper', () => {
     const tip = getEvidenceTip({
       category: '主营业务收入',
       summary: '销售软件授权收入',
-      amount: '20000.00',
+      amount: 20000,
       docType: 'has_invoice',
     })
     expect(tip).toBeNull()

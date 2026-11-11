@@ -31,7 +31,41 @@ npm run dev -- --host 127.0.0.1 --port 5173
 
 热更新访问地址为 `http://127.0.0.1:5173/`；Vite 会把 `/api` 代理到 `http://127.0.0.1:8001`。修改 Python/Vue 文件后会自动重载，不需要重新构建 Docker 镜像。
 
-本机 PostgreSQL 已导入原 SQLite 测试数据，因此测试账户会看到原有公司和凭证；不要再对本机库重复执行正式迁移，除非先恢复备份或重建专用测试数据库。
+本机 PostgreSQL 已导入原 SQLite 测试数据，因此测试账户会看到原有公司和凭证。
+
+### 本地库保持与迁移同步（必做）
+
+应用代码假定本地库已跑齐 Alembic 迁移——运行期 `_ensure_schema` 的补列逻辑按 SQLite
+写就，PostgreSQL 缺列时不会自动补齐，会直接全局 500（2026-11 曾因本地库漂移 4 个迁移
+导致所有接口 500）。拉取到含新迁移的代码后，在 `backend` 目录执行：
+
+```powershell
+.\venv\Scripts\python.exe scripts\migrate_local.py          # upgrade head
+.\venv\Scripts\python.exe scripts\migrate_local.py current  # 查看当前版本
+```
+
+脚本强制使用 `backend/.env` 里的 `MIGRATION_DATABASE_URL`（`solobooks_owner` 专用
+连接串，占位见 `.env.example`，与 `solobooks_app` 密码不同），缺配置时直接报错，
+不会静默连到 alembic.ini 的 SQLite 副本。**勿用 `python -m alembic` 裸命令跑本地库**
+——不带 DATABASE_URL 时它连的是 SQLite，这正是当初漂移没被发现的原因。
+
+已执行过的迁移不要重复执行；本地调试回退用 `migrate_local.py downgrade -1`；
+生产/演练环境迁移仍走 `deploy/deploy.sh`（backend 容器启动时自动执行）与
+`docs/finance-core-runbook.md` 的流程。
+
+## 生产部署
+
+统一用 `deploy/deploy.sh`，不要手动在服务器上 build（小内存机禁止并行构建）：
+
+```bash
+bash deploy/preflight.sh            # 部署前门禁：后端 pytest + 前端 vitest/类型检查/构建/预渲染（也可单独当全量回归）
+bash deploy/deploy.sh --check       # 演练：全部检查 + rsync 预览，不改服务器
+bash deploy/deploy.sh               # 正式部署：要求工作区已提交；自动做部署前快照与回滚锚点
+bash deploy/deploy.sh --verify      # 线上只读核验
+bash deploy/deploy.sh --rollback    # 镜像切回上一版（不回滚数据库）
+```
+
+部署遇到的问题按编号（D-xxx）记录在 solobooks-deploy skill 的 `DEPLOY-LOG.md`，脚本注释引用同一编号。
 
 ## 推荐命令
 

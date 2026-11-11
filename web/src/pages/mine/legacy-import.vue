@@ -16,6 +16,15 @@ import type { BalanceParseResponse, MappingSuggestion, ParseIssue, VoucherParseR
 import { SoloMonthPicker } from '@/components/ui'
 import { formatMoney } from '@/utils/format'
 import { saveWorkbook } from '@/utils/export'
+import {
+  checkOpeningPeriod,
+  describeExpectedPeriod,
+  detectStatementPeriod,
+  expectedOpeningPeriod,
+  sheetToRows,
+  type StatementPeriod,
+} from '@/utils/openingBalanceImport'
+import { openingCutoffOptions } from '@/utils/openingPeriod'
 
 type Mode = 'balance' | 'voucher'
 
@@ -38,6 +47,12 @@ const postDirectly = ref(false)
 const mappingOverrides = ref<Record<string, string>>({})
 const accountOptions = ref<{ label: string; value: string }[]>([])
 
+// 余额表的报表期间：与建账月比对，不符时不允许直接生成期初凭证
+const statementPeriod = ref<StatementPeriod | null>(null)
+const manualPeriod = ref<StatementPeriod | null>(null)
+const cutoffMonth = ref('')
+const periodChecked = ref(false)
+
 const stepUpVisible = ref(false)
 const phone = ref('')
 const code = ref('')
@@ -51,6 +66,56 @@ const suggestions = computed<MappingSuggestion[]>(() => parsed.value?.suggestion
 
 const balanceTotals = computed(() => (mode.value === 'balance' ? balanceResult.value?.totals : null))
 const voucherTotals = computed(() => (mode.value === 'voucher' ? voucherResult.value?.totals : null))
+
+/** 生效的建账年月：启用期间优先，未填则与后端默认一致落到当年 1 月 */
+const effectiveStart = computed(() => {
+  const match = /^(\d{4})-(\d{2})$/.exec(String(startPeriod.value || ''))
+  if (match) return { year: Number(match[1]), month: match[2] }
+  return { year: fiscalYear.value, month: '01' }
+})
+
+const expectedPeriodLabel = computed(() =>
+  describeExpectedPeriod(expectedOpeningPeriod(effectiveStart.value.year, effectiveStart.value.month)),
+)
+
+const periodCheck = computed(() => {
+  if (mode.value !== 'balance' || !periodChecked.value) return null
+  // 表头期间优先：手选截止月只能给「识别不到期间」的表兜底
+  return checkOpeningPeriod(
+    statementPeriod.value ?? manualPeriod.value,
+    effectiveStart.value.year,
+    effectiveStart.value.month,
+  )
+})
+
+const periodBlocked = computed(() => Boolean(periodCheck.value && !periodCheck.value.ok))
+
+const cutoffOptions = computed(() =>
+  openingCutoffOptions(effectiveStart.value.year, effectiveStart.value.month)
+    .map(value => ({ label: value, value })),
+)
+
+function defaultCutoff(): string {
+  const expected = expectedOpeningPeriod(effectiveStart.value.year, effectiveStart.value.month)
+  return `${expected.endYear}-${String(expected.endMonth).padStart(2, '0')}`
+}
+
+function applyCutoff() {
+  // 表头已识别出期间就不允许手选覆盖，否则错月份的表也能通过
+  if (statementPeriod.value) return
+  if (!cutoffMonth.value) {
+    manualPeriod.value = null
+    return
+  }
+  const [year, month] = cutoffMonth.value.split('-').map(Number)
+  manualPeriod.value = {
+    startYear: year,
+    startMonth: 1,
+    endYear: year,
+    endMonth: month,
+    label: `手动选择截止 ${cutoffMonth.value}`,
+  }
+}
 
 function downloadTemplate() {
   const headers = mode.value === 'balance'
@@ -72,11 +137,17 @@ async function onFilePicked(event: Event) {
     const buffer = await file.arrayBuffer()
     const workbook = XLSX.read(buffer, { type: 'array' })
     const sheet = workbook.Sheets[workbook.SheetNames[0]]
-    rawRows.value = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false })
+    // 第三方导出前几行常是标题/期间/单位，表头可能是双层合并单元格；
+    // 直接 sheet_to_json 会把标题行当表头，79 行数据全变成 __EMPTY_*。
+    rawRows.value = sheetToRows(sheet, { raw: false })
     if (rawRows.value.length === 0) {
       message.warning('文件里没有数据行')
       return
     }
+    statementPeriod.value = mode.value === 'balance' ? detectStatementPeriod(sheet) : null
+    manualPeriod.value = null
+    periodChecked.value = mode.value === 'balance'
+    cutoffMonth.value = defaultCutoff()
     await runParse()
   } catch {
     message.error('无法读取该文件，请确认是 Excel（.xlsx/.xls）')
@@ -119,6 +190,10 @@ function reset() {
   voucherResult.value = null
   mappingOverrides.value = {}
   postDirectly.value = false
+  statementPeriod.value = null
+  manualPeriod.value = null
+  cutoffMonth.value = ''
+  periodChecked.value = false
 }
 
 function transferToOpening() {
@@ -437,16 +512,40 @@ onMounted(loadAccounts)
               <SoloMonthPicker v-model:value="startPeriod" clearable style="width: 140px;" />
             </NFormItem>
             <span class="confirm-hint">可先带入期初设置细调，或直接验证生成期初凭证</span>
-            <NButton secondary type="primary" :disabled="issues.length > 0" @click="transferToOpening">
+            <NButton secondary type="primary" :disabled="issues.length > 0 || periodBlocked" @click="transferToOpening">
               带入期初设置细调
             </NButton>
-            <NButton type="primary" :loading="confirming" :disabled="issues.length > 0" @click="startConfirm">直接验证并导入</NButton>
+            <NButton type="primary" :loading="confirming" :disabled="issues.length > 0 || periodBlocked" @click="startConfirm">直接验证并导入</NButton>
           </div>
           <div v-else class="confirm-row">
             <NCheckbox v-model:checked="postDirectly">导入后直接过账（默认生成草稿待审）</NCheckbox>
             <NButton type="primary" :loading="confirming" :disabled="issues.length > 0" @click="startConfirm">
               确认导入 {{ voucherTotals?.vouchers || 0 }} 张凭证
             </NButton>
+          </div>
+
+          <div v-if="mode === 'balance' && periodCheck" class="period-status">
+            <NAlert :type="periodCheck.ok ? 'success' : 'error'" :bordered="false">
+              <template v-if="periodCheck.ok">
+                表格期间已确认（{{ (manualPeriod ?? statementPeriod)?.label || '按账套建账期间' }}）：资产负债取期末余额，损益取本年累计发生额。
+              </template>
+              <template v-else>
+                <div>{{ periodCheck.message }}</div>
+                <div v-if="!statementPeriod" class="period-cutoff-row">
+                  <span>这份表截止到：</span>
+                  <NSelect
+                    v-model:value="cutoffMonth"
+                    :options="cutoffOptions"
+                    size="small"
+                    style="width: 130px;"
+                    @update:value="applyCutoff"
+                  />
+                </div>
+                <div class="period-help">
+                  建账期间 {{ effectiveStart.year }}-{{ effectiveStart.month }} 需要 {{ expectedPeriodLabel }} 的科目余额表。
+                </div>
+              </template>
+            </NAlert>
           </div>
         </NCard>
       </NSpin>
@@ -517,6 +616,9 @@ onMounted(loadAccounts)
 .confirm-row { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
 .confirm-row :deep(.n-form-item) { margin-bottom: 0; }
 .confirm-hint { font-size: 12px; color: var(--solo-text-muted); margin-left: auto; }
+.period-status { margin-top: 12px; }
+.period-cutoff-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.period-help { margin-top: 6px; font-size: 12px; color: var(--solo-text-muted); }
 .stepup-hint { font-size: 12.5px; color: var(--solo-text-muted); margin: 0 0 12px; }
 .code-row { display: flex; gap: 8px; width: 100%; }
 .modal-footer { display: flex; justify-content: flex-end; gap: 8px; }

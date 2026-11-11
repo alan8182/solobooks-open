@@ -42,7 +42,8 @@ from services.accounting_core_service import (
     record_audit,
 )
 
-RD_EXPENSE_ACCOUNT = ("430100103", "研发支出-折旧与摊销")
+# 名称与 chart_of_accounts.json 一致（子科目名自带直接父级前缀）
+RD_EXPENSE_ACCOUNT = ("430100103", "研发支出-费用化支出-折旧与摊销")
 
 
 def _now() -> datetime:

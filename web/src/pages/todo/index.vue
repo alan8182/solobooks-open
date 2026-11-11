@@ -3,14 +3,15 @@
 import { usePageRefresh } from '@/composables/usePageRefresh'
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import { NButton, NSpin, useMessage, NCheckbox, NPopconfirm, NDropdown, NInput } from 'naive-ui'
+import { NButton, NSpin, useMessage, NCheckbox, NPopconfirm, NDropdown, NInput, NTooltip } from 'naive-ui'
 import { getTodos, updateTodoState, requestTodoAiAdvice, linkInvoiceToExpense, type SilentResolvedItem } from '@/api/todo'
 import { updateEntry } from '@/api/record'
 import { markDeadlineFiled } from '@/api/tax-filing'
 import { formatMoney } from '@/utils/format'
 import {
-  fixedAssetTodoRoute,
-  intangibleAssetTodoRoute,
+  extractFilingPeriod,
+  getActionLabel,
+  getActionRoute,
   isFixedAssetTodo,
   isIntangibleAssetTodo,
 } from '@/utils/todoAction'
@@ -396,12 +397,7 @@ async function batchMarkDone() {
   await load()
 }
 
-// 征期税种聚合相关辅助
-function extractFilingPeriod(title: string): string {
-  const match = title.match(/（([^）]+)）/)
-  return match ? match[1] : '本期'
-}
-
+// 征期税种聚合相关辅助（extractFilingPeriod 已收敛到 utils/todoAction）
 function extractTaxName(title: string): string {
   return title
     .replace(/^.+?-\s*/, '')
@@ -555,71 +551,6 @@ function shouldShowTodoItem(groupCategory: string, todo: TodoItem): boolean {
   return true
 }
 
-function getActionRoute(todo: TodoItem) {
-  if (todo.meta?.ruleId === 'tax_registration_unsynced') {
-    return '/tax-registration'
-  }
-  if (isFixedAssetTodo(todo)) {
-    return fixedAssetTodoRoute(todo)
-  }
-  if (isIntangibleAssetTodo(todo)) {
-    return intangibleAssetTodoRoute(todo)
-  }
-  if (todo.meta?.entryId) {
-    return `/ledger/${todo.meta.entryId}`
-  }
-  if (todo.entryId) {
-    return `/ledger/${todo.entryId}`
-  }
-  if (todo.type === 'bank' || todo.meta?.statementId) {
-    // 直达结账向导第四步配对现场，并带上流水定位参数
-    const month = String(todo.meta?.date || '').slice(0, 7)
-    const query = new URLSearchParams()
-    if (month) query.set('month', month)
-    query.set('step', '4')
-    if (todo.meta?.statementId) query.set('statement', String(todo.meta.statementId))
-    return `/closing-wizard?${query.toString()}`
-  }
-  if (todo.meta?.action === 'confirm_asset' || todo.title.includes('固定资产')) {
-    return '/assets'
-  }
-  if (todo.meta?.action === 'review_intangible' || todo.meta?.action === 'view_intangible') {
-    return `/intangibles/${todo.meta?.assetId || ''}`
-  }
-  if (todo.title.includes('无形资产')) {
-    return '/intangibles'
-  }
-  return null
-}
-
-function getActionLabel(todo: TodoItem) {
-  if (todo.meta?.ruleId === 'tax_registration_unsynced') {
-    return '去同步认定'
-  }
-  if (isFixedAssetTodo(todo)) {
-    return '确认折旧方案'
-  }
-  if (isIntangibleAssetTodo(todo)) {
-    return '确认摊销方案'
-  }
-  if (todo.meta?.entryId || todo.entryId) {
-    return '查看关联交易'
-  }
-  if (todo.type === 'bank') {
-    return '去流水对账'
-  }
-  if (todo.meta?.action === 'confirm_asset' || todo.title.includes('固定资产')) {
-    return '设置折旧'
-  }
-  if (todo.meta?.action === 'review_intangible') {
-    return '去复核'
-  }
-  if (todo.meta?.action === 'view_intangible') {
-    return '查看资产'
-  }
-  return '去处理'
-}
-
 onMounted(() => {
   // 从 URL 恢复 tab（旧状态值/非法值一律回落全部）
   const tab = String(route.query.tab || '')
@@ -686,7 +617,7 @@ usePageRefresh(load)
           :loading="requestingAi"
           @click="triggerAiAdvice"
         >
-          <template #icon><i class="ri-sparkling-line" /></template>
+          <template #icon><i class="ri-search-eye-line" /></template>
           AI 分析
         </NButton>
         <NButton secondary size="small" :loading="loading" @click="() => load(false)">
@@ -884,7 +815,7 @@ usePageRefresh(load)
                   <!-- 💡 AI 顾问建议与大白话理由（为不懂财务的小白解惑） -->
                   <div v-if="todo.meta?.aiSuggestion" class="todo-ai-box">
                     <div class="ai-box-badge">
-                      <i class="ri-sparkling-fill" />
+                      <i class="ri-chat-3-line" />
                       <span>{{ todo.meta.aiSuggestion.source === 'llm' ? 'AI 顾问建议' : '智能建议' }}</span>
                     </div>
                     <div class="ai-box-content">
@@ -1122,7 +1053,7 @@ usePageRefresh(load)
 
 <style scoped>
 .todo-page {
-  max-width: 1040px;
+  max-width: var(--page-width);
   margin: 0 auto;
   padding: 20px 16px 72px 16px;
   box-sizing: border-box;

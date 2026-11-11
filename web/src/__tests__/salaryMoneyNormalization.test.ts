@@ -58,8 +58,12 @@ const SHEET_PAYLOAD = {
       allowance: money(0),
       deduction: money(0),
       personal_social_security: money(925),
+      personal_social_insurance: money(525),
+      personal_housing_fund: money(400),
       personal_tax: money(0),
       company_social_security: money(1650),
+      company_social_insurance: money(1250),
+      company_housing_fund: money(400),
       net_salary: money(5575),
       total_cost: money(8150),
     },
@@ -72,13 +76,18 @@ describe('工资表金额归一化', () => {
     const record = sheet.records[0]
     for (const key of [
       'base_salary', 'bonus', 'allowance', 'deduction',
-      'personal_social_security', 'personal_tax', 'company_social_security',
+      'personal_social_security', 'personal_social_insurance', 'personal_housing_fund',
+      'personal_tax', 'company_social_security', 'company_social_insurance', 'company_housing_fund',
       'net_salary', 'total_cost',
     ]) {
       expect(typeof record[key], `${key} 应为 number`).toBe('number')
     }
     expect(record.personal_social_security).toBe(925)
+    expect(record.personal_social_insurance).toBe(525)
+    expect(record.personal_housing_fund).toBe(400)
     expect(record.company_social_security).toBe(1650)
+    expect(record.company_social_insurance).toBe(1250)
+    expect(record.company_housing_fund).toBe(400)
     expect(record.net_salary).toBe(5575)
   })
 

@@ -12,6 +12,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import Response
+from pydantic import Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -37,11 +38,9 @@ from services.accounting_core_service import (
     POSTING_ROLES,
     approve_journal,
     available_periods,
-    close_period,
     ensure_tenant,
     get_idempotent_response,
     get_journal,
-    period_close_checks,
     period_start_for,
     post_journal,
     record_audit,
@@ -173,7 +172,7 @@ async def batch_post_entries_route(
         month_start = period_start_for(body.month)
         rows = (
             await session.execute(
-                select(JournalEntry.id)
+                select(JournalEntry.id, JournalEntry.metadata_json)
                 .where(
                     JournalEntry.company_id == ctx.company_id,
                     JournalEntry.period_start == month_start,
@@ -181,8 +180,14 @@ async def batch_post_entries_route(
                 )
                 .order_by(JournalEntry.occurred_on, JournalEntry.id)
             )
-        ).scalars().all()
-        target_ids = list(rows)
+        ).all()
+        # 归档底稿（仅归档不记账，如支付平台手续费发票）是证据不是待过账凭证：
+        # 整月批量过账不得把它们扫进去过账——2026-10-31 实测手续费底稿被过账，
+        # 造成手续费双计 + 2241 挂账悬空。显式 entryIds 指到底稿时在循环内报错提示。
+        target_ids = [
+            row_id for row_id, entry_meta in rows
+            if not ((entry_meta or {}).get("isArchiveOnly") or (entry_meta or {}).get("is_archive_only"))
+        ]
     else:
         raise HTTPException(status_code=422, detail="请提供需要过账的凭证ID列表或月份")
 
@@ -203,6 +208,11 @@ async def batch_post_entries_route(
             if entry.status == "posted":
                 posted_ids.append(entry.id)
                 continue
+            if (entry.metadata_json or {}).get("isArchiveOnly") or (entry.metadata_json or {}).get("is_archive_only"):
+                raise AccountingError(
+                    "ARCHIVE_ONLY_ENTRY", "仅归档底稿凭证不参与记账，不能批量过账",
+                    409, {"entryId": entry.id},
+                )
 
             async with session.begin_nested():
                 if entry.status == "pending_review":
@@ -599,29 +609,51 @@ async def close_checks_route(
     ctx: AuthContext = Depends(require_auth),
     session: AsyncSession = Depends(get_db_session),
 ):
+    from services.closing_workflow_service import get_closing_snapshot
+
     await ensure_tenant(session, ctx.company_id, ctx.user_id)
-    return await period_close_checks(session, ctx.company_id, month)
+    return await get_closing_snapshot(
+        session,
+        ctx.company_id,
+        month,
+        user_id=ctx.user_id,
+    )
+
+
+class ClosePeriodRequest(StrictRequestModel):
+    expectedSnapshotHash: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
 
 @router.post("/api/periods/{month}/close")
 async def close_period_route(
     month: str,
+    body: ClosePeriodRequest,
     request: Request,
     ctx: AuthContext = Depends(require_auth),
     session: AsyncSession = Depends(get_db_session),
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
 ):
+    from services.closing_workflow_service import close_period_from_snapshot
+
     operation = f"close_period:{month}"
-    payload = {"month": month}
+    payload = {
+        "month": month,
+        "expectedSnapshotHash": body.expectedSnapshotHash,
+    }
     cached = await get_idempotent_response(
         session, company_id=ctx.company_id, key=idempotency_key, operation=operation, payload=payload
     )
     if cached is not None:
         return cached
-    response = await close_period(
+    response = await close_period_from_snapshot(
         session,
         ctx.company_id,
         month,
+        expected_snapshot_hash=body.expectedSnapshotHash,
         user_id=ctx.user_id,
         request_id=_request_id(request),
     )

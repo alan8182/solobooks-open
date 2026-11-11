@@ -34,6 +34,7 @@ from core.chart_policy import CONTAINER_CODES
 from core.money import ZERO, money, money_text
 from db.models import AccountingPeriod, ChartAccount, Company, JournalEntry, JournalLine
 from db.session import session_scope
+from services.reversal_pairs import same_period_reversal_exclusions
 
 POSTED_STATUSES = ("posted", "reversed")
 MAX_LINES = 200_000
@@ -296,17 +297,28 @@ async def build_ledger_book(
     backfill_entries: set[str] = set()
     # 本册期间的凭证张数（不是"截至本月的累计"，封面上的张数要和序时账对得上）
     scope_entry_ids: set[str] = set()
+    # 发生额口径：同期间冲销对不计入各聚合桶（余额是净额，借贷自相抵不受影响），
+    # 否则一次「冲销重记」就把本期发生额成倍虚增。行级明细/序时/封面张数保持
+    # 完整留痕（A1），只影响余额表与明细账页的合计列。
+    excluded_entry_ids = same_period_reversal_exclusions({entry for entry, _ in rows})
 
     for entry, line in rows:
         amount = money(line.amount)
         by_entry[entry.id].append(line)
+        is_excluded = entry.id in excluded_entry_ids
         if entry.period_start < start:
-            _add_line(opening, line, amount)
+            if not is_excluded:
+                _add_line(opening, line, amount)
             continue
-        _add_line(period, line, amount)
+        if not is_excluded:
+            _add_line(period, line, amount)
+        else:
+            # 冲销对行不进合计，但明细账页要按凭证顺序逐笔滚动——桶要先建出来
+            if line.account_code not in period:
+                period[line.account_code] = _empty_bucket(line.account_name)
         # 明细账页要按凭证顺序逐笔滚动，桶里同时留一份有序行
         period[line.account_code].setdefault("lines", []).append((entry, line, amount))
-        if entry.period_start >= year_start:
+        if entry.period_start >= year_start and not is_excluded:
             _add_line(ytd, line, amount)
         scope_entry_ids.add(entry.id)
         if entry.occurred_on < start:
@@ -321,6 +333,10 @@ async def build_ledger_book(
                 "summary": entry.summary,
                 "accountCode": line.account_code,
                 "accountName": line.account_name,
+                # 往来单位：2241/1221 行的对手方身份只存在辅助核算里，
+                # 科目名一律是「其他应付款」，不给出来账簿读不出欠谁的钱
+                "partnerId": (line.auxiliary or {}).get("partner_id") or None,
+                "partnerName": (line.auxiliary or {}).get("partner_name") or None,
                 "direction": line.direction,
                 "debit": money_text(amount) if line.direction == "debit" else "0.00",
                 "credit": money_text(amount) if line.direction == "credit" else "0.00",
@@ -595,6 +611,8 @@ def _build_detail_page(
             "period": entry.period_start.isoformat(),
             "voucherRef": entry.voucher_no,
             "summary": entry.summary,
+            "partnerId": (line.auxiliary or {}).get("partner_id") or None,
+            "partnerName": (line.auxiliary or {}).get("partner_name") or None,
             "debit": money_text(amount) if line.direction == "debit" else "0.00",
             "credit": money_text(amount) if line.direction == "credit" else "0.00",
             "balance": _signed_text(running),
@@ -784,8 +802,12 @@ def _build_general(
     """总账页：每科目 12 行（按月借/贷/余额），复用同一批分录，不新增查询。"""
     month_debit: dict[str, dict[int, Decimal]] = defaultdict(lambda: defaultdict(lambda: ZERO))
     month_credit: dict[str, dict[int, Decimal]] = defaultdict(lambda: defaultdict(lambda: ZERO))
+    # 与余额表/明细账合计同口径：同期间冲销对不计入月度发生额
+    excluded_entry_ids = same_period_reversal_exclusions({entry for entry, _ in rows})
     for entry, line in rows:
         if entry.period_start < year_start or entry.period_start > year_end:
+            continue
+        if entry.id in excluded_entry_ids:
             continue
         amount = money(line.amount)
         target = month_debit if line.direction == "debit" else month_credit

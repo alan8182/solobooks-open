@@ -23,11 +23,12 @@ function makeRouter() {
       { path: '/ledger/book', component: { template: '<div />' } },
       { path: '/assets', component: { template: '<div />' } },
       { path: '/rd-expenses', component: { template: '<div />' } },
+      { path: '/mine/salary', component: { template: '<div />' } },
     ],
   })
 }
 
-async function mountSidebar(options: { mode?: WorkspaceView; path?: string } = {}) {
+async function mountSidebar(options: { mode?: WorkspaceView; path?: string; collapsed?: boolean } = {}) {
   const pinia = createPinia()
   setActivePinia(pinia)
   const viewStore = useWorkspaceViewStore()
@@ -37,7 +38,7 @@ async function mountSidebar(options: { mode?: WorkspaceView; path?: string } = {
   router.push(options.path ?? '/')
   await router.isReady()
   const wrapper = mount(Sidebar, {
-    props: { collapsed: false },
+    props: { collapsed: options.collapsed ?? false },
     global: { plugins: [router, pinia] },
   })
   return { wrapper, router, viewStore }
@@ -118,14 +119,16 @@ describe('sidebar accordion behavior', () => {
 })
 
 describe('sidebar workspace filtering', () => {
-  it('keeps only the boss workflow in the boss view', async () => {
+  it('keeps only the boss workflow in the boss view and prioritizes closing & tax filing at top', async () => {
     const { wrapper } = await mountSidebar({ mode: 'boss' })
 
     expect(wrapper.text()).toContain('工作台')
-    expect(wrapper.text()).toContain('AI 会计')
+    expect(wrapper.text()).toContain('AI CFO')
     expect(wrapper.text()).toContain('待办')
-    expect(wrapper.text()).toContain('小私账')
+    expect(wrapper.text()).toContain('资金流水')
     expect(wrapper.text()).toContain('月度结账')
+    // 工资薪金不再占老板导航栏，收敛于月度结账流程中确认
+    expect(wrapper.text()).not.toContain('工资薪金')
     expect(wrapper.text()).toContain('报税')
     expect(wrapper.text()).toContain('经营')
     expect(wrapper.text()).toContain('每天')
@@ -133,13 +136,32 @@ describe('sidebar workspace filtering', () => {
     expect(wrapper.text()).toContain('复盘')
     // 项目利润收进「经营报表」页卡片，不再占导航位
     expect(wrapper.text()).not.toContain('项目利润')
-    // 每天 4（工作台、AI 会计、待办、小私账）+ 每月 2 + 复盘 1（设置不再占导航位，收进左下角图标）
-    expect(wrapper.findAll('button.nav-item')).toHaveLength(7)
+    // 每月 2（月度结账、报税）+ 每天 4（工作台、AI CFO、待办、资金流水）+ 复盘 1
+    const navItems = wrapper.findAll('button.nav-item')
+    expect(navItems).toHaveLength(7)
+
+    // 核心断言：首组为「每月」，首项为「月度结账」，次项为「报税」
+    const groupLabels = wrapper.findAll('.group-label').map((el) => el.text())
+    expect(groupLabels[0]).toBe('每月')
+    expect(navItems[0].text()).toContain('月度结账')
+    expect(navItems[1].text()).toContain('报税')
+
+    // 视觉特权断言：月度结账拥有 hero 样式类及状态徽标
+    expect(navItems[0].classes()).toContain('nav-item--hero')
+    expect(navItems[0].find('.closing-badge').exists()).toBe(true)
 
     expect(wrapper.text()).not.toContain('经营账本')
     expect(wrapper.text()).not.toContain('发票')
     expect(wrapper.text()).not.toContain('凭证与账簿')
     expect(wrapper.text()).not.toContain('专项核算')
+  })
+
+  it('renders status dot on closing wizard item when sidebar is collapsed', async () => {
+    const { wrapper } = await mountSidebar({ collapsed: true, mode: 'boss' })
+    const heroItem = wrapper.find('.nav-item--hero')
+    expect(heroItem.exists()).toBe(true)
+    expect(heroItem.find('.closing-dot').exists()).toBe(true)
+    expect(heroItem.find('.closing-badge').exists()).toBe(false)
   })
 
   it('moves settings into the bottom-left icon with a flyout in the boss view', async () => {

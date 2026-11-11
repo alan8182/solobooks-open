@@ -768,6 +768,7 @@ usePageRefresh(load)
                   <td>{{ line.voucherRef || '—' }}</td>
                   <td>
                     {{ line.summary }}<span v-if="line.backfill" class="badge">补记</span>
+                    <div v-if="line.partnerName" class="partner-line">往来：{{ line.partnerName }}</div>
                   </td>
                   <td class="cp" :title="cpFull(line)">{{ cpShort(line) }}</td>
                   <td v-if="hasQuantityColumn(page)" class="amount">{{ quantityText(line.quantity) }}</td>
@@ -888,7 +889,7 @@ usePageRefresh(load)
               <tr v-for="(row, index) in chunk" :key="`${row.entryId}-${pageIndex}-${index}`">
                 <td>{{ row.date }}</td>
                 <td>{{ row.voucherRef || '—' }}</td>
-                <td><div class="cell-clip">{{ row.summary }}<span v-if="row.backfill" class="badge">补记</span></div></td>
+                <td><div class="cell-clip">{{ row.summary }}<span v-if="row.backfill" class="badge">补记</span><div v-if="row.partnerName" class="partner-line">往来：{{ row.partnerName }}</div></div></td>
                 <td><div class="cell-clip">{{ row.accountCode }} {{ row.accountName }}</div></td>
                 <td class="amount">{{ ledgerAmountCell(row.debit) }}</td>
                 <td class="amount">{{ ledgerAmountCell(row.credit) }}</td>
@@ -1404,13 +1405,20 @@ usePageRefresh(load)
 
 @media print {
   .col-code { width: 68px; }
-  .col-date { width: 68px; }
-  .col-voucher { width: 76px; }
+  /* 列宽按实测文本宽度定（A4 可用宽约 703px，差额都留给摘要列）：
+     - 日期 68→82："2026-09-12" 实测 67px + 12px 内边距，68px 里只能折成两行；
+     - 凭证号 76→94："VOU-202609-000017" 在 76px 里断成三行、整行撑到 60px，
+       94px 恰好在 "VOU-202609-" 后断一次，两行封顶；
+     - 借或贷 38→48：表头三个字要 35px + 12px 内边距，38px 里只剩 "借…"；
+     - 对方科目维持 118：实测降到 106 会把对方科目折成三行，整页表格高 465→603px；
+     - 金额 82→78 找回空间（"89,140.19" 实测 57px）。 */
+  .col-date { width: 82px; }
+  .col-voucher { width: 94px; }
   .col-cp { width: 118px; }
-  .col-qty { width: 50px; }
-  .col-price { width: 58px; }
-  .col-amount { width: 82px; }
-  .col-dir { width: 38px; }
+  .col-qty { width: 46px; }
+  .col-price { width: 52px; }
+  .col-amount { width: 78px; }
+  .col-dir { width: 48px; }
   .col-count { width: 54px; }
   .col-month { width: 66px; }
   .col-account { width: 128px; }
@@ -1434,6 +1442,17 @@ usePageRefresh(load)
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  /* 上面这些类只挂在表头 th 上：列宽靠 table-layout: fixed 生效，但 tbody
+     的单元格没有类，日期、金额、方向照样会在格子里换行（"2026-09-12"
+     拆成两行、凭证号拆成三行），一行撑成两行高，整页看着松垮。按列位补齐：
+     首列（明细账/日记账/序时账的日期、余额表的科目编码）、金额列、方向列。 */
+  .book-table td:first-child,
+  .book-table td.amount,
+  .book-table td.center {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 }
 
 .amount { text-align: right; font-variant-numeric: tabular-nums; }
@@ -1448,6 +1467,12 @@ usePageRefresh(load)
   border-radius: 4px;
   color: var(--solo-warning);
   font-size: 10px;
+}
+/* 往来单位：2241/1221 行靠它区分欠谁的钱，不占新列，跟摘要同格 */
+.partner-line {
+  color: var(--solo-text-muted);
+  font-size: 10px;
+  line-height: 1.3;
 }
 .parent td { background: var(--book-tint); font-weight: 600; }
 .opening-row td { background: var(--book-tint); color: var(--book-ink); }
@@ -1506,15 +1531,23 @@ usePageRefresh(load)
 
 @media print {
   .no-print { display: none !important; }
-  .book-page { max-width: none; }
+  /* 工作台给每个页面容器加了 padding: 28px 0 56px !important（layout.css 的
+     `:where(.content) > *`）。打印时这 28px 会把整册往下推：首页封面刚好占满
+     262mm，多出的 28px 就把它的页码条挤到第 2 页去（实测「第 1 页」单独落在下一页）。 */
+  .book-page { max-width: none; padding: 0 !important; }
   .page-sheet {
     display: flex;
-    /* A4 可用高度 = 297 − 16(上) − 14(下) = 267mm。页高一旦贴近这个值，
-       body 边距或亚像素误差就会让整页被推到下一页（实测 4 页变 6 页）。
-       PAGE_SIZE 决定了一页最多 24 行（≈ 552px），200mm（756px）足够容纳并留足余量。 */
-    min-height: 200mm;
+    /* A4 可用高度 = 297 − 16(上) − 14(下) = 267mm。页高一旦等于或超过这个值，
+       body 边距或亚像素误差就会让整页被推到下一页（实测 4 页变 6 页），
+       所以留 5mm 余量取 262mm——页码条这才真正落在纸面底部；
+       取 200mm 时页码条离纸底还有 70mm，印出来像悬在纸中间。
+       内容最高的账页（24 行 ≈ 552px ≈ 146mm）仍远小于这个高度。 */
+    min-height: 262mm;
     flex-direction: column;
-    justify-content: space-between;
+    /* 不能用 space-between：它会把多出来的页高平均塞进每个子项之间，
+       内容不足一页时（如明细账末页只剩三行）标题、副标题、表格被拉得七零八落。
+       账页一律从页顶排，只有页码条用 margin-top:auto 沉到页底。 */
+    justify-content: flex-start;
     margin: 0;
     padding: 0;
     border-radius: 0;
@@ -1522,6 +1555,8 @@ usePageRefresh(load)
     page-break-after: always;
   }
   .page-sheet:last-child { break-after: auto; page-break-after: auto; }
+  /* 页码条始终贴页底；页内正文保持从顶部起排 */
+  .page-sheet > .page-footer { margin-top: auto; }
   .book-cover { min-height: auto; flex: 1; }
   .book-table th,
   .book-table td { border-color: var(--book-ink-strong); }

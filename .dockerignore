@@ -6,7 +6,6 @@
 **/__pycache__
 **/.pytest_cache
 **/*.pyc
-backend/data/*.db
 backend/data/*.log
 web/node_modules
 web/dist
@@ -15,3 +14,22 @@ solobooks/unpackage
 logs
 原始税务表格
 设计原型
+# 本地运行产物与私有数据：服务器源码目录里的历史残留也不能进镜像（DEPLOY-LOG D-013）
+**/venv
+**/.venv
+**/.env
+*.csv
+backend/data/*.db*
+backend/data/*.bak*
+backend/data/*.stale*
+backend/data/backups
+backend/data/archives
+backend/data/tax_exports
+backend/data/migration_reports
+backend/data/legacy_tables
+backend/data/inbox
+backend/scratch
+backend/pytest_tmp
+backend/node_modules
+web/.baidu-push-token
+web/dist-verify

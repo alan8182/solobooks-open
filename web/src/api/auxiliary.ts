@@ -16,7 +16,7 @@ export interface AuxiliaryItem {
   createdAt: string
   updatedAt: string
   // partner 专属
-  type?: 'customer' | 'supplier' | 'both'
+  type?: 'customer' | 'supplier' | 'both' | 'person'
   taxId?: string
   contact?: string
   phone?: string

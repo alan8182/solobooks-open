@@ -6,8 +6,10 @@
 // 薪酬页重构守卫：入口组件拆分后，KPI 汇总、分组表头、三阶段进度、草稿编辑重算必须保持正确。
 import { describe, it, expect, vi } from 'vitest'
 import { mount } from '@vue/test-utils'
-import { createPinia } from 'pinia'
+import { createPinia, setActivePinia } from 'pinia'
+import { useWorkspaceViewStore } from '@/stores/workspaceView'
 import SalarySheetTab from '@/pages/mine/salary/components/SalarySheetTab.vue'
+import PayrollRatesModal from '@/pages/mine/salary/components/PayrollRatesModal.vue'
 
 vi.mock('vue-router', () => ({ useRouter: () => ({ push: vi.fn() }), useRoute: () => ({ query: {} }) }))
 vi.mock('naive-ui', async (importOriginal) => {
@@ -22,9 +24,12 @@ const record = (over: Record<string, unknown> = {}) => ({
   net_salary: 10000, total_cost: 13000, ...over,
 })
 
-function mountTab(sheetStatus: string, extra: Record<string, unknown> = {}) {
+function mountTab(sheetStatus: string, extra: Record<string, unknown> = {}, mode: 'boss' | 'accounting' = 'accounting') {
+  const pinia = createPinia()
+  setActivePinia(pinia)
+  useWorkspaceViewStore().setMode(mode)
   return mount(SalarySheetTab, {
-    global: { plugins: [createPinia()] },
+    global: { plugins: [pinia] },
     props: {
       selectedMonth: '2026-10',
       sheet: { id: 's1', status: sheetStatus, records: [], paymentStatus: 'unpaid' } as any,
@@ -45,14 +50,32 @@ describe('salary refactor', () => {
     expect(payload).toEqual({ count: 1, net: 10000, cost: 13000, withheld: 1000 })
   })
 
-  it('renders grouped headers and the three-step progress', () => {
+  it('renders compact columns, auto-save hint and no manual tax/save buttons', () => {
     const text = mountTab('draft').text()
-    for (const label of ['应发项目', '代扣代缴', '实发与成本', '① 成本计提', '② 工资发放']) {
+    for (const label of ['个人五险一金', '单位五险一金', '实发到手', '个税', '① 成本计提', '② 工资发放', '修改后自动保存']) {
       expect(text).toContain(label)
+    }
+    for (const gone of ['申报实务建议', '一键测算', '保存草稿修改', '研发项目工时', '补助/津贴']) {
+      expect(text).not.toContain(gone)
     }
   })
 
-  it('shows accrue button in draft and payment button once accrued', () => {
+  it('shows the research column only when the book has research departments', () => {
+    const rd = mountTab('draft', { departments: [{ name: '行政部', isRd: true }] })
+    expect(rd.text()).toContain('研发项目工时')
+  })
+
+  it('uses boss wording and hides voucher buttons in the boss view', () => {
+    expect(mountTab('draft', {}, 'boss').text()).toContain('确认本月工资表')
+    const accrued = mountTab('accrued', {
+      sheet: { id: 's1', status: 'accrued', records: [], paymentStatus: 'unpaid', ssPaymentStatus: 'unpaid', accrual_voucher_id: 'v1' },
+    }, 'boss').text()
+    expect(accrued).toContain('一键登记已发已缴')
+    expect(accrued).not.toContain('查看计提凭证')
+    expect(accrued).not.toContain('缴纳社保')
+  })
+
+  it('shows accrue button in draft and payment button once accrued (accounting view)', () => {
     expect(mountTab('draft').text()).toContain('计提记账')
     const accrued = mountTab('accrued', {
       sheet: { id: 's1', status: 'accrued', records: [], paymentStatus: 'unpaid', payment_voucher_id: null },
@@ -70,5 +93,21 @@ describe('salary refactor', () => {
     })
     expect(wrapper.text()).toContain('银行流水发现 1 笔')
     expect(wrapper.text()).not.toContain('确认缴纳并核销')
+  })
+
+  it('renders smart OCR screenshot dropzone in rates modal', () => {
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    mount(PayrollRatesModal, {
+      global: { plugins: [pinia] },
+      attachTo: document.body,
+      props: {
+        show: true,
+        selectedMonth: '2026-10',
+        payrollRates: null,
+      },
+    })
+    expect(document.body.textContent).toContain('智能提取：粘贴或上传税务局核定表截图')
+    expect(document.body.textContent).toContain('直接按 Ctrl+V 粘贴')
   })
 })

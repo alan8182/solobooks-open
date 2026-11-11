@@ -1,7 +1,7 @@
 /* Global styles for unified report/statistics pages */
 
 .report-container {
-  max-width: 1240px;
+  max-width: var(--page-width);
   margin: 0 auto;
   padding: 16px 20px 48px 20px;
   width: 100%;

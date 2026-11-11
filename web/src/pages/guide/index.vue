@@ -10,6 +10,7 @@ import { useSetupReadiness } from '@/composables/useSetupReadiness'
 import { useAuthStore } from '@/stores/auth'
 import { useGuideStateStore } from '@/stores/guideState'
 import { GLOSSARY } from '@/utils/glossary'
+import { GUIDE_LIST } from '@/content/guides'
 
 /**
  * 上手引导总页。
@@ -126,6 +127,25 @@ function clearWaived() {
 
     <section class="guide-card">
       <header class="card-header">
+        <h3>操作指引</h3>
+        <span class="card-note">从税局 / 网银 / 微信后台取数的那几步</span>
+      </header>
+      <div class="guide-links">
+        <RouterLink
+          v-for="item in GUIDE_LIST"
+          :key="item.id"
+          class="guide-link-item"
+          :to="`/guides/${item.id}`"
+        >
+          <strong>{{ item.title }}</strong>
+          <span>{{ item.summary }}</span>
+          <i class="ri-arrow-right-line" aria-hidden="true" />
+        </RouterLink>
+      </div>
+    </section>
+
+    <section class="guide-card">
+      <header class="card-header">
         <h3>常见说法</h3>
         <span class="card-note">这些词在系统里都长一个样</span>
       </header>
@@ -160,7 +180,7 @@ function clearWaived() {
           v-if="!demoCompany"
           variant="primary"
           :loading="creating"
-          icon="ri-sparkling-line"
+          icon="ri-play-circle-line"
           @click="handleCreateDemo"
         >
           {{ creating ? '正在生成（约 10 秒）' : '重新生成演示账套' }}
@@ -205,7 +225,7 @@ function clearWaived() {
   display: flex;
   flex-direction: column;
   gap: 18px;
-  max-width: 1080px;
+  max-width: var(--page-width);
   margin: 0 auto;
 }
 
@@ -290,13 +310,62 @@ function clearWaived() {
   margin-top: 14px;
 }
 
+.guide-links {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 12px 0 0;
+}
+
+.guide-link-item {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 12px 34px 12px 14px;
+  border: 1px solid var(--solo-border-light);
+  border-radius: var(--solo-radius-control);
+  background: var(--solo-bg-card);
+  text-decoration: none;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.guide-link-item:hover {
+  border-color: var(--solo-border);
+  background: var(--solo-bg-soft);
+}
+
+.guide-link-item strong {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--solo-text-primary);
+}
+
+.guide-link-item span {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--solo-text-muted);
+}
+
+.guide-link-item i {
+  position: absolute;
+  top: 50%;
+  right: 12px;
+  transform: translateY(-50%);
+  color: var(--solo-text-muted);
+  font-size: 15px;
+}
+
+.guide-link-item:hover i {
+  color: var(--solo-primary);
+}
+
 .glossary-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px 18px;
   margin: 12px 0 0;
 }
-
 .glossary-item {
   display: flex;
   flex-direction: column;

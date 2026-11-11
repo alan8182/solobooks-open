@@ -27,6 +27,8 @@ function navigateToAnchor(hash: string) {
 
 function onLandingScroll() {
   showStickyCta.value = window.scrollY > 480
+  // 吸底操作栏展示期间通知全局内测浮钮上移避让（样式仅在 ≤768px 生效）
+  document.documentElement.classList.toggle('landing-cta-bar-shown', showStickyCta.value)
 }
 
 // ── PPT 式整页翻页：桌面滚轮由 JS 接管 ──
@@ -45,10 +47,11 @@ function slideEls(): HTMLElement[] {
   )
 }
 
-// 所有页都装得进一屏才启用滚轮翻页；存在超高页（小窗口）时回落自由滚动
+// 所有页都装得进一屏才启用滚轮翻页；存在超高页（小窗口）时回落自由滚动。
+// 余量放宽到 8px：个别屏（如 showcase）内容只超预算 1~2px 时，不应静默禁用整个翻页特性
 function canPageFlip(): boolean {
   const budget = window.innerHeight - NAV_HEIGHT
-  return slideEls().every((el) => el.offsetHeight <= budget + 1)
+  return slideEls().every((el) => el.offsetHeight <= budget + 8)
 }
 
 // 滚轮落点在内部可滚动容器上时不劫持
@@ -97,10 +100,12 @@ onMounted(() => {
   document.documentElement.classList.add('landing-scroll-snap')
   window.addEventListener('wheel', onLandingWheel, { passive: false })
   window.addEventListener('scroll', onLandingScroll, { passive: true })
+  onLandingScroll() // 同步首屏初始状态（刷新时恢复滚动位置的场景）
 })
 
 onUnmounted(() => {
   document.documentElement.classList.remove('landing-scroll-snap')
+  document.documentElement.classList.remove('landing-cta-bar-shown')
   window.removeEventListener('wheel', onLandingWheel)
   window.removeEventListener('scroll', onLandingScroll)
   clearTimeout(flipLockTimer)
@@ -114,30 +119,30 @@ const isLoggedIn = computed(() => Boolean(localStorage.getItem('auth_token')))
 const fourPillars = [
   {
     num: '01',
-    title: 'AI 智能做账',
-    desc: '自然语言理解业务动作，发票拍单一键起草分录，借贷自动试算配平。',
-    chips: ['发票/语音智能记账', '1% 税率自动核算', '凭证附原始票据'],
-    icon: 'ri-magic-line',
+    title: '伴随式建立老板财务直觉',
+    desc: '自然语言理解业务动作，老板白话视图与会计分录同源对照，不背借贷术语也能摸清利润与现金流底牌。',
+    chips: ['老板/会计双视图同源', '10 秒确认看懂门道', '凭证附原始票据'],
+    icon: 'ri-file-edit-line',
   },
   {
     num: '02',
-    title: '微信与企银全量对平',
-    desc: '微信商户账单与网银流水 10 秒交叉勾稽，杜绝漏账与重复记账。',
-    chips: ['银行流水 100% 勾稽', '微信商业收款核销', '重复入账智能拦截'],
+    title: '微信与企银 100% 勾稽',
+    desc: '告别传统代账“只抄发票不对流水”的糊弄账，网银与微信商户流水 10 秒交叉配平，账实相符。',
+    chips: ['银行流水 100% 勾稽', '微信商业收款核销', '杜绝漏记与死账'],
     icon: 'ri-git-merge-line',
   },
   {
     num: '03',
     title: '4 步向导式月末封账',
-    desc: '往来核销、设备折旧、小微税负测算，向导一步步指引直达报税底稿。',
+    desc: '往来核销、设备折旧、小微税负测算一步步指引，看清税负临界点，直出电子税务局申报底稿。',
     chips: ['往来款一键冲平', '固定资产自动折旧', '税局申报字段对齐'],
     icon: 'ri-calendar-check-line',
   },
   {
     num: '04',
-    title: '准则合规与公私隔离',
-    desc: '严格遵循小企业会计准则，老板私卡垫资合规冲销，人机双签安全底线。',
-    chips: ['小企业准则标准科目', '私卡垫资免税通道', '人机双签入账确认'],
+    title: '公私隔离与融资尽调就绪',
+    desc: '严格遵循小企业会计准则，老板私卡垫资合规冲销，不留“其他应收款”烂账，随时经得起授信与融资尽调。',
+    chips: ['公私垫资合规隔离', 'Day-1 融资尽调就绪', '人机双签入账确认'],
     icon: 'ri-shield-check-line',
   },
 ]
@@ -149,7 +154,7 @@ const migrateIn = {
   items: [
     { b: '凭证批量导入', t: 'Excel / CSV 三列对齐，自动匹配科目' },
     { b: '期初余额带入', t: '科目余额表开新账，借贷平衡校验' },
-    { b: '流水与发票', t: '银行、微信、税局发票免模板解析' },
+    { b: '流水与发票', t: '银行、平台账单、税局发票免模板解析' },
   ],
   tags: ['Excel / CSV', '列名智能识别', '失败行逐条提示'],
 }
@@ -172,15 +177,16 @@ const migratePromises = [
 ]
 
 // ── 对标企微：深度功能交互展台 (Tab Showcase) ──
-type ShowcaseKey = 'batch' | 'reconcile' | 'closing' | 'dashboard' | 'mcp'
+type ShowcaseKey = 'batch' | 'reconcile' | 'memory' | 'closing' | 'dashboard' | 'mcp'
 const activeShowcase = ref<ShowcaseKey>('batch')
 
 const showcaseTabs = [
   { key: 'batch' as ShowcaseKey, num: '01', title: '凭据归集', icon: 'ri-folder-upload-line' },
   { key: 'reconcile' as ShowcaseKey, num: '02', title: '流水对平', icon: 'ri-git-merge-line' },
-  { key: 'closing' as ShowcaseKey, num: '03', title: '月末结账', icon: 'ri-calendar-check-line' },
-  { key: 'dashboard' as ShowcaseKey, num: '04', title: '经营报表', icon: 'ri-pie-chart-line' },
-  { key: 'mcp' as ShowcaseKey, num: '05', title: 'AI 连接 (MCP & Skills)', icon: 'ri-sparkling-2-line' },
+  { key: 'memory' as ShowcaseKey, num: '03', title: '越用越准', icon: 'ri-brain-line' },
+  { key: 'closing' as ShowcaseKey, num: '04', title: '月末结账', icon: 'ri-calendar-check-line' },
+  { key: 'dashboard' as ShowcaseKey, num: '05', title: '经营报表', icon: 'ri-pie-chart-line' },
+  { key: 'mcp' as ShowcaseKey, num: '06', title: 'AI 连接 (MCP & Skills)', icon: 'ri-plug-line' },
 ]
 
 function switchShowcaseTab(key: ShowcaseKey) {
@@ -190,32 +196,32 @@ function switchShowcaseTab(key: ShowcaseKey) {
 // ── 视觉化指标对比数据 ──
 const comparisons = [
   {
-    dim: '资金成本',
-    hired: '每年 6 到 10 万元',
-    agency: '每年数千元 (基础报税)',
-    solo: '极低成本，人人用得起',
-    highlight: '降本 90%+',
+    dim: '老板财务认知',
+    hired: '专业术语多，老板难看懂账表',
+    agency: '黑盒托管，老板沦为甩手掌柜',
+    solo: '老板白话视图与会计账表同源，边确认边建立财务直觉',
+    highlight: '掌舵人视角',
   },
   {
-    dim: '对账耗时',
-    hired: '依赖月底人工耗费数天',
-    agency: '平时不做真实对账',
-    solo: '银行与微信流水 10 秒自动对平',
+    dim: '融资与尽调就绪',
+    hired: '账目规范，但人力成本高昂',
+    agency: '只抄发票不对流水，授信/尽调需推倒重做',
+    solo: '票、流、账、税 100% 勾稽，随时经得起审计与投资人尽调',
+    highlight: 'Day-1 合规',
+  },
+  {
+    dim: '公私隔离与对账',
+    hired: '依赖月底人工耗费数天核对',
+    agency: '公私混同全塞“其他应收款”留隐患',
+    solo: '企银与微信流水 10 秒配平，个人垫资合规隔离',
     highlight: '10 秒闭环',
   },
   {
-    dim: '业务理解',
-    hired: '需专职沟通业务',
-    agency: '不理解业务，仅抄发票',
-    solo: '自然语言懂语境，从业务动作推导分录',
-    highlight: '懂你的业务',
-  },
-  {
-    dim: '操作门槛',
-    hired: '老板难以看懂会计账表',
-    agency: '完全失去财务掌控',
-    solo: '平时无需琐碎随手记，月末一键导入批量搞定',
-    highlight: '0 财务门槛',
+    dim: '综合成本与门槛',
+    hired: '每年 6 到 10 万元专职成本',
+    agency: '年付数千元，仅做机械报税',
+    solo: '极低成本、0 会计门槛，平时免随手记，月末一键搞定',
+    highlight: '降本 90%+',
   },
 ]
 
@@ -230,7 +236,7 @@ const personaChips = [
   {
     role: '自媒体创作者',
     icon: 'ri-video-line',
-    metrics: [{ val: '10 秒', label: '微信账单导入' }, { val: '自动', label: '摄影器材折旧' }],
+    metrics: [{ val: '10 秒', label: '平台账单导入' }, { val: '自动', label: '摄影器材折旧' }],
     tags: ['商单回款核销', '器材折旧计提', '多渠道收支汇总'],
   },
   {
@@ -287,7 +293,7 @@ const complianceEvidence = [
         <nav class="nav-links">
           <a href="#pillars">核心优势</a>
           <a href="#showcase">功能展台</a>
-          <a href="#showcase" @click.prevent="router.push('/ai-connect')">AI 连接 (MCP & Skills)</a>
+          <a href="/ai-connect" @click.prevent="router.push('/ai-connect')">AI 连接 (MCP & Skills)</a>
           <a href="#compare">方案对比</a>
           <a href="#migrate">账本迁移</a>
           <a href="#personas">适用场景</a>
@@ -322,7 +328,7 @@ const complianceEvidence = [
           <div class="mobile-drawer" @click.stop>
             <div class="mobile-drawer-links">
               <a href="#pillars" @click.prevent="navigateToAnchor('#pillars')">
-                <i class="ri-sparkling-line" />
+                <i class="ri-layout-grid-line" />
                 <span>核心优势</span>
               </a>
               <a href="#showcase" @click.prevent="navigateToAnchor('#showcase')">
@@ -377,8 +383,8 @@ const complianceEvidence = [
 
         <!-- 价值副标 -->
         <p class="hero-sub">
-          专为没有专职会计的小微企业与一人公司打造。<br class="desktop-only" />
-          月末一键导入企银流水、发票与微信账单，AI 自动对平做账，报表直通电子税局。
+          专为不甘做“甩手掌柜”的一人公司与小微企业主理人打造。<br class="desktop-only" />
+          月末一键导入流水与发票，在 10 秒确认中建立老板财务直觉，从第一天起养出经得起授信与融资尽调的体面账。
         </p>
 
         <!-- 行动按钮 -->
@@ -400,7 +406,7 @@ const complianceEvidence = [
             </div>
             <div class="proof-val">10 min</div>
             <div class="proof-title">月末批量全流程搞定</div>
-            <p class="proof-desc">企银流水、发票包与微信对账单一拖即入，平时零琐碎记账负担。</p>
+            <p class="proof-desc">企银流水、发票包与平台交易账单一拖即入，平时零琐碎记账负担。</p>
           </div>
 
           <div class="proof-card">
@@ -410,7 +416,7 @@ const complianceEvidence = [
             </div>
             <div class="proof-val">100%</div>
             <div class="proof-title">严格遵循会计准则</div>
-            <p class="proof-desc">财政部《小企业会计准则》科目映射，借贷实时平衡，底稿直通税局。</p>
+            <p class="proof-desc">财政部《小企业会计准则》科目映射，借贷实时平衡，报税数据一键生成。</p>
           </div>
 
           <div class="proof-card hover-glow" @click="router.push('/ai-connect')">
@@ -420,7 +426,7 @@ const complianceEvidence = [
             </div>
             <div class="proof-val text-gradient">MCP & Skills</div>
             <div class="proof-title">Claude / Cursor / Agent 直连</div>
-            <p class="proof-desc">24 项原生 MCP 账务工具 + 报税/结账等专属 Skills 技能包，开箱即用，人机双签安全闭环。</p>
+            <p class="proof-desc">27 项原生 MCP 账务工具 + 报税/结账等专属 Skills 技能包，开箱即用，人机双签安全闭环。</p>
           </div>
 
           <div class="proof-card">
@@ -503,7 +509,7 @@ const complianceEvidence = [
               <div class="stage-left">
                 <h3 class="stage-title">月末一拖即入，<br />自动生成分录</h3>
                 <p class="stage-desc">
-                  无需日常琐碎记账。月末将网银流水、发票包与微信对账单一键拖入，AI 自动生成准则分录。
+                  无需日常琐碎记账。月末将网银流水、发票包与平台交易账单一键拖入，AI 自动生成准则分录。
                 </p>
                 <div class="stage-bullets">
                   <div class="stage-bullet"><i class="ri-check-line" /><span>网银流水自适应解析，智能匹配会计科目</span></div>
@@ -648,10 +654,75 @@ const complianceEvidence = [
               </div>
             </div>
 
-            <!-- Tab 03: 月末结账 -->
+            <!-- Tab 03: 越用越准（专属记忆规则） -->
+            <div v-else-if="activeShowcase === 'memory'" key="memory" class="stage-grid">
+              <div class="stage-left">
+                <h3 class="stage-title">确认一次，<br />下月自动记住</h3>
+                <p class="stage-desc">
+                  每一笔你确认过的流水，都会沉淀为你们公司专属的记账规则。下月同类流水进来自动优先命中——不用反复教，系统越用越懂你的生意。
+                </p>
+                <div class="stage-bullets">
+                  <div class="stage-bullet"><i class="ri-check-line" /><span>每家企业独立记忆，确认即学会，账目数据不混用</span></div>
+                  <div class="stage-bullet"><i class="ri-check-line" /><span>对手方、用途、金额区间多维识别，命中与纠正全程留痕</span></div>
+                  <div class="stage-bullet"><i class="ri-check-line" /><span>规则透明可管理：可查看、可修改、可停用</span></div>
+                </div>
+              </div>
+              <div class="stage-right">
+                <div class="mockup-window">
+                  <div class="window-bar">
+                    <div class="window-dots"><span class="dot red" /><span class="dot yellow" /><span class="dot green" /></div>
+                    <span class="window-title">企业专属分类规则库</span>
+                    <span class="window-status text-emerald"><i class="ri-brain-line" /> 已记住 32 条规则</span>
+                  </div>
+                  <div class="window-content">
+                    <div class="recon-detail-list">
+                      <div class="recon-card-item success">
+                        <div class="recon-card-icon"><i class="ri-cloud-line" /></div>
+                        <div class="recon-card-main">
+                          <div class="recon-card-row">
+                            <b>「腾讯云」服务器月结扣费</b>
+                            <span class="status-pill green"><i class="ri-check-line" />命中 9 次</span>
+                          </div>
+                          <p>¥328.00 自动归类「管理费用 - 服务器订阅费」，无需 AI 重新分析</p>
+                        </div>
+                      </div>
+
+                      <div class="recon-card-item success">
+                        <div class="recon-card-icon"><i class="ri-user-3-line" /></div>
+                        <div class="recon-card-main">
+                          <div class="recon-card-row">
+                            <b>客户「李先生」项目尾款回款</b>
+                            <span class="status-pill green"><i class="ri-check-line" />命中 4 次</span>
+                          </div>
+                          <p>自动认领「应收账款 - 官网项目」，金额区间 ¥8,000–12,000 已学习</p>
+                        </div>
+                      </div>
+
+                      <div class="recon-card-item warning">
+                        <div class="recon-card-icon"><i class="ri-file-edit-line" /></div>
+                        <div class="recon-card-main">
+                          <div class="recon-card-row">
+                            <b>你纠正过一次，规则已升级</b>
+                            <span class="status-pill blue"><i class="ri-arrow-up-line" />v1 → v2</span>
+                          </div>
+                          <p>「支付宝」提现手续费由「管理费用」修正为「财务费用」，此后同类流水按新规则命中</p>
+                        </div>
+                      </div>
+
+                      <div class="memory-footer-hint">
+                        <i class="ri-shield-check-line" />
+                        <span>全部规则可查看、可修改、可停用 · 记忆仅属于你们公司</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Tab 04: 月末结账 -->
             <div v-else-if="activeShowcase === 'closing'" key="closing" class="stage-grid">
               <div class="stage-left">
-                <h3 class="stage-title">4 步向导结账，<br />底稿直通税局</h3>
+                <h3 class="stage-title">4 步向导结账，<br />报税数据直出</h3>
                 <p class="stage-desc">
                   将复杂的期末损益结转降维为 4 步清晰向导。往来核销、设备折旧与税额测算一步到位。
                 </p>
@@ -711,7 +782,7 @@ const complianceEvidence = [
               </div>
             </div>
 
-            <!-- Tab 04: 经营报表 -->
+            <!-- Tab 05: 经营报表 -->
             <div v-else-if="activeShowcase === 'dashboard'" key="dashboard" class="stage-grid">
               <div class="stage-left">
                 <h3 class="stage-title">实时财务三张表，<br />看懂企业经营</h3>
@@ -759,7 +830,7 @@ const complianceEvidence = [
               </div>
             </div>
 
-            <!-- Tab 05: AI 连接 (MCP & Skills) -->
+            <!-- Tab 06: AI 连接 (MCP & Skills) -->
             <div v-else-if="activeShowcase === 'mcp'" key="mcp" class="stage-grid">
               <div class="stage-left">
                 <h3 class="stage-title">原生支持 MCP + Skills，<br />打造懂小微财税的数字员工</h3>
@@ -767,8 +838,8 @@ const complianceEvidence = [
                   全面支持 Model Context Protocol 协议与 Agent Skills 规范。不仅能在 Claude、Cursor 中对话查账起草凭证，更可挂载专属财税技能包，驱动半自动报税核对等端到端高阶工作流。
                 </p>
                 <div class="stage-bullets">
-                  <div class="stage-bullet"><i class="ri-check-line" /><span><b>24 个原生 MCP 工具</b>：覆盖记账起草、三方流水对账、结账五项检查、申报作业包与资产台账</span></div>
-                  <div class="stage-bullet"><i class="ri-check-line" /><span><b>专属 Agent Skills 技能包</b>：挂载半自动报税伴侣，联动浏览器自动比对税局底账、识别无票收入、预填申报表</span></div>
+                  <div class="stage-bullet"><i class="ri-check-line" /><span><b>27 个原生 MCP 工具</b>：覆盖记账起草、三方流水对账、结账五项检查、申报作业包与资产台账</span></div>
+                  <div class="stage-bullet"><i class="ri-check-line" /><span><b>专属 Agent Skills 技能包</b>：挂载半自动报税伴侣，一键生成报税数据、识别无票收入、引导申报表填写</span></div>
                   <div class="stage-bullet"><i class="ri-check-line" /><span><b>人机双签安全红线</b>：AI 只产生待确认草稿不直接入账、不碰税局密码与提交按钮，数据可审计</span></div>
                 </div>
                 <div class="stage-cta-row">
@@ -797,18 +868,18 @@ const complianceEvidence = [
                     <div class="chat-bubble user-bubble">
                       <div class="bubble-sender">Founder (You)</div>
                       <div class="bubble-text">
-                        帮我准备 Q3 增值税与所得税申报包，并在已打开的电子税务局页面核对开票数据是否一致。
+                        帮我准备 Q3 增值税与所得税申报包，并核对开票数据是否一致。
                       </div>
                     </div>
 
                     <!-- AI 响应 -->
                     <div class="chat-bubble assistant-bubble">
                       <div class="bubble-sender">
-                        <i class="ri-sparkling-fill text-purple" /> Claude Assistant (via SoloBooks MCP & Skills)
+                        <i class="ri-chat-3-line text-purple" /> Claude Assistant (via SoloBooks MCP & Skills)
                       </div>
 
                       <div class="mcp-skill-chip">
-                        <i class="ri-magic-line" />
+                        <i class="ri-tools-line" />
                         <span>已激活技能：<code>solobooks-tax-filing</code>（半自动纳税申报伴侣）</span>
                       </div>
 
@@ -821,20 +892,20 @@ const complianceEvidence = [
                       </div>
 
                       <div class="mcp-call-chip">
-                        <i class="ri-window-line" />
-                        <span>联动浏览器：<code>chrome_devtools__take_snapshot()</code> 读取税局底账</span>
+                        <i class="ri-file-chart-line" />
+                        <span>生成报税数据：<code>增值税及附加税费申报表 + 企业所得税预缴申报表</code></span>
                       </div>
                       <div class="mcp-voucher-preview">
-                        <div class="mcp-v-title">🎯 电子税务局金税底账逆向比对结果</div>
+                        <div class="mcp-v-title">🎯 Q3 报税数据包已生成</div>
                         <div class="mcp-v-lines">
-                          <div>• 税局归集开票销售额：¥245,800.00（与账套发票池 100% 勾稽一致）</div>
-                          <div>• 申报表预填状态：小微免税销售额、实际利润额已在税局网页填妥</div>
-                          <div>• 视觉标注：已在网页中用黄色边框高亮标注所有已填入输入框</div>
+                          <div>• 开票销售额合计：¥245,800.00（与账套发票池 100% 勾稽一致）</div>
+                          <div>• 增值税：小微免征，免税销售额 ¥245,800.00 已按申报表口径列示</div>
+                          <div>• 企业所得税：实际利润额与应补税额 ¥3,410.00 已生成，可直接对照电子税务局填写</div>
                         </div>
                       </div>
                       <div class="mcp-safety-note">
                         <i class="ri-shield-keyhole-line text-emerald" />
-                        <span><b>人机双签安全红线：</b>AI 严禁代点税局「提交申报」按钮。数据已核验无误，请在浏览器中最终由您本人亲手点击提交。</span>
+                        <span><b>人机双签安全红线：</b>AI 只生成报税数据，不代客申报。数据已核验无误，请在电子税务局由您本人核对后亲手提交。</span>
                       </div>
                     </div>
                   </div>
@@ -851,8 +922,8 @@ const complianceEvidence = [
       <div class="section-inner">
         <div class="section-top text-center">
           <p class="section-tag">清晰对比</p>
-          <h2 class="section-headline">为什么选择梭罗记账？</h2>
-          <p class="section-subtitle">为一人公司和小微团队摆脱专职高成本与传统软件的繁重门槛。</p>
+          <h2 class="section-headline">为什么不找传统代账，而选梭罗记账？</h2>
+          <p class="section-subtitle">不止于省下代账费——告别“应付税局的黑盒死账”，做懂财务的清醒掌舵人，养出随时可尽调的合规公司。</p>
         </div>
 
         <div class="compare-grid">
@@ -865,7 +936,7 @@ const complianceEvidence = [
             <!-- 梭罗记账高亮方案 -->
             <div class="solo-solution">
               <div class="solo-solution-label">
-                <i class="ri-sparkling-fill" />梭罗记账
+                <i class="ri-book-open-line" />梭罗记账
               </div>
               <div class="solo-solution-text">{{ comp.solo }}</div>
             </div>
@@ -982,10 +1053,10 @@ const complianceEvidence = [
     <section id="trust" class="section section-trust">
       <div class="section-inner">
         <div class="section-top text-center">
-          <p class="section-tag">合规保障</p>
-          <h2 class="section-headline">严谨合规，放心报税</h2>
+          <p class="section-tag">合规保障与未来期许</p>
+          <h2 class="section-headline">按你期许的公司样子管账</h2>
           <p class="section-subtitle">
-            遵循财政部准则，直通电子税局，让每一笔账目都有据可查。
+            好公司不是融到资才开始规范财务。从第一天起做到票、流、账、税 100% 勾稽，让账本随时接得住银行授信、政策补贴与投资人尽调。
           </p>
         </div>
 
@@ -1012,7 +1083,7 @@ const complianceEvidence = [
       <div class="cta-banner">
         <div class="cta-glow-mesh" />
         <div class="cta-inner text-center">
-          <h2 class="cta-title">让专属 AI 会计，打理你的公司账目</h2>
+          <h2 class="cta-title">让专属 AI CFO，打理你的公司账目</h2>
           <p class="cta-sub">免费注册，1 分钟建立企业专属智能账本。</p>
           <div class="cta-buttons">
             <button class="island-cta-btn" @click="router.push('/login')">
@@ -1033,6 +1104,7 @@ const complianceEvidence = [
             </div>
           </div>
           <nav class="footer-nav">
+            <a href="/learn">学习中心</a>
             <a href="/agreement" target="_blank">服务协议</a>
             <a href="/privacy" target="_blank">隐私政策</a>
             <a href="/login">进入系统</a>
@@ -1077,7 +1149,8 @@ const complianceEvidence = [
 .landing-page {
   min-height: 100vh;
   width: 100%;
-  overflow-x: hidden;
+  /* 必须用 clip 而非 hidden：hidden 会把根节点变成滚动容器，破坏内部 sticky 吸顶导航 */
+  overflow-x: clip;
   background-color: #f8fafc;
   color: #0f172a;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Noto Sans SC", sans-serif;
@@ -1962,7 +2035,8 @@ const complianceEvidence = [
   border-radius: 12px;
   border: 1px solid #e2e8f0;
   width: 100%;
-  max-width: 860px;
+  /* 980px：5 个 tab 单行不折字所需宽度（配合 tab 按钮的 white-space: nowrap） */
+  max-width: 980px;
   box-sizing: border-box;
   margin: 0 auto 32px;
 }
@@ -1978,6 +2052,8 @@ const complianceEvidence = [
   font-size: 13.5px;
   font-weight: 600;
   color: #5b6a7c;
+  /* 禁止逐字折行（"凭据归 集"），窄屏由 nav-bar 横向滚动兜底 */
+  white-space: nowrap;
   cursor: pointer;
   transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
   position: relative;
@@ -2245,6 +2321,28 @@ const complianceEvidence = [
 .status-pill.amber {
   background: #fffbeb;
   color: #d97706;
+}
+
+.status-pill.blue {
+  background: #eaf1fe;
+  color: var(--solo-info);
+}
+
+.memory-footer-hint {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px dashed #cdd9e8;
+  border-radius: 8px;
+  background: #f8fafc;
+  font-size: 12px;
+  color: #5b6a7c;
+}
+
+.memory-footer-hint i {
+  color: #0f7354;
 }
 
 /* 结账向导卡片 */
@@ -3426,6 +3524,12 @@ const complianceEvidence = [
 
   .mobile-sticky-bar {
     display: flex;
+  }
+
+  /* 吸底操作栏展示期间，全局内测浮钮上移避让，避免遮挡"免费试用"主 CTA。
+     整条选择器必须包进 :global（fab 属于子组件，scoped 属性选择器匹配不到） */
+  :global(html.landing-cta-bar-shown .beta-contact-fab) {
+    bottom: 86px;
   }
 
   .nav-links {

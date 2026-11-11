@@ -6,7 +6,6 @@
 import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 import piniaPluginPersistedstate from 'pinia-plugin-persistedstate'
-import naive from 'naive-ui'
 import App from './App.vue'
 import router from './router'
 import './style.css'
@@ -18,6 +17,9 @@ pinia.use(piniaPluginPersistedstate)
 
 app.use(pinia)
 app.use(router)
-app.use(naive)
+// 不要 app.use(naive)：全局注册会把整个 naive-ui（约 1MB 原始 / 278KB gzip）
+// 打进入口 chunk，官网首屏也得先下载整套组件库。全站用到 naive 的 116 个组件文件
+// 都是显式 import 具体组件（无 <n-xxx> kebab 用法、无 resolveComponent、无
+// globalProperties），按需引入即可，不需要全局注册。
 
 app.mount('#app')

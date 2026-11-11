@@ -6,6 +6,7 @@
 import apiClient from './client'
 import type { Entry } from './types'
 import { makeIdempotencyKey } from './client'
+import type { PeriodCloseChecks } from '@/utils/closingReadiness'
 
 const headers = () => ({ 'Idempotency-Key': makeIdempotencyKey() })
 
@@ -89,7 +90,7 @@ export function adjustEntryVoucherLines(
   return apiClient.patch(`/api/record/entries/${entryId}/voucher-lines`, payload, { headers: headers() })
 }
 
-export function getPeriodCloseChecks(month: string): Promise<Record<string, unknown>> {
+export function getPeriodCloseChecks(month: string): Promise<PeriodCloseChecks> {
   return apiClient.get(`/api/periods/${month}/close-checks`)
 }
 
@@ -114,8 +115,12 @@ export function getBackfillTarget(businessDate: string): Promise<BackfillTarget>
   return apiClient.get('/api/periods/backfill-target', { params: { businessDate } })
 }
 
-export function closePeriod(month: string): Promise<Record<string, unknown>> {
-  return apiClient.post(`/api/periods/${month}/close`, {}, { headers: headers() })
+export function closePeriod(month: string, expectedSnapshotHash: string): Promise<Record<string, unknown>> {
+  return apiClient.post(
+    `/api/periods/${month}/close`,
+    { expectedSnapshotHash },
+    { headers: headers() },
+  )
 }
 
 // ── 暂估入账（月末票未到） ──────────────────────────────────

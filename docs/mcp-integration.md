@@ -93,9 +93,9 @@ curl -X POST https://<域名>/mcp \
 
 ## 三、能力清单
 
-**查询（19 个）**：`get_month_summary`（月度汇总）、`list_entries`（账目列表）、`list_invoice_entries`（发票）、`list_bank_statements`（流水）、`list_fixed_assets`（固定资产台账：原值/折旧/净值）、`list_intangible_assets`（无形资产台账：原值/摊销/净值/权利到期）、`get_advance_balances`（股东/员工垫付与报销台账）、`get_aging`（应收/应付账龄）、`list_todos`（待办）、`search_books`（全文搜索）、`get_entry_detail`、`get_company_profile`（公司画像/AI 记忆，只读）、`run_close_checks`（结账五项检查）、`list_unmatched`（未对账流水 + 建议）、`preview_accruals`、`preview_asset_actions`（计提预览）、`get_filing_deadlines`（征期）、`generate_close_report` / `generate_filing_package`（报告/申报作业包）。
+**查询（20 个）**：`get_month_summary`（月度汇总）、`list_entries`（账目列表）、`list_invoice_entries`（发票）、`list_bank_statements`（流水）、`list_fixed_assets`（固定资产台账：原值/折旧/净值）、`list_intangible_assets`（无形资产台账：原值/摊销/净值/权利到期）、`get_advance_balances`（股东/员工垫付与报销台账）、`get_aging`（应收/应付账龄）、`list_todos`（待办）、`search_books`（全文搜索）、`get_entry_detail`、`get_company_profile`（公司画像/AI 记忆，只读）、`run_close_checks`（结账五项检查）、`list_unmatched`（未对账流水 + 建议）、`preview_accruals`、`preview_asset_actions`（计提预览）、`get_filing_deadlines`（征期）、`generate_close_report` / `generate_filing_package`（报告/申报作业包）、`search_tax_policy`（税收政策检索）。
 
-**起草（5 个，需读写草稿权限，产出均为待确认草稿，在梭罗记账产品内确认后才入账）**：`propose_voucher` / `propose_vouchers`（记账草稿）、`propose_match`（对账建议）、`propose_accrual、propose_asset_closure`（折旧/工资计提草稿）。公司画像（AI 长期记忆）对 MCP 只读：分类习惯等记忆的写入只能在产品内完成。
+**起草与对账闭环（7 个，需读写草稿权限，产出均为待确认草稿，在梭罗记账产品内确认后才入账）**：`propose_voucher` / `propose_vouchers`（记账草稿）、`propose_match`（对账建议）、`propose_accrual`、`propose_asset_closure`（折旧/工资计提草稿）、`record_private_expense`（公私分明私账支出登记）。公司画像（AI 长期记忆）对 MCP 只读：分类习惯等记忆的写入只能在产品内完成。
 
 **为 agent 效率与系统安全做的核心设计（2026-10-12）**：
 

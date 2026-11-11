@@ -15,6 +15,10 @@ async function freshModule(): Promise<ViewModeModule> {
 }
 
 describe('useStatementViewMode', () => {
+  // 冷启动重导入（连带 pinia、auth store、API 客户端）单独跑约 4 秒，与 pytest
+  // 并行争 CPU 时会越过默认 5 秒上限（D-016），三个用例都走 freshModule，逐个放宽到 20 秒
+  const CASE_TIMEOUT = 20_000
+
   beforeEach(() => {
     localStorage.clear()
     vi.resetModules()
@@ -25,7 +29,7 @@ describe('useStatementViewMode', () => {
     const { useStatementViewMode } = await freshModule()
     const { mode } = useStatementViewMode()
     expect(mode.value).toBe('boss')
-  })
+  }, CASE_TIMEOUT)
 
   it('persists the chosen mode and restores it for a new mount', async () => {
     const { useStatementViewMode } = await freshModule()
@@ -37,7 +41,7 @@ describe('useStatementViewMode', () => {
     // 新页面挂载（新模块副本）应读回会计视图
     const { useStatementViewMode: useFresh } = await freshModule()
     expect(useFresh().mode.value).toBe('accounting')
-  })
+  }, CASE_TIMEOUT)
 
   it('switches back to boss and persists the default', async () => {
     const { useStatementViewMode } = await freshModule()
@@ -48,5 +52,5 @@ describe('useStatementViewMode', () => {
 
     const { useStatementViewMode: useFresh } = await freshModule()
     expect(useFresh().mode.value).toBe('boss')
-  })
+  }, CASE_TIMEOUT)
 })

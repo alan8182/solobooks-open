@@ -23,6 +23,12 @@ async def _mcp_schema():
     try:
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+        # bank_service keeps a small set of compatibility tables outside ORM.
+        # Closing snapshots scan them, so parity tests must provide the same
+        # schema as the application startup path.
+        from services import bank_service
+
+        await bank_service._ensure_schema()
     finally:
         await engine.dispose()
     yield
@@ -181,17 +187,24 @@ class TestPatTokenService:
 
 class TestMcpToolRegistration:
     async def test_open_tools_registered(self):
-        """读 + 写草稿全集注册（26 = 内部 27 - 刻意不开放的 update_company_profile）。"""
+        """MCP 暴露 20 个只读工具与 7 个草稿/对账闭环工具，但不暴露锁账工具。"""
         from agent.mcp_server import MCP_READ_TOOLS, MCP_WRITE_TOOLS, mcp
 
         tools = await mcp.list_tools()
         names = {t.name for t in tools}
         assert names == MCP_READ_TOOLS | MCP_WRITE_TOOLS
-        assert len(names) == 26
+        assert len(names) == 27
         assert "get_advance_balances" in names
         assert "list_intangible_assets" in names
         assert "list_private_expenses" in names
         assert "record_private_expense" in names
+        assert "propose_statement_vouchers" in names
+        assert {
+            "propose_match",
+            "propose_accrual",
+            "propose_asset_closure",
+        } <= names
+        assert "close_period" not in names
 
     async def test_company_profile_write_not_exposed(self):
         """画像写入不对 MCP 开放：工具仍在内部层，但 MCP 侧不可见不可调。"""
@@ -618,12 +631,18 @@ class TestOptimizations:
         report_param = TOOLS_BY_NAME["generate_close_report"].parameters["properties"]["month"]
         assert report_param["description"] == "月份，格式 YYYY-MM"
 
-    async def test_run_close_checks_ttl_cache(self, monkeypatch):
+    async def test_run_close_checks_always_reads_live_snapshot(self, monkeypatch):
         from agent import tools
         from agent.tools import _ANALYSIS_CACHE, _run_close_checks, ToolContext
+        from services import closing_workflow_service
 
         ctx = ToolContext(user_id="mcp_cache_u", company_id="c1")
         _ANALYSIS_CACHE.clear()
+        monkeypatch.setattr(
+            closing_workflow_service,
+            "APP_PUBLIC_URL",
+            "https://solobooks.example",
+        )
 
         calls = 0
 
@@ -633,14 +652,40 @@ class TestOptimizations:
             return {"canClose": True, "count": calls}
 
         from services import accounting_core_service
+        from services import asset_closure_service
 
         monkeypatch.setattr(accounting_core_service, "period_close_checks", fake_checks)
 
+        async def empty_asset_preview(*_args, **_kwargs):
+            return {
+                "fixedAssets": {
+                    "missingCards": [],
+                    "dueDepreciation": [],
+                    "blockedItems": [],
+                },
+                "intangibles": {
+                    "missingCards": [],
+                    "dueAmortization": [],
+                    "blockedItems": [],
+                },
+            }
+
+        monkeypatch.setattr(
+            asset_closure_service,
+            "preview_asset_closure_in_session",
+            empty_asset_preview,
+        )
+
         r1 = await _run_close_checks(ctx, "2026-01")
         assert r1["count"] == 1
+        assert (
+            r1["manualClose"]["url"]
+            == "https://solobooks.example/closing-wizard?month=2026-01&step=3"
+        )
+        assert r1["manualClose"]["requiresLogin"] is True
         r2 = await _run_close_checks(ctx, "2026-01")
-        assert r2["count"] == 1  # 命中短缓存
-        assert calls == 1
+        assert r2["count"] == 2
+        assert calls == 2
 
 
 

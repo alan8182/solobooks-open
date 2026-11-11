@@ -81,5 +81,7 @@ describe('LandingPage 移动端适配交互', () => {
     expect(wrapper.find('.hero-proof-bento').text()).toContain('100%')
     expect(wrapper.find('.hero-proof-bento').text()).toContain('MCP & Skills')
     expect(wrapper.find('.hero-proof-bento').text()).toContain('¥0')
+    expect(wrapper.text()).toContain('老板财务认知')
+    expect(wrapper.text()).toContain('融资与尽调就绪')
   })
 })

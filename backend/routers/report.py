@@ -40,7 +40,11 @@ from services.accounting_core_service import (
     journal_entries_for_reports,
     posted_entries_for_reports,
 )
-from services.tax_filing_export_service import build_statement_data, default_completed_period
+from services.tax_filing_export_service import (
+    _is_reversal_of_opening,
+    build_statement_data,
+    default_completed_period,
+)
 from services.equity_service import get_equity_changes
 from services.vat_filing_service import build_small_scale_vat_assist
 from services.vat_service import VAT_PAYABLE_ACCOUNT
@@ -384,8 +388,18 @@ def _income_statement_entry_values(entry: dict) -> dict[str, Decimal]:
     values = _empty_income_statement_values()
     if entry.get("source") == "wechat_settlement" or entry.get("isClosingTransfer"):
         return values
-    # 期初凭证不进利润表；但年中建账的 YTD 过渡凭证承载启用前损益，必须计入
-    if entry.get("entryType") == "opening" and not str(entry.get("id") or "").endswith("-ytd"):
+    # 冲销期初凭证的冲销凭证与期初同进同出，一并排除（期初重设后不排除会把
+    # 启用前损益反向冲一遍）
+    if _is_reversal_of_opening(entry):
+        return values
+    # 期初凭证不进利润表；但年中建账「已过账」的 YTD 过渡凭证承载启用前损益，
+    # 必须计入（旧代 YTD 已冲销，只认 posted，避免与新代重复）
+    is_ytd_opening = (
+        entry.get("entryType") == "opening"
+        and str(entry.get("id") or "").endswith("-ytd")
+        and entry.get("voucherStatus") == "posted"
+    )
+    if entry.get("entryType") == "opening" and not is_ytd_opening:
         return values
 
     voucher = entry.get("voucherLines") or {}
@@ -407,7 +421,15 @@ def _income_statement_entry_values(entry: dict) -> dict[str, Decimal]:
                 if not classified:
                     continue
                 bucket, nature = classified
-                signed = amount if side == ("credit" if nature == "income" else "debit") else -amount
+                natural_side = "credit" if nature == "income" else "debit"
+                if is_ytd_opening:
+                    # 方向毛额：只取天然方向一侧（收入贷方/费用借方），对侧是原账本
+                    # 的结转毛额不是真实发生额；净额口径会把月结型老账读成全 0
+                    if side != natural_side:
+                        continue
+                    signed = amount
+                else:
+                    signed = amount if side == natural_side else -amount
                 values[bucket] += signed
                 _add_statement_details(values, bucket, signed, f"{name} {category}")
         return values
@@ -1087,14 +1109,16 @@ async def balance_sheet(
     """资产负债表：与税务报表共用已过账复式分录及科目余额口径；支持月报/季报。
 
     同一份数据返回两种视图：boss（非零科目明细）与 standard（会小企01表全量行次，
-    含年初/期末两列）。年初余额取自 balance_opening——有显式期初凭证用期初，
-    否则从历史分录派生（见 opening_balance_service 跨年连续性）。
+    含年初/期末两列）。年初余额取自 balance_opening——优先用期初导入时存的年初快照，
+    1 月建账没有快照时用期初本身（见 opening_balance_service.get_year_start_balances）。
     """
     period = _period_label(req.month, req.periodType)
     statement = await build_statement_data(ctx.user_id, ctx.company_id, period, req.periodType)
     balance = statement.balance_current
     opening = statement.balance_opening
-    current_profit = statement.profit_ytd.get("net_profit", Decimal("0"))
+    # retained_earnings 由净额口径的 profit_ytd_net 累计而成，权益分解必须用同一
+    # 口径；profit_ytd 现含 YTD 方向毛额（利润表本年累计），不能在这里混用
+    current_profit = statement.profit_ytd_net.get("net_profit", Decimal("0"))
     prior_retained = balance.get("retained_earnings", Decimal("0")) - current_profit
 
     def item(code: str, name: str, key: str, sign: int = 1) -> BalanceSheetItem:
@@ -1286,6 +1310,7 @@ async def balance_sheet(
             total_assets == d2(balance.get("liability_equity_total", Decimal("0")))
             and opening_assets == d2(opening.get("liability_equity_total", Decimal("0")))
         ),
+        openingKnown=statement.year_start_known,
     )
 
     return BalanceSheetResponse(

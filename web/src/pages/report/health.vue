@@ -158,7 +158,7 @@ onMounted(load)
         </NButton>
         <div class="report-title-section">
           <h2>健康评分与财税体检</h2>
-          <p class="report-subtitle">基于真实账套、五项结账检查与发票数据，百分制量化评估经营合规与财务健康</p>
+          <p class="report-subtitle">基于真实账套、流水勾稽与五项结账检查，百分制量化评估经营合规与融资尽调（DD）就绪水平</p>
         </div>
       </div>
       <div class="report-header-right">
@@ -214,7 +214,7 @@ onMounted(load)
         <!-- 2. 五维健康度矩阵 -->
         <div class="section-title-bar">
           <h3 class="report-section-title">五维健康指标</h3>
-          <span class="section-tip">涵盖账务、票据、资金、税务与盈利五大核心支柱</span>
+          <span class="section-tip">涵盖账务、票据、资金、税务与盈利五大支柱——不仅算清当下风险，更看清距离合规扩张与融资尽调还差哪块拼图</span>
         </div>
         <div class="dims-grid mb-4">
           <NCard
@@ -302,7 +302,7 @@ onMounted(load)
         <NCard :bordered="false" class="report-card mb-4 diagnosis-card">
           <div class="diagnosis-header">
             <div class="diagnosis-title-row">
-              <i class="ri-sparkling-2-fill diagnosis-icon"></i>
+              <i class="ri-line-chart-line diagnosis-icon"></i>
               <h3 class="report-section-title" style="margin: 0;">AI 财务经理经营点评与优化指引</h3>
             </div>
             <NButton
@@ -312,7 +312,7 @@ onMounted(load)
               :loading="diagnosisLoading"
               @click="generateDiagnosis"
             >
-              <template #icon><i class="ri-magic-line"></i></template>
+              <template #icon><i class="ri-file-chart-line"></i></template>
               生成深度经营洞察
             </NButton>
             <NButton

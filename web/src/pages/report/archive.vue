@@ -456,7 +456,7 @@ onMounted(load)
 }
 .evidence-pill.warning {
   background: #fef3c7;
-  color: #b45309;
+  color: var(--solo-warning);
 }
 .evidence-pill.info {
   background: #eff6ff;

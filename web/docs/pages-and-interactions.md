@@ -28,7 +28,7 @@
 
 - **AppLayout.vue**：挂载时校验登录态 → `fetchProfile()` → `entryStore.fetchEntries()`，失败跳登录。固定侧边栏 + 顶栏 + `<router-view>`；支持侧栏折叠（切换 `--sidebar-width`）、`Ctrl/Cmd+K` 唤起全局搜索；≤1024px 隐藏侧栏。容器宽度采用分层响应式标准（见 `web/docs/design_guidelines.md`）：外层上限 1440px，多列财务报表、银行对账、统一账册工作台及台账全面支持 1200px~1240px 宽屏舒展展示，表单详情页保持 640px~720px 居中聚焦。
 - **Sidebar.vue**：菜单定义在 `utils/constants.ts` 的 `NAV_ITEMS`，按工作阶段分四组：
-  - **日常**：工作台 `/`、AI 会计 `/copilot`、待办 `/todos`
+  - **日常**：工作台 `/`、AI CFO `/copilot`、待办 `/todos`
   - **账务**：经营账本 `/ledger`、发票台账 `/invoices`（含抽屉导入）、银行流水 `/bank`、记账凭证 `/vouchers`、电子账簿 `/ledger/books`（总账/明细账/序时账/多栏账/项目余额五合一）
   - **周期**：月度结账 `/closing-wizard`、税务申报 `/tax-filing`、经营报表 `/reports`
   - **工具**：专项核算（资产台账 `/assets`、研发费用 `/rd-expenses`、薪酬 `/mine/salary`、老板私账 `/private-expenses`、归集与分摊 `/aggregation`）与设置（公司信息、会计科目、辅助核算、期初、旧账导入、备份归档、审计日志、AI 连接、个人设置）
@@ -68,11 +68,11 @@
 | `asset.ts` / `intangible.ts` | 固定资产与无形资产卡片、折旧/摊销补提测算与处置 |
 | `salary.ts` | 员工、工资表、计提/发放、社保个税、研发工时分配 |
 | `legacy.ts` / `backup.ts` / `mcpTokens.ts` | 旧账导入 / 备份归档 / MCP 令牌 |
-| `todo.ts` / `private-expense.ts` / `category.ts` / `audit.ts` / `copilot.ts` | 待办 / 私账 / 分类 / 审计日志 / AI 会计 |
+| `todo.ts` / `private-expense.ts` / `category.ts` / `audit.ts` / `copilot.ts` | 待办 / 私账 / 分类 / 审计日志 / AI CFO |
 
 ### 1.5 官网首页（`src/pages/landing/index.vue`，公开）
 
-- 面向访客的营销页：吸顶白色通栏导航（≤640px 收起链接）、Hero + 可切换三场景的「梭罗 AI 会计工作台」mockup、方案对比、Agent 能力、适用场景、合规资质（4 层架构）、页脚（ICP 预留位 `ICP_LICENSE`）。
+- 面向访客的营销页：吸顶白色通栏导航（≤640px 收起链接）、Hero + 可切换三场景的「梭罗 AI CFO 工作台」mockup、方案对比、Agent 能力、适用场景、合规资质（4 层架构）、页脚（ICP 预留位 `ICP_LICENSE`）。
 - 主 CTA 统一为「免费注册 / 登录」：注册后自动获得演示账套，不再展示免注册试用入口。
 - 锚点板块带 `scroll-margin-top` 防吸顶导航遮挡。注意：`.landing-page` 不可加 `overflow-x: hidden`，否则 sticky 导航失效（已踩坑）。
 
@@ -82,7 +82,7 @@
 
 - **验证码登录**：`POST /api/auth/phone/send-code`（60s 倒计时）→ `POST /api/auth/phone/login`。
 - **密码登录**：`POST /api/auth/password/login`；「忘记密码」弹窗走验证码重置 `POST /api/auth/password/reset`。
-- 登录成功统一 `finishLogin`：`setSession` + `fetchProfile` → `window.location.replace('/')`；未设密码（`has_password === false`）或昵称为空时写 `sessionStorage['solo:setup-password-hint']`，由登录后首页弹「完善账号信息」引导。
+- 登录成功统一 `finishLogin`：`setSession` + `fetchProfile` → `window.location.replace('/')`。新用户首登时若仅有演示账套，首页自动呈现沙盒与建账引导；已有真实账套的用户直达工作台，不予打扰。
 - **演示账套**：新手机号首次登录即注册，后端同步生成一本带样本数据的演示账套并设为当前账套；测试账号 `13800000000 / 123456` 保留供调试，前端不单独展示入口。
 - 视觉遵循安静经营台（纯白卡片、无光晕/毛玻璃）；≤960px 收起左侧「梭罗实景协作卡」（三场景切换的纯 CSS 展示卡），登录卡内展示品牌区（定位语 + 口号 + 三个特色胶囊）；左上角「← 返回官网首页」。
 
@@ -98,7 +98,7 @@
 - 顶部栏公司切换器右侧常驻 `老板 | 会计` 分段开关；移动端放在抽屉顶部。
 - 首次进入默认老板视图；切换后按公司写入 `solo:workspace-view:{companyId}`，不是按角色强制。
 - 视图只改变导航、默认页面、信息密度和文案，不改变服务端权限；老板切到会计视图也不能越权过账或关账。
-- 老板视图：保留六个高频入口，按使用节奏分为三组——`每天`：`老板工作台`（`/`，含上传发票、上传流水、记一笔）、`AI 会计`（`/copilot`）、`待办`（`/todos`）；`每月`：`月度结账`（`/closing-wizard`）、`报税`（`/tax-filing`）；`复盘`：`经营`（`/reports`）。经营账本、发票导入、银行流水、项目利润等通过工作台卡片、任务或报表卡片进入；公司信息和个人设置收进用户菜单。
+- 老板视图：保留六个高频入口，按使用节奏分为三组——`每天`：`老板工作台`（`/`，含上传发票、上传流水、记一笔）、`AI CFO`（`/copilot`）、`待办`（`/todos`）；`每月`：`月度结账`（`/closing-wizard`）、`报税`（`/tax-filing`）；`复盘`：`经营`（`/reports`）。经营账本、发票导入、银行流水、项目利润等通过工作台卡片、任务或报表卡片进入；公司信息和个人设置收进用户菜单。
 - 会计视图：完整侧栏，包含凭证与账簿（`/ledger/books`）、会计科目、辅助核算、期初、旧账导入、备份、审计、MCP、研发费用和完整归集工作台。
 - 会计专属路由通过 `meta.workspace: ['accounting']` 标记；老板深链访问时不拦截，页面顶部显示视图提示，可一键切换或返回工作台。
 
@@ -109,7 +109,7 @@
 | 路由 | 页面 | 一句话用途 |
 |---|---|---|
 | `/` | home/index.vue | Agent 驾驶舱：唯一主动作 + 统一任务列表 + 经营概览 + 最近账目 |
-| `/copilot` | copilot/index.vue | AI 会计对话工作台（查账/记账/票据/语音，流式） |
+| `/copilot` | copilot/index.vue | AI CFO 对话工作台（查账/记账/票据/语音，流式） |
 | `/ledger`、`/ledger/:id` | ledger/ | 经营账本流水列表与交易明细（编辑/冲销） |
 | `/ledger/books` | ledger/books.vue | 统一电子账簿工作台（总分类账/明细分类账/序时账/多栏账/项目余额 5 合 1） |
 | `/vouchers`、`/vouchers/:id`、`/vouchers/print` | voucher/ | 凭证生成管理、详情与打印 |
@@ -137,11 +137,13 @@
 
 ## 3. AI 记账与账本凭证
 
-### 3.1 AI 会计工作台 `/copilot`
+### 3.1 AI CFO 工作台 `/copilot`
 
 - **API**：`chatAgentStream`（POST `/api/agent/chat`，fetch + SSE 流式）、`listAgentActions`（GET `/api/agent/actions?status=pending`）、`recordReceipt`（POST `/api/record/receipt`，multipart 图片）、`recordSpeech`（POST `/api/record/speech`，录音）。
 - **组件**：`AgentActionCard.vue`（待确认动作审批卡）；助手回复经 `utils/markdown.ts`（marked + DOMPurify 消毒）渲染。
-- **资产处理确认**：AI 先调 `preview_asset_actions` 找缺卡交易和待补提折旧/摊销，再调 `propose_asset_closure` 生成一张 `propose_accrual`（`kind=asset_closure`）确认卡；老板确认后在同一事务内建固定资产/无形资产卡并按期间补提，任一步失败整批回滚。
+- **结账快照与修复草稿**：产品内 AI 和 MCP 共用 `closing.v1` 快照。`run_close_checks` 返回 `snapshotHash`、`periodVersion`、`findings[].findingId` 与权威 ID；`list_unmatched`、`preview_accruals`、`preview_asset_actions` 必须用同一哈希校验。对账、流水分类、计提和资产处理只能创建带 `closingBinding` 的待确认动作，快照变化时动作自动过期且不写入任何会计数据。
+- **最终锁账边界**：对话和 MCP 不注册锁账工具。只有 `/closing-wizard` 的登录用户确认会把预览 `snapshotHash` 传给后端；后端取得账期锁后重算快照，哈希变化返回 `CLOSING_SNAPSHOT_STALE` 并刷新检查结果，不自动重试。
+- **资产处理确认**：AI 先调 `preview_asset_actions` 找缺卡交易和待补提折旧/摊销，再调 `propose_asset_closure` 生成一张 `propose_accrual`（`kind=asset_closure`）确认卡；动作绑定发起时的快照。老板确认后在同一事务内建固定资产/无形资产卡并按期间补提，任一步失败整批回滚。
 - **交互逻辑**：
   - 发送后 assistant 消息进入 `streaming` 状态，按 SSE 事件处理：`token` 增量追加正文并自动滚动；`tool_call`/`tool_result` 增删工具步骤（running/ok/fail，带中文标签映射）；`action` 插入审批卡；`error` 标记失败。AbortController 支持「停止」。
   - 图片识别成功后将结果拼成文本自动发送；语音经 MediaRecorder 录音 → ASR → 自动发送（<2KB 视为误触丢弃）。
@@ -238,7 +240,7 @@
 
 - **老板视图摘要**：页面顶部显示“本月是否可关账、还有几项待处理、待过账凭证数、阻断数、下一个待办”，并可切换到会计视图查看完整五步流程。
 - 已结账月份（`periodStatus==='closed'`）直接落到第 5 步只读展示。
-- 内嵌 **ClosingAgentPanel**（AI 结账顾问）：SSE 流式对话，工具含 run_close_checks / list_unmatched / propose_match 等，可产生待审批动作卡。
+- 月度结账只通过向导中的确定性规则完成；AI CFO 不提供对话式结账入口，也不能生成结账动作或直接锁账。
 
 ### 5.2 银行流水 `/bank`
 
@@ -286,7 +288,7 @@
 
 Agent 驾驶舱式布局，按「先处理、再看数」排列：
 
-1. 问候 + 老板视图的三张高频卡片：上传发票、上传流水、记一笔；会计视图保留「录入凭证 / 问 AI 会计」主按钮和四个专业入口。
+1. 问候 + 老板视图的三张高频卡片：上传发票、上传流水、记一笔；会计视图保留「录入凭证 / 问 AI CFO」主按钮和四个专业入口。
 2. 经营概览（净利润、收入、支出、本年/上月切换），不再展示硬编码健康结论。
 3. 底部双栏：左侧「今天要处理」统一任务列表（`useTaskInbox` / `TaskInbox`），右侧最近 5 条账目。任务列表聚合 AI 待确认草稿、月度结账阻断、税务征期、普通待办，最多 5 条，按逾期、截止日、阻断程度和优先级排序，标注来源。同截止日的多个税种合并为一条“税务申报有 N 项待处理”，避免重复占满列表。
 
@@ -295,7 +297,7 @@ Agent 驾驶舱式布局，按「先处理、再看数」排列：
 老板视图与会计视图的差异：
 
 - 老板视图：标题为“老板工作台”，页头下方三张高频卡片：上传发票、上传流水、记一笔；再往下是经营概览，底部左侧任务、右侧最近账目。
-- 会计视图：标题为“会计工作台”，主动作“录入凭证 / 问 AI 会计”，在任务列表上方增加凭证管理、总账、月末结账、税务申报四个专业入口。
+- 会计视图：标题为“会计工作台”，主动作“录入凭证 / 问 AI CFO”，在任务列表上方增加凭证管理、总账、月末结账、税务申报四个专业入口。
 
 ### 6.2 `/mine` 系列
 

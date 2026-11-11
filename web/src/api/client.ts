@@ -14,9 +14,9 @@ import { createDiscreteApi } from 'naive-ui'
 // company_social_security / net_salary 全部漏网，保持字符串传入 NInputNumber。
 // naive-ui 的 format() 见 typeof value !== 'number' 直接返回空串，草稿工资表 5 列金额
 // 因此永远显示 placeholder「请输入」——用户以为没填，手工覆盖掉系统算好的社保。
-// 故补 _salary / _base / _security / bonus / allowance / deduction 六个后缀；
+// 故补 _salary / _base / _security / _insurance / _fund / bonus / allowance / deduction 等后缀；
 // 二级校验（纯数字）保证 social_security 这类枚举值不会被误转。
-const MONEY_KEY = /(?:amount|income|expense|profit|cost|tax|vat|assets|liabilities|equity|deductible|inflow|outflow|net|debit|credit|balance|value|sales|rate|percent|amortization|_salary|_base|_security|_total|bonus|allowance|deduction)$/i
+const MONEY_KEY = /(?:amount|income|expense|profit|cost|tax|vat|assets|liabilities|equity|deductible|inflow|outflow|net|debit|credit|balance|value|sales|rate|percent|amortization|_salary|_base|_security|_insurance|_fund|_total|bonus|allowance|deduction)$/i
 
 function normalizeMoneyForDisplay(value: unknown, key = ''): any {
   // Binary downloads (XLS/PDF/images) must bypass JSON display normalization.

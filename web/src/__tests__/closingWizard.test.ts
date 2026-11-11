@@ -13,10 +13,24 @@ import {
   invoiceDisplayAmount,
   isReconciledEntry,
   isNonBankSettledEntry,
+  isReversalLikeEntry,
+  canResetEntryDisposition,
+  isLiveInvoiceEntry,
+  invoiceDedupKey,
+  isPreferredInvoiceEntry,
+  invoiceRowStatus,
+  invoiceNeedsAttention,
   formatDispositionTag,
   formatDispositionExplanation,
   reconciliationDifference,
+  voucherLinesSummary,
   signedInvoiceAmount,
+  DISPOSITION_EXCLUDED_CATEGORIES,
+  RD_EXPENSE_CATEGORY,
+  dispositionCategoryGroups,
+  dispositionCategoryOf,
+  isEffectiveRdProject,
+  hasEffectiveRdProjects,
 } from '@/utils/closingWizard'
 import { sortEntriesByDateDescending } from '@/utils/entrySort'
 
@@ -334,6 +348,39 @@ describe('non-bank settled entries disposition check', () => {
     expect(formatDispositionTag({ payer: 'advance_offset' })).toBe('冲前期预收')
   })
 
+  it('excludes reversal chains from confirmed disposition resets', () => {
+    expect(isReversalLikeEntry({ entryType: 'reversal' })).toBe(true)
+    expect(isReversalLikeEntry({ entry_type: 'reversal' })).toBe(true)
+    expect(isReversalLikeEntry({ status: 'reversed' })).toBe(true)
+    expect(isReversalLikeEntry({ reversalOf: 'orig-1' })).toBe(true)
+    expect(isReversalLikeEntry({ entryType: 'standard', status: 'posted' })).toBe(false)
+  })
+
+  it('only allows unposted, non-bank-import dispositions to be reset', () => {
+    expect(canResetEntryDisposition({
+      id: 'invoice-1',
+      payer: 'boss_personal',
+      status: 'draft',
+    })).toBe(true)
+    expect(canResetEntryDisposition({
+      id: 'invoice-1',
+      payer: 'boss_personal',
+      status: 'posted',
+    })).toBe(false)
+    expect(canResetEntryDisposition({
+      id: 'reim-bank-1',
+      payer: 'boss_personal',
+      source: 'bank_import',
+      status: 'pending_review',
+    })).toBe(false)
+    expect(canResetEntryDisposition({
+      id: 'reversal-1',
+      payer: 'boss_personal',
+      entryType: 'reversal',
+      status: 'posted',
+    })).toBe(false)
+  })
+
   it('formats boss-friendly accounting explanations accurately', () => {
     expect(formatDispositionExplanation({ payer: 'boss_personal', direction: 'expense' })).toContain('公司欠老板垫付款')
     expect(formatDispositionExplanation({ paymentStatus: 'unpaid', direction: 'income' })).toContain('客户欠款')
@@ -343,3 +390,191 @@ describe('non-bank settled entries disposition check', () => {
   })
 })
 
+describe('closing wizard invoice list dedup and status', () => {
+  const original = {
+    id: 'orig-1',
+    title: '发票-深圳市腾讯计算机系统有限公司',
+    occurDate: '2026-06-02',
+    amount: 300,
+    direction: 'expense',
+    invoiceNumber: '26957000000148730058',
+    payer: 'boss_personal',
+    voucherStatus: 'reversed',
+    reversalOf: null,
+  }
+  const reversal = {
+    id: 'rev-1',
+    title: '冲销：发票-深圳市腾讯计算机系统有限公司',
+    occurDate: '2026-06-02',
+    amount: -300,
+    direction: 'expense',
+    entryType: 'reversal',
+    reversalOf: 'orig-1',
+  }
+  const reposted = {
+    id: 'new-1',
+    title: '发票-深圳市腾讯计算机系统有限公司',
+    occurDate: '2026-06-02',
+    amount: 300,
+    direction: 'expense',
+    payer: 'company_account',
+    voucherStatus: 'posted',
+  }
+
+  it('treats reversal entries and reversed originals as non-live invoices', () => {
+    expect(isLiveInvoiceEntry(original)).toBe(false)
+    expect(isLiveInvoiceEntry(reversal)).toBe(false)
+    expect(isLiveInvoiceEntry(reposted)).toBe(true)
+  })
+
+  it('collapses a reversed original and its repost onto one dedup key', () => {
+    expect(invoiceDedupKey(reposted)).not.toBe('')
+    expect(isPreferredInvoiceEntry(reposted, original)).toBe(true)
+    expect(isPreferredInvoiceEntry(original, reposted)).toBe(false)
+  })
+
+  it('gives every row exactly one non-conflicting status', () => {
+    const reimbursed = invoiceRowStatus({
+      status: 'matched', payer: 'boss_personal', paymentStatus: '',
+    })
+    expect(reimbursed.kind).toBe('reimbursed')
+    expect(reimbursed.label).toContain('已报销')
+    expect(invoiceRowStatus({ status: 'matched', payer: 'company_account' }).kind).toBe('reconciled')
+    expect(invoiceRowStatus({ payer: 'boss_personal' }).kind).toBe('advance')
+    expect(invoiceRowStatus({ status: 'pending_confirmation' }).kind).toBe('pending')
+    expect(invoiceRowStatus({}).kind).toBe('unmatched')
+    expect(invoiceRowStatus({ is_archive_only: true }).kind).toBe('archived')
+  })
+
+  it('only counts unmatched and pending rows as needing attention', () => {
+    expect(invoiceNeedsAttention({})).toBe(true)
+    expect(invoiceNeedsAttention({ status: 'pending_confirmation' })).toBe(true)
+    expect(invoiceNeedsAttention({ status: 'matched' })).toBe(false)
+    expect(invoiceNeedsAttention({ payer: 'boss_personal' })).toBe(false)
+    expect(invoiceNeedsAttention({ is_archive_only: true })).toBe(false)
+  })
+})
+
+
+describe('voucherLinesSummary', () => {
+  it('renders debit and credit sides with code, name and amount', () => {
+    expect(
+      voucherLinesSummary({
+        debit: [{ accountCode: '5602999', accountName: '管理费用-其他', amount: '481.33' }],
+        credit: [{ accountCode: '2241', accountName: '其他应付款', amount: '481.33' }],
+      }),
+    ).toBe('借 5602999 管理费用-其他 ¥481.33 ／ 贷 2241 其他应付款 ¥481.33')
+  })
+
+  it('handles empty sides and missing voucher', () => {
+    expect(voucherLinesSummary({ debit: [], credit: [] })).toBe('')
+    expect(voucherLinesSummary(null)).toBe('')
+    expect(voucherLinesSummary({ debit: [{ accountCode: '1002', accountName: '银行存款', amount: 5 }] }).startsWith('借 1002')).toBe(true)
+  })
+})
+
+describe('dispositionCategoryGroups', () => {
+  const options = [
+    { label: '── 收入 ──', value: '__header_income__', disabled: true },
+    { label: '主营业务收入', value: 'income|主营业务收入|5001|主营业务收入' },
+    { label: '营业外收入', value: 'income|营业外收入|5301|营业外收入' },
+    { label: '── 员工成本 ──', value: '__header_salary__', disabled: true },
+    { label: '工资发放', value: 'expense|工资发放|221101|应付职工薪酬-工资' },
+    { label: '社保公积金', value: 'expense|社保公积金|221102|应付职工薪酬-社保' },
+    { label: '── 费用支出 ──', value: '__header_expense__', disabled: true },
+    { label: '办公费', value: 'expense|办公费|5602004|管理费用-办公费' },
+    { label: '信息技术服务费', value: 'expense|信息技术服务费|5602015|管理费用-信息技术服务费' },
+    { label: '研发支出-费用化支出', value: 'expense|研发支出-费用化支出|4301|研发支出-费用化支出' },
+    { label: '其他支出', value: 'expense|其他支出|5602999|管理费用-其他' },
+    { label: '── 资本 ──', value: '__header_capital__', disabled: true },
+    { label: '股东投入', value: 'owner_transfer|股东投入|3001|实收资本' },
+  ]
+
+  it('expense 方向：只保留费用组，剔除工资/社保/研发/资本类，组头转为分组标签', () => {
+    const groups = dispositionCategoryGroups(options as any, 'expense')
+    expect(groups.map((g) => g.label)).toEqual(['费用支出'])
+    expect(groups[0].options.map((o) => o.label)).toEqual(['办公费', '信息技术服务费', '其他支出'])
+  })
+
+  it('income 方向：只保留收入组', () => {
+    const groups = dispositionCategoryGroups(options as any, 'income')
+    expect(groups.map((g) => g.label)).toEqual(['收入'])
+    expect(groups[0].options.map((o) => o.label)).toEqual(['主营业务收入', '营业外收入'])
+  })
+
+  it('账号内没有有效研发项目时不暴露研发分类，避免选中后补不齐明细', () => {
+    expect(DISPOSITION_EXCLUDED_CATEGORIES.has(RD_EXPENSE_CATEGORY)).toBe(false)
+    const groups = dispositionCategoryGroups(options as any, 'expense')
+    expect(groups.flatMap((g) => g.options).some((o) => o.value.includes('研发支出'))).toBe(false)
+  })
+
+  it('账号内有有效研发项目时暴露研发分类，可就地补项目与费用类别', () => {
+    const groups = dispositionCategoryGroups(options as any, 'expense', true)
+    const flat = groups.flatMap((g) => g.options)
+    expect(flat.some((o) => o.value.includes(RD_EXPENSE_CATEGORY))).toBe(true)
+    // 工资/社保仍属系统路径，常驻开关不影响它们的剔除
+    expect(flat.some((o) => o.value.includes('工资发放'))).toBe(false)
+    expect(flat.some((o) => o.value.includes('社保公积金'))).toBe(false)
+  })
+})
+
+describe('研发项目有效性判定（与后端 _add_lines 口径对齐）', () => {
+  it('只有 active / completed 的项目可用于归集', () => {
+    expect(isEffectiveRdProject({ status: 'active' }, '2026-06')).toBe(true)
+    expect(isEffectiveRdProject({ status: 'completed' }, '2026-06')).toBe(true)
+    expect(isEffectiveRdProject({ status: 'draft' }, '2026-06')).toBe(false)
+    expect(isEffectiveRdProject({ status: 'archived' }, '2026-06')).toBe(false)
+    expect(isEffectiveRdProject(null, '2026-06')).toBe(false)
+  })
+
+  it('项目周期不覆盖目标月份时不算有效，避免点确认才报 RD_PROJECT_DATE_MISMATCH', () => {
+    const june = '2026-06'
+    expect(isEffectiveRdProject({ status: 'active', startDate: '2026-06-01' }, june)).toBe(true)
+    expect(isEffectiveRdProject({ status: 'active', startDate: '2026-06-30' }, june)).toBe(true)
+    expect(isEffectiveRdProject({ status: 'active', startDate: '2026-07-01' }, june)).toBe(false)
+    expect(isEffectiveRdProject({ status: 'active', endDate: '2026-05-31' }, june)).toBe(false)
+    expect(isEffectiveRdProject({ status: 'active', endDate: '2026-06-01' }, june)).toBe(true)
+    expect(
+      isEffectiveRdProject({ status: 'active', startDate: '2026-01-01', endDate: '2026-12-31' }, june),
+    ).toBe(true)
+  })
+
+  it('月份边界按当月最后一天判定（含 2 月与 31 天月）', () => {
+    expect(isEffectiveRdProject({ status: 'active', startDate: '2026-02-28' }, '2026-02')).toBe(true)
+    expect(isEffectiveRdProject({ status: 'active', startDate: '2026-03-01' }, '2026-02')).toBe(false)
+    expect(isEffectiveRdProject({ status: 'active', endDate: '2026-04-30' }, '2026-04')).toBe(true)
+    // 4 月 29 日结项仍覆盖 4 月；3 月 31 日结项才算不覆盖
+    expect(isEffectiveRdProject({ status: 'active', endDate: '2026-04-29' }, '2026-04')).toBe(true)
+    expect(isEffectiveRdProject({ status: 'active', endDate: '2026-03-31' }, '2026-04')).toBe(false)
+  })
+
+  it('带时间戳的日期按天比较，不受时分秒影响', () => {
+    expect(
+      isEffectiveRdProject({ status: 'active', startDate: '2026-06-30T23:59:59Z' }, '2026-06'),
+    ).toBe(true)
+    expect(
+      isEffectiveRdProject({ status: 'active', endDate: '2026-06-01T00:00:01Z' }, '2026-06'),
+    ).toBe(true)
+  })
+
+  it('hasEffectiveRdProjects：任意一个项目有效即常驻', () => {
+    const june = '2026-06'
+    expect(hasEffectiveRdProjects([], june)).toBe(false)
+    expect(hasEffectiveRdProjects(null, june)).toBe(false)
+    expect(hasEffectiveRdProjects([{ status: 'draft' }], june)).toBe(false)
+    expect(
+      hasEffectiveRdProjects(
+        [{ status: 'draft' }, { status: 'active', startDate: '2026-06-01' }],
+        june,
+      ),
+    ).toBe(true)
+  })
+})
+
+describe('dispositionCategoryOf', () => {
+  it('从选项值取出分类名', () => {
+    expect(dispositionCategoryOf('expense|信息技术服务费|5602015|管理费用-信息技术服务费')).toBe('信息技术服务费')
+    expect(dispositionCategoryOf('')).toBe('')
+    expect(dispositionCategoryOf(null)).toBe('')
+  })
+})

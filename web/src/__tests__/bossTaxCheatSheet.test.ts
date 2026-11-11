@@ -42,6 +42,8 @@ describe('BossTaxCheatSheet electronic tax bureau cheat sheet', () => {
         pkg: defaultPkg,
         period: '2026-Q3',
       },
+      // 步骤 4 的个税指引是 RouterLink（GuideTrigger），单测不挂路由表
+      global: { stubs: { RouterLink: true } },
     })
 
     // 免税结论收进增值税步骤标签（hero banner 已并入小抄步骤流）
@@ -57,6 +59,8 @@ describe('BossTaxCheatSheet electronic tax bureau cheat sheet', () => {
         pkg: defaultPkg,
         period: '2026-Q3',
       },
+      // 步骤 4 的个税指引是 RouterLink（GuideTrigger），单测不挂路由表
+      global: { stubs: { RouterLink: true } },
     })
 
     expect(wrapper.text()).toContain('增值税及附加税费申报')
@@ -76,6 +80,8 @@ describe('BossTaxCheatSheet electronic tax bureau cheat sheet', () => {
         pkg: defaultPkg,
         period: '2026-Q3',
       },
+      // 步骤 4 的个税指引是 RouterLink（GuideTrigger），单测不挂路由表
+      global: { stubs: { RouterLink: true } },
     })
 
     // 按钮文案必须带出事项名（历史 bug：读不存在的 title 字段，引号里一片空白）
@@ -120,6 +126,7 @@ describe('BossTaxCheatSheet electronic tax bureau cheat sheet', () => {
         pkg: pkgWithBlockersAndDeadlines,
         period: '2026-Q2',
       },
+      global: { stubs: { RouterLink: true } },
     })
 
     // 阻断项已上移到父页面导航卡（「存在阻断」标签）与底稿核对区，小抄本身专注申报步骤，

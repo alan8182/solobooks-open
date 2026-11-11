@@ -283,7 +283,7 @@ onMounted(load)
 </template>
 
 <style scoped>
-.audit-share-page { max-width: 860px; margin: 0 auto; padding: 20px 16px 48px; }
+.audit-share-page { max-width: var(--page-width); margin: 0 auto; padding: 20px 16px 48px; }
 .page-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 16px; }
 .page-header h1 { font-size: 20px; margin: 0 0 6px; }
 .share-row { border: 1px solid var(--border-2, #eee); border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; }

@@ -13,6 +13,7 @@ import {
   type SalaryPaymentSuggestion, type PayrollLiabilitySuggestion, type PayrollRates, type DepartmentItem,
 } from '@/api/salary'
 import { SoloMonthPicker } from '@/components/ui'
+import { useWorkspaceViewStore } from '@/stores/workspaceView'
 import { getRdProjects } from '@/api/rd'
 import type { RdProject } from '@/api/types'
 import SalarySheetTab from './salary/components/SalarySheetTab.vue'
@@ -25,6 +26,7 @@ import RdAllocationModal from './salary/components/RdAllocationModal.vue'
 
 const route = useRoute()
 const message = useMessage()
+const viewStore = useWorkspaceViewStore()
 
 const activeTab = ref<'sheet' | 'roster'>('sheet')
 const loading = ref(false)
@@ -67,11 +69,12 @@ const taxInitialSpecial = computed(() =>
   Number(employees.value.find((e) => e.id === taxTarget.value?.employee_id)?.special_additional_deduction || 0))
 
 const statusPill = computed(() => {
+  const boss = viewStore.isBoss
   switch (sheet.value?.status) {
-    case 'paid': return { cls: 'pill-paid', icon: 'ri-checkbox-circle-line', text: '已发放记账' }
-    case 'accrued': return { cls: 'pill-accrued', icon: 'ri-time-line', text: '已计提记账' }
-    case 'pending_review': return { cls: 'pill-pending', icon: 'ri-shield-flash-line', text: '计提待复核' }
-    default: return { cls: 'pill-draft', icon: 'ri-draft-line', text: '草稿（待计提）' }
+    case 'paid': return { cls: 'pill-paid', icon: 'ri-checkbox-circle-line', text: boss ? '已发薪完结' : '已发放记账' }
+    case 'accrued': return { cls: 'pill-accrued', icon: 'ri-time-line', text: boss ? '已确认（待发薪）' : '已计提记账' }
+    case 'pending_review': return { cls: 'pill-pending', icon: 'ri-shield-flash-line', text: '待复核' }
+    default: return { cls: 'pill-draft', icon: 'ri-draft-line', text: boss ? '草稿（待确认）' : '草稿（待计提）' }
   }
 })
 
@@ -165,7 +168,8 @@ function onTaxApply(taxDue: number) {
     source.net_salary = Math.round((gross - Number(source.personal_social_security || 0) - taxDue) * 100) / 100
     records.value = [...records.value]
   }
-  message.success(`已填入本期应扣个税 ${formatMoney(taxDue)}，记得保存草稿`)
+  sheetTabRef.value?.triggerAutoSave?.()
+  message.success(`已更新本期应扣个税 ${formatMoney(taxDue)}`)
 }
 
 watch(selectedMonth, () => {
@@ -207,12 +211,14 @@ usePageRefresh(() => Promise.all([fetchSalarySheet(), fetchPaymentSuggestions()]
     <div class="page-header">
       <div class="header-left">
         <div class="title-row">
-          <h2>薪酬与社保管理</h2>
+          <h2>{{ viewStore.isBoss ? '工资薪金' : '薪酬与社保管理' }}</h2>
           <span v-if="sheet" class="status-pill" :class="statusPill.cls">
             <i :class="statusPill.icon" />{{ statusPill.text }}
           </span>
         </div>
-        <p class="subtitle">管理在职员工花名册，按月核算工资、社保公积金及个税并自动生成记账凭证</p>
+        <p class="subtitle">
+          {{ viewStore.isBoss ? '核对每月员工工资与社保个税，确认后自动入账' : '管理在职员工花名册，按月核算工资、社保公积金及个税并自动生成记账凭证' }}
+        </p>
       </div>
       <div class="header-actions">
         <div class="month-selector">
@@ -251,11 +257,11 @@ usePageRefresh(() => Promise.all([fetchSalarySheet(), fetchPaymentSuggestions()]
         <NTab name="roster">员工花名册 · {{ employees.length }}</NTab>
       </NTabs>
       <div class="tabs-actions">
-        <NButton size="small" quaternary @click="showDept = true">
+        <NButton v-if="activeTab === 'roster' || !viewStore.isBoss" size="small" quaternary @click="showDept = true">
           <template #icon><i class="ri-team-line" /></template>部门设置
         </NButton>
         <NButton size="small" quaternary @click="showRates = true">
-          <template #icon><i class="ri-percent-line" /></template>社保公积金比例
+          <template #icon><i class="ri-percent-line" /></template>{{ viewStore.isBoss ? '社保比例' : '社保公积金比例' }}
         </NButton>
         <NButton
           v-if="activeTab === 'sheet'"
@@ -278,6 +284,7 @@ usePageRefresh(() => Promise.all([fetchSalarySheet(), fetchPaymentSuggestions()]
         :records="records"
         :employees="employees"
         :departments="departments"
+        :rd-projects="rdProjects"
         :rd-allocations="rdAllocations"
         :payment-suggestions="paymentSuggestions"
         :liability-suggestions="liabilitySuggestions"
@@ -311,7 +318,7 @@ usePageRefresh(() => Promise.all([fetchSalarySheet(), fetchPaymentSuggestions()]
 
 <style scoped>
 .salary-page {
-  max-width: 1240px;
+  max-width: var(--page-width);
   margin: 0 auto;
   padding: 16px 0 48px;
   width: 100%;

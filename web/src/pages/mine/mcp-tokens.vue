@@ -327,7 +327,7 @@ onMounted(fetchTokens)
 
 <style scoped>
 .mcp-tokens-page {
-  max-width: 960px;
+  max-width: var(--page-width);
   margin: 0 auto;
 }
 

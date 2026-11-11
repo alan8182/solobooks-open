@@ -556,14 +556,16 @@ async def update_user_profile(
 
 async def create_company(user_id: str, name: str, extra: dict | None = None) -> Dict:
     await _ensure_db_ready()
+    from services.industry_template_service import normalize_company_industry_payload
+
+    extra_clean = {k: v for k, v in (extra or {}).items() if k != "employeeCount"}
+    extra_clean.update(_normalize_vat_fields(extra_clean))
+    extra_clean = await normalize_company_industry_payload(extra_clean)
     conn = await get_conn()
     try:
-        # employeeCount 已废弃（人数从员工名册派生），老客户端传入时静默忽略
-        extra_clean = {k: v for k, v in (extra or {}).items() if k != "employeeCount"}
-        extra_clean.update(_normalize_vat_fields(extra_clean))
         company = {
             "company_id": _new_id("c"),
-            "name": name,
+            "name": str(name).strip(),
             "owner_user_id": user_id,
             "created_at": _now_iso(),
             **extra_clean,
@@ -611,6 +613,26 @@ async def _assert_start_date_not_before_entries(conn, company_id: str, start_dat
 
 async def update_company(user_id: str, company_id: str, updates: dict) -> Dict:
     await _ensure_db_ready()
+    from services.industry_template_service import normalize_company_industry_payload
+
+    normalized_updates = dict(updates)
+    if any(key in updates for key in ("industry", "industryCode")):
+        previous = await get_company(company_id)
+        if previous is not None:
+            industry_updates = {
+                key: updates[key]
+                for key in (
+                    "industry",
+                    "industryCode",
+                    "industryTemplateCode",
+                    "restrictedIndustry",
+                )
+                if key in updates
+            }
+            normalized_updates = await normalize_company_industry_payload(
+                industry_updates,
+                previous=previous,
+            )
     conn = await get_conn()
     try:
         cursor = await conn.execute(
@@ -632,14 +654,23 @@ async def update_company(user_id: str, company_id: str, updates: dict) -> Dict:
                 403,
             )
 
+        previous = dict(company)
         for key in [
             "name", "type", "taxpayerType", "startDate", "taxId",
-            "restrictedIndustry", "industry",
+            "restrictedIndustry", "industry", "industryCode",
+            "industryTemplateVersion", "industryTemplateAppliedAt",
             "vatRate", "vatFilingCycle", "businessIncomeIitFilingCycle",
             "onboardingType",
         ]:
-            if key in updates:
-                company[key] = updates[key]
+            if key in normalized_updates:
+                company[key] = normalized_updates[key]
+        if (
+            any(key in updates for key in ("industry", "industryCode"))
+            and not str(normalized_updates.get("industryCode") or "").strip()
+            and not str(normalized_updates.get("industry") or "").strip()
+        ):
+            company.pop("industryTemplateVersion", None)
+            company.pop("industryTemplateAppliedAt", None)
         # 只归一/校验本次提交的增值税字段：对存量 payload 整体重跑会让历史脏数据
         # 阻断任何无关字段的更新（如改名也 500）
         vat_update = {
@@ -649,6 +680,8 @@ async def update_company(user_id: str, company_id: str, updates: dict) -> Dict:
         }
         if vat_update:
             company.update(_normalize_vat_fields(vat_update))
+        if "name" in updates:
+            company["name"] = str(company["name"]).strip()
 
         await _assert_start_date_not_before_entries(conn, company_id, company.get("startDate"))
         company["updated_at"] = _now_iso()

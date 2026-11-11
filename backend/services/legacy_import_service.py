@@ -38,10 +38,20 @@ BALANCE_ALIASES = {
     "accountCode": ("科目编码", "科目代码", "科目编号", "account_code", "accountcode", "code"),
     "accountName": ("科目名称", "科目", "account_name", "accountname", "name"),
     "direction": ("方向", "余额方向", "direction"),
-    "debit": ("期初余额(借)", "期初余额（借）", "期初借方", "借方期初", "debit_balance", "opening_debit"),
-    "credit": ("期初余额(贷)", "期初余额（贷）", "期初贷方", "贷方期初", "credit_balance", "opening_credit"),
-    "ytdDebit": ("本年累计借方", "本年累计借方发生额", "ytd_debit", "debit_ytd"),
-    "ytdCredit": ("本年累计贷方", "本年累计贷方发生额", "ytd_credit", "credit_ytd"),
+    # 双层表头拼出来的复合列名（期初余额 + 借方），第三方导出基本都长这样。
+    # 期末优先：年中建账要的是建账前一月末的余额，期初列是 1 月 1 日的数。
+    "debit": (
+        "期末余额借方", "期末余额(借)", "期末余额（借）", "期末借方", "借方期末",
+        "期初余额借方", "期初余额(借)", "期初余额（借）", "期初借方", "借方期初",
+        "借方余额", "debit_balance", "opening_debit",
+    ),
+    "credit": (
+        "期末余额贷方", "期末余额(贷)", "期末余额（贷）", "期末贷方", "贷方期末",
+        "期初余额贷方", "期初余额(贷)", "期初余额（贷）", "期初贷方", "贷方期初",
+        "贷方余额", "credit_balance", "opening_credit",
+    ),
+    "ytdDebit": ("本年累计借方", "本年累计借方发生额", "本年累计发生额借方", "ytd_debit", "debit_ytd"),
+    "ytdCredit": ("本年累计贷方", "本年累计贷方发生额", "本年累计发生额贷方", "ytd_credit", "credit_ytd"),
     "partnerName": ("往来单位", "客户", "供应商", "partner_name", "partnername"),
 }
 

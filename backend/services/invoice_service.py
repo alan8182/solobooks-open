@@ -13,7 +13,13 @@ import re
 
 from services.database import get_conn
 from services.entry_service import save_entry
-from services.account_mapper import CATEGORY_TO_ACCOUNT, get_voucher_hint
+from services.account_mapper import (
+    CATEGORY_TO_ACCOUNT,
+    EMPLOYEE_PAYER_PREFIX,
+    PAYER_BOSS,
+    get_voucher_hint,
+    normalize_payer,
+)
 from services.invoice_llm_prompts import INVOICE_CLASSIFY_PROMPT
 from services.llm import safe_chat_text_json
 from core.money import ZERO, money, money_text, rate
@@ -371,13 +377,35 @@ INCOME_CREDIT_ACCOUNTS = {"5001", "5051"}
 VAT_PAYABLE_ACCOUNT_CODE = "2221026"
 
 
+def _is_personal_advance_payer(payer: str) -> bool:
+    """付款方是否是具体的垫付人（老板，或带姓名的员工）。
+
+    裸 ``employee_personal`` 不知道是谁的钱，`resolve_entry_person` 也不会建档；
+    此时仍按原逻辑挂供应商，避免 2241 行两头落空。
+    """
+    if payer == PAYER_BOSS:
+        return True
+    if payer.startswith(f"{EMPLOYEE_PAYER_PREFIX}:"):
+        return bool(payer.split(":", 1)[1].strip())
+    return False
+
+
 def _attach_partner_auxiliary(
-    voucher: Dict[str, Any], partner: Dict[str, str]
+    voucher: Dict[str, Any],
+    partner: Dict[str, str],
+    *,
+    skip_person_advance_lines: bool = False,
 ) -> Dict[str, Any]:
     """把往来单位写进挂账分录（1122/2241 等往来科目）的 auxiliary。
 
     只挂往来科目：费用/收入行挂客户没有意义，挂上去反而污染按往来单位的费用分析。
+
+    ``skip_person_advance_lines``：发票由老板/员工垫付时，2241 的对手方是垫付人
+    而不是供应商，这里留空，交给 ``_add_lines`` 按 metadata["payer"] 解析个人
+    往来单位（行上已有 partner 时它不会覆盖）。
     """
+    from core.chart_policy import is_person_advance_account
+
     auxiliary = {"partner_id": partner["id"], "partner_name": partner["name"]}
     output: Dict[str, Any] = {}
     for side in ("debit", "credit"):
@@ -390,13 +418,78 @@ def _attach_partner_auxiliary(
                 },
             }
             if str(line.get("accountCode") or "").startswith(("1122", "1123", "2202", "2203", "1221", "2241"))
+            and not (
+                skip_person_advance_lines
+                and is_person_advance_account(line.get("accountCode"))
+            )
             else line
             for line in (voucher.get(side) or [])
         ]
     return output
 
 
-def _validate_invoice_voucher(direction: str, voucher: Dict[str, Any], *, reversal: bool = False) -> Dict[str, Any]:
+async def _find_offset_wanglai(
+    company_id: str, direction: str, amount: Decimal, invoice_date: str
+) -> Optional[Dict[str, Any]]:
+    """找以前期间等额、未被发票冲抵的往来暂付/暂收凭证。
+
+    "先付款、后收票"的闭环：5 月银行付款认可入账会挂 借 122199（往来暂付款）；
+    6 月发票导入时命中该暂付款，则发票凭证的往来侧直接落 122199（费用票贷方 /
+    收入票借方）完成对冲，而不是挂 2241/1122 待收付。命中返回
+    {id, accountName, occurredOn}；无候选返回 None。
+    FIFO 取最老的一笔（未冲抵的按发生期升序）。
+    """
+    from sqlalchemy import select
+
+    from db.models import JournalEntry, JournalLine
+    from db.session import session_scope
+    from services.accounting_core_service import ACTIVE_ENTRY_STATUSES
+
+    stmt_amount = money(amount)
+    if stmt_amount <= ZERO:
+        return None
+    invoice_day = str(invoice_date or "")[:10]
+    if not invoice_day:
+        return None
+    line_code = "122199" if direction == "expense" else "2241"
+    line_direction = "debit" if direction == "expense" else "credit"
+
+    async with session_scope() as session:
+        rows = (
+            await session.execute(
+                select(JournalEntry.id, JournalEntry.summary, JournalEntry.occurred_on, JournalLine.account_name)
+                .join(JournalLine, JournalLine.journal_entry_id == JournalEntry.id)
+                .where(
+                    JournalEntry.company_id == company_id,
+                    JournalEntry.status.in_(tuple(ACTIVE_ENTRY_STATUSES)),
+                    JournalEntry.entry_type == "standard",
+                    JournalEntry.occurred_on < date.fromisoformat(invoice_day),
+                    JournalEntry.metadata_json["category"].as_string() == "往来款",
+                    JournalLine.company_id == company_id,
+                    JournalLine.account_code == line_code,
+                    JournalLine.direction == line_direction,
+                    JournalLine.amount == stmt_amount,
+                    # 排除已被发票冲抵的暂付款（linkedInvoiceEntryId 缺失或为空）
+                    JournalEntry.metadata_json["linkedInvoiceEntryId"].as_string().is_(None)
+                    | (JournalEntry.metadata_json["linkedInvoiceEntryId"].as_string() == ""),
+                )
+                .order_by(JournalEntry.occurred_on.asc())
+                .limit(1)
+            )
+        ).first()
+        if not rows:
+            return None
+        return {
+            "id": rows[0],
+            "summary": rows[1],
+            "occurredOn": str(rows[2]),
+            "accountName": rows[3] or ("其他应收款-待收款项" if direction == "expense" else "其他应付款-其他"),
+        }
+
+
+def _validate_invoice_voucher(
+    direction: str, voucher: Dict[str, Any], *, reversal: bool = False, offset: bool = False
+) -> Dict[str, Any]:
     """发票凭证的科目白名单：票是凭证，不是资金记录。
 
     - 费用票：贷方只能是 2241 应付（未付款状态），不允许直接贷 1002
@@ -405,6 +498,10 @@ def _validate_invoice_voucher(direction: str, voucher: Dict[str, Any], *, revers
 
     reversal=True 是红冲进项冲销凭证：借贷已对调、金额已取正，
     借方必须是 2241（冲销原应付），贷方是费用科目。
+
+    offset=True 是"先付款、后收票"的往来冲抵凭证：费用票贷方挂 122199
+    （冲此前往来暂付款）、收入票借方挂 2241（冲此前往来暂收款），
+    替代默认的 2241/1122 挂账。
     """
     debit = voucher.get("debit") or []
     credit = voucher.get("credit") or []
@@ -414,16 +511,20 @@ def _validate_invoice_voucher(direction: str, voucher: Dict[str, Any], *, revers
         raise ValueError(f"发票凭证借贷不平：借 {debit_total} 贷 {credit_total}")
     if direction == "expense":
         codes = {str(line.get("accountCode") or "") for line in (debit if reversal else credit)}
-        if codes != {INVOICE_PENDING_PAYABLE["accountCode"]}:
+        allowed_payable = {INVOICE_PENDING_PAYABLE["accountCode"]} | ({"122199"} if offset else set())
+        if codes - allowed_payable:
             raise ValueError(
                 "红冲进项发票必须借 2241 其他应付款-发票待付款，冲销原应付"
                 if reversal
-                else "费用发票必须挂贷方 2241 其他应付款-发票待付款，不能直接冲减银行存款"
+                else "费用发票必须挂贷方 2241 其他应付款-发票待付款（或冲抵往来暂付款 122199），不能直接冲减银行存款"
             )
     elif direction == "income":
         debit_codes = {str(line.get("accountCode") or "") for line in debit}
-        if debit_codes != {INVOICE_PENDING_RECEIVABLE["accountCode"]}:
-            raise ValueError("收入发票必须挂借方 1122 应收账款，不能直接增加银行存款")
+        allowed_receivable = {INVOICE_PENDING_RECEIVABLE["accountCode"]} | ({"2241"} if offset else set())
+        if debit_codes - allowed_receivable:
+            raise ValueError(
+                "收入发票必须挂借方 1122 应收账款（或冲抵往来暂收款 2241），不能直接增加银行存款"
+            )
         allowed = INCOME_CREDIT_ACCOUNTS | {VAT_PAYABLE_ACCOUNT_CODE}
         extra = {str(line.get("accountCode") or "") for line in credit} - allowed
         if extra:
@@ -485,11 +586,26 @@ async def import_invoices(company_id: str, user_id: str, rows: List[Dict[str, An
         seller = str(row.get("seller_name") or "").strip()
         item = str(row.get("item_name") or "").strip()
         # ponytail: 支付平台手续费发票自动识别为仅归档底稿，避免重复计入手续费并虚增银行支出对账差额
+        # 品名词只认"手续费/支付服务费"这类支付通道特征；"技术服务费"是普通经营采购
+        # （SaaS/AI 服务等）的规范品名，裸命中会把正常供应商发票误归档——2026-10-31
+        # DeepSeek 技术服务费发票被误归档，导致待办撮合池漏票、付款侧永远报"待补票据"。
         is_platform_fee = bool(
             re.search(r"财付通|微信支付|支付宝|连连支付|网银在线", seller)
-            or re.search(r"手续费|支付服务费|技术服务费", f"{item} {row.get('title', '')}")
+            or re.search(r"手续费|支付服务费", f"{item} {row.get('title', '')}")
         )
         is_archive = bool(row.get("is_archive_only") or row.get("isArchiveOnly") or is_platform_fee)
+
+        # 导入确认卡片的付款方：默认公司账户，用户选垫付才改。垫付=发票已由个人
+        # 付清，2241 的对手方是垫付人；未付款票的对手方仍是供应商，不能被抢走。
+        payer = normalize_payer(row.get("payer"))
+        payment_status = str(
+            row.get("paymentStatus") or row.get("payment_status") or ""
+        ).strip().lower()
+        personal_advance = (
+            suggestion["direction"] == "expense"
+            and _is_personal_advance_payer(payer)
+            and payment_status != "unpaid"
+        )
 
         entry_data = {
             "title": row.get("title", f"发票-{row.get('seller_name', '')}"),
@@ -503,7 +619,7 @@ async def import_invoices(company_id: str, user_id: str, rows: List[Dict[str, An
             "billingStatus": "has_invoice",
             "is_archive_only": is_archive,
             "isArchiveOnly": is_archive,
-            "payer": row.get("payer", "company_account"),
+            "payer": payer,
             # Set vatAmount and vatRate in the entry payload
             "vatAmount": safe_money(row.get("tax_amount")),
             "vatRate": parse_vat_rate(row.get("tax_rate", "")),
@@ -531,6 +647,11 @@ async def import_invoices(company_id: str, user_id: str, rows: List[Dict[str, An
             "rdAllocationBasis": row.get("rdAllocationBasis"),
             "rdNotes": row.get("rdNotes"),
         }
+        if payment_status:
+            entry_data["paymentStatus"] = payment_status
+        elif personal_advance:
+            # 老板/员工已经掏钱付了这张票，不是待付款；结账核对时按非公户结算处理。
+            entry_data["paymentStatus"] = "paid"
 
         # 去重指纹：发票号是最强业务键；缺失时退化为 日期+销售方+金额+方向 的组合键。
         # 否则 external_key 为 NULL，唯一约束不生效，同一张发票跨渠道/重复导入无法拦截。
@@ -578,26 +699,58 @@ async def import_invoices(company_id: str, user_id: str, rows: List[Dict[str, An
                 vat_rate=vat_hint_rate,
                 vat_amount=entry_data.get("vatAmount") if vat_hint_rate is None and entry_data.get("vatSeparated") else None,
             )
+            # 先付款、后收票：命中以前期间等额、未冲抵的往来暂付/暂收 → 往来侧
+            # 直接对冲（费用票贷 122199 / 收入票借 2241），不再挂 2241/1122 待收付；
+            # 红冲（负金额）不走对冲。探测失败静默回落默认挂账。
+            # 个人垫付的票不存在"公司先付过"的暂付款，不参与对冲，否则会静默把
+            # 应挂股东的 2241 改成 122199。
+            is_reversal = suggestion["direction"] == "expense" and money(row.get("amount", 0)) < ZERO
+            offset_wanglai = None
+            if suggestion["direction"] in ("expense", "income") and not is_reversal and not personal_advance:
+                try:
+                    offset_wanglai = await _find_offset_wanglai(
+                        company_id,
+                        suggestion["direction"],
+                        safe_money(row.get("amount", 0)),
+                        str(entry_data.get("occurDate") or ""),
+                    )
+                except Exception:
+                    pass
             if suggestion["direction"] == "expense" and hint.get("credit"):
-                hint["credit"] = [dict(line, accountCode="2241", accountName="其他应付款-发票待付款") for line in hint["credit"]]
+                if offset_wanglai:
+                    hint["credit"] = [dict(line, accountCode="122199", accountName=offset_wanglai["accountName"]) for line in hint["credit"]]
+                    entry_data["offsetFromEntryId"] = offset_wanglai["id"]
+                else:
+                    # 垫付票的 2241 是「公司欠垫付人」，不是「发票待付款」。
+                    payable_name = "其他应付款" if personal_advance else "其他应付款-发票待付款"
+                    hint["credit"] = [dict(line, accountCode="2241", accountName=payable_name) for line in hint["credit"]]
             elif suggestion["direction"] == "income" and hint.get("debit"):
-                hint["debit"] = [dict(line, accountCode="1122", accountName="应收账款-发票待收") for line in hint["debit"]]
+                if offset_wanglai:
+                    hint["debit"] = [dict(line, accountCode="2241", accountName=offset_wanglai["accountName"]) for line in hint["debit"]]
+                    entry_data["offsetFromEntryId"] = offset_wanglai["id"]
+                else:
+                    hint["debit"] = [dict(line, accountCode="1122", accountName="应收账款-发票待收") for line in hint["debit"]]
             # 红冲进项（负金额）：借贷对调、金额取正，形成冲销凭证（借 2241 / 贷费用）。
             # 销项红冲的增值税冲销暂不处理，仍按原样失败。
-            is_reversal = suggestion["direction"] == "expense" and money(row.get("amount", 0)) < ZERO
             if is_reversal:
                 hint = {
                     "debit": [{**line, "amount": abs(money(line.get("amount") or ZERO))} for line in hint.get("credit", [])],
                     "credit": [{**line, "amount": abs(money(line.get("amount") or ZERO))} for line in hint.get("debit", [])],
                 }
             if hint.get("debit") and hint.get("credit"):
-                entry_data["voucherLines"] = _validate_invoice_voucher(suggestion["direction"], hint, reversal=is_reversal)
+                entry_data["voucherLines"] = _validate_invoice_voucher(
+                    suggestion["direction"], hint, reversal=is_reversal, offset=bool(offset_wanglai)
+                )
 
         # 往来单位挂到挂账分录（费用票贷 2241 / 收入票借 1122）上：
         # 往来账、账龄、核算项目余额表都以行级 auxiliary 为数据源。
         partner = partner_by_index[index] if index < len(partner_by_index) else None
         if partner and entry_data.get("voucherLines"):
-            entry_data["voucherLines"] = _attach_partner_auxiliary(entry_data["voucherLines"], partner)
+            entry_data["voucherLines"] = _attach_partner_auxiliary(
+                entry_data["voucherLines"],
+                partner,
+                skip_person_advance_lines=personal_advance,
+            )
 
         try:
             if suggestion["category"] == "研发支出-费用化支出" and not (
@@ -607,6 +760,26 @@ async def import_invoices(company_id: str, user_id: str, rows: List[Dict[str, An
             entry = await save_entry(
                 entry_data, user_id=user_id, company_id=company_id, trusted_voucher=True
             )
+            # 冲抵落账后给暂付款回写 linkedInvoiceEntryId（防二次冲抵的标记）。
+            # draft 暂付款走 metadata，已过账走 POSTED_PROJECTION_FIELDS 投影，
+            # update_draft 内部自动分流。标记失败不阻断导入——账务已正确，
+            # 最坏情况是该暂付款可能被再次选中，人工改凭证即可纠正。
+            if offset_wanglai:
+                try:
+                    from services.accounting_core_service import update_draft
+                    from db.session import session_scope
+
+                    async with session_scope() as session:
+                        await update_draft(
+                            session,
+                            offset_wanglai["id"],
+                            {"linkedInvoiceEntryId": entry.get("id", "")},
+                            company_id=company_id,
+                            user_id=user_id,
+                            request_id=f"offset-inv-{entry.get('id', '')}",
+                        )
+                except Exception:
+                    pass
             return {
                 "id": entry.get("id", ""),
                 "title": entry.get("title", ""),
@@ -614,6 +787,13 @@ async def import_invoices(company_id: str, user_id: str, rows: List[Dict[str, An
                 # 发票主数据双写用的快照（返回前剔除，不进 API 响应）
                 "_invoicePayload": entry_data,
                 "_partnerId": (partner or {}).get("id"),
+                "_offset": {
+                    "invoiceEntryId": entry.get("id", ""),
+                    "offsetEntryId": offset_wanglai["id"],
+                    "offsetTitle": offset_wanglai.get("summary", ""),
+                    "amount": money_text(safe_money(row.get("amount", 0))),
+                    "occurredOn": offset_wanglai.get("occurredOn", ""),
+                } if offset_wanglai else None,
             }
         except Exception as e:
             return {"title": entry_data["title"], "success": False, "error": str(e)}
@@ -629,9 +809,13 @@ async def import_invoices(company_id: str, user_id: str, rows: List[Dict[str, An
     # 凭证已落库后再写台账：唯一约束 (company_id, dedup_fingerprint) 保证重跑幂等，
     # 单批一次 session，避免逐行开关事务。
     invoice_records: list[tuple[str | None, dict[str, Any], str | None]] = []
+    offsets: list[Dict[str, Any]] = []
     for result in results:
         payload = result.pop("_invoicePayload", None)
         partner_id = result.pop("_partnerId", None)
+        offset_info = result.pop("_offset", None)
+        if offset_info:
+            offsets.append(offset_info)
         if result.get("success") and result.get("id") and isinstance(payload, dict):
             invoice_records.append((str(result["id"]), payload, partner_id))
     invoice_written = 0
@@ -654,4 +838,5 @@ async def import_invoices(company_id: str, user_id: str, rows: List[Dict[str, An
         "entries": entry_results,
         "invoicesWritten": invoice_written,
         "partnersLinked": sum(1 for _, _, partner_id in invoice_records if partner_id),
+        "offsets": offsets,
     }

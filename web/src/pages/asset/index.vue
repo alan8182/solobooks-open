@@ -196,7 +196,7 @@ usePageRefresh(() => {
 
 <style scoped>
 .asset-page {
-  max-width: 1240px;
+  max-width: var(--page-width);
   margin: 0 auto;
   padding: 16px 0 48px 0;
   width: 100%;

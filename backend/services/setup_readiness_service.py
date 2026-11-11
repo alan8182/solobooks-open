@@ -137,11 +137,14 @@ def _step(
     }
 
 
-def _opening_entry_id(company_id: str, fiscal_year: int) -> str:
-    """与 ``opening_balance_service._entry_id`` 保持一致。
+def _opening_id_prefix(company_id: str, fiscal_year: int) -> str:
+    """期初凭证 id 前缀。
 
-    必须按 id 查而不是按 ``period_start``：年中建账时期初凭证的 period_start
-    是启用月份（如 2026-06），不是 1-1，按期间查会漏。
+    不能用固定 id：期初被冲销后重导会换一代 id（``-g2``），固定 id 会指向墓碑。
+    必须按前缀 + entry_type 查，且排除已冲销的。
+
+    也不能按 ``period_start`` 查：年中建账时期初凭证的 period_start 是启用月份
+    （如 2026-06），不是 1-1，按期间查会漏。
     """
     return f"opening-{company_id}-{fiscal_year}"
 
@@ -223,17 +226,35 @@ async def _opening_result(
     顺序不能调：显式凭证优先，其次旧账导入，再次上年结转，最后才是「从零起账」。
     """
     company_id = company.company_id
-    entry = await session.get(JournalEntry, _opening_entry_id(company_id, fiscal_year))
-    if entry is not None and entry.company_id == company_id:
+    prefix = _opening_id_prefix(company_id, fiscal_year)
+    # 主凭证（YTD 过渡凭证带 -ytd 后缀，不算）；冲销后重导会换一代 id，
+    # 所以按前缀取全部、再看活的那一代。
+    all_mains = [
+        e
+        for e in (
+            await session.execute(
+                select(JournalEntry).where(
+                    JournalEntry.company_id == company_id,
+                    JournalEntry.entry_type == "opening",
+                    JournalEntry.id.startswith(prefix),
+                )
+            )
+        ).scalars().all()
+        if not e.id.endswith("-ytd")
+    ]
+    live = [e for e in all_mains if e.status != "reversed"]
+    entry = next((e for e in live if e.status == "posted"), live[0] if live else None)
+    if entry is not None:
         if entry.status == "posted":
             # 必须复用 check_balanced：它排除损益/成本科目，自己 sum 会误报不平
             balance = await check_balanced(company_id, fiscal_year, session=session)
             if balance["balanced"] and balance["total_debit"] != "0.00":
                 return "done", f"已录入 {balance['count']} 个科目的期初", False
             return "doing", "期初已录入，但借贷不平", False
-        if entry.status == "reversed":
-            return "todo", "期初已冲销，请重新录入", False
         return "doing", "期初草稿还没确认", False
+    if all_mains:
+        # 有凭证但全部被冲销：等用户重新录入
+        return "todo", "期初已冲销，请重新录入", False
 
     imported = await _legacy_imported_count(session, company_id)
     if imported:

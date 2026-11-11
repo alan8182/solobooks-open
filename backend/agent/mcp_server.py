@@ -69,11 +69,12 @@ MCP_READ_TOOLS = frozenset(
 # 「建议回路」开投毒通道（notes 还会被逐字拼进 agent system prompt）。
 MCP_WRITE_TOOLS = frozenset(
     {
+        "propose_voucher",
+        "propose_vouchers",
+        "propose_statement_vouchers",
         "propose_match",
         "propose_accrual",
         "propose_asset_closure",
-        "propose_voucher",
-        "propose_vouchers",
         "record_private_expense",
     }
 )
@@ -300,7 +301,7 @@ def _build_resources(mcp: FastMCP) -> None:
         {
             "uri_template": "solobooks://close-checks/{month}",
             "name": "close_checks",
-            "description": "某月结账五项检查结果",
+            "description": "某月 closing.v1 结账快照（含 snapshotHash、periodVersion 与 findings）",
             "tool": "run_close_checks",
             "args": {"month": "month"},
             "params": {"month": {"type": "string", "description": "月份，格式 YYYY-MM"}},
@@ -357,16 +358,20 @@ def _build_prompts(mcp: FastMCP) -> None:
     mcp.add_prompt(
         FunctionPrompt(
             name="closing_guide",
-            description="月度结账引导：跑结账检查并逐项解读，给出可执行建议",
+            description="月度结账安全检查：读取统一快照、解释 findings，并可在 write:draft 权限下创建修复草稿",
             arguments=[PromptArgument(name="month", description="月份，格式 YYYY-MM", required=True)],
             fn=lambda month: (
-                f"请作为梭罗记账的 AI 会计，引导我完成 {month} 的月度结账检查。步骤：\n"
-                "1. 调用 run_close_checks(month) 获取五项检查（账证/账账/账实/账表/税表）结果；\n"
-                "2. 对每一项 blocked/needs_review 的检查，用 list_unmatched(month)、list_todos 等工具定位具体问题；\n"
-                "3. 给出修复建议。可以用 propose_voucher / propose_match 起草修复凭证或对账（我只会在产品内确认后才入账）；\n"
-                "3b. 调用 preview_asset_actions(month) 检查缺资产卡和待补提折旧/摊销；有可处理项时用 propose_asset_closure(month) 生成一张资产处理确认卡（我只会在产品内确认后才执行）；\n"
-                "4. 不要声称已结账——真正的关账操作（close）需要我在产品内执行。\n"
-                "最后用老板看得懂的语言汇总：本月能不能结账、还差什么。"
+                f"请对梭罗记账 {month} 月度结账做安全检查。步骤：\n"
+                "1. 调用 run_close_checks(month)，保留 schemaVersion、snapshotHash、periodVersion 和 findings；\n"
+                "2. 用 list_unmatched、preview_accruals、preview_asset_actions 定位问题时，传入同一 snapshotHash；\n"
+                "3. 只引用工具返回的金额、笔数、状态、findingId 和权威 ID，禁止自行加总或推测；\n"
+                "4. 只有令牌具备 write:draft 时，才可按 findingId 调用 propose_match、propose_statement_vouchers、"
+                "propose_accrual 或 propose_asset_closure（后者引用 ASSET_CLOSURE finding）；"
+                "这些只创建待确认草稿，绝不表示已执行；\n"
+                "5. 修复动作确认后重新运行 run_close_checks；最终锁账必须由用户在梭罗记账的「月度结账」向导中完成；\n"
+                "6. 回复时必须原样展示工具返回的 manualClose.url，并渲染为可点击 Markdown 链接；说明该链接会要求登录，"
+                "打开后仍会重新检查。禁止把链接说成已经锁账，也禁止寻找或调用任何锁账工具。\n"
+                "最后用老板看得懂的语言汇总：本月当前能否结账、还差什么、哪些草稿待确认，并附上网页锁账入口。"
             ),
         )
     )
@@ -374,17 +379,21 @@ def _build_prompts(mcp: FastMCP) -> None:
     mcp.add_prompt(
         FunctionPrompt(
             name="reconciliation_review",
-            description="对账核对：逐笔核对流水与账目，起草匹配建议",
+            description="对账安全审查：基于同一结账快照列出差异，并可在 write:draft 权限下创建待确认草稿",
             arguments=[PromptArgument(name="month", description="月份，格式 YYYY-MM", required=True)],
             fn=lambda month: (
-                f"请作为梭罗记账的对账助手，帮我核对 {month} 的银行/微信流水与账目。步骤：\n"
-                "1. 调用 list_unmatched(month) 获取未匹配流水与 AI 建议；\n"
-                "2. 逐笔检查：金额、日期、方向是否与账目对应；微信到账要特别留意是否与已有收入重复（重复入账会被系统拦截）；\n"
-                "3. 对确认匹配的，用 propose_match 起草对账（我会产品内确认）；对无票流水建议我手工分类；\n"
-                "4. 输出一张简表：已匹配 / 建议匹配 / 需要我看一眼，各多少笔。"
+                f"请对梭罗记账 {month} 的银行/微信流水与账目做安全核对。步骤：\n"
+                "1. 先调用 run_close_checks(month)，再以同一 snapshotHash 调用 list_unmatched；\n"
+                "2. 逐笔检查金额、日期、方向；AI 对账建议只用于展示，执行前必须用 findingId、statementId、entryIds 复核；\n"
+                "3. 已有凭证的匹配使用 propose_match；需要新凭证的流水使用 propose_statement_vouchers，"
+                "金额、方向、日期和摘要由服务端从原始流水填充；\n"
+                "4. 只有 write:draft 令牌可以创建草稿；创建后明确说明“待确认、尚未执行”；\n"
+                "5. 输出简表：可生成草稿 / 存在重复风险 / 需要人工核对；把 run_close_checks 返回的 "
+                "manualClose.url 原样展示为可点击 Markdown 链接，锁账仍由用户在「月度结账」向导确认。"
             ),
         )
     )
+
 
 
 def build_mcp_server(name: str = "solobooks") -> FastMCP:
@@ -392,9 +401,10 @@ def build_mcp_server(name: str = "solobooks") -> FastMCP:
     mcp = FastMCP(
         name,
         instructions=(
-            "梭罗记账 SoloBooks：一人公司及小微企业的 AI 会计。工具按令牌绑定的公司隔离。"
+            "梭罗记账 SoloBooks：一人公司及小微企业的 AI CFO。工具按令牌绑定的公司隔离。"
             "查询类工具可任意调用；propose_* 写入工具只产生待确认草稿，"
-            "需要用户在梭罗记账产品内确认后才入账。"
+            "需要用户在梭罗记账产品内确认后才入账。最终锁账不对 MCP 暴露；"
+            "结账检查结果中的 manualClose.url 是登录后网页入口。"
         ),
     )
 
@@ -452,9 +462,17 @@ def build_mcp_server(name: str = "solobooks") -> FastMCP:
 
 
 async def _execute_with_identity(tool_name: str, arguments: dict, identity: PatIdentity) -> Any:
-    from agent.tools import execute_tool
+    from agent.tools import ToolContext, execute_tool
 
-    result = await execute_tool(tool_name, arguments, identity.context)
+    result = await execute_tool(
+        tool_name,
+        arguments,
+        ToolContext(
+            user_id=identity.context.user_id,
+            company_id=identity.context.company_id,
+            source="mcp",
+        ),
+    )
     # 工具层业务错误（{"error": msg}，不抛异常）转 MCP isError 语义：
     # 客户端按错误渲染，留痕记 success=False 而非伪装成功
     if isinstance(result, dict) and result.get("error"):

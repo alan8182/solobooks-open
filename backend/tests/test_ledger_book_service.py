@@ -159,6 +159,68 @@ async def test_book_balance_matches_legacy_summary():
 
 
 @pytest.mark.asyncio
+async def test_book_balance_matches_legacy_summary_with_reversal_pairs():
+    """同月冲销对场景下整册余额表与旧接口仍逐字段一致（两边同口径剔除）。
+
+    根因回归：发生额剔除「同月冲销对」的口径必须同时落在 build_ledger_book
+    与 get_balance_summary 两边——只改一边会打爆 parity 并造成口径撕裂。
+    顺带锁定有效发生额数值：冲销对（原凭证+冲销）剔除后只剩重记那张。
+    """
+    from services.accounting_core_service import reverse_journal
+    from db.session import session_scope
+
+    company_id = "c-book-parity-rev"
+    await _setup_company(company_id)
+
+    def income_payload(entry_id: str) -> dict:
+        return {
+            "id": entry_id,
+            "direction": "income",
+            "amount": "500.00",
+            "title": "咨询服务收入",
+            "category": "主营业务收入",
+            "occurDate": "2026-10-08",
+            "sourceType": "manual",
+            "voucherLines": {
+                "debit": [{"accountCode": "1002", "accountName": "银行存款", "amount": "500.00"}],
+                "credit": [{"accountCode": "5001", "accountName": "主营业务收入", "amount": "500.00"}],
+            },
+        }
+
+    async with session_scope() as session:
+        first = await create_entry(
+            session, income_payload(f"{company_id}-income-1"),
+            company_id=company_id, user_id="owner-1",
+            request_id=f"{company_id}-req-1", confirm=True,
+        )
+        await reverse_journal(
+            session, first.id, company_id=company_id, user_id="owner-1",
+            request_id=f"{company_id}-rev", reason="测试冲销",
+        )
+        await create_entry(
+            session, income_payload(f"{company_id}-income-2"),
+            company_id=company_id, user_id="owner-1",
+            request_id=f"{company_id}-req-2", confirm=True,
+        )
+
+    book = await build_ledger_book(company_id, month="2026-10", include_zero_rows=True)
+    legacy = await get_balance_summary(company_id, "2026-10")
+
+    assert legacy["totalDebit"] == "500.00", "有效发生额：冲销对剔除，只剩重记那张"
+    assert book["balance"]["totalDebit"] == legacy["totalDebit"]
+    assert book["balance"]["totalCredit"] == legacy["totalCredit"]
+    assert book["balance"]["isBalanced"] == legacy["isBalanced"] is True
+
+    new_rows = _by_code(book["balance"]["items"])
+    old_rows = _by_code(legacy["items"])
+    assert set(new_rows) == set(old_rows)
+    for code, old in old_rows.items():
+        new = new_rows[code]
+        for field in ("openingBalance", "debitTotal", "creditTotal", "closingBalance"):
+            assert new[field] == old[field], f"{code}.{field} 与旧接口不一致"
+
+
+@pytest.mark.asyncio
 async def test_book_details_roll_forward_matches_balance():
     """账页自洽：期初 + 借 - 贷 == 期末，且期末与余额表同数。"""
     company_id = "c-book-roll"
@@ -602,3 +664,54 @@ async def test_journal_book_splits_by_cash_account():
         assert item["pageNo"] == cursor
         cursor += item["pageCount"]
     assert book["pagination"]["totalPages"] == cursor - 1
+
+
+@pytest.mark.asyncio
+async def test_book_shows_partner_for_person_advance_lines():
+    """垫付凭证的 2241 行要带出往来单位：科目名统一是「其他应付款」，
+    谁垫的钱只存在辅助核算里，账簿不给出来就分不清欠谁。"""
+    company_id = "c-book-partner"
+    await _setup_company(company_id)
+    from db.session import session_scope
+
+    async with session_scope() as session:
+        await create_entry(
+            session,
+            {
+                "id": f"{company_id}-boss",
+                "direction": "expense",
+                "amount": "100.00",
+                "title": "老板垫付办公费",
+                "category": "办公费",
+                "occurDate": "2026-10-15",
+                "sourceType": "manual",
+                "payer": "boss_personal",
+            },
+            company_id=company_id,
+            user_id="owner-1",
+            request_id=f"{company_id}-req",
+            confirm=True,
+        )
+
+    book = await build_ledger_book(company_id, month="2026-10")
+
+    detail_row = next(
+        row
+        for page in book["details"]
+        if page["code"] == "2241"
+        for row in page["lines"]
+    )
+    assert detail_row["partnerName"] == "股东"
+    assert detail_row["partnerId"]
+
+    chronological_row = next(
+        row for row in book["chronological"]["items"] if row["accountCode"] == "2241"
+    )
+    assert chronological_row["partnerName"] == "股东"
+    assert chronological_row["partnerId"] == detail_row["partnerId"]
+
+    # 借方费用行不挂往来单位，不能整册串味
+    expense_row = next(
+        row for row in book["chronological"]["items"] if row["accountCode"].startswith("5602")
+    )
+    assert expense_row["partnerName"] is None

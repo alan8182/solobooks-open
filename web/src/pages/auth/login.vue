@@ -95,14 +95,9 @@ async function finishLogin(resp: Awaited<ReturnType<typeof loginByPhoneCode>>) {
   authStore.setSession(resp)
   await authStore.fetchProfile()
   message.success('登录成功')
-  // 昵称为空或未设密码时，让登录后的首页弹一次"完善账号信息"引导。
-  const needPassword = resp.has_password === false
-  const needNickname = !String(authStore.user?.nickname || '').trim()
-  if (needPassword || needNickname) {
-    sessionStorage.setItem('solo:setup-password-hint', '1')
-  } else {
+  try {
     sessionStorage.removeItem('solo:setup-password-hint')
-  }
+  } catch { /* ignore */ }
   // Reload the app from its authenticated entry point. This avoids a stale
   // login route or a rejected client-side navigation swallowing the jump.
   window.location.replace('/')
@@ -228,8 +223,8 @@ async function handleForgotReset() {
       <aside class="brand-pane">
         <h1 class="brand-title">把账记简单，<br />把经营看清楚。</h1>
         <p class="brand-desc">
-          面向一人公司与微型团队的财务底座。<br />
-          流水自动对账，凭证合规留痕，告别繁复财务焦虑。
+          告别“甩手掌柜”与应付报税的黑盒代账。<br />
+          在日常确认中建立老板财务直觉，从第一天起养出经得起授信与融资尽调的体面账。
         </p>
       </aside>
 
@@ -245,12 +240,12 @@ async function handleForgotReset() {
             <span class="logo-sub">SoloBooks</span>
           </div>
         </div>
-        <p class="mobile-brand-positioning">一人公司及小微企业的 AI 会计 Agent</p>
+        <p class="mobile-brand-positioning">不当甩手掌柜 · 养出经得起尽调的合规公司</p>
         <p class="mobile-brand-slogan">把账记简单，把经营看清楚。</p>
         <div class="mobile-brand-pills">
-          <span>零会计门槛</span>
-          <span>流水自动对账</span>
-          <span>合规月结向导</span>
+          <span>建立老板财务直觉</span>
+          <span>票流税 100% 勾稽</span>
+          <span>融资与授信就绪</span>
         </div>
       </div>
 
@@ -264,7 +259,7 @@ async function handleForgotReset() {
             <span class="logo-sub">SoloBooks</span>
           </div>
         </div>
-        <p class="subtitle">一人公司及小微企业的 AI 会计 Agent</p>
+        <p class="subtitle">懂财务、重合规的一人公司与小微企业 AI CFO</p>
       </div>
 
       <NAlert v-if="errorMsg" type="error" closable class="mb-4" @close="errorMsg = ''">

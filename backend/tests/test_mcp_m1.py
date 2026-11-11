@@ -130,11 +130,17 @@ class TestWriteToolScopeGate:
         log = await _latest_call_log("propose_voucher", "mcp_m1_writer")
         assert log is not None and log.success is True
 
-    async def test_preview_accruals_is_read_scope(self):
+    async def test_closing_previews_are_read_scope(self):
         from agent.mcp_server import _required_scope
 
         assert _required_scope("preview_accruals") == "read"
         assert _required_scope("preview_asset_actions") == "read"
+
+    async def test_closing_repair_drafts_require_write_scope(self):
+        from agent.mcp_server import _required_scope
+
+        assert _required_scope("propose_match") == "write:draft"
+        assert _required_scope("propose_accrual") == "write:draft"
         assert _required_scope("propose_asset_closure") == "write:draft"
 
 

@@ -126,7 +126,12 @@ class TestPrompts:
         text = result.messages[0].content.text if hasattr(result, "messages") else str(result)
         assert "2026-09" in text
         assert "run_close_checks" in text
-        assert "不要声称已结账" in text
+        assert "snapshotHash" in text
+        assert "propose_asset_closure" in text
+        assert "待确认" in text
+        assert "月度结账" in text
+        assert "manualClose.url" in text
+        assert "Markdown" in text
 
     async def test_reconciliation_review_renders_month(self):
         from agent.mcp_server import mcp
@@ -135,3 +140,7 @@ class TestPrompts:
         text = result.messages[0].content.text if hasattr(result, "messages") else str(result)
         assert "2026-10" in text
         assert "list_unmatched" in text
+        assert "propose_match" in text
+        assert "write:draft" in text
+        assert "锁定账" in text or "锁账" in text
+        assert "manualClose.url" in text

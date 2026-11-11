@@ -217,7 +217,7 @@ usePageRefresh(() => Promise.all([store.bootstrap(), loadStats()]))
 
 <style scoped>
 .agg-page {
-  max-width: 1080px;
+  max-width: var(--page-width);
   margin: 0 auto;
 }
 .page-header {

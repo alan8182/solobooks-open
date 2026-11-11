@@ -110,9 +110,6 @@ function openFiling(period: string) {
       <div class="card-head">
         <div class="card-head-left">
           <span class="card-title">申报节奏预览</span>
-          <span class="card-sub">
-            按认定表铺出的 {{ year }} 年应报清单，点击税种卡片可直达对应属期的「税务申报」
-          </span>
         </div>
         <NSpace align="center" :size="8">
           <NSelect

@@ -5,6 +5,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { NAV_ITEMS, type BossGroup, type NavGroup, type NavItem } from '@/utils/constants'
 import { useWorkspaceViewStore } from '@/stores/workspaceView'
 import { itemVisible } from '@/utils/workspace'
+import { useClosingStatus } from '@/composables/useClosingStatus'
 
 const props = withDefaults(defineProps<{ collapsed: boolean; mobile?: boolean }>(), {
   mobile: false,
@@ -14,6 +15,7 @@ const emit = defineEmits<{ toggle: []; navigate: [] }>()
 const route = useRoute()
 const router = useRouter()
 const viewStore = useWorkspaceViewStore()
+const closingStatus = useClosingStatus()
 const expandedMenu = ref<string | null>(null)
 const visibleItems = computed<NavItem[]>(() => {
   return NAV_ITEMS
@@ -24,7 +26,7 @@ const visibleItems = computed<NavItem[]>(() => {
     }))
     .filter((item) => Boolean(item.path) || Boolean(item.children?.length))
 })
-const BOSS_GROUPS: BossGroup[] = ['每天', '每月', '复盘', '设置']
+const BOSS_GROUPS: BossGroup[] = ['每月', '每天', '复盘', '设置']
 const WORKSPACE_GROUPS: NavGroup[] = ['日常', '账务', '周期', '工具']
 
 // 设置收纳：老板视图折进左下角小图标（低频入口不占主航）；
@@ -84,6 +86,27 @@ const navGroups = computed(() => {
 
 function isActive(path: string) {
   if (path === '/' || path === '/mine') return route.path === path
+  if (viewStore.isBoss) {
+    if (path === '/bank' || path === '/private-expenses') {
+      return (
+        route.path.startsWith('/bank') ||
+        route.path.startsWith('/private-expenses') ||
+        route.path.startsWith('/reports/advance-balances') ||
+        route.path.startsWith('/reports/ar-aging') ||
+        route.path.startsWith('/reports/ap-aging')
+      )
+    }
+    if (path === '/reports') {
+      if (
+        route.path.startsWith('/reports/advance-balances') ||
+        route.path.startsWith('/reports/ar-aging') ||
+        route.path.startsWith('/reports/ap-aging')
+      ) {
+        return false
+      }
+      return route.path.startsWith('/reports')
+    }
+  }
   return route.path.startsWith(path)
 }
 
@@ -180,14 +203,34 @@ watch(
             v-else-if="item.path"
             type="button"
             class="nav-item"
-            :class="{ active: isActive(item.path) }"
-            :title="collapsed ? itemDisplayLabel(item) : undefined"
+            :class="{
+              active: isActive(item.path),
+              'nav-item--hero': item.path === '/closing-wizard',
+            }"
+            :title="item.path === '/closing-wizard'
+              ? closingStatus.badgeTitle.value
+              : collapsed ? itemDisplayLabel(item) : undefined"
             @click="navigate(item.path)"
           >
             <span class="nav-item-inner">
               <i :class="[item.icon, 'nav-icon']" />
               <span v-if="!collapsed" class="nav-label">{{ itemDisplayLabel(item) }}</span>
             </span>
+            <template v-if="item.path === '/closing-wizard'">
+              <span
+                v-if="!collapsed"
+                class="closing-badge"
+                :class="closingStatus.badgeType.value"
+                :title="closingStatus.badgeTitle.value"
+              >
+                {{ closingStatus.badgeText.value }}
+              </span>
+              <span
+                v-else
+                class="closing-dot"
+                :class="closingStatus.badgeType.value"
+              />
+            </template>
           </button>
 
           <div
@@ -533,6 +576,72 @@ watch(
 .nav-item.active .nav-icon {
   color: var(--solo-primary);
   transform: none;
+}
+/* 月度结账专属 Hero 视觉特权样式 */
+.nav-item--hero {
+  background: var(--solo-bg-blue-soft, rgba(14, 165, 233, 0.06));
+  border: 1px solid rgba(14, 165, 233, 0.16);
+  font-weight: 600;
+}
+.nav-item--hero .nav-icon {
+  color: var(--solo-primary, #0284c7);
+}
+.nav-item--hero:hover {
+  background: rgba(14, 165, 233, 0.12);
+  border-color: rgba(14, 165, 233, 0.3);
+}
+.nav-item--hero.active {
+  background: var(--solo-primary);
+  color: #fff;
+  border-color: var(--solo-primary);
+}
+.nav-item--hero.active .nav-icon,
+.nav-item--hero.active .nav-label {
+  color: #fff;
+}
+.nav-item--hero.active .closing-badge {
+  background: rgba(255, 255, 255, 0.2);
+  color: #fff;
+  border-color: rgba(255, 255, 255, 0.35);
+}
+
+.closing-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: 9999px;
+  line-height: 1.4;
+  white-space: nowrap;
+  letter-spacing: 0.2px;
+  transition: all 0.2s ease;
+}
+.closing-badge.warning {
+  color: var(--solo-warning);
+  background: #fef3c7;
+  border: 1px solid #fde68a;
+}
+.closing-badge.success {
+  color: var(--solo-income);
+  background: #d1fae5;
+  border: 1px solid #a7f3d0;
+}
+
+.closing-dot {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  border: 1.5px solid var(--solo-bg-sidebar, #fff);
+}
+.closing-dot.warning {
+  background-color: #f59e0b;
+}
+.closing-dot.success {
+  background-color: #10b981;
 }
 .nav-icon {
   font-size: 18px;

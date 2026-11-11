@@ -14,11 +14,15 @@ services:
       #   docker compose exec -u root postgres chown postgres:postgres /var/lib/postgresql/wal_archive
       - postgres_wal_archive:/var/lib/postgresql/wal_archive
       - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    # D-015：没有基础备份时归档文件零恢复价值，还以 ~4.4G/周 塞满根分区。
+    # /bin/true 让归档器即时"成功"→ pg_wal 正常回收、归档卷不再增长。
+    # 备份方案落地（D-008）时改回真实归档命令并配 pg_basebackup。
+    # 注意：注释不能写进下面的折叠块里——块标量内的每一行都是 postgres 参数。
     command: >
       postgres
       -c wal_level=replica
       -c archive_mode=on
-      -c archive_command='test ! -f /var/lib/postgresql/wal_archive/%f && cp %p /var/lib/postgresql/wal_archive/%f'
+      -c archive_command='/bin/true'
       -c archive_timeout=300
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-solobooks_owner} -d ${POSTGRES_DB:-solobooks}"]
@@ -62,6 +66,15 @@ services:
       # 管理后台安全前提：生产环境必须关闭开发兜底 token（否则垃圾 token 按 test_user_001 放行）
       - AUTH_DEV_FALLBACK=0
       - ACCOUNTING_TIMEZONE=Asia/Shanghai
+      # 邮件收单通道（docs/mail-inbound.md）：四项 MAIL_INBOUND_* 配齐才启动 IMAP 轮询，
+      # 全部留空 = 功能静默（前端入口显示「收取服务未开通」，不影响手动上传）
+      - MAIL_INBOUND_IMAP_HOST=${MAIL_INBOUND_IMAP_HOST:-}
+      - MAIL_INBOUND_IMAP_PORT=${MAIL_INBOUND_IMAP_PORT:-993}
+      - MAIL_INBOUND_IMAP_USER=${MAIL_INBOUND_IMAP_USER:-}
+      - MAIL_INBOUND_IMAP_PASSWORD=${MAIL_INBOUND_IMAP_PASSWORD:-}
+      - MAIL_INBOUND_DOMAIN=${MAIL_INBOUND_DOMAIN:-}
+      - MAIL_POLL_SECONDS=${MAIL_POLL_SECONDS:-180}
+      - MAIL_INBOUND_MAX_ATTACHMENT_MB=${MAIL_INBOUND_MAX_ATTACHMENT_MB:-50}
     depends_on:
       postgres:
         condition: service_healthy
@@ -84,7 +97,9 @@ services:
         # 默认 npmmirror（与 Dockerfile ARG 默认一致），可设 NPM_REGISTRY 覆盖
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
     ports:
-      - "${EXTERNAL_PORT:-8080}:80"
+      # 只绑环回：宿主 nginx 反代的正是 127.0.0.1:8080；此前对公网开放 8080
+      # 会绕过 TLS 直连容器（待办 P2 收口）
+      - "127.0.0.1:${EXTERNAL_PORT:-8080}:80"
     depends_on:
       backend:
         condition: service_healthy

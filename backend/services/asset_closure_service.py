@@ -16,7 +16,7 @@ from core.fixed_asset_categories import get_category as get_fixed_asset_category
 from core.intangible_categories import get_category as get_intangible_category
 from db.models import AccountingPeriod, FixedAsset, IntangibleAsset
 from db.session import session_scope
-from services.accounting_core_service import _json_safe, ensure_tenant
+from services.accounting_core_service import _json_safe, ensure_tenant, list_journals
 from services.amortization_engine import (
     list_due_amortization_periods,
     run_amortization_catch_up,
@@ -25,7 +25,6 @@ from services.depreciation_engine import (
     list_due_depreciation_periods,
     run_depreciation_catch_up,
 )
-from services.entry_service import list_entries
 from services.fixed_asset_service import (
     create_asset_from_entry,
     get_fixed_asset_entry_prefill,
@@ -94,7 +93,7 @@ async def _preview_asset_closure(
     fixed_blocked: list[dict[str, Any]] = []
     intangible_blocked: list[dict[str, Any]] = []
 
-    entries = await list_entries(user_id, company_id)
+    entries = await list_journals(session, company_id)
     reversed_ids = {
         str(entry.get("reversalOf") or "")
         for entry in entries
@@ -219,6 +218,16 @@ async def preview_asset_closure(
 ) -> dict[str, Any]:
     async with session_scope() as session:
         return await _preview_asset_closure(session, company_id, user_id, month)
+
+
+async def preview_asset_closure_in_session(
+    session: AsyncSession,
+    company_id: str,
+    user_id: str,
+    month: str,
+) -> dict[str, Any]:
+    """Reuse the authoritative asset preview inside a caller-owned transaction."""
+    return await _preview_asset_closure(session, company_id, user_id, month)
 
 
 def build_asset_closure_payload(preview: dict[str, Any]) -> dict[str, Any]:

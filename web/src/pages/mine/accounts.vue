@@ -730,7 +730,7 @@ onMounted(loadTree)
 
 <style scoped>
 .accounts-page {
-  max-width: 1200px;
+  max-width: var(--page-width);
   margin: 0 auto;
   padding: 16px 0 32px 0;
   width: 100%;

@@ -2,7 +2,7 @@
 <script setup lang="ts">
 import { computed, h, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { NDropdown, useMessage } from 'naive-ui'
+import { NDropdown, NTooltip, useMessage } from 'naive-ui'
 import type { DropdownOption } from 'naive-ui'
 import { useAuthStore } from '@/stores/auth'
 import { useUsageStore } from '@/stores/usage'
@@ -61,7 +61,7 @@ const userOptions = computed<DropdownOption[]>(() => {
       label: () =>
         h('div', { style: 'display:flex;align-items:center;gap:8px;min-width:200px;' }, [
           h('i', {
-            class: 'ri-sparkling-2-line',
+            class: 'ri-chat-3-line',
             style: 'font-size:15px;color:var(--solo-primary,#175cff);',
           }),
           h('span', { style: 'font-size:13px;color:var(--solo-text-secondary,#555);' }, '本月 AI 用量'),
@@ -141,7 +141,15 @@ function handleUserAction(key: string) {
         </button>
       </NDropdown>
 
-      <SoloStatusBadge v-if="isDemoCompany" plain tone="info">演示账套</SoloStatusBadge>
+      <NTooltip v-if="isDemoCompany" trigger="hover">
+        <template #trigger>
+          <SoloStatusBadge plain tone="info">
+            <i class="ri-flask-line" style="margin-right: 4px;" aria-hidden="true" />
+            演示账套
+          </SoloStatusBadge>
+        </template>
+        当前处于沙盒演示环境，样本数据仅供体验；可在「公司管理」随时建立真实企业账套。
+      </NTooltip>
 
       <WorkspaceViewSwitch class="workspace-view-switch" />
     </div>

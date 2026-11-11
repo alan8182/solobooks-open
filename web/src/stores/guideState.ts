@@ -197,6 +197,37 @@ export function resolveChecklistDisplay(
   return 'expanded'
 }
 
+export interface L0GateContext {
+  isReplay: boolean
+  hasManualCompany: boolean
+  isCurrentDemo: boolean
+  l0SeenAt: string | null
+  userL0Seen: boolean
+  legacyDismissed: boolean
+  sessionShown: boolean
+  companyCreatedAt: string | null | undefined
+  now?: Date
+}
+
+/**
+ * L0 起跑线弹窗准入规则（纯函数）：
+ * - 用户在 /guide 点「重看新手引导」带有 isReplay 时一律放行；
+ * - 若用户已经手动设置了真实账套（hasManualCompany），或当前账套本身为真实账套（!isCurrentDemo），永不自动强弹建账分流卡片；
+ * - 账号已看过（l0SeenAt / userL0Seen / legacyDismissed）或本会话已弹过（sessionShown）不弹；
+ * - 公司创建超过 14 天（EXPAND_WINDOW_DAYS）不弹；
+ * - 仅在纯演示账套且未建立真实账套的初始体验期弹出。
+ */
+export function shouldOpenL0Modal(ctx: L0GateContext): boolean {
+  if (ctx.isReplay) return true
+  if (ctx.hasManualCompany || !ctx.isCurrentDemo) return false
+  if (ctx.l0SeenAt) return false
+  if (ctx.userL0Seen || ctx.legacyDismissed) return false
+  if (ctx.sessionShown) return false
+  const age = daysSince(ctx.companyCreatedAt, ctx.now)
+  if (age === null || age >= EXPAND_WINDOW_DAYS) return false
+  return true
+}
+
 export const useGuideStateStore = defineStore('guideState', () => {
   const authStore = useAuthStore()
   const state = ref<GuideState>(readGuideState(authStore.currentCompanyId))

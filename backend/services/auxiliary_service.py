@@ -16,20 +16,23 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
-from sqlalchemy import func, select
+from sqlalchemy import func, inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.chart_policy import auxiliary_kinds_for_account
 from core.errors import AccountingError
 from db.models import Department, JournalEntry, JournalLine, Partner, Project
 from db.session import session_scope
+from services.account_mapper import EMPLOYEE_PAYER_PREFIX, PAYER_BOSS, normalize_payer
 
 KINDS = ("partner", "department", "project")
 MODELS = {"partner": Partner, "department": Department, "project": Project}
 NAME_FIELD = {"partner": "name", "department": "name", "project": "name"}
 ID_KEY = {"partner": "partner_id", "department": "department_id", "project": "project_id"}
 NAME_KEY = {"partner": "partner_name", "department": "department_name", "project": "project_name"}
-CODE_PREFIX = {"customer": "C", "supplier": "S", "both": "B"}
+CODE_PREFIX = {"customer": "C", "supplier": "S", "both": "B", "person": "P"}
+# 个人（股东/员工）不是客户也不是供应商，单独一类；三处校验共用，避免各写一份漂移
+PARTNER_TYPES = ("customer", "supplier", "both", "person")
 POSTED_STATUSES = ("posted", "reversed")
 
 
@@ -155,7 +158,7 @@ async def create_master(
         code = str(payload.get("code") or "").strip()
         if kind == "partner":
             partner_type = str(payload.get("type") or "both").strip()
-            if partner_type not in ("customer", "supplier", "both"):
+            if partner_type not in PARTNER_TYPES:
                 partner_type = "both"
             prefix = CODE_PREFIX.get(partner_type, "B")
         else:
@@ -234,7 +237,7 @@ async def update_master(
                     raise AccountingError("DUPLICATE_AUXILIARY_CODE", f"编码 {code} 已存在", 409)
                 row.code = code
         if isinstance(row, Partner):
-            if "type" in payload and payload.get("type") in ("customer", "supplier", "both"):
+            if "type" in payload and payload.get("type") in PARTNER_TYPES:
                 row.type = str(payload["type"])
             for field, key in (
                 ("tax_id", "taxId"),
@@ -482,6 +485,154 @@ async def ensure_partner_by_name(
     if user_id:
         await _audit(company_id, user_id, "auto_create", "partner", result["id"], {"name": target})
     return result
+
+
+BOSS_PARTNER_CODE = "P-BOSS"
+BOSS_PARTNER_FALLBACK_NAME = "股东"
+
+
+async def _boss_display_name(session: AsyncSession, company_id: str) -> str:
+    """老板姓名：优先员工档案里 ``is_owner=1`` 的人，没有档案就叫「股东」。
+
+    员工表由工资模块用裸 SQL 建（salary_service._ensure_schema），测试库或
+    尚未启用工资模块的账套里可能不存在。这里先探表再查，任何异常都退回
+    「股东」——建账不能因为取不到老板姓名而失败。
+    """
+    try:
+        # 只探表不够：老库的 employees 可能缺 is_owner/is_active 列，查询报错会
+        # 毒化 PostgreSQL 事务（异常被吞掉也没用），所以连列一起确认。
+        columns = await session.run_sync(
+            lambda conn: (
+                {col["name"] for col in inspect(conn).get_columns("employees")}
+                if inspect(conn).has_table("employees")
+                else set()
+            )
+        )
+        if {"name", "is_owner", "is_active"} <= columns:
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT name FROM employees WHERE company_id = :company_id "
+                        "AND is_owner = 1 AND is_active = 1 ORDER BY name LIMIT 1"
+                    ),
+                    {"company_id": company_id},
+                )
+            ).first()
+            if row and str(row[0] or "").strip():
+                return str(row[0]).strip()
+    except Exception:
+        pass
+    return BOSS_PARTNER_FALLBACK_NAME
+
+
+async def ensure_person_partner(
+    session: AsyncSession,
+    company_id: str,
+    name: str,
+    *,
+    code: str = "",
+    user_id: str = "",
+) -> dict[str, str] | None:
+    """按姓名取「个人」往来单位，不存在则建档，**复用调用方事务**。
+
+    与 ``ensure_partner_by_name`` 的区别：本函数不自己开 ``session_scope``，
+    供记账主流程（``_add_lines``）在既有事务里调用，避免辅助档案与凭证分两个
+    事务提交。老板固定编码 ``P-BOSS``，通讯录里改了名字也还能命中，不会因为
+    改名再建一个「股东」。
+    """
+    target = str(name or "").strip()
+    code_taken = False
+    if code:
+        row = (
+            await session.execute(
+                select(Partner).where(Partner.company_id == company_id, Partner.code == code)
+            )
+        ).scalar_one_or_none()
+        if row is not None and row.is_active:
+            return {"id": row.id, "name": row.name}
+        # 停用的老板档案不能复用：normalize_line_auxiliary 会以 INACTIVE 拒绝
+        # 整张凭证。记下编码已被占用，另建一个启用中的新档。
+        code_taken = row is not None
+    if not target:
+        return None
+    rows = (
+        await session.execute(select(Partner).where(Partner.company_id == company_id))
+    ).scalars().all()
+    normalized = _normalize_name(target)
+    for row in rows:
+        if row.is_active and _normalize_name(row.name) == normalized:
+            return {"id": row.id, "name": row.name}
+    partner = Partner(
+        company_id=company_id,
+        code=(
+            code
+            if code and not code_taken
+            else await _next_code(session, company_id, Partner, CODE_PREFIX["person"])
+        ),
+        name=target,
+        type="person",
+        mnemonic=_mnemonic(target),
+    )
+    session.add(partner)
+    await session.flush()
+    result = {"id": partner.id, "name": partner.name}
+    if user_id:
+        await _audit(company_id, user_id, "auto_create", "partner", result["id"], {"name": target})
+    return result
+
+
+# 这些分类无论付款人字段写的是什么，对手方都是股东本人（股东取现通常走公户）
+SHAREHOLDER_CATEGORIES = frozenset(
+    {"股东取现", "老板取现", "股东垫付", "老板垫付", "股东垫付报销", "老板垫付报销"}
+)
+
+
+async def resolve_entry_person(
+    session: AsyncSession,
+    company_id: str,
+    *,
+    payer: Any,
+    category: str = "",
+    payment_status: Any = "",
+    source: str = "",
+    user_id: str = "",
+) -> dict[str, str] | None:
+    """把一笔业务解析成个人往来单位；只有垫付类业务才有对手方。
+
+    返回 None 的几种情况都是刻意的：
+    - 裸 ``employee_personal``（没带姓名）：不知道是谁的垫付，挂一个「员工」
+      大杂烩只会让往来余额表多出一个假分组。
+    - ``unpaid``：挂账的对手方是供应商/客户，老板垫付是另一笔债权，不能抢
+      走发票导入挂上的供应商。
+
+    ``invoice_import`` 不再一刀切跳过：导入行若已按票面销售方挂好往来单位，
+    调用方（``_add_lines``）不会覆盖；没挂上的（如老板垫付的腾讯云发票）
+    正是要靠这里补出「欠老板的钱」。
+    """
+    if str(payment_status or "").strip().lower() == "unpaid":
+        return None
+    normalized = normalize_payer(payer)
+    if normalized == PAYER_BOSS or str(category or "").strip() in SHAREHOLDER_CATEGORIES:
+        name = await _boss_display_name(session, company_id)
+        return await ensure_person_partner(
+            session, company_id, name, code=BOSS_PARTNER_CODE, user_id=user_id
+        )
+    if normalized.startswith(f"{EMPLOYEE_PAYER_PREFIX}:"):
+        name = normalized.split(":", 1)[1].strip()
+        if name:
+            return await ensure_person_partner(session, company_id, name, user_id=user_id)
+    return None
+
+
+async def resolve_payer_partner(
+    session: AsyncSession,
+    company_id: str,
+    payer: Any,
+    *,
+    user_id: str = "",
+) -> dict[str, str] | None:
+    """兼容入口：只按付款人解析（历史回填脚本/旧调用方使用）。"""
+    return await resolve_entry_person(session, company_id, payer=payer, user_id=user_id)
 
 
 async def assign_entry_auxiliary(

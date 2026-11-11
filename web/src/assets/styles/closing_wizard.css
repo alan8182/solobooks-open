@@ -36,14 +36,6 @@
   color: var(--solo-primary);
   flex-shrink: 0;
 }
-.sparkling-icon {
-  font-size: 20px;
-  animation: shine 2s ease-in-out infinite;
-}
-@keyframes shine {
-  0%, 100% { opacity: 0.8; transform: scale(1); }
-  50% { opacity: 1; transform: scale(1.1); }
-}
 .alert-text {
   display: flex;
   flex-direction: column;
@@ -186,6 +178,26 @@
   text-overflow: ellipsis;
 }
 
+/* 警告态：本月单据未齐（发票/微信账单/银行流水有类别还没上传），配色同 zero-record 族 */
+.step-status-bar.step-status-bar--warning {
+  background: var(--solo-warning-bg, #fff5e8);
+  border-color: rgba(245, 158, 11, 0.35);
+}
+
+.step-status-bar--warning .step-status-icon {
+  color: var(--solo-warning, #a05c10);
+}
+
+.step-status-bar--warning .step-status-label {
+  color: var(--solo-warning, #a05c10);
+}
+
+/* 警告文案含缺失清单，允许换行避免被省略号截断 */
+.step-status-bar--warning .step-status-text {
+  white-space: normal;
+  color: var(--solo-text-secondary, #586474);
+}
+
 /* 第一步发票表：疑似流水提示 / 无操作占位 */
 .invoice-candidate-hint {
   display: block;
@@ -277,6 +289,199 @@
   display: flex;
   align-items: center;
   gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+/* 两步确认：第一次点击只选付款人，卡片原地展开第二步科目确认 */
+.pending-entry-card--expanded {
+  flex-wrap: wrap;
+  align-items: flex-start;
+  border-color: var(--solo-primary);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--solo-primary) 18%, transparent);
+}
+
+/* 展开后标题那列不能再被按钮挤窄：给主信息一个下限，按钮换行到下一排 */
+.pending-entry-card--expanded .pending-entry-main {
+  flex: 1 1 320px;
+}
+
+.pending-entry-card--expanded .pending-entry-amount {
+  flex: 0 0 auto;
+}
+
+.disposition-chip--active {
+  border-color: var(--solo-primary) !important;
+  color: var(--solo-primary) !important;
+  font-weight: 600;
+}
+
+.pending-entry-plan {
+  flex-basis: 100%;
+  margin-top: 2px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--solo-border-light, #edf0f4);
+}
+
+.pending-entry-plan-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  flex-wrap: wrap;
+}
+
+.pending-entry-plan-title {
+  font-weight: 600;
+  color: var(--solo-text-primary);
+}
+
+.pending-entry-plan-category {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--solo-text-secondary);
+  flex-wrap: wrap;
+}
+
+.pending-entry-plan-category strong {
+  color: var(--solo-text-primary);
+}
+
+.plan-label {
+  color: var(--solo-text-muted);
+}
+
+.plan-muted {
+  color: var(--solo-text-muted);
+  font-size: 12px;
+}
+
+.pending-entry-plan-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--solo-bg-subtle, #f7f9fc);
+}
+
+.plan-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--solo-text-primary);
+  flex-wrap: wrap;
+}
+
+.plan-side {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  line-height: 18px;
+  text-align: center;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.plan-side.debit {
+  color: var(--solo-primary);
+  background: color-mix(in srgb, var(--solo-primary) 12%, transparent);
+}
+
+.plan-side.credit {
+  color: var(--solo-income, #0f7354);
+  background: color-mix(in srgb, var(--solo-income, #0f7354) 12%, transparent);
+}
+
+.plan-code {
+  color: var(--solo-text-muted);
+  font-family: var(--solo-font-mono, ui-monospace, monospace);
+  font-size: 12px;
+}
+
+.plan-partner {
+  color: var(--solo-text-secondary);
+  font-size: 12px;
+}
+
+.plan-amount {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+}
+
+.plan-note {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--solo-text-secondary);
+}
+
+.plan-note.warning {
+  color: var(--solo-warning, #b8860b);
+}
+
+.plan-error {
+  font-size: 12px;
+  color: var(--solo-text-muted);
+}
+
+.pending-entry-plan-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
+/* 研发归集子表单：分类选「研发支出-费用化支出」后就地展开，不跳弹窗 */
+.pending-entry-rd {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--solo-primary-light, #d6e4ff);
+  background: var(--solo-primary-bg, #f5f9ff);
+}
+
+.pending-entry-rd-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+.pending-entry-rd-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-weight: 600;
+  color: var(--solo-primary, #2b5aed);
+}
+
+.pending-entry-rd-hint {
+  color: var(--solo-text-secondary);
+}
+
+.pending-entry-rd-fields {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+.pending-entry-rd-note {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--solo-text-muted);
 }
 
 /* 3.1 Step 1 三列导入卡片：默认紧凑单行放下，导入后展开的卡片横跨整行 */
@@ -322,6 +527,10 @@
   grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 14px;
   align-items: start;
+}
+/* 邮件收件箱卡：第 1 步顶部通栏，与下方三张导入卡保持同一间距 */
+.step1-inbox-card {
+  margin-bottom: 14px;
 }
 .step1-import-grid .n-card {
   margin-bottom: 0;

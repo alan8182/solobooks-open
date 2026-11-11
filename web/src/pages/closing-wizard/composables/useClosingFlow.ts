@@ -11,9 +11,11 @@
  * 汇合点，判定权仍归各域所有，本模块只编排与请求。
  */
 import { ref, type Ref } from 'vue'
-import { useMessage } from 'naive-ui'
+import { useDialog, useMessage } from 'naive-ui'
 import apiClient from '@/api/client'
 import { getAIDiagnosis, getIncomeStatement } from '@/api/report'
+import { getTodos } from '@/api/todo'
+import { buildClosingTodoSummary, type ClosingTodoSummary } from '@/utils/closingTodos'
 import { getClosingReadiness, canBatchPostDrafts } from '@/utils/closingReadiness'
 import { reportErrorToast } from '@/utils/errorPresenter'
 import { offerRescue } from '@/composables/useRescue'
@@ -36,6 +38,7 @@ export function useClosingFlow(options: {
     confirmZeroActivity, loadReconciliationHealth, hasBlockingReconciliationRisk, entryStore,
   } = options
   const message = useMessage()
+  const dialog = useDialog()
 
   const closed = ref(false)
   const closingLoading = ref(false)
@@ -49,6 +52,8 @@ export function useClosingFlow(options: {
   // 本次结账减免的增值税及免税凭证号
   const vatExemptAmount = ref(0)
   const vatExemptVoucherRefs = ref<string[]>([])
+  // 结账成功页「结账后待办」卡的摘要数据（只读展示，不做卡内办结）
+  const closingTodos = ref<ClosingTodoSummary>({ pendingCount: 0, topItems: [] })
 
   const canBatchPostAndClose = () => canBatchPostDrafts(periodCloseChecks.value)
 
@@ -66,6 +71,52 @@ export function useClosingFlow(options: {
     }
   }
 
+  async function getFinancialContentWarning() {
+    if (isZeroRecordMonth.value) {
+      return {
+        title: `${month.value} 尚无业务记录`,
+        content: '本月凭证、银行流水和发票均为空。若您还没有录入或导入本月业务，建议先返回检查；继续结账后，本期将按零收支锁定归档。',
+      }
+    }
+
+    try {
+      const statement = await getIncomeStatement(month.value, 'summary')
+      const detailRows = Array.isArray(statement?.rows)
+        ? statement.rows.filter(row => !row.isSubtotal)
+        : []
+      if (detailRows.length === 0) {
+        return {
+          title: `${month.value} 利润表暂无明细`,
+          content: '系统没有读取到本月利润表明细。若您还没有录入或过账本月业务，建议先返回检查；继续结账后，本期账册将锁定归档。',
+        }
+      }
+      const allZero = detailRows.every((row) =>
+        Math.abs(Number(row.values?.current || 0)) < 0.005
+      )
+      return allZero ? {
+        title: `${month.value} 收入和支出均为 0`,
+        content: '系统检查到本月利润表中的收入、成本和费用均为 0。若您还没有录入或过账本月业务，建议先返回检查；继续结账后，本期将按零收支锁定归档。',
+      } : null
+    } catch {
+      // 无法核实利润表时先提醒，避免接口异常让全零账目直接结账。
+      return {
+        title: `${month.value} 利润表暂时无法核对`,
+        content: '系统暂时无法确认本月收入和支出是否已录入。请先检查本月业务；若确认无需补录，仍可继续结账并锁定归档。',
+      }
+    }
+  }
+
+  // 结账后待办摘要：给成功页待办卡取数。与 fetchClosedMetrics 同一原则——
+  // 引导可以失灵但不能挡住主流程，失败时静默置空，卡片整块不渲染
+  async function fetchClosingTodos() {
+    try {
+      const resp = await getTodos()
+      closingTodos.value = buildClosingTodoSummary(resp.todos || [])
+    } catch {
+      closingTodos.value = { pendingCount: 0, topItems: [] }
+    }
+  }
+
   async function generateDiagnosis() {
     if (diagnosisLoading.value) return
     diagnosisLoading.value = true
@@ -79,7 +130,7 @@ export function useClosingFlow(options: {
   }
 
   // Perform Month-end Closing and lock period
-  async function runClosing() {
+  async function runClosing(confirmedZeroClose: boolean = false) {
     if (hasBlockingPayroll.value) {
       currentStep.value = 2
       message.warning('本月在职员工工资尚未完成计提，请先计提后再结账（发放可延至次月）。')
@@ -89,9 +140,23 @@ export function useClosingFlow(options: {
       message.warning('本月尚未录入任何账目记录。若确认本月无经营业务，请先勾选确认零申报。')
       return
     }
+    if (closingLoading.value) return
 
     closingLoading.value = true
     try {
+      if (confirmedZeroClose !== true) {
+        const warning = await getFinancialContentWarning()
+        if (warning) {
+          dialog.warning({
+            ...warning,
+            positiveText: '仍要继续结账',
+            negativeText: '返回检查',
+            onPositiveClick: () => { void runClosing(true) },
+          })
+          return
+        }
+      }
+
       await loadReconciliationHealth()
       if (hasBlockingReconciliationRisk()) {
         currentStep.value = 2
@@ -107,15 +172,25 @@ export function useClosingFlow(options: {
         message.warning(`还不能结账：${blocking.map(item => item.title).join('、')}`)
         return
       }
+      if (!checks.snapshotHash) {
+        currentStep.value = 3
+        message.warning('结账预览已失效，请重新加载本月检查结果后再确认')
+        periodCloseChecks.value = await apiClient.get(`/api/periods/${month.value}/close-checks`)
+        return
+      }
 
       // 幂等键交给 axios 拦截器按次生成：固定 key 会让反结账后的重新结账命中
       // 上一次成功响应的缓存，前端显示成功而实际未落库
-      const result: any = await apiClient.post(`/api/periods/${month.value}/close`)
+      const result: any = await apiClient.post(`/api/periods/${month.value}/close`, {
+        expectedSnapshotHash: checks.snapshotHash,
+      })
       closed.value = result.status === 'closed' || result.periodStatus === 'closed'
       periodCloseChecks.value = result
       currentStep.value = 3
       await entryStore.fetchEntries()
       await fetchClosedMetrics()
+      // 待办卡不阻塞成功 toast，取到后自行填充
+      void fetchClosingTodos()
       const postedCount = Number(result.autoPostedCount || 0)
       const closingRefs: string[] = Array.isArray(result.closingVoucherRefs) ? result.closingVoucherRefs.filter(Boolean) : []
       closingVoucherRefs.value = closingRefs
@@ -130,6 +205,16 @@ export function useClosingFlow(options: {
       if (detail?.code === 'CLOSE_CHECK_FAILED' && detail.context?.checks) {
         periodCloseChecks.value = { ...periodCloseChecks.value, checks: detail.context.checks, canClose: false }
         message.error('本月核验仍有阻断项；本次自动过账已一并回滚，请按检查结果处理后重试。')
+      } else if (detail?.code === 'CLOSING_SNAPSHOT_STALE') {
+        try {
+          periodCloseChecks.value = await apiClient.get(`/api/periods/${month.value}/close-checks`)
+        } catch {
+          periodCloseChecks.value = null
+        }
+        currentStep.value = 3
+        message.warning('账务数据在确认前发生了变化，本次没有结账。已刷新最新检查结果，请重新核对后再确认。', {
+          duration: 7000,
+        })
       } else if (detail?.code === 'REVIEW_REQUIRED') {
         // 救援层能定位到具体是哪张待复核，比这里一句笼统的话有用
         if (!offerRescue(err)) {
@@ -158,7 +243,9 @@ export function useClosingFlow(options: {
     closingVoucherRefs,
     vatExemptAmount,
     vatExemptVoucherRefs,
+    closingTodos,
     fetchClosedMetrics,
+    fetchClosingTodos,
     generateDiagnosis,
     runClosing,
     downloadReport,

@@ -264,3 +264,58 @@ def test_account_matches_uses_prefix_not_whitelist():
     assert _account_matches("5602", "5602001") is True
     assert _account_matches("5602001", "56020011") is True
     assert _account_matches("5602001", "5602002") is False
+
+
+@pytest.mark.asyncio
+async def test_month_summary_excludes_same_month_reversal_pairs():
+    """月度汇总剔除同月冲销对：发生额只剩有效活动，余额不变。
+
+    根因回归：「冲销重记」（原凭证过账 → 同月冲销 → 重记）会把当月借贷
+    发生额成倍虚增（期初重设场景实测 3 倍）。余额是净额，冲销对自相抵，
+    不受影响。跨月冲销不在此列（是更正当期的真实动作），由更晚月份口径覆盖。
+    """
+    from services.accounting_core_service import create_entry, reverse_journal
+    from db.session import session_scope
+
+    company_id = "c-ledger-revpair"
+    await _setup_company(company_id)
+
+    def income_payload(entry_id: str) -> dict:
+        return {
+            "id": entry_id,
+            "direction": "income",
+            "amount": "500.00",
+            "title": "咨询服务收入",
+            "category": "主营业务收入",
+            "occurDate": "2026-10-08",
+            "sourceType": "manual",
+            "voucherLines": {
+                "debit": [{"accountCode": "1002", "accountName": "银行存款", "amount": "500.00"}],
+                "credit": [{"accountCode": "5001", "accountName": "主营业务收入", "amount": "500.00"}],
+            },
+        }
+
+    async with session_scope() as session:
+        first = await create_entry(
+            session, income_payload(f"{company_id}-income-1"),
+            company_id=company_id, user_id="owner-1",
+            request_id=f"{company_id}-req-1", confirm=True,
+        )
+        await reverse_journal(
+            session, first.id, company_id=company_id, user_id="owner-1",
+            request_id=f"{company_id}-rev", reason="测试冲销",
+        )
+        await create_entry(
+            session, income_payload(f"{company_id}-income-2"),
+            company_id=company_id, user_id="owner-1",
+            request_id=f"{company_id}-req-2", confirm=True,
+        )
+
+    summary = await get_balance_summary(company_id, "2026-10")
+    bank = next(item for item in summary["items"] if item["accountCode"] == "1002")
+    assert bank["debitTotal"] == "500.00", "同月冲销对（原凭证+冲销）剔除，只剩重记那张"
+    assert bank["creditTotal"] == "0.00"
+    assert bank["closingBalance"] == "500.00"
+    assert summary["totalDebit"] == "500.00"
+    assert summary["totalCredit"] == "500.00"
+    assert summary["isBalanced"] is True

@@ -64,6 +64,20 @@ async def query_aging(
             )
         ).all()
 
+    # 冲销对相互抵消，不参与账龄。否则「已冲销原凭证 + 红字冲销凭证」会被按
+    # 正数各算一次，未收金额凭空翻倍（口径同 closing_validation_service 的
+    # reversal_ids 处理）。
+    reversal_of_ids = {
+        str(entry.reversal_of_id)
+        for entry, _ in rows
+        if entry.entry_type == "reversal" and entry.reversal_of_id
+    }
+    rows = [
+        (entry, line)
+        for entry, line in rows
+        if entry.entry_type != "reversal" and str(entry.id) not in reversal_of_ids
+    ]
+
     def bucket_row(entry, line) -> dict[str, Any]:
         amount = money(line.amount)
         days = max(0, (reference - entry.occurred_on).days)

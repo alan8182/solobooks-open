@@ -1,6 +1,6 @@
 <!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
-import { computed, ref, onMounted } from 'vue'
+import { computed, ref, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { NCard, NButton, NModal, NForm, NFormItem, NInput, NSelect, NTag, NPopover, NTooltip, NDatePicker, useMessage, NSpace, NGrid, NGi } from 'naive-ui'
 import { useAuthStore } from '@/stores/auth'
@@ -8,7 +8,16 @@ import { useCompanyStore } from '@/stores/company'
 import { updateCompany as apiUpdateCompany, deleteCompany as apiDeleteCompany } from '@/api/auth'
 import { listTaxRegistrations, type TaxRegistrationRow } from '@/api/tax-registration'
 import { reportErrorToast } from '@/utils/errorPresenter'
-import { restrictedIndustryFor, filterIndustryGroups, isRestrictedIndustry } from '@/utils/industryTax'
+import { restrictedIndustryFor, filterIndustryGroups } from '@/utils/industryTax'
+import {
+  companyCreateLandingPath,
+  parseCompanyCreateQuery,
+  shouldSwitchAfterCreate,
+} from '@/utils/companyOnboarding'
+import {
+  getIndustryTemplates,
+  type IndustryTemplateItem,
+} from '@/api/industryTemplates'
 import type { CompanyInfo } from '@/api/types'
 import { SoloEmpty } from '@/components/ui'
 
@@ -27,12 +36,34 @@ function defaultCreateForm() {
     // formatted-value 的「无值」哨兵是 null，空字符串会被当作待解析日期导致弹窗崩溃
     startDate: null as string | null,
     taxId: '',
-    restrictedIndustry: 'no', industry: '',
+    restrictedIndustry: 'no', industry: '', industryCode: '',
+    industryTouched: false, legacyIndustryName: '',
   }
 }
 const showCreate = ref(false)
 const createForm = ref(defaultCreateForm())
 const creating = ref(false)
+// 从建账引导（?create=new|migration）进入：创建后要切到新主体并去下一步，
+// 与页面右上角「新增主体」的既有行为区分开。
+const createFromOnboarding = ref(false)
+
+interface CreateSuccessState {
+  companyId: string
+  name: string
+  onboardingType: 'new' | 'migration'
+  switched: boolean
+}
+const createSuccessState = ref<CreateSuccessState | null>(null)
+
+function handleNextAction(path: string) {
+  closeSuccessModal()
+  router.push(path)
+}
+
+function closeSuccessModal() {
+  showCreate.value = false
+  createSuccessState.value = null
+}
 
 // Edit dialog
 const showEdit = ref(false)
@@ -42,8 +73,9 @@ const editForm = ref({
   name: '', type: '有限责任公司', taxpayerType: '小规模纳税人',
   startDate: null as string | null,
   taxId: '',
-  restrictedIndustry: 'no', industry: '', vatFilingCycle: '' as string,
+  restrictedIndustry: 'no', industry: '', industryCode: '', vatFilingCycle: '' as string,
   businessIncomeIitFilingCycle: '' as string,
+  industryTouched: false, legacyIndustryName: '',
 })
 const saving = ref(false)
 
@@ -54,17 +86,19 @@ const companyTypes = [
 ]
 
 /** 选定行业后自动判定「是否限制/禁止行业」（不再暴露手动选择框）。 */
-function applyIndustryDefault(target: 'create' | 'edit', industry: string | null) {
-  const value = industry ?? ''
-  // 清空行业时不改动手动选择，避免把用户改过的「是」重置掉
-  if (!value) return
-  const answer = restrictedIndustryFor(value)
+function applyIndustryDefault(target: 'create' | 'edit', industryCode: string | null) {
+  const code = (industryCode ?? '').trim()
+  const template = industryTemplates.value.find(item => item.code === code)
   if (target === 'create') {
-    createForm.value.industry = value
-    createForm.value.restrictedIndustry = answer
+    createForm.value.industryCode = template?.code || ''
+    createForm.value.industry = template?.name || ''
+    createForm.value.legacyIndustryName = ''
+    createForm.value.restrictedIndustry = template?.restrictedDefault ? 'yes' : 'no'
   } else {
-    editForm.value.industry = value
-    editForm.value.restrictedIndustry = answer
+    editForm.value.industryCode = template?.code || ''
+    editForm.value.industry = template?.name || ''
+    editForm.value.legacyIndustryName = ''
+    editForm.value.restrictedIndustry = template?.restrictedDefault ? 'yes' : 'no'
   }
 }
 
@@ -72,59 +106,90 @@ function applyIndustryDefault(target: 'create' | 'edit', industry: string | null
 // 实测点击选项后 toggle 任意父级 ref 都能让渲染恢复，故用哨兵计数器在每次选择后强制重渲染。
 const industrySelectSync = ref(0)
 
-function onIndustryChange(target: 'create' | 'edit', industry: string | null) {
+function onIndustryChange(target: 'create' | 'edit', industryCode: string | null) {
   industrySelectSync.value++
-  applyIndustryDefault(target, industry)
+  if (target === 'create') createForm.value.industryTouched = true
+  else editForm.value.industryTouched = true
+  applyIndustryDefault(target, industryCode)
+}
+
+function defaultRestrictedFor(target: 'create' | 'edit'): 'yes' | 'no' {
+  const form = target === 'create' ? createForm.value : editForm.value
+  const template = industryTemplates.value.find(item => item.code === form.industryCode)
+  if (template) return template.restrictedDefault ? 'yes' : 'no'
+  return restrictedIndustryFor(form.industry)
+}
+
+/** 恢复模板默认值（不改变用户已选择的行业本身）。 */
+function restoreIndustryDefault(target: 'create' | 'edit') {
+  if (target === 'create') createForm.value.restrictedIndustry = defaultRestrictedFor('create')
+  else editForm.value.restrictedIndustry = defaultRestrictedFor('edit')
 }
 
 function bingSearchUrl(name: string) {
   return `https://cn.bing.com/search?q=${encodeURIComponent(name.trim())}`
 }
 
-// 行业口径：国民经济行业分类 GB/T 4754-2017 大类，与爱企查「所属行业」逐字对齐，可搜索
-// hidden: 默认折叠（非目标客户行业），通过「显示全部行业」展开；只影响选项展示，不删数据。
 type IndustryGroup = { label: string; children: string[]; hidden?: boolean }
-const industryGroups: IndustryGroup[] = [
-  { label: '农、林、牧、渔业', hidden: true, children: ['农业', '林业', '畜牧业', '渔业', '农、林、牧、渔专业及辅助性活动'] },
-  { label: '采矿业', hidden: true, children: ['煤炭开采和洗选业', '石油和天然气开采业', '黑色金属矿采选业', '有色金属矿采选业', '非金属矿采选业', '开采专业及辅助性活动', '其他采矿业'] },
-  { label: '制造业', hidden: true, children: ['农副食品加工业', '食品制造业', '酒、饮料和精制茶制造业', '烟草制品业', '纺织业', '纺织服装、服饰业', '皮革、毛皮、羽毛及其制品和制鞋业', '木材加工和木、竹、藤、棕、草制品业', '家具制造业', '造纸和纸制品业', '印刷和记录媒介复制业', '文教、工美、体育和娱乐用品制造业', '石油、煤炭及其他燃料加工业', '化学原料和化学制品制造业', '医药制造业', '化学纤维制造业', '橡胶和塑料制品业', '非金属矿物制品业', '黑色金属冶炼和压延加工业', '有色金属冶炼和压延加工业', '金属制品业', '通用设备制造业', '专用设备制造业', '汽车制造业', '铁路、船舶、航空航天和其他运输设备制造业', '电气机械和器材制造业', '计算机、通信和其他电子设备制造业', '仪器仪表制造业', '其他制造业', '废弃资源综合利用业', '金属制品、机械和设备修理业'] },
-  { label: '电力、热力、燃气及水生产和供应业', hidden: true, children: ['电力、热力生产和供应业', '燃气生产和供应业', '水的生产和供应业'] },
-  { label: '建筑业', hidden: true, children: ['房屋建筑业', '土木工程建筑业', '建筑安装业', '建筑装饰、装修和其他建筑业'] },
-  { label: '批发和零售业', children: ['批发业', '零售业'] },
-  { label: '交通运输、仓储和邮政业', hidden: true, children: ['铁路运输业', '道路运输业', '水上运输业', '航空运输业', '管道运输业', '多式联运和运输代理业', '装卸搬运和仓储业', '邮政业'] },
-  { label: '住宿和餐饮业', children: ['住宿业', '餐饮业'] },
-  { label: '信息传输、软件和信息技术服务业', children: ['电信、广播电视和卫星传输服务', '互联网和相关服务', '软件和信息技术服务业'] },
-  { label: '金融业', hidden: true, children: ['货币金融服务', '资本市场服务', '保险业', '其他金融业'] },
-  { label: '房地产业', hidden: true, children: ['房地产业'] },
-  { label: '租赁和商务服务业', children: ['租赁业', '商务服务业'] },
-  { label: '科学研究和技术服务业', children: ['研究和试验发展', '专业技术服务业', '科技推广和应用服务业'] },
-  { label: '水利、环境和公共设施管理业', hidden: true, children: ['水利管理业', '生态保护和环境治理业', '公共设施管理业', '土地管理业'] },
-  { label: '居民服务、修理和其他服务业', children: ['居民服务业', '机动车、电子产品和日用产品修理业', '其他服务业'] },
-  { label: '教育', children: ['教育'] },
-  { label: '卫生和社会工作', hidden: true, children: ['卫生', '社会工作'] },
-  { label: '文化、体育和娱乐业', children: ['新闻和出版业', '广播、电视、电影和录音制作业', '文化艺术业', '体育', '娱乐业'] },
-]
+const industryTemplates = ref<IndustryTemplateItem[]>([])
+const industryLoading = ref(false)
+const industryGroups = computed<IndustryGroup[]>(() => {
+  const grouped = new Map<string, { children: IndustryTemplateItem[]; hidden: boolean }>()
+  for (const item of industryTemplates.value) {
+    const current = grouped.get(item.groupName) || { children: [], hidden: true }
+    current.children.push(item)
+    current.hidden = current.hidden && item.hidden
+    grouped.set(item.groupName, current)
+  }
+  return [...grouped.entries()].map(([label, group]) => ({
+    label,
+    hidden: group.hidden,
+    children: group.children
+      .sort((a, b) => a.sortOrder - b.sortOrder)
+      .map(item => item.name),
+  }))
+})
 
 // 「显示全部行业」开关（新建/编辑共用）；默认只展示小微企业常见行业
 const showAllIndustries = ref(false)
 
-function buildIndustryOptions(selected?: string) {
+function buildIndustryOptions(selectedCode?: string) {
+  const selectedTemplate = industryTemplates.value.find(item => item.code === selectedCode)
+  const selectedName = selectedTemplate?.name || ''
   return [
-    ...filterIndustryGroups(industryGroups, {
+    ...filterIndustryGroups(industryGroups.value, {
       showAll: showAllIndustries.value,
-      selected,
+      selected: selectedName,
     }).map((g) => ({
       type: 'group' as const,
       label: g.label,
       key: g.label,
-      children: g.children.map((name) => ({ label: name, value: name })),
+      children: g.children
+        .map((name) => industryTemplates.value.find(candidate => candidate.name === name))
+        .filter((item): item is IndustryTemplateItem => Boolean(item))
+        .filter(item => showAllIndustries.value || !item.hidden || item.code === selectedCode)
+        .map(item => ({ label: item.name, value: item.code })),
     })),
-    { label: '其他行业', value: '其他行业' },
-  ]
+  ].filter(group => group.children.length > 0)
 }
 
-const createIndustryOptions = computed(() => buildIndustryOptions(createForm.value.industry))
-const editIndustryOptions = computed(() => buildIndustryOptions(editForm.value.industry))
+const createIndustryOptions = computed(() => buildIndustryOptions(createForm.value.industryCode))
+const editIndustryOptions = computed(() => buildIndustryOptions(editForm.value.industryCode))
+
+async function loadIndustryTemplates() {
+  industryLoading.value = true
+  try {
+    industryTemplates.value = (await getIndustryTemplates()).items
+    if (showEdit.value && !editForm.value.industryTouched) {
+      const target = companies.value.find(co => co.company_id === editingId.value)
+      if (target) syncEditIndustryFromCompany(target)
+    }
+  } catch {
+    message.warning('行业模板加载失败，暂时保留当前已选行业')
+  } finally {
+    industryLoading.value = false
+  }
+}
 
 // 税费种认定表同步后，申报周期由认定表接管：这两个手填字段降级为「未同步时的兜底」，
 // 留着可编辑只会让用户以为改这里能改征期，实际改了不生效。
@@ -143,20 +208,54 @@ const iitCycleSynced = ref(false)
 
 onMounted(async () => {
   loadCompanies()
-  try {
-    const result = await listTaxRegistrations()
-    vatCycleSynced.value = groupCycleSynced(result.items, 'vat')
-    iitCycleSynced.value = groupCycleSynced(result.items, 'business_income_iit_prepay')
-  } catch {
-    // 认定表读取失败不影响主体信息编辑，仅退化为可编辑
-  }
+  await Promise.all([
+    loadIndustryTemplates(),
+    (async () => {
+      try {
+        const result = await listTaxRegistrations()
+        vatCycleSynced.value = groupCycleSynced(result.items, 'vat')
+        iitCycleSynced.value = groupCycleSynced(result.items, 'business_income_iit_prepay')
+      } catch {
+        // 认定表读取失败不影响主体信息编辑，仅退化为可编辑
+      }
+    })(),
+  ])
   // 深链 ?edit=<companyId>：供启用日期校验的引导弹窗直达编辑表单
   const editId = typeof route.query.edit === 'string' ? route.query.edit : ''
   if (editId) {
     const target = companies.value.find((co) => co.company_id === editId)
     if (target) openEdit(target)
   }
+  applyCreateQuery()
 })
+
+// 页面会被 KeepAlive 缓存：从对话页再次带着 ?create= 进来时不会重新 mount，需监听 query
+watch(
+  () => route.query.create,
+  () => applyCreateQuery(),
+)
+
+// 弹窗关闭（取消/完成）后复位建账引导标记，避免下次从「新增主体」按钮进来时
+// 仍被当成引导入口，创建完又把用户带去建账落点。已填内容保留，取消不丢输入。
+watch(showCreate, (visible) => {
+  if (visible) return
+  createFromOnboarding.value = false
+  createForm.value.onboardingType = 'new'
+  createSuccessState.value = null
+})
+
+/** 对话页建账卡片 / 首次引导的深链：直接打开「新增主体」并预设建账场景。 */
+function applyCreateQuery() {
+  const intent = parseCompanyCreateQuery(route.query.create)
+  if (!intent) return
+  createForm.value.onboardingType = intent
+  createFromOnboarding.value = true
+  showCreate.value = true
+  // 消费一次即清掉参数，避免刷新或返回时反复弹窗
+  const restQuery = { ...route.query }
+  delete restQuery.create
+  router.replace({ path: route.path, query: restQuery })
+}
 
 function loadCompanies() {
   if (authStore.user) {
@@ -180,10 +279,12 @@ async function handleSelect(co: CompanyInfo) {
 }
 
 async function handleCreate() {
+  if (creating.value) return
   if (!createForm.value.name.trim()) {
     message.warning('请输入公司名称')
     return
   }
+  // 税号是申报作业包和报表报送的必填项，建账时就要求填全，避免建完再补、报税时被拦。
   if (!createForm.value.taxId.trim()) {
     message.warning('请输入纳税人识别号')
     return
@@ -193,27 +294,77 @@ async function handleCreate() {
     return
   }
   const rawTaxId = createForm.value.taxId.trim().toUpperCase()
-  if (rawTaxId && !/^[0-9A-Z]{15}$|^[0-9A-Z]{17}$|^[0-9A-Z]{18}$|^[0-9A-Z]{20}$/.test(rawTaxId)) {
+  if (!/^[0-9A-Z]{15}$|^[0-9A-Z]{17}$|^[0-9A-Z]{18}$|^[0-9A-Z]{20}$/.test(rawTaxId)) {
     message.warning('纳税人识别号格式不正确（15/17/18/20 位字母数字）')
     return
   }
+  await submitCreate(rawTaxId)
+}
+
+async function submitCreate(rawTaxId: string) {
+  const wasDemo = authStore.companies.find((co) => co.company_id === authStore.currentCompanyId)?.isDemo === true
+  const fromOnboarding = createFromOnboarding.value
+  const onboardingType = createForm.value.onboardingType
+  // 落点要带启用月，重置表单前先留住
+  const startDate = createForm.value.startDate
+  const needSwitch = shouldSwitchAfterCreate(wasDemo, fromOnboarding)
   creating.value = true
   try {
-    await companyStore.create({
-      ...createForm.value,
+    const company = await companyStore.create({
+      onboardingType: createForm.value.onboardingType,
+      name: createForm.value.name,
+      type: createForm.value.type,
+      taxpayerType: createForm.value.taxpayerType,
       taxId: rawTaxId,
       restrictedIndustry: createForm.value.restrictedIndustry === 'yes',
-      industry: createForm.value.industry || undefined,
       startDate: createForm.value.startDate || undefined,
+      industryCode: createForm.value.industryCode || undefined,
     })
-    loadCompanies()
-    showCreate.value = false
-    createForm.value = defaultCreateForm()
-    message.success('创建成功')
+    let switched = false
+    if (needSwitch) {
+      try {
+        await authStore.switchCompanyContext(company.company_id)
+        switched = true
+      } catch {
+        // 主体已经建好了，切换失败不能再报「创建失败」；提示用户手动切换
+        message.warning('主体已创建，但自动切换失败，请在主体列表里手动切换')
+      }
+    }
+    if (!needSwitch || switched) loadCompanies()
+    message.success(wasDemo && switched ? '已创建正式账套并切换生效' : '创建成功')
+    if (fromOnboarding && (!needSwitch || switched)) {
+      showCreate.value = false
+      createForm.value = defaultCreateForm()
+      createFromOnboarding.value = false
+      await router.push(companyCreateLandingPath(onboardingType, startDate))
+    } else {
+      createSuccessState.value = {
+        companyId: company.company_id,
+        name: company.name,
+        onboardingType,
+        switched,
+      }
+      createForm.value = defaultCreateForm()
+    }
   } catch (err) {
     reportErrorToast(message, err, '创建失败')
   } finally {
     creating.value = false
+  }
+}
+
+function syncEditIndustryFromCompany(co: CompanyInfo) {
+  const template = industryTemplates.value.find(item =>
+    (co.industryCode && item.code === co.industryCode)
+    || (!co.industryCode && co.industry && item.name === co.industry),
+  )
+  editForm.value.industryCode = template?.code || ''
+  editForm.value.industry = template?.name || co.industry || ''
+  editForm.value.legacyIndustryName = !template && co.industry ? co.industry : ''
+  if (co.restrictedIndustry === undefined || co.restrictedIndustry === null) {
+    editForm.value.restrictedIndustry = template
+      ? (template.restrictedDefault ? 'yes' : 'no')
+      : restrictedIndustryFor(co.industry)
   }
 }
 
@@ -230,9 +381,13 @@ function openEdit(co: CompanyInfo) {
       ? restrictedIndustryFor(co.industry)
       : (co.restrictedIndustry ? 'yes' : 'no'),
     industry: co.industry || '',
+    industryCode: '',
     vatFilingCycle: co.vatFilingCycle || '',
     businessIncomeIitFilingCycle: co.businessIncomeIitFilingCycle || '',
+    industryTouched: false,
+    legacyIndustryName: '',
   }
+  syncEditIndustryFromCompany(co)
   showEdit.value = true
 }
 
@@ -256,14 +411,19 @@ async function handleSaveEdit() {
   }
   saving.value = true
   try {
+    const industryChange = editForm.value.industryTouched
+      ? { industryCode: editForm.value.industryCode || '' }
+      : {}
     await apiUpdateCompany(editingId.value, {
-      ...editForm.value,
+      name: editForm.value.name,
+      type: editForm.value.type,
+      taxpayerType: editForm.value.taxpayerType,
       taxId: rawTaxId,
       restrictedIndustry: editForm.value.restrictedIndustry === 'yes',
-      industry: editForm.value.industry || undefined,
       startDate: editForm.value.startDate || undefined,
       vatFilingCycle: editForm.value.vatFilingCycle || undefined,
       businessIncomeIitFilingCycle: editForm.value.businessIncomeIitFilingCycle || undefined,
+      ...industryChange,
     })
     // Refresh profile to get updated company list
     await authStore.fetchProfile()
@@ -306,9 +466,12 @@ async function confirmDelete() {
   try {
     await apiDeleteCompany(target.company_id, deleteNameInput.value.trim())
     showDelete.value = false
+    deleteTarget.value = null
     message.success(`主体「${target.name}」已永久删除`)
+    // 重新拉档案后必须回填页面本地列表：这里的 companies 是 fetchProfile 之前
+    // 拷来的旧数组，不重取就还指着已删除的卡片，要整页刷新才消失。
     await authStore.fetchProfile()
-    companyStore.setCompanies(authStore.companies as CompanyInfo[])
+    loadCompanies()
     if (authStore.companies.length === 0) {
       message.info('当前已无主体，请新建一个主体后继续使用')
     }
@@ -328,9 +491,6 @@ async function confirmDelete() {
         <p class="text-muted">管理您的所有公司及纳税人身份</p>
       </div>
       <NSpace>
-        <NButton secondary type="primary" @click="router.push('/copilot?scene=onboarding')">
-          <i class="ri-sparkling-2-line" />&nbsp;AI 引导建账 / 代账转入
-        </NButton>
         <NButton type="primary" @click="showCreate = true">新增主体</NButton>
       </NSpace>
     </div>
@@ -478,28 +638,134 @@ async function confirmDelete() {
     </NModal>
 
     <!-- Create Modal -->
-    <NModal v-model:show="showCreate" title="新增主体" preset="card" style="width: 720px; max-width: 92vw;">
-      <NForm>
-        <NGrid :cols="2" :x-gap="16">
-          <NGi :span="2">
-            <NFormItem label="第一步：选择建账情况">
-              <NSelect
-                v-model:value="createForm.onboardingType"
-                :options="[
-                  { label: '新成立公司 · 从零开始记账（无历史期初余额）', value: 'new' },
-                  { label: '已记账公司 · 从其他代账或财务软件转入（需导入期初余额）', value: 'migration' },
-                ]"
-              />
-            </NFormItem>
-          </NGi>
+    <NModal
+      v-model:show="showCreate"
+      :title="createSuccessState ? '主体创建成功' : '新增主体'"
+      preset="card"
+      style="width: 720px; max-width: 92vw;"
+      :mask-closable="!creating"
+    >
+      <!-- 若刚刚创建成功，展示清晰的下一步行动卡 -->
+      <div v-if="createSuccessState" class="create-success-panel">
+        <div class="create-success-header">
+          <i class="ri-checkbox-circle-fill success-icon" aria-hidden="true" />
+          <div class="success-header-text">
+            <h3>「{{ createSuccessState.name }}」已创建完成</h3>
+            <p>
+              {{ createSuccessState.switched ? '当前账套已自动切换至该主体。' : '' }}
+              每一步明确推进，为你规划接下来的推荐操作：
+            </p>
+          </div>
+        </div>
+
+        <div class="next-step-cards">
+          <!-- 新成立公司：主推税费种认定，备选工作台记账 -->
+          <template v-if="createSuccessState.onboardingType === 'new'">
+            <div class="next-step-card primary-card" role="button" tabindex="0" @click="handleNextAction('/tax-registration')">
+              <div class="step-card-badge">推荐第一步</div>
+              <div class="step-card-content">
+                <i class="ri-government-line step-icon" aria-hidden="true" />
+                <div class="step-text">
+                  <strong>同步电子税务局税费种认定</strong>
+                  <span>对接税局认定表，自动生成精准的申报日历与税种清单（支持复制粘贴或截图识别）</span>
+                </div>
+              </div>
+              <NButton type="primary" size="small">立即前往同步</NButton>
+            </div>
+
+            <div class="next-step-card secondary-card" role="button" tabindex="0" @click="handleNextAction('/')">
+              <div class="step-card-content">
+                <i class="ri-dashboard-line step-icon" aria-hidden="true" />
+                <div class="step-text">
+                  <strong>先去工作台记账 / 上传流水</strong>
+                  <span>系统已按小规模纳税人标准税种自动兜底，可随时开始日常记账或对账</span>
+                </div>
+              </div>
+              <NButton secondary size="small">进入工作台</NButton>
+            </div>
+          </template>
+
+          <!-- 已记账公司（代账转入）：主推导入期初，备选税费种认定 -->
+          <template v-else>
+            <div class="next-step-card primary-card" role="button" tabindex="0" @click="handleNextAction('/mine/opening')">
+              <div class="step-card-badge">推荐第一步</div>
+              <div class="step-card-content">
+                <i class="ri-exchange-box-line step-icon" aria-hidden="true" />
+                <div class="step-text">
+                  <strong>导入期初科目余额表</strong>
+                  <span>上传上一家代账软件导出的科目余额表 Excel，保证新老账目无缝衔接</span>
+                </div>
+              </div>
+              <NButton type="primary" size="small">去导入期初余额</NButton>
+            </div>
+
+            <div class="next-step-card secondary-card" role="button" tabindex="0" @click="handleNextAction('/tax-registration')">
+              <div class="step-card-content">
+                <i class="ri-government-line step-icon" aria-hidden="true" />
+                <div class="step-text">
+                  <strong>同步税费种认定</strong>
+                  <span>核对税局认定的税种与申报周期</span>
+                </div>
+              </div>
+              <NButton secondary size="small">去税费种认定</NButton>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <template v-else>
+        <NForm>
+          <NGrid :cols="2" :x-gap="16">
+            <NGi :span="2">
+              <NFormItem label="第一步：选择建账情况">
+                <!-- 只有两个场景，直接平铺成卡片：少一次展开，也把两条路的差别写在同一屏 -->
+                <div class="onboarding-choice" role="radiogroup" aria-label="建账情况">
+                  <button
+                    type="button"
+                    role="radio"
+                    class="onboarding-option"
+                    :class="{ active: createForm.onboardingType === 'new' }"
+                    :aria-checked="createForm.onboardingType === 'new'"
+                    @click="createForm.onboardingType = 'new'"
+                  >
+                    <i class="ri-seedling-line" aria-hidden="true" />
+                    <span class="onboarding-copy">
+                      <strong>新成立公司</strong>
+                      <span>从零开始记账，无历史期初余额</span>
+                    </span>
+                    <i class="ri-checkbox-circle-fill onboarding-check" aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    role="radio"
+                    class="onboarding-option"
+                    :class="{ active: createForm.onboardingType === 'migration' }"
+                    :aria-checked="createForm.onboardingType === 'migration'"
+                    @click="createForm.onboardingType = 'migration'"
+                  >
+                    <i class="ri-exchange-box-line" aria-hidden="true" />
+                    <span class="onboarding-copy">
+                      <strong>已记账公司</strong>
+                      <span>从其他代账或财务软件转入，需导入期初余额</span>
+                    </span>
+                    <i class="ri-checkbox-circle-fill onboarding-check" aria-hidden="true" />
+                  </button>
+                </div>
+              </NFormItem>
+            </NGi>
           <NGi>
             <NFormItem label="公司名称" required>
               <NInput v-model:value="createForm.name" placeholder="请输入公司全称" />
             </NFormItem>
           </NGi>
           <NGi>
+            <!-- 税号是申报作业包和报表报送的必填项，建账时即要求填写 -->
             <NFormItem label="纳税人识别号" required>
-              <NInput v-model:value="createForm.taxId" maxlength="20" placeholder="15/17/18/20 位字母数字">
+              <NInput
+                v-model:value="createForm.taxId"
+                maxlength="20"
+                placeholder="15/17/18/20 位字母数字"
+              >
                 <template #suffix>
                   <NTooltip trigger="hover">
                     <template #trigger>
@@ -507,7 +773,7 @@ async function confirmDelete() {
                         <i class="ri-external-link-line" />
                       </NButton>
                     </template>
-                    快速查询复制
+                    {{ createForm.name.trim() ? '去搜索并复制统一社会信用代码' : '先填写公司名称，再去搜索税号' }}
                   </NTooltip>
                 </template>
               </NInput>
@@ -575,7 +841,18 @@ async function confirmDelete() {
               </template>
               <div class="industry-field">
                 <!-- :key 哨兵计数器强制重渲染：见 onIndustryChange 注释 -->
-                <NSelect :key="industrySelectSync" v-model:value="createForm.industry" :options="createIndustryOptions" placeholder="选填，可输入搜索" clearable filterable :virtual-scroll="false" @update:value="onIndustryChange('create', $event)" />
+                <NSelect
+                  :key="`create-${industrySelectSync}`"
+                  v-model:value="createForm.industryCode"
+                  :options="createIndustryOptions"
+                  :loading="industryLoading"
+                  :disabled="industryLoading"
+                  placeholder="选填；可输入搜索"
+                  clearable
+                  filterable
+                  :virtual-scroll="false"
+                  @update:value="onIndustryChange('create', $event)"
+                />
                 <NButton text type="primary" size="tiny" class="industry-more-toggle" @click="showAllIndustries = !showAllIndustries">
                   {{ showAllIndustries ? '收起全部行业' : '找不到你的行业？显示全部行业' }}
                 </NButton>
@@ -595,7 +872,7 @@ async function confirmDelete() {
                   </NButton>
                 </div>
                 <div
-                  v-else-if="isRestrictedIndustry(createForm.industry)"
+                  v-else-if="createForm.industryCode && defaultRestrictedFor('create') === 'yes'"
                   class="industry-restriction-hint"
                 >
                   <div>已按实际业务标记为「非限制/禁止行业」。</div>
@@ -604,7 +881,7 @@ async function confirmDelete() {
                     type="primary"
                     size="tiny"
                     class="industry-override-link"
-                    @click="createForm.restrictedIndustry = restrictedIndustryFor(createForm.industry)"
+                    @click="restoreIndustryDefault('create')"
                   >
                     恢复默认判断
                   </NButton>
@@ -615,8 +892,12 @@ async function confirmDelete() {
         </NGrid>
       </NForm>
       <div class="form-tip"><i class="ri-information-line" />目前仅支持小规模纳税人，一般纳税人暂不支持</div>
+      </template>
       <template #footer>
-        <NSpace justify="end">
+        <div v-if="createSuccessState" class="success-modal-footer">
+          <NButton @click="closeSuccessModal">稍后处理，留在本页</NButton>
+        </div>
+        <NSpace v-else justify="end">
           <NButton @click="showCreate = false">取消</NButton>
           <NButton type="primary" :loading="creating" @click="handleCreate">确认创建</NButton>
         </NSpace>
@@ -642,7 +923,7 @@ async function confirmDelete() {
                         <i class="ri-external-link-line" />
                       </NButton>
                     </template>
-                    快速查询复制
+                    {{ editForm.name.trim() ? '去搜索并复制统一社会信用代码' : '先填写公司名称，再去搜索税号' }}
                   </NTooltip>
                 </template>
               </NInput>
@@ -753,10 +1034,27 @@ async function confirmDelete() {
               </template>
               <div class="industry-field">
                 <!-- :key 哨兵计数器强制重渲染：见 onIndustryChange 注释 -->
-                <NSelect :key="industrySelectSync" v-model:value="editForm.industry" :options="editIndustryOptions" placeholder="选填，可输入搜索" clearable filterable :virtual-scroll="false" @update:value="onIndustryChange('edit', $event)" />
+                <NSelect
+                  :key="`edit-${industrySelectSync}`"
+                  v-model:value="editForm.industryCode"
+                  :options="editIndustryOptions"
+                  :loading="industryLoading"
+                  :disabled="industryLoading"
+                  placeholder="选填；可输入搜索"
+                  clearable
+                  filterable
+                  :virtual-scroll="false"
+                  @update:value="onIndustryChange('edit', $event)"
+                />
                 <NButton text type="primary" size="tiny" class="industry-more-toggle" @click="showAllIndustries = !showAllIndustries">
                   {{ showAllIndustries ? '收起全部行业' : '找不到你的行业？显示全部行业' }}
                 </NButton>
+                <div
+                  v-if="editForm.legacyIndustryName && !editForm.industryCode"
+                  class="industry-restriction-hint"
+                >
+                  当前主体沿用历史行业「{{ editForm.legacyIndustryName }}」。不改行业时会原样保留；重新选择后将关联后台模板。
+                </div>
                 <div
                   v-if="editForm.restrictedIndustry === 'yes'"
                   class="industry-restriction-hint is-restricted"
@@ -773,7 +1071,7 @@ async function confirmDelete() {
                   </NButton>
                 </div>
                 <div
-                  v-else-if="isRestrictedIndustry(editForm.industry)"
+                  v-else-if="editForm.industryCode && defaultRestrictedFor('edit') === 'yes'"
                   class="industry-restriction-hint"
                 >
                   <div>已按实际业务标记为「非限制/禁止行业」。</div>
@@ -782,7 +1080,7 @@ async function confirmDelete() {
                     type="primary"
                     size="tiny"
                     class="industry-override-link"
-                    @click="editForm.restrictedIndustry = restrictedIndustryFor(editForm.industry)"
+                    @click="restoreIndustryDefault('edit')"
                   >
                     恢复默认判断
                   </NButton>
@@ -805,7 +1103,7 @@ async function confirmDelete() {
 
 <style scoped>
 .companies-page {
-  max-width: 720px;
+  max-width: var(--page-width-narrow);
   margin: 0 auto;
 }
 .form-section-label {
@@ -832,6 +1130,76 @@ async function confirmDelete() {
 .tax-search-btn {
   font-size: 15px;
   color: var(--solo-text-muted);
+}
+.onboarding-choice {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  width: 100%;
+}
+.onboarding-option {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: 100%;
+  padding: 12px 34px 12px 14px;
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius-control);
+  background: var(--solo-bg-card);
+  color: var(--solo-text-primary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 160ms ease-out, background-color 160ms ease-out;
+}
+.onboarding-option:hover {
+  border-color: var(--solo-primary);
+  background: var(--solo-bg-blue-soft);
+}
+.onboarding-option:focus-visible {
+  outline: 2px solid var(--solo-primary);
+  outline-offset: 1px;
+}
+.onboarding-option.active {
+  border-color: var(--solo-primary);
+  background: var(--solo-bg-blue-soft);
+}
+.onboarding-option > i:first-child {
+  color: var(--solo-primary);
+  font-size: 18px;
+  line-height: 1.4;
+}
+.onboarding-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.onboarding-copy strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+.onboarding-copy span {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--solo-text-secondary);
+}
+.onboarding-check {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  font-size: 16px;
+  color: var(--solo-primary);
+  opacity: 0;
+  transition: opacity 160ms ease-out;
+}
+.onboarding-option.active .onboarding-check {
+  opacity: 1;
+}
+@media (max-width: 560px) {
+  .onboarding-choice {
+    grid-template-columns: 1fr;
+  }
 }
 .page-header {
   display: flex;
@@ -994,5 +1362,120 @@ async function confirmDelete() {
   align-items: stretch;
   gap: 2px;
   width: 100%;
+}
+
+.create-success-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 4px 0 10px;
+}
+
+.create-success-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  padding: 16px;
+  background: var(--solo-bg-blue-soft);
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius-control);
+}
+
+.create-success-header .success-icon {
+  font-size: 26px;
+  color: var(--solo-primary);
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.success-header-text h3 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 650;
+  color: var(--solo-text-primary);
+}
+
+.success-header-text p {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: var(--solo-text-secondary);
+  line-height: 1.5;
+}
+
+.next-step-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.next-step-card {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px;
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius-control);
+  background: var(--solo-bg-card);
+  cursor: pointer;
+  transition: all 160ms ease-out;
+}
+
+.next-step-card:hover {
+  border-color: var(--solo-primary);
+  background: var(--solo-bg-blue-soft);
+}
+
+.next-step-card.primary-card {
+  border-color: var(--solo-primary);
+}
+
+.step-card-badge {
+  position: absolute;
+  top: -10px;
+  left: 14px;
+  background: var(--solo-primary);
+  color: var(--solo-bg-card);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 8px;
+  border-radius: 9999px;
+}
+
+.step-card-content {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex: 1;
+}
+
+.step-card-content .step-icon {
+  font-size: 24px;
+  color: var(--solo-primary);
+  flex-shrink: 0;
+}
+
+.step-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.step-text strong {
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--solo-text-primary);
+}
+
+.step-text span {
+  font-size: 12px;
+  color: var(--solo-text-secondary);
+  line-height: 1.4;
+}
+
+.success-modal-footer {
+  display: flex;
+  justify-content: flex-end;
 }
 </style>

@@ -678,7 +678,7 @@ onMounted(() => {
 <style scoped>
 /* 表格版面比卡片流宽：容纳 7 列仍保持呼吸感 */
 .voucher-page {
-  max-width: 960px;
+  max-width: var(--page-width);
   margin: 0 auto;
 }
 

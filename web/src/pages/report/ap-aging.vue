@@ -5,6 +5,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { NCard, NButton, NTag, useMessage, NSpin, NRadioGroup, NRadioButton } from 'naive-ui'
 import apiClient from '@/api/client'
 import { formatMoney, formatDate } from '@/utils/format'
+import BossTrackNav from '@/components/business/BossTrackNav.vue'
 
 interface AgingItem {
   date: string
@@ -92,6 +93,7 @@ onMounted(load)
 
 <template>
   <div class="report-container">
+    <BossTrackNav />
     <div class="report-header">
       <div class="report-header-left">
         <NButton text class="report-back-btn" @click="handleBack">

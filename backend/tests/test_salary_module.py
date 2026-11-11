@@ -36,10 +36,12 @@ async def _setup_company(company_id: str, posting_policy: str = "owner_self_post
     now = "2027-01-01T00:00:00+00:00"
     async with session_scope() as session:
         await ensure_tenant(session, company_id, "owner-1")
+        company = (
+            await session.execute(select(Company).where(Company.company_id == company_id))
+        ).scalar_one()
+        # 申报作业包要求统一社会信用代码：给测试账套一个合法占位
+        company.payload = {**(company.payload or {}), "taxId": "91330100MA2TEST001"}
         if posting_policy != "owner_self_post":
-            company = (
-                await session.execute(select(Company).where(Company.company_id == company_id))
-            ).scalar_one()
             company.posting_policy = posting_policy
         if posting_policy == "maker_checker":
             session.add(AuthUser(
@@ -308,19 +310,24 @@ async def test_partial_rd_allocation_goes_to_admin():
     rd_total = sum(Decimal(str(l["amount"])) for l in lines["debit"] if l["accountCode"] == "430100101")
     admin_salary = sum(Decimal(str(l["amount"])) for l in lines["debit"] if l["accountCode"] == "5602001")
     admin_social = sum(Decimal(str(l["amount"])) for l in lines["debit"] if l["accountCode"] == "5602016")
+    admin_housing = sum(Decimal(str(l["amount"])) for l in lines["debit"] if l["accountCode"] == "5602017")
     gross = Decimal("10000.00")
     company_ss = (gross * Decimal("0.33")).quantize(Decimal("0.01"))  # 25% 社保 + 8% 公积金
+    company_housing = (gross * Decimal("0.08")).quantize(Decimal("0.01"))  # 8% 单位公积金
+    company_social = company_ss - company_housing  # 25% 单位社保
     r_cost = gross + company_ss
     assert rd_total == (r_cost * Decimal("0.6")).quantize(Decimal("0.01"))
-    # 40% 余额拆成两条管理费用明细：工资池与单位社保池各自按工时分摊
+    # 40% 余额拆成三条管理费用明细：工资/社保/公积金三池各自按工时分摊
     assert admin_salary == (gross * Decimal("0.4")).quantize(Decimal("0.01"))
-    assert admin_social == (company_ss * Decimal("0.4")).quantize(Decimal("0.01"))
-    assert admin_salary + admin_social == (r_cost - rd_total).quantize(Decimal("0.01"))
-    # 贷方四个明细科目齐备，且四者之和 == 借方合计
+    assert admin_social == (company_social * Decimal("0.4")).quantize(Decimal("0.01"))
+    assert admin_housing == (company_housing * Decimal("0.4")).quantize(Decimal("0.01"))
+    assert admin_salary + admin_social + admin_housing == (r_cost - rd_total).quantize(Decimal("0.01"))
+    # 贷方明细科目齐备（221102 只挂社保、221105 挂公积金），且贷方合计 == 借方合计
     personal_ss = (gross * Decimal("0.185")).quantize(Decimal("0.01"))
     net = gross - personal_ss
     assert sum(Decimal(str(l["amount"])) for l in lines["credit"] if l["accountCode"] == "221101") == net
-    assert sum(Decimal(str(l["amount"])) for l in lines["credit"] if l["accountCode"] == "221102") == company_ss
+    assert sum(Decimal(str(l["amount"])) for l in lines["credit"] if l["accountCode"] == "221102") == company_social
+    assert sum(Decimal(str(l["amount"])) for l in lines["credit"] if l["accountCode"] == "221105") == company_housing
     assert sum(Decimal(str(l["amount"])) for l in lines["credit"] if l["accountCode"] == "221104") == personal_ss
     assert sum(Decimal(str(l["amount"])) for l in lines["credit"] if l["accountCode"] == "2221012") == 0
     debit_sum = sum(Decimal(str(l["amount"])) for l in lines["debit"])
@@ -432,7 +439,7 @@ async def _account_net_balance(company_id: str, code: str) -> Decimal:
 
 @pytest.mark.asyncio
 async def test_four_vouchers_close_the_loop():
-    """五笔分录闭环：221101/221102/221104/2221012 期末余额全部归零。"""
+    """五笔分录闭环：221101/221102/221105/221104/2221012 期末余额全部归零。"""
     await _setup_company("c-sal-loop")
 
     from services.entry_service import get_entry
@@ -468,9 +475,11 @@ async def test_four_vouchers_close_the_loop():
     # V1 计提
     e1 = await get_entry(accrued["accrual_voucher_id"], user_id="owner-1", company_id="c-sal-loop")
     assert _sum_by_code(e1["voucherLines"]["debit"], "5602001") == gross
-    assert _sum_by_code(e1["voucherLines"]["debit"], "5602016") == company_ss
+    assert _sum_by_code(e1["voucherLines"]["debit"], "5602016") == company_ss - company_hf
+    assert _sum_by_code(e1["voucherLines"]["debit"], "5602017") == company_hf
     assert _sum_by_code(e1["voucherLines"]["credit"], "221101") == net
-    assert _sum_by_code(e1["voucherLines"]["credit"], "221102") == company_ss
+    assert _sum_by_code(e1["voucherLines"]["credit"], "221102") == company_ss - company_hf
+    assert _sum_by_code(e1["voucherLines"]["credit"], "221105") == company_hf
     assert _sum_by_code(e1["voucherLines"]["credit"], "221104") == personal_ss
     assert _sum_by_code(e1["voucherLines"]["credit"], "2221012") == p_tax
     assert Decimal(str(e1["amount"])) == gross + company_ss
@@ -488,9 +497,9 @@ async def test_four_vouchers_close_the_loop():
     assert _sum_by_code(e3["voucherLines"]["debit"], "221104") == personal_ss - personal_hf
     assert _sum_by_code(e3["voucherLines"]["credit"], "1002") == company_ss + personal_ss - company_hf - personal_hf
 
-    # V4 缴公积金：单独一笔，仍冲 221102/221104
+    # V4 缴公积金：单独一笔，冲 221105（单位公积金）/221104（个人合并代扣）
     e4 = await get_entry(hf["hf_paid_voucher_id"], user_id="owner-1", company_id="c-sal-loop")
-    assert _sum_by_code(e4["voucherLines"]["debit"], "221102") == company_hf
+    assert _sum_by_code(e4["voucherLines"]["debit"], "221105") == company_hf
     assert _sum_by_code(e4["voucherLines"]["debit"], "221104") == personal_hf
     assert _sum_by_code(e4["voucherLines"]["credit"], "1002") == company_hf + personal_hf
 
@@ -499,8 +508,8 @@ async def test_four_vouchers_close_the_loop():
     assert _sum_by_code(e5["voucherLines"]["debit"], "2221012") == p_tax
     assert _sum_by_code(e5["voucherLines"]["credit"], "1002") == p_tax
 
-    # 闭环断言：四个中间科目余额归零，银行净流出 = 总人工成本
-    for code in ("221101", "221102", "221104", "2221012"):
+    # 闭环断言：五个中间科目余额归零，银行净流出 = 总人工成本
+    for code in ("221101", "221102", "221104", "221105", "2221012"):
         assert await _account_net_balance("c-sal-loop", code) == 0, f"{code} 未结平"
     assert await _account_net_balance("c-sal-loop", "1002") == -(gross + company_ss)
 
@@ -630,8 +639,9 @@ async def test_rd_split_and_ss_mixed_allocation():
 
     admin_salary = _sum_by_code(lines["debit"], "5602001")
     admin_social = _sum_by_code(lines["debit"], "5602016")
+    admin_housing = _sum_by_code(lines["debit"], "5602017")
     rd_total = _sum_by_code(lines["debit"], "430100101")
-    assert admin_salary + admin_social + rd_total == total_gross + total_ss
+    assert admin_salary + admin_social + admin_housing + rd_total == total_gross + total_ss
     debit_sum = sum((Decimal(str(l["amount"])) for l in lines["debit"]), Decimal("0"))
     credit_sum = sum((Decimal(str(l["amount"])) for l in lines["credit"]), Decimal("0"))
     assert debit_sum == credit_sum, "双池分摊出现舍入残差导致凭证不平"
@@ -718,21 +728,25 @@ async def test_repeating_decimal_rates_keep_voucher_balanced():
     credit_sum = sum((Decimal(str(l["amount"])) for l in lines["credit"]), Decimal("0"))
     assert debit_sum == credit_sum, "循环小数费率导致分摊溢出、凭证不平"
 
-    # 研发丁：gross 5000 / c_ss 1650，RD 池 money(5000×0.999999)=5000.00 全额进研发
-    # 研发戊：gross 3000 / c_ss 990，RD 池 2999.70 + 989.90，残差 0.30 + 0.10 归管理费用
-    assert _sum_by_code(lines["debit"], "430100101") == Decimal("10639.60")
+    # 研发丁：gross 5000 / c_ss 1650（社保 1250 + 公积金 400），RD 三池 rate 0.999999
+    # 全部吃满 → 研发行 5000.00+1250.00+400.00
+    # 研发戊：gross 3000 / c_ss 990（社保 750 + 公积金 240），三池残差
+    # 0.30（工资）+ 0.07（社保）+ 0.02（公积金）归管理费用
+    assert _sum_by_code(lines["debit"], "430100101") == Decimal("10639.61")
     assert _sum_by_code(lines["debit"], "5602001") == Decimal("0.30")
-    assert _sum_by_code(lines["debit"], "5602016") == Decimal("0.10")
-    # 贷方：净工资 4075+2445、单位社保 1650+990、个人社保 925+555
+    assert _sum_by_code(lines["debit"], "5602016") == Decimal("0.07")
+    assert _sum_by_code(lines["debit"], "5602017") == Decimal("0.02")
+    # 贷方：净工资 4075+2445、单位社保 1250+750、单位公积金 400+240、个人社保 925+555
     assert _sum_by_code(lines["credit"], "221101") == Decimal("6520.00")
-    assert _sum_by_code(lines["credit"], "221102") == Decimal("2640.00")
+    assert _sum_by_code(lines["credit"], "221102") == Decimal("2000.00")
+    assert _sum_by_code(lines["credit"], "221105") == Decimal("640.00")
     assert _sum_by_code(lines["credit"], "221104") == Decimal("1480.00")
-    # 每个员工的三条项目明细合计精确等于其 RD 池（最大余数法闭合）
+    # 每个员工的三条项目明细合计精确等于其 RD 三池之和（最大余数法闭合）
     rd_lines = [l for l in lines["debit"] if l["accountCode"] == "430100101"]
     ding = [l for l in rd_lines if "研发丁" in l["rdDetail"]["notes"]]
     wu = [l for l in rd_lines if "研发戊" in l["rdDetail"]["notes"]]
     assert sum((Decimal(str(l["amount"])) for l in ding), Decimal("0")) == Decimal("6650.00")
-    assert sum((Decimal(str(l["amount"])) for l in wu), Decimal("0")) == Decimal("3989.60")
+    assert sum((Decimal(str(l["amount"])) for l in wu), Decimal("0")) == Decimal("3989.61")
 
 
 @pytest.mark.asyncio
@@ -1381,3 +1395,295 @@ async def test_custom_rd_department_requires_allocation():
     await get_or_create_salary_sheet("c-sal-dept-rd", "2027-09")
     with pytest.raises(ValueError, match="必须登记研发项目工时"):
         await accrue_salary_sheet("c-sal-dept-rd", "owner-1", "2027-09")
+
+
+@pytest.mark.asyncio
+async def test_backfill_social_insurance_does_not_skew_housing_fund():
+    """回填社保（如大病互助或尾差调整）不带偏公积金，计提与缴纳分毫不差。"""
+    await _setup_company("c-sal-split-bf")
+
+    from services.entry_service import get_entry
+    from services.rd_allocation_service import replace_salary_allocations
+    from services.salary_service import (
+        create_employee, get_or_create_salary_sheet, update_salary_records,
+        accrue_salary_sheet, pay_payroll_liability,
+    )
+
+    await create_employee("c-sal-split-bf", "张三", "行政部", 10000, 5000)
+    sheet = await get_or_create_salary_sheet("c-sal-split-bf", "2027-05")
+    await replace_salary_allocations("c-sal-split-bf", "owner-1", "2027-05", [])
+
+    rec = sheet["records"][0]
+    # 默认按 5000 基数：个人社保 525，个人公积金 400，单位社保 1250，单位公积金 400
+    assert Decimal(rec["personal_housing_fund"]) == Decimal("400.00")
+    assert Decimal(rec["personal_social_insurance"]) == Decimal("525.00")
+    assert Decimal(rec["company_housing_fund"]) == Decimal("400.00")
+    assert Decimal(rec["company_social_insurance"]) == Decimal("1250.00")
+
+    # 模拟用户对照电子税务局核定表回填：
+    # 假设医保含 4.00 元大病险，个人社保实际为 529.00（+4），单位社保实际为 1255.00（+5）
+    # 公积金保持 400.00 不动
+    updated = await update_salary_records("c-sal-split-bf", "2027-05", [
+        {
+            **rec,
+            "personal_social_insurance": "529.00",
+            "personal_housing_fund": "400.00",
+            "company_social_insurance": "1255.00",
+            "company_housing_fund": "400.00",
+        }
+    ])
+    up_rec = updated["records"][0]
+    # 个人合计 = 529 + 400 = 929；单位合计 = 1255 + 400 = 1655
+    assert Decimal(up_rec["personal_social_security"]) == Decimal("929.00")
+    assert Decimal(up_rec["company_social_security"]) == Decimal("1655.00")
+    assert Decimal(up_rec["personal_housing_fund"]) == Decimal("400.00")
+    assert Decimal(up_rec["company_housing_fund"]) == Decimal("400.00")
+    assert Decimal(up_rec["net_salary"]) == Decimal("9071.00") # 10000 - 929
+
+    # 计提记账
+    accrued = await accrue_salary_sheet("c-sal-split-bf", "owner-1", "2027-05")
+    acc_entry = await get_entry(accrued["accrual_voucher_id"], user_id="owner-1", company_id="c-sal-split-bf")
+    lines = acc_entry["voucherLines"]
+
+    # 借方：工资 10000，单位社保 1255，单位公积金 400
+    assert _sum_by_code(lines["debit"], "5602001") == Decimal("10000.00")
+    assert _sum_by_code(lines["debit"], "5602016") == Decimal("1255.00")
+    assert _sum_by_code(lines["debit"], "5602017") == Decimal("400.00")
+
+    # 贷方：实发 9071，单位社保 1255，单位公积金 400，代扣个人 929
+    assert _sum_by_code(lines["credit"], "221101") == Decimal("9071.00")
+    assert _sum_by_code(lines["credit"], "221102") == Decimal("1255.00")
+    assert _sum_by_code(lines["credit"], "221105") == Decimal("400.00")
+    assert _sum_by_code(lines["credit"], "221104") == Decimal("929.00")
+
+    # 缴纳社保：单位社保 1255 + 个人社保 529 = 1784
+    ss = await pay_payroll_liability("c-sal-split-bf", "owner-1", "2027-05", "social_security", pay_date="2027-06-10")
+    ss_entry = await get_entry(ss["ss_paid_voucher_id"], user_id="owner-1", company_id="c-sal-split-bf")
+    assert Decimal(str(ss_entry["amount"])) == Decimal("1784.00")
+
+    # 缴纳公积金：单位公积金 400 + 个人公积金 400 = 800
+    hf = await pay_payroll_liability("c-sal-split-bf", "owner-1", "2027-05", "housing_fund", pay_date="2027-06-10")
+    hf_entry = await get_entry(hf["hf_paid_voucher_id"], user_id="owner-1", company_id="c-sal-split-bf")
+    assert Decimal(str(hf_entry["amount"])) == Decimal("800.00")
+
+
+@pytest.mark.asyncio
+async def test_batch_tax_preview_after_social_security_backfill():
+    """回填社保后一键批量试算全员个税，专项扣除按新社保+公积金精确扣除。"""
+    await _setup_company("c-sal-batch-iit")
+
+    from services.salary_service import (
+        create_employee, get_or_create_salary_sheet, update_salary_records,
+    )
+    from services.salary_iit_service import preview_sheet_individual_income_tax
+
+    # 员工 A：工资 12000，基数 5000；员工 B：工资 8000，基数 5000
+    emp_a = await create_employee("c-sal-batch-iit", "员工A", "行政部", 12000, 5000, hire_date="2027-01-01")
+    emp_b = await create_employee("c-sal-batch-iit", "员工B", "行政部", 8000, 5000, hire_date="2027-01-01")
+
+    sheet = await get_or_create_salary_sheet("c-sal-batch-iit", "2027-01")
+    recs = sheet["records"]
+    rec_a = next(r for r in recs if r["employee_id"] == emp_a["id"])
+    rec_b = next(r for r in recs if r["employee_id"] == emp_b["id"])
+
+    # 回填员工 A 个人社保 525 + 公积金 400 = 925；员工 B 个人社保 525 + 公积金 400 = 925
+    # 批量试算
+    batch_res = await preview_sheet_individual_income_tax(
+        "c-sal-batch-iit",
+        "2027-01",
+        [
+            {"employeeId": emp_a["id"], "gross": Decimal("12000.00"), "withheld": Decimal("925.00")},
+            {"employeeId": emp_b["id"], "gross": Decimal("8000.00"), "withheld": Decimal("925.00")},
+        ],
+    )
+    items = {item["employeeId"]: item for item in batch_res["items"]}
+
+    # A: 12000 - 5000 - 925 = 6075 -> 3% = 182.25
+    assert Decimal(items[emp_a["id"]]["taxableIncome"]) == Decimal("6075.00")
+    assert Decimal(items[emp_a["id"]]["taxDue"]) == Decimal("182.25")
+
+    # B: 8000 - 5000 - 925 = 2075 -> 3% = 62.25
+    assert Decimal(items[emp_b["id"]]["taxableIncome"]) == Decimal("2075.00")
+    assert Decimal(items[emp_b["id"]]["taxDue"]) == Decimal("62.25")
+
+    # 合计 182.25 + 62.25 = 244.50
+    assert Decimal(batch_res["totalTaxDue"]) == Decimal("244.50")
+
+
+@pytest.mark.asyncio
+async def test_parse_tax_rates_screenshot(monkeypatch):
+    """验证多模态视觉模型解析社保核定表截图，提取单位与个人费率。"""
+    from services.salary_service import parse_tax_rates_screenshot
+
+    def mock_chat_vision_json(prompt, image_url, **kwargs):
+        assert kwargs.get("model") == "qwen-vl-ocr"
+        return {
+            "province": "浙江省",
+            "items": [
+                {"name": "企业职工基本养老保险费", "payer": "company", "rate": 0.16},
+                {"name": "企业职工基本养老保险费", "payer": "personal", "rate": 0.08},
+                {"name": "失业保险费", "payer": "company", "rate": 0.005},
+                {"name": "失业保险费", "payer": "personal", "rate": 0.005},
+                {"name": "基本医疗保险费", "payer": "company", "rate": 0.095},
+                {"name": "基本医疗保险费", "payer": "personal", "rate": 0.02},
+                {"name": "工伤保险费", "payer": "company", "rate": 0.002},
+            ],
+            "socialCompany": 0.262,
+            "socialPersonal": 0.105,
+            "housingCompany": 0.0,
+            "housingPersonal": 0.0,
+            "summary": "单位社保 26.2%，个人社保 10.5%",
+        }
+
+    monkeypatch.setattr("services.llm.chat_vision_json", mock_chat_vision_json)
+
+    res = await parse_tax_rates_screenshot("data:image/png;base64,AAAA")
+    assert res["success"] is True
+    assert res["province"] == "浙江省"
+    assert res["socialCompany"] == 0.262
+    assert res["socialPersonal"] == 0.105
+    assert len(res["items"]) == 7
+
+
+@pytest.mark.asyncio
+async def test_company_region_auto_matches_payroll_rates():
+    """企业注册地自动匹配费率：浙江企业预设 26.2%/10.5%，江苏企业预设 24.2%/10.5%。"""
+    import json
+    from services.salary_service import (
+        default_payroll_rates, get_payroll_rates, match_region_from_company,
+    )
+    from services.database import get_conn
+
+    # 1. 区域关键字匹配逻辑
+    assert match_region_from_company({"name": "杭州芥子星辰智能科技有限公司"}) == "浙江"
+    assert match_region_from_company({"name": "浙江某某进出口贸易有限公司"}) == "浙江"
+    assert match_region_from_company({"name": "南京某某软件有限公司"}) == "江苏"
+    assert match_region_from_company({"name": "深圳某某网络有限公司"}) == "深圳"
+    assert match_region_from_company({"name": "北京某某传媒有限公司"}) == "北京"
+    assert match_region_from_company({"name": "无地域普通公司"}) is None
+
+    # 2. 默认费率字典计算
+    zj_rates = default_payroll_rates({"name": "杭州南山科技有限公司"})
+    assert zj_rates["socialCompany"] == Decimal("0.262")
+    assert zj_rates["socialPersonal"] == Decimal("0.105")
+
+    js_rates = default_payroll_rates({"name": "苏州工业园区科技有限公司"})
+    assert js_rates["socialCompany"] == Decimal("0.242")
+    assert js_rates["socialPersonal"] == Decimal("0.105")
+
+    # 3. 真实 DB 账套查询自动带出
+    await _setup_company("c-zj-company")
+    conn = await get_conn()
+    try:
+        await conn.execute(
+            "UPDATE auth_companies SET payload = ? WHERE company_id = ?",
+            (json.dumps({"name": "杭州某某科技有限公司"}), "c-zj-company"),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    res = await get_payroll_rates("c-zj-company")
+    assert res["region"] == "浙江"
+    assert Decimal(res["rates"]["socialCompany"]) == Decimal("0.262")
+    assert Decimal(res["rates"]["socialPersonal"]) == Decimal("0.105")
+    assert res["isCustomized"] is False
+
+
+@pytest.mark.asyncio
+async def test_salary_sheet_auto_carries_forward_previous_month():
+    """首次填报工资/社保/公积金后，后续月份草稿自动延续上月数据，并支持灵活修改。"""
+    from services.salary_service import (
+        get_or_create_salary_sheet,
+        update_salary_records,
+        create_employee,
+    )
+    company_id = "c-carry-forward-test"
+    await _setup_company(company_id)
+
+    # 1. 创建员工 A（老员工，2026-10 入职）与 员工 B（新员工，2026-11 入职）
+    emp_a = await create_employee(
+        company_id=company_id,
+        name="张三",
+        department="管理部",
+        base_salary=Decimal("10000.00"),
+        social_security_base=Decimal("5000.00"),
+        hire_date="2026-10-01",
+    )
+    emp_b = await create_employee(
+        company_id=company_id,
+        name="李四",
+        department="管理部",
+        base_salary=Decimal("8000.00"),
+        social_security_base=Decimal("4000.00"),
+        hire_date="2026-11-01",
+    )
+
+    # 2. 2026-10 月工资表：此时只有张三在职
+    sheet_10 = await get_or_create_salary_sheet(company_id, "2026-10")
+    assert len(sheet_10["records"]) == 1
+    rec_a_10 = sheet_10["records"][0]
+    assert rec_a_10["employee_name"] == "张三"
+
+    # 3. 用户在 10 月录入/回填了税局实缴社保与奖金补贴
+    update_data = [{
+        "id": rec_a_10["id"],
+        "base_salary": "12000.00",
+        "bonus": "1000.00",
+        "allowance": "500.00",
+        "deduction": "200.00",
+        "personal_social_insurance": "800.00",
+        "personal_housing_fund": "600.00",
+        "company_social_insurance": "2000.00",
+        "company_housing_fund": "600.00",
+        "personal_tax": "150.00",
+    }]
+    updated_10 = await update_salary_records(company_id, "2026-10", update_data)
+    rec_a_10_up = updated_10["records"][0]
+    assert rec_a_10_up["net_salary"] == "11750.00"  # 12000 + 1000 + 500 - 200 - 1400 - 150
+    assert rec_a_10_up["total_cost"] == "15900.00"  # 13300 + 2600
+
+    # 4. 2026-11 月自动创建工资表：张三自动延续 10 月数据，李四走花名册初始值
+    sheet_11 = await get_or_create_salary_sheet(company_id, "2026-11")
+    assert len(sheet_11["records"]) == 2
+    rec_a_11 = next(r for r in sheet_11["records"] if r["employee_id"] == emp_a["id"])
+    rec_b_11 = next(r for r in sheet_11["records"] if r["employee_id"] == emp_b["id"])
+
+    # 张三（老员工）：全额延续 10 月的实缴明细与发放参数
+    assert rec_a_11["base_salary"] == "12000.00"
+    assert rec_a_11["bonus"] == "1000.00"
+    assert rec_a_11["allowance"] == "500.00"
+    assert rec_a_11["deduction"] == "200.00"
+    assert rec_a_11["personal_social_insurance"] == "800.00"
+    assert rec_a_11["personal_housing_fund"] == "600.00"
+    assert rec_a_11["company_social_insurance"] == "2000.00"
+    assert rec_a_11["company_housing_fund"] == "600.00"
+    assert rec_a_11["personal_tax"] == "150.00"
+    assert rec_a_11["net_salary"] == "11750.00"
+    assert rec_a_11["total_cost"] == "15900.00"
+
+    # 李四（新员工）：走初始配置
+    assert rec_b_11["base_salary"] == "8000.00"
+    assert rec_b_11["bonus"] == "0.00"
+    assert rec_b_11["personal_tax"] == "0.00"
+
+    # 5. 留有修改入口：当月微调张三的奖金与税额
+    up_11 = [{
+        "id": rec_a_11["id"],
+        "base_salary": "12000.00",
+        "bonus": "2000.00",  # 本月奖金调整为 2000
+        "allowance": "500.00",
+        "deduction": "200.00",
+        "personal_social_insurance": "800.00",
+        "personal_housing_fund": "600.00",
+        "company_social_insurance": "2000.00",
+        "company_housing_fund": "600.00",
+        "personal_tax": "180.00",
+    }]
+    res_11 = await update_salary_records(company_id, "2026-11", up_11)
+    rec_a_11_mod = next(r for r in res_11["records"] if r["employee_id"] == emp_a["id"])
+    assert rec_a_11_mod["bonus"] == "2000.00"
+    assert rec_a_11_mod["net_salary"] == "12720.00"  # 14300 - 1400 - 180
+
+
+

@@ -275,6 +275,25 @@ async def confirm_statement_match(
         if conflict:
             raise AccountingError("MATCH_CONFLICT", "其中一笔账目已匹配其他银行流水", 409)
         payload = await serialize_journal(session, entry)
+        if entry_ids is not None:
+            # 新确认（entry_ids=None 是修复模式，豁免）硬校验：底稿与跨期凭证不能当
+            # 核销凭证。建议层护栏（_entry_not_after_statement / isArchiveOnly 过滤）
+            # 只是"不再推荐"，权威层必须拒绝——否则旧建议/旧前端仍能造出
+            # 5 月流水配 6 月底稿这种关不了账的配对（2026-10-31 实测踩坑）。
+            from services.bank_service import _entry_not_after_statement
+
+            if payload.get("isArchiveOnly"):
+                raise AccountingError(
+                    "ARCHIVE_ONLY_MATCH",
+                    "仅归档底稿凭证不参与银行核销，请在付款当期确认收支入账",
+                    409,
+                )
+            if not _entry_not_after_statement(payload.get("occurDate"), str(statement["transaction_date"])):
+                raise AccountingError(
+                    "CROSS_PERIOD_MATCH",
+                    "凭证日期晚于流水日期（先付款后收票），请在付款当期确认收支入账，不能跨期配对",
+                    409,
+                )
         payer = str(payload.get("payer") or "")
         if (payer in {"boss_personal", "employee_personal"} or payer.startswith("employee_personal:")) and \
                 _entry_bank_effect_from_payload(payload) == ZERO:

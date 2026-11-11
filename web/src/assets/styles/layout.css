@@ -2,13 +2,19 @@
 
 /* 1. All routing pages inside AppLayout main content have the exact same container layout
  *
- *    `:where()` 让这条规则**特异度为 0**，页面自己的容器宽度（.book-page 940、
- *    .ledger-page 1180、.page-container 680…）才能真正生效。
+ *    `:where()` 让这条规则**特异度为 0**，页面自己的容器宽度声明才能真正生效。
+ *    页面宽度统一收敛为三档 CSS 变量（定义见 variables.css）：
+ *      --page-width (1240)        标准档，绝大多数工作页，也是未显式声明宽度的页面的默认落点
+ *      --page-width-wide (1440)   宽档，数据宽表页（税务登记、聚合待办、账本列表）
+ *      --page-width-narrow (760)  窄档，详情/设置聚焦页
+ *    特例（自有意图，不套三档）：电子账本 .book-page 940（聚焦记账面 + 右侧锚点导航）、
+ *    月度结账向导 920↔1240 双态、凭证打印 .print-page 820（A4 版面）。
  *    之前这里写的是 `max-width: 1440px !important`，把所有页面的宽度声明都吃掉了：
  *    聚焦型页面被拉成满宽，电子账簿的操作区还被右侧固定导航压住。
  */
-:where(.content) > * {
-  max-width: 1440px;
+/* 通知条不是路由页面：套上页面容器的 28/56 内边距会被撑成一张 115px 高的大卡片 */
+:where(.content) > *:where(:not(.workspace-view-notice)) {
+  max-width: var(--page-width);
   margin: 0 auto !important;
   /* 顶部 28px 原本由 .content 的 padding 提供，现在移到这里：
      滚动容器的 padding 会让 sticky 元素吸附在 padding 内侧、露出缝隙。 */

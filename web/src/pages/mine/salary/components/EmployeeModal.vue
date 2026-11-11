@@ -23,12 +23,14 @@ const message = useMessage()
 const saving = ref(false)
 
 const isEditing = computed(() => Boolean(props.employee?.id))
+const showAdvanced = ref(false)
+const ssBaseTouched = ref(false)
 
 const form = ref({
   name: '',
-  department: '研发部',
+  department: '行政部',
   base_salary: 6000,
-  social_security_base: 4000,
+  social_security_base: 6000,
   is_owner: false,
   hire_date: null as string | null,
   special_additional_deduction: 0,
@@ -37,6 +39,13 @@ const form = ref({
 watch(() => props.show, (visible) => {
   if (visible) {
     if (props.employee) {
+      const hasAdv = Boolean(
+        props.employee.hire_date ||
+        Number(props.employee.special_additional_deduction || 0) > 0 ||
+        props.employee.is_owner,
+      )
+      showAdvanced.value = hasAdv
+      ssBaseTouched.value = true
       form.value = {
         name: props.employee.name,
         department: props.employee.department,
@@ -47,11 +56,13 @@ watch(() => props.show, (visible) => {
         special_additional_deduction: Number(props.employee.special_additional_deduction || 0),
       }
     } else {
+      showAdvanced.value = false
+      ssBaseTouched.value = false
       form.value = {
         name: '',
-        department: '研发部',
+        department: props.departmentOptions[0]?.value || '行政部',
         base_salary: 6000,
-        social_security_base: 4000,
+        social_security_base: 6000,
         is_owner: false,
         hire_date: null,
         special_additional_deduction: 0,
@@ -59,6 +70,19 @@ watch(() => props.show, (visible) => {
     }
   }
 })
+
+function onBaseSalaryChange(val: number | null) {
+  const next = Number(val || 0)
+  form.value.base_salary = next
+  if (!ssBaseTouched.value) {
+    form.value.social_security_base = next
+  }
+}
+
+function setSsPreset(val: number) {
+  ssBaseTouched.value = true
+  form.value.social_security_base = val
+}
 
 function closeModal() {
   emit('update:show', false)
@@ -118,63 +142,81 @@ async function handleSave() {
           :consistent-menu-width="false"
         />
       </NFormItem>
-      <NFormItem label="入职日期">
-        <NDatePicker
-          v-model:formatted-value="form.hire_date"
-          value-format="yyyy-MM-dd"
-          type="date"
-          clearable
-          size="medium"
-          style="width: 100%"
-          placeholder="不填则不限月份"
-        />
-      </NFormItem>
-      <NFormItem label="业主标记">
-        <div class="owner-flag-row">
-          <NSwitch v-model:value="form.is_owner" size="small" />
-          <span class="owner-flag-hint">
-            个体户/个独业主本人的工资不得税前扣除，汇算清缴时按此标记自动调增
-          </span>
-        </div>
-      </NFormItem>
       <NFormItem label="基本工资">
         <NInputNumber
-          v-model:value="form.base_salary"
+          :value="form.base_salary"
           :min="0"
           :precision="2"
-          :step="100"
+          :step="500"
           style="width: 100%"
+          @update:value="onBaseSalaryChange"
         >
           <template #prefix>¥</template>
         </NInputNumber>
       </NFormItem>
       <NFormItem label="社保基数">
-        <NInputNumber
-          v-model:value="form.social_security_base"
-          :min="0"
-          :precision="2"
-          :step="100"
-          style="width: 100%"
-        >
-          <template #prefix>¥</template>
-        </NInputNumber>
+        <div class="ss-field-wrap">
+          <NInputNumber
+            v-model:value="form.social_security_base"
+            :min="0"
+            :precision="2"
+            :step="500"
+            style="width: 100%"
+            @update:value="ssBaseTouched = true"
+          >
+            <template #prefix>¥</template>
+          </NInputNumber>
+          <div class="ss-presets">
+            <button type="button" class="preset-chip" :class="{ active: form.social_security_base === form.base_salary }" @click="setSsPreset(form.base_salary)">按全额工资</button>
+            <button type="button" class="preset-chip" :class="{ active: form.social_security_base === 4000 }" @click="setSsPreset(4000)">最低基数 4000</button>
+            <button type="button" class="preset-chip" :class="{ active: form.social_security_base === 0 }" @click="setSsPreset(0)">不交社保 (0)</button>
+          </div>
+        </div>
       </NFormItem>
-      <NFormItem label="专项附加">
-        <NInputNumber
-          v-model:value="form.special_additional_deduction"
-          :min="0"
-          :precision="2"
-          :step="500"
-          style="width: 100%"
-        >
-          <template #prefix>¥</template>
-        </NInputNumber>
-      </NFormItem>
+
+      <div class="advanced-toggle-row">
+        <button type="button" class="advanced-toggle-btn" @click="showAdvanced = !showAdvanced">
+          <i :class="showAdvanced ? 'ri-arrow-up-s-line' : 'ri-arrow-down-s-line'" />
+          <span>{{ showAdvanced ? '收起选填项' : '更多选填项（个税专项附加 / 入职日期 / 业主标记）' }}</span>
+        </button>
+      </div>
+
+      <template v-if="showAdvanced">
+        <NFormItem label="专项附加">
+          <NInputNumber
+            v-model:value="form.special_additional_deduction"
+            :min="0"
+            :precision="2"
+            :step="500"
+            style="width: 100%"
+          >
+            <template #prefix>¥</template>
+          </NInputNumber>
+        </NFormItem>
+        <NFormItem label="入职日期">
+          <NDatePicker
+            v-model:formatted-value="form.hire_date"
+            value-format="yyyy-MM-dd"
+            type="date"
+            clearable
+            size="medium"
+            style="width: 100%"
+            placeholder="不填则默认当月在职"
+          />
+        </NFormItem>
+        <NFormItem label="业主标记">
+          <div class="owner-flag-row">
+            <NSwitch v-model:value="form.is_owner" size="small" />
+            <span class="owner-flag-hint">
+              个体户/个独业主本人的工资不得税前扣除，汇算清缴时自动调增
+            </span>
+          </div>
+        </NFormItem>
+        <p class="form-hint">
+          专项附加为每月扣除合计（子女教育 2000/人、房贷 1000、赡养老人 3000 等），仅用于个税自动测算。
+        </p>
+      </template>
     </NForm>
-    <p class="form-hint">
-      专项附加为每月扣除合计（子女教育 2000/人、房贷利息 1000、赡养老人 3000、婴幼儿照护 2000 等），
-      仅用于个税试算，按实际申报口径填写。
-    </p>
     <template #footer>
       <NSpace justify="end">
         <NButton @click="closeModal">取消</NButton>
@@ -185,6 +227,55 @@ async function handleSave() {
 </template>
 
 <style scoped>
+.ss-field-wrap {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ss-presets {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.preset-chip {
+  border: 1px solid var(--solo-border-light);
+  background: var(--solo-bg-card);
+  color: var(--solo-text-secondary);
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.preset-chip:hover {
+  border-color: var(--solo-primary);
+  color: var(--solo-primary);
+}
+.preset-chip.active {
+  background: var(--solo-bg-blue-soft);
+  border-color: var(--solo-primary);
+  color: var(--solo-primary);
+  font-weight: 600;
+}
+.advanced-toggle-row {
+  margin: 4px 0 12px;
+}
+.advanced-toggle-btn {
+  border: none;
+  background: transparent;
+  color: var(--solo-text-secondary);
+  font-size: 12px;
+  padding: 4px 0;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.advanced-toggle-btn:hover {
+  color: var(--solo-primary);
+}
 .owner-flag-row {
   display: flex;
   align-items: center;

@@ -4,6 +4,7 @@
 *.key
 !.env.example
 deploy/.env.staging.local
+deploy/docker-compose.override.yml
 deploy/docker-compose.local.yml
 
 # Python
@@ -36,6 +37,9 @@ Thumbs.db
 logs/
 \.cache/
 *~[0-9]*
+# 部署脚本的运行副本与日志、临时下载的真实业务数据（勿入库）
+.deploy_run/
+downloads/
 
 # ── 开源前隐私/版权隔离 ──
 # 运行日志
@@ -46,11 +50,6 @@ backend/data/*.log
 测试发票.jpg
 *.pdf
 1777620180673.txt
-# 小程序端源码：**保持 git 跟踪**（2026-10-27 决策）。仅含公开 appid（无
-# secret/地图 key，模板残留的腾讯 LBS 演示 key 已于 2026-10-27 清除），
-# 开源发布走 scripts/sync_to_open.sh 白名单隔离；
-# 本条仅拦截未来误放的未跟踪新文件，对已跟踪文件不生效。
-solobooks/
 # 私有运维脚本（含服务器 IP / 凭据）
 deploy/deploy.sh
 deploy/update-dev.ps1
@@ -98,6 +97,9 @@ web/dist-verify/
 .slidep/
 .workbuddy-ai/
 
+# 本地临时样本（真实业务数据，勿入库）
+tmp/
+
 # Office 锁文件（Word/WPS 打开时的 ~$ 临时文件）
 ~$*
 
@@ -109,3 +111,8 @@ archive/
 
 # 本地引入的外部技能库
 .vendor/
+
+# 赛事与商业材料的大体积成品与字体（本地保留，不入库；archive/ 整体规则兜底其余归档内容）
+*.ttc
+__MACOSX/
+/梭罗记账-WorkBuddy连接器上架资料包.zip

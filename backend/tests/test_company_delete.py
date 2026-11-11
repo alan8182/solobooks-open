@@ -28,6 +28,25 @@ async def _ensure_schema() -> None:
     await todo_ready()
 
 
+async def _ensure_fallback_access() -> None:
+    """开发兜底身份固定为 (test_user_001, c1)，require_auth 每次请求都会校验
+    对 c1 的归属；隔离测试库未必有 c1，缺则按 owner 补齐（幂等）。"""
+    from db.models import Company
+    from db.session import session_scope
+
+    async with session_scope() as session:
+        if await session.get(Company, "c1") is None:
+            session.add(
+                Company(
+                    company_id="c1",
+                    owner_user_id="test_user_001",
+                    payload={"name": "兜底主体"},
+                    created_at="2026-01-01T00:00:00+00:00",
+                    updated_at="2026-01-01T00:00:00+00:00",
+                )
+            )
+
+
 async def _seed_company(company_id: str, name: str, owner: str = "u-del") -> None:
     from db.models import (
         AgentAction,
@@ -259,6 +278,7 @@ def test_delete_api_requires_exact_name(client, auth_headers):
 
     async def _run() -> None:
         await _ensure_schema()
+        await _ensure_fallback_access()
         # 认证兜底身份是 test_user_001；确保它不是当前主体
         from db.models import AuthUser
         from db.session import session_scope
@@ -296,6 +316,27 @@ def test_delete_api_requires_exact_name(client, auth_headers):
     )
     assert ok.status_code == 200
     assert ok.json()["deleted"] is True
+
+
+def test_delete_api_tolerates_stored_name_whitespace(client, auth_headers):
+    """存量主体名带前导/尾随空格时（早期创建入口未 trim），按可见名删除应成功。"""
+    import asyncio
+
+    async def _run() -> None:
+        await _ensure_schema()
+        await _ensure_fallback_access()
+        await _seed_company("c-del-ws", " 空格主体名 ", owner="test_user_001")
+
+    asyncio.run(_run())
+
+    ok = client.request(
+        "DELETE",
+        "/api/auth/companies/c-del-ws",
+        json={"confirmName": "空格主体名"},
+        headers=auth_headers,
+    )
+    assert ok.status_code == 200
+    assert ok.json()["companyName"] == "空格主体名"
 
 
 def test_reconciliation_links_are_purged_before_journal_entries():

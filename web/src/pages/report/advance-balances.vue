@@ -13,6 +13,7 @@ import { saveWorkbook } from '@/utils/export'
 import {
   SoloDrawer, SoloEmpty, SoloFieldHelp, SoloMonthPicker, SoloTable,
 } from '@/components/ui'
+import BossTrackNav from '@/components/business/BossTrackNav.vue'
 import { usePageRefresh } from '@/composables/usePageRefresh'
 
 export interface AdvanceEntryItem {
@@ -421,6 +422,7 @@ onMounted(load)
 
 <template>
   <div class="report-container">
+    <BossTrackNav />
     <div class="report-header no-print">
       <div class="report-header-left">
         <NButton text class="report-back-btn" @click="router.push({ path: '/reports', query: { month } })">
@@ -730,7 +732,7 @@ onMounted(load)
   color: var(--solo-text-primary);
 }
 .summary-value.income { color: var(--solo-primary, #1747b0); }
-.summary-value.expense { color: var(--solo-expense, #cf4b38); }
+.summary-value.expense { color: var(--solo-expense, #bd3d3d); }
 .summary-sub {
   font-size: 12px;
   color: var(--solo-text-muted);
@@ -939,10 +941,10 @@ onMounted(load)
   font-variant-numeric: tabular-nums;
 }
 .drawer-entry-amount.income {
-  color: var(--solo-income, #12805c);
+  color: var(--solo-income, #0f7354);
 }
 .drawer-entry-amount.expense {
-  color: var(--solo-expense, #cf4b38);
+  color: var(--solo-expense, #bd3d3d);
 }
 .drawer-entry-actions {
   display: flex;

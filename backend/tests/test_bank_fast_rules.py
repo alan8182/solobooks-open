@@ -5,10 +5,18 @@
 from decimal import Decimal
 import pytest
 from services.bank_service import (
+    _needs_business_purpose_confirmation,
+    guard_statement_classification,
+    identify_explicit_it_service_rule,
     identify_statement_fast_rule,
     extract_statement_rule_pattern,
+    extract_statement_purpose_key,
     save_company_category_rule,
     ai_suggest_matches,
+    list_company_category_rules,
+    match_company_category_rule,
+    update_company_category_rule,
+    delete_company_category_rule,
 )
 from services.database import get_conn
 
@@ -95,10 +103,124 @@ def test_general_business_expense_not_fast_rule():
     assert rule is None
 
 
+def test_generic_wanglai_with_it_company_uses_low_confidence_it_fallback():
+    """模型误判应付账款时，可根据交易对手行业词降置信度改判信息技术服务费。"""
+    stmt = {
+        "id": "stmt-generic-wanglai",
+        "description": (
+            "汇兑 | 附言: 往来款 "
+            "(对方: 杭州深度求索人工智能基础技术研究有限公司)"
+        ),
+        "amount": Decimal("-500.00"),
+        "transaction_date": "2026-05-31",
+    }
+
+    assert _needs_business_purpose_confirmation(stmt) is True
+
+    guarded = guard_statement_classification(
+        stmt,
+        {
+            "direction": "expense",
+            "category": "供应商付款",
+            "accountCode": "2202",
+            "accountName": "应付账款",
+            "confidence": 0.92,
+        },
+    )
+    assert guarded["category"] == "信息技术服务费"
+    assert guarded["accountCode"] == "5602015"
+    assert guarded["confidence"] == 0.72
+    assert guarded["requiresConfirmation"] is True
+    assert "人工智能" in guarded["reason"]
+    assert "供应商付款" in guarded["reason"]
+
+
+def test_generic_wanglai_with_ordinary_company_remains_pending():
+    """普通公司名没有行业或采购证据时，仍不能猜测应付账款。"""
+    stmt = {
+        "id": "stmt-generic-ordinary-company",
+        "description": "汇兑 | 附言: 往来款 (对方: 任意商务服务有限公司)",
+        "amount": Decimal("-500.00"),
+        "transaction_date": "2026-05-31",
+    }
+
+    guarded = guard_statement_classification(
+        stmt,
+        {
+            "direction": "expense",
+            "category": "供应商付款",
+            "accountCode": "2202",
+            "accountName": "应付账款",
+            "confidence": 0.92,
+        },
+    )
+    assert guarded["category"] == "其他支出"
+    assert guarded["accountCode"] == "5602999"
+    assert guarded["confidence"] == 0.45
+    assert guarded["requiresConfirmation"] is True
+    assert "没有货款、采购款或应付账款等采购证据" in guarded["reason"]
+
+
+def test_explicit_api_service_maps_to_it_service_without_vendor_allowlist():
+    """显式业务词足够时可按信息技术服务费入账，且规则不依赖具体供应商。"""
+    stmt = {
+        "id": "stmt-explicit-api",
+        "description": "汇兑 | 附言: API调用服务费 (对方: 任意技术服务公司)",
+        "amount": Decimal("-500.00"),
+        "transaction_date": "2026-05-31",
+    }
+
+    rule = identify_explicit_it_service_rule(stmt)
+    assert rule is not None
+    assert rule["category"] == "信息技术服务费"
+    assert rule["confidence"] == 0.94
+    assert rule["rule"] == "explicit_it_service_rule"
+
+
+def test_ordinary_service_fee_is_not_bank_fee_without_bank_charge_evidence():
+    """普通“服务费”没有手续费、转账费等证据时，不能归为银行手续费。"""
+    stmt = {
+        "id": "stmt-service-fee",
+        "description": "汇兑 | 附言: 技术服务费 (对方: 任意技术服务公司)",
+        "amount": Decimal("-300.00"),
+        "transaction_date": "2026-05-31",
+    }
+
+    guarded = guard_statement_classification(
+        stmt,
+        {
+            "direction": "expense",
+            "category": "银行及金融手续费",
+            "accountCode": "5603002",
+            "accountName": "财务费用-手续费",
+            "confidence": 0.88,
+        },
+    )
+    assert guarded["category"] == "其他支出"
+    assert guarded["requiresConfirmation"] is True
+    assert "没有银行手续费、转账费或账户管理费证据" in guarded["reason"]
+
+
+def test_prepayment_with_api_wording_is_not_forced_to_it_expense():
+    """预付款性质优先按往来处理，不能仅因摘要出现 API 就费用化。"""
+    stmt = {
+        "id": "stmt-prepaid-api",
+        "description": "汇兑 | 附言: 预付API服务费 (对方: 任意技术服务公司)",
+        "amount": Decimal("-500.00"),
+        "transaction_date": "2026-05-31",
+    }
+
+    assert identify_explicit_it_service_rule(stmt) is None
+
+
 def test_extract_statement_rule_pattern():
     desc = "汇兑 | 附言：小程序注册验证 (对方: 招商银行股份有限公司深圳高新园科创支行)"
     assert extract_statement_rule_pattern(desc) == "招商银行股份有限公司深圳高新园科创支行"
     assert extract_statement_rule_pattern("转出-云服务费 20260618") == "转出-云服务费"
+    assert extract_statement_purpose_key(desc) == "小程序注册验证"
+    assert extract_statement_purpose_key(
+        "汇兑 | 附言: 往来款 (对方: 任意信息技术有限公司)"
+    ) == ""
 
 
 @pytest.mark.asyncio
@@ -144,14 +266,248 @@ async def test_company_memory_rule_upsert_updates_category():
     try:
         cursor = await conn.execute(
             "SELECT category FROM bank_category_rules "
-            "WHERE company_id = ? AND match_pattern = ?",
-            (company_id, "测试银行C"),
+            "WHERE company_id = ? AND counterparty_key = ?",
+            (company_id, "测试银行c"),
         )
         row = await cursor.fetchone()
     finally:
         await conn.close()
     assert row is not None
     assert row["category"] == "办公费"
+
+
+@pytest.mark.asyncio
+async def test_company_rules_are_tenant_isolated_and_keep_business_purposes_separate():
+    desc_cloud = "汇兑 | 附言: API调用服务费 (对方: 通用服务有限公司)"
+    desc_rent = "汇兑 | 附言: 办公用房租金 (对方: 通用服务有限公司)"
+
+    await save_company_category_rule(
+        "test_rule_tenant_a", desc_cloud, Decimal("-500"), "信息技术服务费"
+    )
+    await save_company_category_rule(
+        "test_rule_tenant_a", desc_rent, Decimal("-8000"), "租金物业"
+    )
+    await save_company_category_rule(
+        "test_rule_tenant_b", desc_cloud, Decimal("-500"), "办公费"
+    )
+
+    company_a = await list_company_category_rules("test_rule_tenant_a")
+    company_b = await list_company_category_rules("test_rule_tenant_b")
+    assert company_a["total"] == 2
+    assert company_b["total"] == 1
+    assert {item["category"] for item in company_a["items"]} == {
+        "信息技术服务费",
+        "租金物业",
+    }
+    assert company_b["items"][0]["category"] == "办公费"
+
+    cloud_match = match_company_category_rule(
+        {
+            "description": desc_cloud,
+            "amount": Decimal("-500"),
+            "transaction_date": "2026-06-01",
+        },
+        company_a["items"],
+    )
+    rent_match = match_company_category_rule(
+        {
+            "description": desc_rent,
+            "amount": Decimal("-8000"),
+            "transaction_date": "2026-06-02",
+        },
+        company_a["items"],
+    )
+    assert cloud_match and cloud_match["category"] == "信息技术服务费"
+    assert rent_match and rent_match["category"] == "租金物业"
+    assert cloud_match["matchKind"] == rent_match["matchKind"] == "exact"
+
+
+@pytest.mark.asyncio
+async def test_specific_business_rule_beats_counterparty_only_rule():
+    company_id = "test_rule_specificity_co"
+    vendor = "通用云服务有限公司"
+    broad = f"汇兑 | 附言: 往来款 (对方: {vendor})"
+    specific = f"汇兑 | 附言: 云服务订阅费 (对方: {vendor})"
+    await save_company_category_rule(
+        company_id, broad, Decimal("-100"), "其他应收款"
+    )
+    await save_company_category_rule(
+        company_id, specific, Decimal("-100"), "信息技术服务费"
+    )
+    listing = await list_company_category_rules(company_id)
+    assert listing["total"] == 2
+
+    match = match_company_category_rule(
+        {
+            "description": specific,
+            "amount": Decimal("-100"),
+            "transaction_date": "2026-06-01",
+        },
+        listing["items"],
+    )
+    assert match is not None
+    assert match["category"] == "信息技术服务费"
+    assert match["matchKind"] == "exact"
+    assert match["requiresReview"] is False
+
+    broad_match = match_company_category_rule(
+        {
+            "description": broad,
+            "amount": Decimal("-100"),
+            "transaction_date": "2026-06-01",
+        },
+        listing["items"],
+    )
+    assert broad_match is not None
+    assert broad_match["matchKind"] == "counterparty_only"
+    assert broad_match["requiresReview"] is True
+    assert broad_match["confidence"] <= 0.78
+
+
+@pytest.mark.asyncio
+async def test_company_rule_can_be_disabled_edited_and_deleted():
+    company_id = "test_rule_management_co"
+    desc = "汇兑 | 附言: 云服务订阅费 (对方: 规则管理测试公司)"
+    await save_company_category_rule(
+        company_id, desc, Decimal("-300"), "信息技术服务费"
+    )
+    listing = await list_company_category_rules(company_id)
+    rule = listing["items"][0]
+
+    updated = await update_company_category_rule(
+        company_id,
+        rule["id"],
+        {"enabled": False, "category": "办公费"},
+        user_id="u-rule-test",
+    )
+    assert updated is not None
+    assert updated["enabled"] is False
+    assert updated["category"] == "办公费"
+    assert updated["accountCode"] == "5602004"
+
+    enabled = await list_company_category_rules(company_id, enabled=True)
+    assert enabled["total"] == 0
+    all_rules = await list_company_category_rules(company_id)
+    assert all_rules["total"] == 1
+    assert await delete_company_category_rule(
+        company_id, rule["id"], user_id="u-rule-test"
+    ) is True
+    assert (await list_company_category_rules(company_id))["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_category_rule_router_uses_authenticated_company_only():
+    from deps.auth import AuthContext
+    from routers.bank import (
+        CategoryRuleUpdateRequest,
+        list_category_rules,
+        patch_category_rule,
+        remove_category_rule,
+    )
+
+    desc = "汇兑 | 附言: API调用服务费 (对方: 路由隔离测试公司)"
+    await save_company_category_rule(
+        "test_rule_route_a", desc, Decimal("-10"), "信息技术服务费"
+    )
+    await save_company_category_rule(
+        "test_rule_route_b", desc, Decimal("-10"), "办公费"
+    )
+    ctx = AuthContext(user_id="u-route-test", company_id="test_rule_route_a")
+
+    listing = await list_category_rules(
+        q="",
+        direction="",
+        enabled=None,
+        limit=100,
+        offset=0,
+        ctx=ctx,
+    )
+    assert listing["total"] == 1
+    rule = listing["items"][0]
+    assert rule["category"] == "信息技术服务费"
+
+    updated = await patch_category_rule(
+        rule["id"],
+        CategoryRuleUpdateRequest(enabled=False),
+        ctx=ctx,
+    )
+    assert updated["enabled"] is False
+    assert await remove_category_rule(rule["id"], ctx=ctx) == {"status": "deleted"}
+    assert (await list_company_category_rules("test_rule_route_b"))["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_company_rule_hit_count_is_idempotent_per_statement():
+    company_id = "test_rule_hit_count_co"
+    desc = "汇兑 | 附言: API调用服务费 (对方: 命中计数服务有限公司)"
+    await save_company_category_rule(
+        company_id, desc, Decimal("-88"), "信息技术服务费"
+    )
+    await _insert_statements(company_id, [
+        (
+            "stmt-rule-hit-1",
+            company_id,
+            "2026-06-04",
+            desc,
+            "-88.00",
+            "1000.00",
+            "batch-rule-hit",
+            "2026-06-04T00:00:00Z",
+        ),
+    ])
+
+    first = await ai_suggest_matches(company_id, month="2026-06")
+    second = await ai_suggest_matches(company_id, month="2026-06")
+    assert first[0]["rule"] == second[0]["rule"] == "company_memory_rule"
+
+    rules = await list_company_category_rules(company_id)
+    assert rules["items"][0]["hitCount"] == 1
+    assert rules["items"][0]["lastHitStatementId"] == "stmt-rule-hit-1"
+
+
+@pytest.mark.asyncio
+async def test_rule_match_requires_review_for_refund_closed_period_and_amount_jump():
+    company_id = "test_rule_guard_co"
+    desc = "汇兑 | 附言: API调用服务费 (对方: 风控测试服务有限公司)"
+    await save_company_category_rule(
+        company_id, desc, Decimal("-100"), "信息技术服务费"
+    )
+    rules = (await list_company_category_rules(company_id))["items"]
+
+    refund_match = match_company_category_rule(
+        {
+            "description": "汇兑 | 附言: 云服务退款 (对方: 风控测试服务有限公司)",
+            "amount": Decimal("100"),
+            "transaction_date": "2026-06-10",
+        },
+        rules,
+    )
+    assert refund_match is None  # 方向不同，不能串用
+
+    closed_match = match_company_category_rule(
+        {
+            "description": desc,
+            "amount": Decimal("-100"),
+            "transaction_date": "2026-05-10",
+        },
+        rules,
+        closed_months={"2026-05"},
+    )
+    assert closed_match is not None
+    assert closed_match["requiresReview"] is True
+    assert any("已关账" in reason for reason in closed_match["reviewReasons"])
+
+    amount_match = match_company_category_rule(
+        {
+            "description": desc,
+            "amount": Decimal("-50000"),
+            "transaction_date": "2026-06-10",
+        },
+        rules,
+    )
+    assert amount_match is not None
+    assert amount_match["requiresReview"] is True
+    assert any("历史规则范围" in reason for reason in amount_match["reviewReasons"])
 
 
 async def _insert_statements(company_id: str, rows: list[tuple]) -> None:
@@ -301,3 +657,16 @@ async def test_ai_suggest_survives_missing_category_rules_table(monkeypatch):
     assert len(suggestions) == 1
     assert suggestions[0]["statementId"] == "stmt-broken-1"
     assert suggestions[0]["rule"] == "bank_interest"
+
+
+def test_entry_not_after_statement_period_guard():
+    """跨期护栏：候选凭证晚于流水日即"先付款后收票"，不得建议跨期配对。"""
+    from services.bank_service import _entry_not_after_statement as guard
+
+    assert guard("2033-06-02", "2033-05-31") is False
+    assert guard("2033-05-31", "2033-05-31") is True
+    assert guard("2033-05-30", "2033-05-31") is True
+    # 空日期无法判定 → 放行（不误伤日期缺失的历史凭证）
+    assert guard("", "2033-05-31") is True
+    assert guard("2033-06-02", "") is True
+    assert guard(None, None) is True

@@ -89,13 +89,15 @@ export const PRIORITY_LABELS: Record<string, { label: string; color: string }> =
 export interface NavChildItem {
   path: string
   label: string
+  bossLabel?: string
   icon: string
   workspace?: WorkspaceView[]
 }
 
 export type NavGroup = '日常' | '账务' | '周期' | '工具'
+// 老板视图核心驱动力为每月结账与报税，因此「每月」作为首选核心组置顶；
 // 「设置」在老板视图里也要留着：税费种认定、个人设置都是老板自己要看的东西（公司信息通过顶部公司管理进入）
-export type BossGroup = '每天' | '每月' | '复盘' | '设置'
+export type BossGroup = '每月' | '每天' | '复盘' | '设置'
 
 export interface NavItem {
   path?: string
@@ -111,16 +113,15 @@ export interface NavItem {
 // 按用户工作阶段分组：日常协同 → 账务处理 → 周期核算 → 低频工具。
 // 不按系统模块堆功能，避免出现“财务工具”这类混合分类。
 export const NAV_ITEMS: NavItem[] = [
-  // 日常协同（以 AI 会计为核心）
+  // 日常协同（以 AI CFO 为核心）
   { path: '/', label: '工作台', bossLabel: '工作台', bossGroup: '每天', icon: 'ri-dashboard-3-line', group: '日常' },
-  { path: '/copilot', label: 'AI 会计', bossGroup: '每天', icon: 'ri-sparkling-fill', group: '日常' },
+  { path: '/copilot', label: 'AI CFO', bossGroup: '每天', icon: 'ri-chat-3-line', group: '日常' },
   { path: '/todos', label: '待办', bossGroup: '每天', icon: 'ri-checkbox-circle-line', group: '日常' },
-  { path: '/private-expenses', label: '小私账', bossLabel: '小私账', bossGroup: '每天', icon: 'ri-wallet-3-line', group: '日常', workspace: ['boss'] },
 
   // 账务处理（原始单据 → 流水 → 凭证 → 账簿）
   { path: '/ledger', label: '经营账本', icon: 'ri-book-open-line', group: '账务', workspace: ['accounting'] },
   { path: '/invoices', label: '发票台账', icon: 'ri-receipt-line', group: '账务', workspace: ['accounting'] },
-  { path: '/bank', label: '银行流水', icon: 'ri-bank-line', group: '账务', workspace: ['accounting'] },
+  { path: '/bank', label: '银行流水', bossLabel: '资金流水', bossGroup: '每天', icon: 'ri-bank-line', group: '账务' },
   {
     label: '凭证与账簿',
     icon: 'ri-file-list-3-line',
@@ -136,6 +137,7 @@ export const NAV_ITEMS: NavItem[] = [
   },
 
   // 周期核算（月末结账与季末税报）
+  // 工资薪金不再占老板视图顶层导航：老板操作收敛到「月度结账（/closing-wizard）」核对确认，会计视图收敛于「专项核算 -> 薪酬管理」
   { path: '/closing-wizard', label: '月度结账', bossGroup: '每月', icon: 'ri-calendar-check-line', group: '周期' },
   { path: '/tax-filing', label: '税务申报', bossLabel: '报税', bossGroup: '每月', icon: 'ri-file-shield-2-line', group: '周期' },
   { path: '/reports', label: '经营报表', bossLabel: '经营', bossGroup: '复盘', icon: 'ri-bar-chart-box-line', group: '周期' },
@@ -150,7 +152,7 @@ export const NAV_ITEMS: NavItem[] = [
     children: [
       { path: '/assets', label: '长期资产', icon: 'ri-archive-line' },
       { path: '/rd-expenses', label: '研发费用', icon: 'ri-flask-line', workspace: ['accounting'] },
-      { path: '/mine/salary', label: '薪酬管理', icon: 'ri-coins-line' },
+      { path: '/mine/salary', label: '薪酬管理', bossLabel: '工资薪金', icon: 'ri-coins-line' },
       { path: '/private-expenses', label: '老板私账', icon: 'ri-wallet-3-line', workspace: ['accounting'] },
       { path: '/aggregation', label: '归集与分摊', icon: 'ri-node-tree', workspace: ['accounting'] },
     ],
@@ -164,6 +166,7 @@ export const NAV_ITEMS: NavItem[] = [
     bossGroup: '设置',
     children: [
       { path: '/tax-registration', label: '税费种认定', icon: 'ri-government-line' },
+      { path: '/mine/audit-share', label: '专家协审', icon: 'ri-shield-check-line' },
       { path: '/mine/accounts', label: '会计科目', icon: 'ri-node-tree', workspace: ['accounting'] },
       { path: '/mine/contacts', label: '往来单位', icon: 'ri-contacts-book-line', workspace: ['accounting'] },
       { path: '/mine/opening', label: '期初建账', icon: 'ri-calendar-check-line', workspace: ['accounting'] },
@@ -177,7 +180,7 @@ export const NAV_ITEMS: NavItem[] = [
 // AI 功能场景的中文标签：对应后端 llm_usage 埋点的 scene 字段（services/llm.py）。
 // 个人设置页「AI 用量」与管理后台用量页共用，新增 scene 时两处一起生效。
 export const AI_SCENE_LABELS: Record<string, string> = {
-  agent_chat: 'AI 会计对话',
+  agent_chat: 'AI CFO 对话',
   copilot: '经营助手',
   invoice_ocr: '单据识别',
   classify: '智能分类',

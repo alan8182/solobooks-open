@@ -19,7 +19,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
-from core.money import ZERO, money
+from core.money import ZERO, money, money_text
 from services import business_income_iit_service, company_entity_service, filing_deadline_service, headcount_service
 from services.tax_filing_export_service import build_statement_data, parse_period
 from services.vat_filing_service import VAT_REVENUE_ACCOUNTS, build_small_scale_vat_assist
@@ -394,12 +394,15 @@ def _checklist(
     entity_type: str = "ltd",
     cit_applicable: bool = True,
     active_groups: Optional[set] = None,
+    social_months: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """申报事项清单（不含 vat/cit 两个主表，它们单独成节）。
 
     `active_groups` 为税费种认定表里出现过的申报表组；为 None 表示公司还没同步
     认定表，按内置清单全量展示。同步过之后，认定表里没有的税种不再出现在清单里
     ——否则用户刚把不需要的税种去掉，页面上又冒出来一条待办。
+    `social_months` 为该年已计提社保的月份（salary_service 口径），按月展开社保费事项；
+    认定表分组里没有社保，所以不受 active_groups 裁剪。
     """
     items: List[Dict[str, Any]] = []
     year = int(period[:4]) if period[:4].isdigit() else date.today().year
@@ -443,6 +446,37 @@ def _checklist(
                     "needsEmployeeSetup": needs_employee_setup,
                     "actionPath": "/mine/salary" if needs_employee_setup else None,
                     "actionLabel": "去录入员工" if needs_employee_setup else None,
+                }
+            )
+    if social_months:
+        # 社保费按月申报：只展开已计提社保的月份（口径同 expected_schedule）
+        q_num = int(quarter[-1])
+        first_month = (q_num - 1) * 3 + 1
+        for month_no in range(first_month, first_month + 3):
+            month_key = f"{year}-{month_no:02d}"
+            totals = social_months.get(month_key)
+            if not totals:
+                continue
+            company_ss = _d2(totals.get("company"))
+            personal_ss = _d2(totals.get("personal"))
+            amounts = (
+                f"¥{money_text(company_ss + personal_ss)}（单位 ¥{money_text(company_ss)} + "
+                f"个人代扣 ¥{money_text(personal_ss)}，不含公积金）"
+            )
+            paid = bool(totals.get("ssPaid"))
+            items.append(
+                {
+                    "taxKind": "social_insurance",
+                    "itemPeriod": month_key,
+                    "name": f"{filing_deadline_service.TAX_KINDS['social_insurance']['name']}（{month_no} 月）",
+                    "guide": filing_deadline_service.TAX_KINDS["social_insurance"]["guide"],
+                    "hint": (
+                        f"工资表已计提社保 {amounts}。"
+                        + ("缴社保凭证已入账，确认电子税务局申报状态后办结。" if paid
+                           else "到电子税务局申报缴款后，回工资表记录缴社保凭证。")
+                    ),
+                    "actionPath": None if paid else "/mine/salary",
+                    "actionLabel": None if paid else "去工资表",
                 }
             )
     if entity_type != "ltd" and _enabled("business_income_iit_prepay"):
@@ -508,6 +542,16 @@ async def build_filing_package(
     package_period = quarter if is_quarter else period
     period_type = "quarter" if is_quarter else "month"
 
+    # 税号是申报作业包和报送报表的必填项：宁可拦在生成前，也不让用户在
+    # 电子税务局发现表头空着。新公司允许先建账，但报税前必须补填。
+    from services.account_service import get_company
+
+    company = await get_company(company_id) or {}
+    if not str(company.get("taxId") or "").strip():
+        raise ValueError(
+            "缺少统一社会信用代码（纳税人识别号）：请先到「主体管理」补填，再生成申报作业包"
+        )
+
     # 权威分录整包只取一次：vat/cit/cross_check/deduction 四段共享
     # （原实现每段各自全量加载+序列化一遍，申报包一次请求四倍开销）
     authoritative_entries = await _authoritative_entries(company_id)
@@ -537,6 +581,16 @@ async def build_filing_package(
     registrations = await tax_registration_service.list_registrations(company_id)
     active_groups = {reg["returnGroup"] for reg in registrations} or None
 
+    # 社保费事项：清单展开与征期物化共用同一信号
+    social_months: Dict[str, Dict[str, Any]] = {}
+    try:
+        from services import salary_service
+
+        social_year = int(quarter[:4]) if quarter[:4].isdigit() else date.today().year
+        social_months = await salary_service.social_insurance_month_summary(company_id, social_year)
+    except Exception:  # noqa: BLE001 —— 工资表查询失败只少一张提示卡，不拖垮作业包
+        logger.exception("social insurance month summary failed company=%s", company_id)
+
     # 征期状态（物化后读取）
     try:
         await filing_deadline_service.refresh_deadlines(company_id)
@@ -549,13 +603,23 @@ async def build_filing_package(
     def _item_state(tax_kind: str, item_period: Optional[str] = None) -> Dict[str, Any]:
         row = by_key.get((tax_kind, item_period or quarter))
         if row:
+            evidence_data = row.get("filedEvidence") or {}
             return {
                 "deadlineId": row["id"],
                 "status": row["status"],
                 "dueDate": row["dueDate"],
                 "daysLeft": row["daysLeft"],
+                "filedAt": row.get("filedAt"),
+                "filedEvidence": evidence_data,
             }
-        return {"deadlineId": None, "status": "untracked", "dueDate": None, "daysLeft": None}
+        return {
+            "deadlineId": None,
+            "status": "untracked",
+            "dueDate": None,
+            "daysLeft": None,
+            "filedAt": None,
+            "filedEvidence": None,
+        }
 
     # 增值税征期随公司申报周期：月报公司取该季度末月，季报公司取季度期间
     # 周期以税费种认定表为准（公司档案只是未同步前的兜底）
@@ -640,6 +704,7 @@ async def build_filing_package(
                 entity_type=entity_type,
                 cit_applicable=cit_applicable,
                 active_groups=active_groups,
+                social_months=social_months,
             )
         ],
         "summary": {
@@ -662,6 +727,24 @@ async def mark_item_filed(
     evidence: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """清单项/税种完成（含回执归档信息）。"""
+    from db.models import FilingDeadline
+    from db.session import session_scope
+    from sqlalchemy import select
+
+    evidence_dict = dict(evidence or {})
+    async with session_scope() as session:
+        row = (
+            await session.execute(
+                select(FilingDeadline).where(
+                    FilingDeadline.id == deadline_id,
+                    FilingDeadline.company_id == company_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            raise ValueError("征期记录不存在")
+
     return await filing_deadline_service.mark_filed(
-        company_id, user_id, deadline_id, evidence=evidence
+        company_id, user_id, deadline_id, evidence=evidence_dict
     )
+

@@ -5,12 +5,13 @@ import { accountingErrorText } from '@/utils/errors'
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
-  NButton, NCard, NInputNumber, NPopconfirm, NSelect, NSpin, NSwitch, NTag, NTooltip, useMessage,
+  NAlert, NButton, NCard, NInputNumber, NPopconfirm, NSelect, NSpin, NSwitch, NTag, NTooltip, useMessage,
 } from 'naive-ui'
 import apiClient from '@/api/client'
 import { useAuthStore } from '@/stores/auth'
 import { useWorkspaceViewStore } from '@/stores/workspaceView'
 import BossTaxCheatSheet from '@/components/business/BossTaxCheatSheet.vue'
+import GuideTrigger from '@/components/business/GuideTrigger.vue'
 import { SoloSkeleton } from '@/components/ui'
 import {
   FILING_CARD_ORDER,
@@ -41,6 +42,7 @@ interface DeadlineInfo {
   status: string
   dueDate: string | null
   daysLeft: number | null
+  filedAt?: string | null
 }
 interface ChecklistItem {
   taxKind: string
@@ -56,6 +58,7 @@ interface ChecklistItem {
   actionPath?: string | null
   actionLabel?: string | null
   itemPeriod?: string
+  filedAt?: string | null
 }
 interface CrossDiff {
   code: string
@@ -204,6 +207,8 @@ if (queryPeriod && !periodOptions.value.some(o => o.value === queryPeriod)) {
 const period = ref(queryPeriod || (vatCycle.value === 'month' ? defaultMonth : defaultQuarter))
 const loading = ref(false)
 const pkg = ref<Package | null>(null)
+// 未填税号时后端会拒绝生成申报作业包：单独渲染阻断页，而不是只弹一条 toast 留白屏
+const taxIdMissing = ref(false)
 const filingBusy = ref('')
 const hideZeroFields = ref(true)
 
@@ -225,14 +230,28 @@ const cardTitleMap: Record<FilingCardKey, string> = {
 
 async function load() {
   loading.value = true
+  taxIdMissing.value = false
   try {
     const data = await apiClient.get(`/api/tax-filing/packages/${period.value}`)
     pkg.value = data as unknown as Package
   } catch (err) {
-    message.error(accountingErrorText(err))
+    const detail = accountingErrorText(err)
+    if (detail.includes('统一社会信用代码')) {
+      taxIdMissing.value = true
+    } else {
+      message.error(detail)
+    }
   } finally {
     loading.value = false
   }
+}
+
+function goFixTaxId() {
+  const companyId = authStore.currentCompanyId
+  router.push({
+    path: '/mine/companies',
+    query: companyId ? { edit: companyId } : undefined,
+  })
 }
 
 async function handlePeriodChange() {
@@ -695,7 +714,7 @@ const switcherCards = computed(() => {
       metric: otherSummary.pendingCount > 0
         ? `待确认 ${otherSummary.pendingCount} 项`
         : `${otherSummary.resolvedCount}/${otherSummary.totalCount} 已确认`,
-      sub: '印花税 · 个税扣缴等',
+      sub: '印花税 · 个税 · 社保等',
       tag: otherTag,
       isDone: otherSummary.status === 'filed' || otherSummary.status === 'waived',
     },
@@ -720,7 +739,9 @@ function startFilingFromOverview() {
   activeCard.value = nextPendingFromOverview.value ?? 'vat'
 }
 
-onMounted(load)
+onMounted(async () => {
+  await load()
+})
 
 // 从别的标签切回来时静默重拉，避免对着旧数字干活
 usePageRefresh(load)
@@ -790,6 +811,13 @@ usePageRefresh(load)
       </div>
       <SoloSkeleton variant="card" :rows="4" />
       <SoloSkeleton variant="card" :rows="3" />
+    </div>
+
+    <div v-else-if="taxIdMissing" class="tax-id-blocker">
+      <NAlert type="error" title="缺少统一社会信用代码（纳税人识别号）">
+        申报作业包和财务报表报送都需要税号。请先到「主体管理」补填，再回来申报。
+      </NAlert>
+      <NButton type="primary" @click="goFixTaxId">去补填税号</NButton>
     </div>
 
     <NSpin v-else :show="loading">
@@ -1671,6 +1699,7 @@ usePageRefresh(load)
                       </template>
                       逐项确认印花税、个人所得税代扣代缴及当季特定申报事项，无税源事项可直接办结
                     </NTooltip>
+                    <GuideTrigger guide="iit" label="个税怎么申报？" />
                   </div>
                 </div>
               </div>
@@ -1718,7 +1747,7 @@ usePageRefresh(load)
                     class="other-hint-action"
                     @click="router.push(item.actionPath)"
                   >
-                    <i class="ri-user-add-line" />&nbsp;{{ item.actionLabel || '去处理' }}
+                    <i :class="item.needsEmployeeSetup ? 'ri-user-add-line' : 'ri-arrow-right-line'" />&nbsp;{{ item.actionLabel || '去处理' }}
                   </NButton>
                 </div>
 
@@ -1734,7 +1763,7 @@ usePageRefresh(load)
                       size="small"
                       type="primary"
                       :loading="filingBusy === item.deadlineId"
-                      @click="markFiled(item.deadlineId, item.name, item.taxKind === 'stamp_duty')"
+                      @click="markFiled(item.deadlineId, item.name)"
                     >
                       标记办结
                     </NButton>
@@ -1773,10 +1802,21 @@ usePageRefresh(load)
         </template>
       </template>
     </NSpin>
+
+
   </div>
 </template>
 
 <style scoped>
+/* 缺税号阻断页：不渲染申报卡片，先把补填入口给到用户 */
+.tax-id-blocker {
+  max-width: 620px;
+  margin: 48px auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 16px;
+}
 /* 首次加载骨架：先按真实布局摆出「一排步骤卡 + 两块内容卡」*/
 .tax-skeleton {
   display: flex;
@@ -1833,7 +1873,7 @@ usePageRefresh(load)
 }
 
 .tax-filing-page {
-  max-width: 1160px;
+  max-width: var(--page-width);
   margin: 0 auto;
   padding-bottom: 32px;
   width: 100%;
@@ -2676,7 +2716,7 @@ usePageRefresh(load)
   margin-left: auto;
 }
 .task-done-badge {
-  color: #0f7354;
+  color: var(--solo-primary, #0f7354);
   font-weight: 600;
   font-size: 13px;
 }
@@ -2801,4 +2841,5 @@ usePageRefresh(load)
   margin-bottom: 0;
   color: var(--solo-text-muted, #636e7c);
 }
+
 </style>

@@ -406,7 +406,7 @@ usePageRefresh(() => entryStore.fetchEntries())
     <div class="page-header">
       <div>
         <h2>经营账本</h2>
-        <p>流水清晰可查，所有账目均由 AI 会计实时分类归集</p>
+        <p>流水清晰可查，所有账目均由 AI CFO 实时分类归集</p>
       </div>
       <NSpace>
         <NButton :disabled="filteredEntries.length === 0" @click="handleExportExcel">
@@ -572,7 +572,7 @@ usePageRefresh(() => entryStore.fetchEntries())
             <template #action>
               <NButton v-if="hasActiveFilters" @click="resetFilters">清除筛选</NButton>
               <NButton v-else type="primary" @click="router.push('/copilot')">
-                <template #icon><i class="ri-sparkling-fill" /></template>
+                <template #icon><i class="ri-chat-3-line" /></template>
                 AI 记第一笔
               </NButton>
             </template>
@@ -586,7 +586,7 @@ usePageRefresh(() => entryStore.fetchEntries())
 <style scoped>
 .ledger-page {
   width: 100%;
-  max-width: 1180px;
+  max-width: var(--page-width);
   margin: 0 auto;
 }
 

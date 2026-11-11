@@ -24,6 +24,21 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+@pytest.fixture(autouse=True)
+def _isolated_archive_dir(monkeypatch, tmp_path):
+    """归档产物一律写进临时目录（D-013 防再犯）。
+
+    此前测试触发 build_archive 时直接往真实 backend/data/archives 写文件，
+    本地已累积数百个测试产物。服务在调用时才解析模块常量 ARCHIVE_DIR，
+    monkeypatch 模块属性即可让所有测试路径生效。
+    """
+    from services import backup_archive_service
+
+    target = tmp_path / "archives"
+    target.mkdir()
+    monkeypatch.setattr(backup_archive_service, "ARCHIVE_DIR", target)
+
+
 @pytest.fixture
 def client():
     """FastAPI TestClient isolated from pytest-asyncio event loops."""

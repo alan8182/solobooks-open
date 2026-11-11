@@ -105,4 +105,14 @@ AGE_IDENTITY_FILE=/secure/age-key.txt ./restore-drill.sh backups/solobooks-....d
 - `REVIEW_REQUIRED`：maker-checker 模式由不同人员复核。
 - `STEP_UP_REQUIRED`：重新发送短信验证码；token 单次使用、限定公司和动作、5 分钟有效。
 
+## 发生额与报表取数口径
+
+余额与发生额是两套口径，消费方必须对齐，不得各写一套：
+
+- **余额**：全口径净额。已过账（posted）与已冲销（reversed）凭证全部参与，冲销对借贷自相抵，净额恒正确。
+- **聚合发生额**（月度汇总 `get_balance_summary`、账簿册 `build_ledger_book` 余额表/明细账合计/总账、结账检查「账账核对」）：**剔除同期间冲销对**——被冲销原凭证与其冲销凭证落在同一 `period_start` 时两张都不计入；跨期冲销保留（是更正当期的真实动作）。共享实现在 `services/reversal_pairs.py::same_period_reversal_exclusions`，两边由 parity 测试锁定一致。
+- **行级账簿**（明细账/序时账/日记账的逐凭证行）：完整留痕，不剔除。因此冲销重记当月，明细行合计会大于聚合发生额，这是口径设计而不是错账。
+- **报表发生额**（申报财务报表/利润表，`tax_filing_export_service`）：期初凭证（`entryType=opening`）与其冲销凭证都不进发生额，期初数由「期初余额映射」代替；YTD 过渡凭证只计「已过账」的，且利润表本年累计按**方向毛额**读取（收入取贷方累计、费用取借方累计——原账本每月结转损益时损益科目净额为 0）。资产负债表权益（`profit_ytd_net`）保持净额口径，避免与用户期初挂账的 3103/3104 重复计入。
+- 冲销凭证的识别：metadata `reversalOf`（dict）/ `reversal_of_id` 列（ORM）；期初凭证 id 前缀 `opening-{company_id}-{year}[-gN][-ytd]`。
+
 所有人工调整必须写明原因和请求 ID，审计事件不得更新或删除。

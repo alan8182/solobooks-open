@@ -329,11 +329,11 @@ onMounted(async () => {
             <span class="scene-tokens">{{ formatTokens(row.totalTokens) }}</span>
           </div>
         </div>
-        <div v-else class="usage-empty">本月还没有 AI 使用记录，去「AI 会计」试试连续记账吧。</div>
+        <div v-else class="usage-empty">本月还没有 AI 使用记录，去「AI CFO」试试连续记账吧。</div>
 
         <div class="profile-tip">
           <i class="ri-information-line" />
-          统计口径：自然月内本人全部 AI 功能（AI 会计对话、智能记账、单据识别、报表洞察等）的
+          统计口径：自然月内本人全部 AI 功能（AI CFO 对话、智能记账、单据识别、报表洞察等）的
           token 消耗，跨账套合并计算；语音与图片识别按调用次数计。
         </div>
       </NSpin>
@@ -542,7 +542,7 @@ onMounted(async () => {
 
 <style scoped>
 .mine-page {
-  max-width: 760px;
+  max-width: var(--page-width-narrow);
   margin: 0 auto;
   padding: 8px 16px 48px;
 }

@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import StaticPool
 
 from core.errors import AccountingError, ENTRY_BEFORE_START_DATE, ENTRY_POSTED_IMMUTABLE, PERIOD_CLOSED
-from core.money import money, money_text
+from core.money import ZERO, money, money_text
 from db.base import Base
 from db.models import (
     AccountingPeriod,
@@ -22,9 +22,11 @@ from db.models import (
     Company,
     CompanyMember,
     ChartAccount,
+    Invoice,
     JournalEntry,
     JournalLine,
     LegacyEntryProjection,
+    Partner,
     ReconciliationLink,
     SourceTransaction,
 )
@@ -51,7 +53,12 @@ from services.accounting_core_service import (
     update_draft,
 )
 from services.opening_balance_service import get_opening_balances, save_opening_balances
-from services.bank_service import import_statements_core
+from services.bank_service import (
+    _STATEMENT_ORDER,
+    build_balance_reconciliation,
+    import_statements_core,
+    normalize_bank_reference,
+)
 from services.bank_settlement_service import confirm_statement_match
 from services.rd_service import correct_unallocated_entry, create_project, rd_reconciliation_summary
 
@@ -69,7 +76,8 @@ async def accounting_sessions():
             "id TEXT PRIMARY KEY, company_id TEXT NOT NULL, transaction_date TEXT NOT NULL, "
             "description TEXT NOT NULL, amount NUMERIC(20,2) NOT NULL, "
             "balance NUMERIC(20,2) NOT NULL, statement_id TEXT NOT NULL, "
-            "matched_entry_id TEXT, description_normalized INTEGER NOT NULL, created_at TEXT NOT NULL)"
+            "matched_entry_id TEXT, description_normalized INTEGER NOT NULL, created_at TEXT NOT NULL, "
+            "transaction_reference TEXT, source_row_index INTEGER)"
         )
         await connection.exec_driver_sql(
             "CREATE TABLE bank_statement_matches (statement_id TEXT, company_id TEXT, entry_id TEXT, "
@@ -183,6 +191,337 @@ async def test_bank_import_rolls_back_bank_source_and_audit_together(accounting_
         assert (await session.execute(select(SourceTransaction))).scalars().all() == []
         assert (await session.execute(select(AuditEvent))).scalars().all() == []
         assert (await session.execute(text("SELECT count(*) FROM bank_statements"))).scalar_one() == 0
+
+
+# 中国银行 2026-05 真实流水：2026-05-17 14:02:48 一秒内连发三笔 -4.50 手续费，
+# 日期/摘要/金额完全相同，只有交易后余额与流水号不同。旧去重键（日期+摘要+金额）
+# 把它们折叠成一笔，用户只看到「自动过滤 2 条重复流水」＝凭空少记两笔费用。
+FEE_ROW_BALANCES = ["3241.00", "2736.50", "2332.00"]
+
+
+def _fee_rows(balances=None):
+    return [
+        {
+            "transaction_date": "2026-05-17 14:02:48",
+            "description": "收费 | 对公跨行转账汇款手续费",
+            "amount": "-4.50",
+            "balance": balance,
+        }
+        for balance in (balances or FEE_ROW_BALANCES)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_same_day_same_amount_fees_with_different_balance_all_import(accounting_sessions):
+    async with accounting_sessions() as session:
+        async with session.begin():
+            result = await import_statements_core(
+                session,
+                company_id="c-bank-fee-dedup",
+                user_id="owner-fee-dedup",
+                rows=_fee_rows(),
+                statement_id="202605银行流水.xls",
+                request_id="req-fee-dedup",
+            )
+    assert result["imported"] == 3
+    assert result["skipped"] == 0
+    assert result["errors"] == 0
+
+
+@pytest.mark.asyncio
+async def test_identical_balance_row_is_the_only_real_duplicate(accounting_sessions):
+    """余额也相同才是同一笔：重传同一文件仍应被拦下，不能放开成重复入账。"""
+    async with accounting_sessions() as session:
+        async with session.begin():
+            await import_statements_core(
+                session,
+                company_id="c-bank-fee-again",
+                user_id="owner-fee-again",
+                rows=_fee_rows(),
+                statement_id="batch-a",
+                request_id="req-fee-again-1",
+            )
+        async with session.begin():
+            again = await import_statements_core(
+                session,
+                company_id="c-bank-fee-again",
+                user_id="owner-fee-again",
+                rows=_fee_rows(),
+                statement_id="batch-b",
+                request_id="req-fee-again-2",
+            )
+    assert again["imported"] == 0
+    assert again["skipped"] == 3
+    assert "余额" in again["skippedDetails"][0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_source_without_balance_still_dedupes_on_date_desc_amount(accounting_sessions):
+    """无余额列的源（余额恒为 0）行为不变：同日同额同摘要仍按重复拦截。"""
+    rows = [
+        {
+            "transaction_date": "2026-05-17",
+            "description": "收费 | 对公跨行转账汇款手续费",
+            "amount": "-4.50",
+        }
+        for _ in range(3)
+    ]
+    async with accounting_sessions() as session:
+        async with session.begin():
+            result = await import_statements_core(
+                session,
+                company_id="c-bank-no-balance",
+                user_id="owner-no-balance",
+                rows=rows,
+                statement_id="batch-nb",
+                request_id="req-no-balance",
+            )
+    assert result["imported"] == 1
+    assert result["skipped"] == 2
+
+
+@pytest.mark.asyncio
+async def test_dedup_matches_date_only_rows_when_import_gains_time(accounting_sessions):
+    """历史行只存到日期，新导入带时分秒：按前 10 位比日期，同一笔不能重复入账。"""
+    async with accounting_sessions() as session:
+        async with session.begin():
+            await import_statements_core(
+                session,
+                company_id="c-bank-time-upgrade",
+                user_id="owner-time-upgrade",
+                rows=[{
+                    "transaction_date": "2026-05-20",
+                    "description": "网上支付 | 稿费 (对方: 于天鹏)",
+                    "amount": "-700.00",
+                    "balance": "225.00",
+                }],
+                statement_id="batch-old",
+                request_id="req-time-upgrade-1",
+            )
+        async with session.begin():
+            upgraded = await import_statements_core(
+                session,
+                company_id="c-bank-time-upgrade",
+                user_id="owner-time-upgrade",
+                rows=[{
+                    "transaction_date": "2026-05-20 21:46:46",
+                    "description": "网上支付 | 稿费 (对方: 于天鹏)",
+                    "amount": "-700.00",
+                    "balance": "225.00",
+                }],
+                statement_id="batch-new",
+                request_id="req-time-upgrade-2",
+            )
+    assert upgraded["imported"] == 0
+    assert upgraded["skipped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_same_reference_is_the_same_transaction_even_when_balance_differs(accounting_sessions):
+    """流水号是银行给的身份：同号即同一笔，余额对不上也只能是解析问题了。"""
+    rows = [
+        {"transaction_date": "2026-05-20 21:46:46", "description": "收费 | 手续费",
+         "amount": "-4.50", "balance": "220.50", "transaction_reference": "259755500976"},
+        {"transaction_date": "2026-05-20 21:46:46", "description": "收费 | 手续费",
+         "amount": "-4.50", "balance": "999.99", "transaction_reference": "259755500976"},
+    ]
+    async with accounting_sessions() as session:
+        async with session.begin():
+            result = await import_statements_core(
+                session,
+                company_id="c-bank-ref-same",
+                user_id="owner-ref-same",
+                rows=rows,
+                statement_id="batch-ref-same",
+                request_id="req-ref-same",
+            )
+    assert result["imported"] == 1
+    assert result["skipped"] == 1
+    assert "交易流水号" in result["skippedDetails"][0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_different_reference_with_identical_fingerprint_both_import(accounting_sessions):
+    """有号时号是权威：哪怕指纹一模一样，不同号就是两笔真实交易。"""
+    rows = [
+        {"transaction_date": "2026-05-17 14:02:48", "description": "收费 | 手续费",
+         "amount": "-4.50", "balance": "0", "transaction_reference": "178223308989"},
+        {"transaction_date": "2026-05-17 14:02:48", "description": "收费 | 手续费",
+         "amount": "-4.50", "balance": "0", "transaction_reference": "178242294986"},
+    ]
+    async with accounting_sessions() as session:
+        async with session.begin():
+            result = await import_statements_core(
+                session,
+                company_id="c-bank-ref-diff",
+                user_id="owner-ref-diff",
+                rows=rows,
+                statement_id="batch-ref-diff",
+                request_id="req-ref-diff",
+            )
+    assert result["imported"] == 2
+    assert result["skipped"] == 0
+
+
+@pytest.mark.asyncio
+async def test_reference_import_still_dedupes_legacy_row_without_reference(accounting_sessions):
+    """库中历史行没有号时，带号重导必须回落到复合键，不能重复入账。"""
+    legacy = {
+        "transaction_date": "2026-05-20",
+        "description": "网上支付 | 稿费 (对方: 于天鹏)",
+        "amount": "-700.00",
+        "balance": "225.00",
+    }
+    upgraded = {**legacy, "transaction_date": "2026-05-20 21:46:46",
+                "transaction_reference": "259755500978"}
+    async with accounting_sessions() as session:
+        async with session.begin():
+            await import_statements_core(
+                session, company_id="c-bank-ref-legacy", user_id="owner-ref-legacy",
+                rows=[legacy], statement_id="batch-legacy", request_id="req-ref-legacy-1",
+            )
+        async with session.begin():
+            again = await import_statements_core(
+                session, company_id="c-bank-ref-legacy", user_id="owner-ref-legacy",
+                rows=[upgraded], statement_id="batch-legacy-2", request_id="req-ref-legacy-2",
+            )
+    assert again["imported"] == 0
+    assert again["skipped"] == 1
+    assert "余额" in again["skippedDetails"][0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_reference_row_is_not_reimported_when_source_loses_reference(accounting_sessions):
+    """反向兼容：库中有号、新导入无号（导出格式退化）也不能重复入账。"""
+    row = {
+        "transaction_date": "2026-05-20 21:46:46",
+        "description": "网上支付 | 稿费 (对方: 于天鹏)",
+        "amount": "-700.00",
+        "balance": "225.00",
+    }
+    async with accounting_sessions() as session:
+        async with session.begin():
+            await import_statements_core(
+                session, company_id="c-bank-ref-lost", user_id="owner-ref-lost",
+                rows=[{**row, "transaction_reference": "259755500978"}],
+                statement_id="batch-ref-lost", request_id="req-ref-lost-1",
+            )
+        async with session.begin():
+            again = await import_statements_core(
+                session, company_id="c-bank-ref-lost", user_id="owner-ref-lost",
+                rows=[row], statement_id="batch-ref-lost-2", request_id="req-ref-lost-2",
+            )
+    assert again["imported"] == 0
+    assert again["skipped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_same_reference_with_different_amount_is_flagged_for_review(accounting_sessions):
+    """同号却换了金额：拦下，并且不能只说"重复"——要提示核对流水号。"""
+    async with accounting_sessions() as session:
+        async with session.begin():
+            await import_statements_core(
+                session, company_id="c-bank-ref-conflict", user_id="owner-ref-conflict",
+                rows=[{"transaction_date": "2026-05-20 21:46:46", "description": "收费 | 手续费",
+                       "amount": "-4.50", "balance": "220.50",
+                       "transaction_reference": "259755500976"}],
+                statement_id="batch-ref-conflict", request_id="req-ref-conflict-1",
+            )
+        async with session.begin():
+            conflict = await import_statements_core(
+                session, company_id="c-bank-ref-conflict", user_id="owner-ref-conflict",
+                rows=[{"transaction_date": "2026-05-20 21:46:46", "description": "收费 | 手续费",
+                       "amount": "-9.90", "balance": "215.10",
+                       "transaction_reference": "259755500976"}],
+                statement_id="batch-ref-conflict-2", request_id="req-ref-conflict-2",
+            )
+    assert conflict["imported"] == 0
+    assert conflict["skipped"] == 1
+    assert "不一致" in conflict["skippedDetails"][0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_same_second_rows_follow_file_order_and_balance_chain(accounting_sessions):
+    """真实 202605 中国银行流水：同一秒六笔按文件行序还原，余额链必须闭合。
+
+    旧实现用 "id 倒序" 当同秒 tie-break，会把六笔倒着算，期初/期末全错；
+    这里用 13 笔真实数据的完整余额链做验收。
+    """
+    rows = [
+        ("2026-05-20 21:46:46", "-700.00", "225.00", "259755500978"),
+        ("2026-05-20 21:46:46", "-4.50", "220.50", "259755500976"),
+        ("2026-05-20 21:34:06", "-600.00", "929.50", "258561536981"),
+        ("2026-05-20 21:34:06", "-4.50", "925.00", "258561536979"),
+        ("2026-05-20 09:09:10", "-350.00", "1534.00", "134712032984"),
+        ("2026-05-20 09:09:10", "-4.50", "1529.50", "134712032982"),
+        ("2026-05-18 16:05:49", "-448.00", "1884.00", "201487390985"),
+        ("2026-05-17 14:02:48", "-350.00", "3245.50", "178234433994"),
+        ("2026-05-17 14:02:48", "-4.50", "3241.00", "178234433992"),
+        ("2026-05-17 14:02:48", "-500.00", "2741.00", "178223308991"),
+        ("2026-05-17 14:02:48", "-4.50", "2736.50", "178223308989"),
+        ("2026-05-17 14:02:48", "-400.00", "2336.50", "178242294988"),
+        ("2026-05-17 14:02:48", "-4.50", "2332.00", "178242294986"),
+    ]
+    async with accounting_sessions() as session:
+        async with session.begin():
+            result = await import_statements_core(
+                session,
+                company_id="c-bank-order",
+                user_id="owner-order",
+                rows=[
+                    {
+                        "transaction_date": txn_date,
+                        "description": "收费 | 对公跨行转账汇款手续费" if amount == "-4.50" else "小额普通 | 稿费",
+                        "amount": amount,
+                        "balance": balance,
+                        "transaction_reference": reference,
+                        "source_row_index": index,
+                    }
+                    for index, (txn_date, amount, balance, reference) in enumerate(rows)
+                ],
+                statement_id="202605银行流水.xls",
+                request_id="req-bank-order",
+            )
+            assert result["imported"] == 13 and result["skipped"] == 0
+            ordered = (await session.execute(text(
+                "SELECT * FROM bank_statements WHERE company_id = :c ORDER BY " + _STATEMENT_ORDER
+            ), {"c": "c-bank-order"})).mappings().all()
+
+    assert [(row["transaction_date"], money_text(row["balance"])) for row in ordered] == [
+        ("2026-05-17 14:02:48", "3245.50"),
+        ("2026-05-17 14:02:48", "3241.00"),
+        ("2026-05-17 14:02:48", "2741.00"),
+        ("2026-05-17 14:02:48", "2736.50"),
+        ("2026-05-17 14:02:48", "2336.50"),
+        ("2026-05-17 14:02:48", "2332.00"),
+        ("2026-05-18 16:05:49", "1884.00"),
+        ("2026-05-20 09:09:10", "1534.00"),
+        ("2026-05-20 09:09:10", "1529.50"),
+        ("2026-05-20 21:34:06", "929.50"),
+        ("2026-05-20 21:34:06", "925.00"),
+        ("2026-05-20 21:46:46", "225.00"),
+        ("2026-05-20 21:46:46", "220.50"),
+    ]
+
+    reconciliation = build_balance_reconciliation([dict(row) for row in ordered], ZERO)
+    assert money_text(reconciliation["opening_balance"]) == "3595.50"
+    assert money_text(reconciliation["bank_closing_balance"]) == "220.50"
+    assert money_text(reconciliation["expense_total"]) == "3375.00"
+    assert money_text(reconciliation["flow_difference"]) == "0.00"
+    assert reconciliation["flow_balanced"] is True
+
+
+def test_normalize_bank_reference_rejects_unusable_values():
+    assert normalize_bank_reference("  259755500978 ") == "259755500978"
+    assert normalize_bank_reference(178234433994) == "178234433994"
+    assert normalize_bank_reference("259755500999999.0") == "259755500999999"
+    # 25 位大数已被浮点摧毁（Excel/JSON 双重精度损失），宁可当没有
+    assert normalize_bank_reference("2.5975550099999998e+24") == ""
+    assert normalize_bank_reference(1e25) == ""
+    assert normalize_bank_reference(0.5) == ""
+    assert normalize_bank_reference("000000000000") == ""
+    assert normalize_bank_reference("") == ""
+    assert normalize_bank_reference(None) == ""
 
 
 @pytest.mark.asyncio
@@ -760,6 +1099,71 @@ async def test_posted_entry_payment_status_is_tracking_only(accounting_sessions)
 
 
 @pytest.mark.asyncio
+async def test_auto_repost_rebinds_invoice_master_data(accounting_sessions):
+    """自动冲销重记后，发票主数据必须指向新凭证，并把发票号带回新凭证投影。"""
+    async with accounting_sessions() as session:
+        async with session.begin():
+            await ensure_tenant(session, "c-invoice-rebind", "owner-1")
+            await create_entry(
+                session,
+                {
+                    **sample_payload("invoice-1"),
+                    "direction": "expense",
+                    "title": "发票-深圳市腾讯计算机系统有限公司",
+                    "category": "其他支出",
+                    "sourceType": "invoice_import",
+                    "invoiceNumber": "26957000000148730058",
+                    "payer": "boss_personal",
+                    "voucherLines": {
+                        "debit": [{"accountCode": "5602999", "accountName": "管理费用-其他", "amount": "100.10"}],
+                        "credit": [{"accountCode": "2241", "accountName": "其他应付款", "amount": "100.10"}],
+                    },
+                },
+                company_id="c-invoice-rebind",
+                user_id="owner-1",
+                request_id="req-invoice-1",
+                confirm=True,
+            )
+            session.add(
+                Invoice(
+                    id="inv-rebind-1",
+                    company_id="c-invoice-rebind",
+                    entry_id="invoice-1",
+                    direction="expense",
+                    invoice_number="26957000000148730058",
+                    invoice_date=date(2026, 7, 1),
+                    seller_name="深圳市腾讯计算机系统有限公司",
+                    amount_incl_tax=Decimal("100.10"),
+                    dedup_fingerprint="26957000000148730058",
+                )
+            )
+            await session.flush()
+
+    async with accounting_sessions() as session:
+        async with session.begin():
+            reposted = await update_draft(
+                session,
+                "invoice-1",
+                {"payer": "company_account", "autoReverseRepost": True},
+                company_id="c-invoice-rebind",
+                user_id="owner-1",
+                request_id="req-invoice-2",
+            )
+            original = await get_journal(session, "invoice-1", company_id="c-invoice-rebind")
+            assert original.status == "reversed"
+            assert reposted.id != "invoice-1"
+            invoice = (
+                await session.execute(
+                    select(Invoice).where(Invoice.id == "inv-rebind-1")
+                )
+            ).scalar_one()
+            assert invoice.entry_id == reposted.id
+            projection = await session.get(LegacyEntryProjection, reposted.id)
+            assert projection is not None
+            assert json.loads(projection.payload)["invoiceNumber"] == "26957000000148730058"
+
+
+@pytest.mark.asyncio
 async def test_duplicate_bank_entry_detection_blocks_repeat_bookkeeping(accounting_sessions):
     """等额同向、日期相近的银行存款凭证应被判为重复，阻止再记一笔。"""
     from services.bank_service import find_duplicate_bank_entries
@@ -1059,6 +1463,79 @@ async def test_transaction_rollback_does_not_leave_partial_journal(accounting_se
     async with accounting_sessions() as session:
         rows = (await session.execute(select(JournalEntry))).scalars().all()
         assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_delete_draft_removes_invoice_ledger_row(accounting_sessions):
+    """删除发票凭证必须同步删除台账行。
+
+    invoices.entry_id 是 ON DELETE SET NULL：只删凭证会留下一张 entry_id 为空的
+    孤儿票，台账仍按"待过账"展示并计入汇总，而结账只读凭证又看不到它。
+    """
+    async with accounting_sessions() as session:
+        async with session.begin():
+            await create_entry(
+                session,
+                sample_payload("invoice-draft"),
+                company_id="c-invoice-delete",
+                user_id="owner",
+                request_id="create-invoice-draft",
+                confirm=False,
+            )
+            session.add(Invoice(
+                id="inv-draft",
+                company_id="c-invoice-delete",
+                entry_id="invoice-draft",
+                invoice_number="26957000000148730058",
+                dedup_fingerprint="26957000000148730058",
+            ))
+            await session.flush()
+
+            await delete_draft(
+                session,
+                "invoice-draft",
+                company_id="c-invoice-delete",
+                user_id="owner",
+                request_id="delete-invoice-draft",
+            )
+
+        invoices = (await session.execute(select(Invoice))).scalars().all()
+    assert invoices == []
+
+
+@pytest.mark.asyncio
+async def test_reimport_after_delete_revives_void_source(accounting_sessions):
+    """删除凭证后重导同一张发票不能撞 DUPLICATE_SOURCE。
+
+    delete_draft 把来源置为 void 而不删行，create_entry 若把 void 也当作已入账，
+    重新导入就会 409——前端只显示笼统的"未能成功导入发票"。
+    """
+    payload = {
+        **sample_payload("reimport-1"),
+        "source": "invoice_import",
+        "invoiceNumber": "26957000000148730058",
+        "dedupFingerprint": "26957000000148730058",
+    }
+    async with accounting_sessions() as session:
+        async with session.begin():
+            await create_entry(
+                session, payload, company_id="c-reimport", user_id="owner",
+                request_id="create-reimport-1", confirm=False,
+            )
+            await delete_draft(
+                session, "reimport-1", company_id="c-reimport", user_id="owner",
+                request_id="delete-reimport-1",
+            )
+            await create_entry(
+                session, {**payload, "id": "reimport-2"}, company_id="c-reimport",
+                user_id="owner", request_id="create-reimport-2", confirm=False,
+            )
+            sources = (await session.execute(
+                select(SourceTransaction).where(SourceTransaction.company_id == "c-reimport")
+            )).scalars().all()
+            assert len(sources) == 1
+            assert sources[0].status == "candidate"
+            assert await session.get(JournalEntry, "reimport-2") is not None
 
 
 @pytest.mark.asyncio
@@ -1947,7 +2424,7 @@ async def test_research_expense_participates_in_profit_closing(accounting_sessio
                     "voucherLines": {
                         "debit": [{
                             "accountCode": "430100101",
-                            "accountName": "研发支出-人员人工",
+                            "accountName": "研发支出-费用化支出-人员人工",
                             "amount": "500.00",
                             "rdDetail": {
                                 "projectId": "rd-1", "expenseType": "personnel",
@@ -2408,3 +2885,440 @@ async def test_inventory_transfer_closes_cost(accounting_sessions):
                 {"name": "测试公司", "taxId": "91310000TEST"},
             )
             assert stmt.profit_current["cost"] == Decimal("2500.00")
+
+
+# ── 垫付人身份落到往来单位（2241/1221 行辅助核算）────────────────────────────
+
+
+def _person_payload(
+    entry_id: str,
+    *,
+    payer: str = "boss_personal",
+    direction: str = "expense",
+    category: str = "办公费",
+    amount: str = "100.00",
+    **extra,
+) -> dict:
+    return {
+        "id": entry_id,
+        "direction": direction,
+        "amount": amount,
+        "title": "垫付测试",
+        "category": category,
+        "occurDate": "2026-07-01",
+        "sourceType": "manual",
+        "payer": payer,
+        **extra,
+    }
+
+
+async def _line_of(session, entry_id: str, account_code: str) -> JournalLine:
+    return (
+        await session.execute(
+            select(JournalLine).where(
+                JournalLine.journal_entry_id == entry_id,
+                JournalLine.account_code == account_code,
+            )
+        )
+    ).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_boss_expense_attaches_person_partner(accounting_sessions):
+    async with accounting_sessions() as session:
+        async with session.begin():
+            entry = await create_entry(
+                session,
+                _person_payload("pp-boss"),
+                company_id="c-person",
+                user_id="owner",
+                request_id="pp-boss",
+                confirm=False,
+            )
+            line = await _line_of(session, entry.id, "2241")
+            assert line.auxiliary["partner_name"] == "股东"
+            partner = await session.get(Partner, line.auxiliary["partner_id"])
+            assert partner is not None
+            assert partner.type == "person"
+            assert partner.code == "P-BOSS"
+
+
+@pytest.mark.asyncio
+async def test_employee_expense_attaches_named_person_partner(accounting_sessions):
+    async with accounting_sessions() as session:
+        async with session.begin():
+            entry = await create_entry(
+                session,
+                _person_payload("pp-employee", payer="employee_personal:张三"),
+                company_id="c-person-emp",
+                user_id="owner",
+                request_id="pp-employee",
+                confirm=False,
+            )
+            line = await _line_of(session, entry.id, "2241")
+            assert line.auxiliary["partner_name"] == "张三"
+            partner = await session.get(Partner, line.auxiliary["partner_id"])
+            assert partner.type == "person"
+            assert partner.code.startswith("P")
+
+
+@pytest.mark.asyncio
+async def test_person_partner_is_reused_across_entries(accounting_sessions):
+    async with accounting_sessions() as session:
+        async with session.begin():
+            first = await create_entry(
+                session,
+                _person_payload("pp-reuse-1"),
+                company_id="c-person-reuse",
+                user_id="owner",
+                request_id="pp-reuse-1",
+                confirm=False,
+            )
+            second = await create_entry(
+                session,
+                _person_payload("pp-reuse-2"),
+                company_id="c-person-reuse",
+                user_id="owner",
+                request_id="pp-reuse-2",
+                confirm=False,
+            )
+            first_line = await _line_of(session, first.id, "2241")
+            second_line = await _line_of(session, second.id, "2241")
+            assert first_line.auxiliary["partner_id"] == second_line.auxiliary["partner_id"]
+            partners = (
+                await session.execute(select(Partner).where(Partner.company_id == "c-person-reuse"))
+            ).scalars().all()
+            assert len(partners) == 1
+
+
+@pytest.mark.asyncio
+async def test_unpaid_invoice_keeps_supplier_counterparty(accounting_sessions):
+    async with accounting_sessions() as session:
+        async with session.begin():
+            unpaid = await create_entry(
+                session,
+                _person_payload("pp-unpaid", paymentStatus="unpaid"),
+                company_id="c-person-unpaid",
+                user_id="owner",
+                request_id="pp-unpaid",
+                confirm=False,
+            )
+            assert (await _line_of(session, unpaid.id, "2241")).auxiliary == {}
+
+
+@pytest.mark.asyncio
+async def test_boss_paid_import_without_partner_gets_boss(accounting_sessions):
+    """老板垫付的导入发票：票面没挂往来单位时，2241 行要能看出欠老板的钱。"""
+    async with accounting_sessions() as session:
+        async with session.begin():
+            imported = await create_entry(
+                session,
+                _person_payload("pp-imported", sourceType="invoice_import"),
+                company_id="c-person-import",
+                user_id="owner",
+                request_id="pp-imported",
+                confirm=False,
+            )
+            line = await _line_of(session, imported.id, "2241")
+            assert line.auxiliary["partner_name"] == "股东"
+            assert line.auxiliary["partner_id"]
+
+
+@pytest.mark.asyncio
+async def test_existing_partner_is_not_overwritten_by_payer(accounting_sessions):
+    async with accounting_sessions() as session:
+        async with session.begin():
+            supplier = Partner(
+                id="pt-supplier", company_id="c-person-existing", code="S0001",
+                name="腾讯云", type="supplier",
+            )
+            session.add(supplier)
+            await session.flush()
+            entry = await create_entry(
+                session,
+                _person_payload(
+                    "pp-existing",
+                    voucherLines={
+                        "debit": [{"accountCode": "5602999", "accountName": "管理费用-其他", "amount": "100.00"}],
+                        "credit": [{
+                            "accountCode": "2241",
+                            "accountName": "其他应付款",
+                            "amount": "100.00",
+                            "auxiliary": {"partner_id": "pt-supplier", "partner_name": "腾讯云"},
+                        }],
+                    },
+                ),
+                company_id="c-person-existing",
+                user_id="owner",
+                request_id="pp-existing",
+                confirm=False,
+            )
+            assert (await _line_of(session, entry.id, "2241")).auxiliary["partner_id"] == "pt-supplier"
+
+
+@pytest.mark.asyncio
+async def test_shareholder_withdrawal_with_company_payer_gets_boss_partner(accounting_sessions):
+    async with accounting_sessions() as session:
+        async with session.begin():
+            entry = await create_entry(
+                session,
+                _person_payload(
+                    "pp-withdraw",
+                    direction="owner_transfer",
+                    category="股东取现",
+                    amount="2000.00",
+                    payer="company_account",
+                ),
+                company_id="c-person-withdraw",
+                user_id="owner",
+                request_id="pp-withdraw",
+                confirm=False,
+            )
+            line = await _line_of(session, entry.id, "122102")
+            assert line.auxiliary["partner_name"] == "股东"
+
+
+@pytest.mark.asyncio
+async def test_update_draft_payer_change_rewrites_person_partner(accounting_sessions):
+    async with accounting_sessions() as session:
+        async with session.begin():
+            entry = await create_entry(
+                session,
+                _person_payload("pp-change"),
+                company_id="c-person-change",
+                user_id="owner",
+                request_id="pp-change",
+                confirm=False,
+            )
+            assert (await _line_of(session, entry.id, "2241")).auxiliary["partner_name"] == "股东"
+
+            await update_draft(
+                session,
+                entry.id,
+                {"payer": "employee_personal:李四"},
+                company_id="c-person-change",
+                user_id="owner",
+                request_id="pp-change-2",
+            )
+            assert (await _line_of(session, entry.id, "2241")).auxiliary["partner_name"] == "李四"
+
+
+@pytest.mark.asyncio
+async def test_inactive_boss_partner_does_not_block_entry(accounting_sessions):
+    async with accounting_sessions() as session:
+        async with session.begin():
+            session.add(
+                Partner(
+                    id="pt-old-boss", company_id="c-person-inactive", code="P-BOSS",
+                    name="股东", type="person", is_active=False,
+                )
+            )
+            await session.flush()
+            entry = await create_entry(
+                session,
+                _person_payload("pp-inactive"),
+                company_id="c-person-inactive",
+                user_id="owner",
+                request_id="pp-inactive",
+                confirm=False,
+            )
+            line = await _line_of(session, entry.id, "2241")
+            assert line.auxiliary["partner_id"] != "pt-old-boss"
+            partner = await session.get(Partner, line.auxiliary["partner_id"])
+            assert partner.is_active and partner.code != "P-BOSS"
+
+
+@pytest.mark.asyncio
+async def test_reversal_replays_person_partner(accounting_sessions):
+    async with accounting_sessions() as session:
+        async with session.begin():
+            entry = await create_entry(
+                session,
+                _person_payload("pp-reverse"),
+                company_id="c-person-reverse",
+                user_id="owner",
+                request_id="pp-reverse",
+                confirm=False,
+            )
+            original = await _line_of(session, entry.id, "2241")
+            await post_journal(
+                session, entry.id, company_id="c-person-reverse", user_id="owner", request_id="pp-post"
+            )
+            reversal = await reverse_journal(
+                session,
+                entry.id,
+                company_id="c-person-reverse",
+                user_id="owner",
+                request_id="pp-rev",
+                reason="测试冲销",
+            )
+            replayed = await _line_of(session, reversal.id, "2241")
+            assert replayed.auxiliary["partner_id"] == original.auxiliary["partner_id"]
+
+
+@pytest.mark.asyncio
+async def test_backfill_restores_person_partner(accounting_sessions):
+    import importlib.util
+    from pathlib import Path as _Path
+
+    script = _Path(__file__).resolve().parent.parent / "scripts" / "backfill_payer_partners.py"
+    spec = importlib.util.spec_from_file_location("backfill_payer_partners", script)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    async with accounting_sessions() as session:
+        async with session.begin():
+            entry = await create_entry(
+                session,
+                _person_payload("pp-backfill"),
+                company_id="c-person-backfill",
+                user_id="owner",
+                request_id="pp-backfill",
+                confirm=False,
+            )
+            line = await _line_of(session, entry.id, "2241")
+            line.auxiliary = {}
+            await session.flush()
+
+        # 预览不写库
+        async with accounting_sessions() as session:
+            async with session.begin():
+                touched, rows = await module.backfill_company(session, "c-person-backfill", apply=False)
+                assert (touched, rows) == (1, 1)
+            assert (await _line_of(session, entry.id, "2241")).auxiliary == {}
+
+        async with accounting_sessions() as session:
+            async with session.begin():
+                touched, rows = await module.backfill_company(session, "c-person-backfill", apply=True)
+                assert (touched, rows) == (1, 1)
+            restored = await _line_of(session, entry.id, "2241")
+            assert restored.auxiliary["partner_name"] == "股东"
+
+        # 幂等：再跑一次没有可补的行
+        async with accounting_sessions() as session:
+            async with session.begin():
+                assert await module.backfill_company(session, "c-person-backfill", apply=True) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_invoice_import_entry_rejects_direction_flip(accounting_sessions):
+    """发票凭证方向锁定：进项票（expense）不能被改成 income 方向。"""
+    from services.accounting_core_service import update_draft
+
+    payload = sample_payload("inv-flip", occurred_on="2026-08-18")
+    payload.update({
+        "direction": "expense",
+        "category": "其他支出",
+        "source": "invoice_import",
+        "invoiceNumber": "26117000001250896293",
+        "voucherLines": {
+            "debit": [{"accountCode": "5602999", "accountName": "管理费用-其他", "amount": "481.33"}],
+            "credit": [{"accountCode": "2241", "accountName": "其他应付款", "amount": "481.33"}],
+        },
+    })
+    async with accounting_sessions() as session:
+        async with session.begin():
+            await ensure_tenant(session, "c-inv-lock", "owner-1")
+            await create_entry(session, payload, company_id="c-inv-lock",
+                               user_id="owner-1", request_id="req-1", confirm=False)
+
+        with pytest.raises(AccountingError) as exc:
+            await update_draft(
+                session, "inv-flip",
+                {"direction": "income", "category": "主营业务收入"},
+                company_id="c-inv-lock", user_id="owner-1", request_id="req-2",
+            )
+        assert exc.value.code == "INVOICE_DIRECTION_LOCKED"
+
+
+@pytest.mark.asyncio
+async def test_invoice_import_entry_same_direction_category_change_ok(accounting_sessions):
+    """同方向改分类合法（两步流的第二步）：重算后借贷保持挂账/费用形状。"""
+    from services.accounting_core_service import serialize_journal, update_draft
+
+    payload = sample_payload("inv-same", occurred_on="2026-08-18")
+    payload.update({
+        "direction": "expense",
+        "category": "其他支出",
+        "source": "invoice_import",
+        "voucherLines": {
+            "debit": [{"accountCode": "5602999", "accountName": "管理费用-其他", "amount": "481.33"}],
+            "credit": [{"accountCode": "2241", "accountName": "其他应付款", "amount": "481.33"}],
+        },
+    })
+    async with accounting_sessions() as session:
+        async with session.begin():
+            await ensure_tenant(session, "c-inv-same", "owner-1")
+            await create_entry(session, payload, company_id="c-inv-same",
+                               user_id="owner-1", request_id="req-1", confirm=False)
+
+        await update_draft(
+            session, "inv-same",
+            {"category": "信息技术服务费", "payer": "boss_personal"},
+            company_id="c-inv-same", user_id="owner-1", request_id="req-2",
+        )
+        serialized = await serialize_journal(session, await session.get(
+            __import__("db.models", fromlist=["JournalEntry"]).JournalEntry, "inv-same"
+        ))
+        assert serialized["category"] == "信息技术服务费"
+        codes = {line["accountCode"] for line in serialized["voucherLines"]["credit"]}
+        assert codes == {"2241"}  # 老板垫付重算后贷方仍是 2241（挂公司欠老板款）
+
+
+@pytest.mark.asyncio
+async def test_ledger_to_ledger_excludes_same_month_reversal_pairs(accounting_sessions):
+    """账账核对的发生额剔除同月冲销对：只剩重记那张，借贷仍平衡。
+
+    根因回归：冲销对计入发生额让「期初重设/当月更正重记」后的账账核对
+    借贷各成倍虚增（期初重设场景实测 3 倍）。余额试算不受影响（净额自相抵），
+    与月度汇总/账簿册同一口径（services/reversal_pairs.py）。
+    """
+    async with accounting_sessions() as session:
+        async with session.begin():
+            entry = await create_entry(
+                session, sample_payload("rev-pair-1", occurred_on="2026-07-10"),
+                company_id="c-rev-pair", user_id="owner", request_id="req-1", confirm=True,
+            )
+            await post_journal(session, entry.id, company_id="c-rev-pair", user_id="owner", request_id="post-1")
+            await reverse_journal(
+                session, entry.id, company_id="c-rev-pair", user_id="owner",
+                request_id="rev-1", reason="测试冲销",
+            )
+            again = await create_entry(
+                session, sample_payload("rev-pair-2", occurred_on="2026-07-20"),
+                company_id="c-rev-pair", user_id="owner", request_id="req-2", confirm=True,
+            )
+            await post_journal(session, again.id, company_id="c-rev-pair", user_id="owner", request_id="post-2")
+
+        checks = await period_close_checks(session, "c-rev-pair", "2026-07")
+        ledger = next(c for c in checks["checks"] if c["code"] == "LEDGER_TO_LEDGER")
+        assert Decimal(ledger["debit"]) == Decimal("100.10"), "同月冲销对剔除，只剩重记那张"
+        assert Decimal(ledger["credit"]) == Decimal("100.10")
+        assert ledger["status"] == "passed"
+
+
+@pytest.mark.asyncio
+async def test_ledger_to_ledger_keeps_cross_period_reversal(accounting_sessions):
+    """跨月冲销不剔除：冲销凭证是更正当期的真实动作，留在当月发生额里。"""
+    async with accounting_sessions() as session:
+        async with session.begin():
+            entry = await create_entry(
+                session, sample_payload("rev-cross-1", occurred_on="2026-07-10"),
+                company_id="c-rev-cross", user_id="owner", request_id="req-1", confirm=True,
+            )
+            await post_journal(session, entry.id, company_id="c-rev-cross", user_id="owner", request_id="post-1")
+        # 8 月才冲销 7 月的凭证：7 月发生额保留原凭证，8 月保留冲销凭证
+        async with session.begin():
+            reversal = await reverse_journal(
+                session, entry.id, company_id="c-rev-cross", user_id="owner",
+                request_id="rev-cross", reason="跨月冲销", reversal_date=date(2026, 8, 5),
+            )
+            assert reversal.occurred_on == date(2026, 8, 5)
+
+        checks_july = await period_close_checks(session, "c-rev-cross", "2026-07")
+        july = next(c for c in checks_july["checks"] if c["code"] == "LEDGER_TO_LEDGER")
+        assert Decimal(july["debit"]) == Decimal("100.10"), "7 月原凭证保留"
+        checks_aug = await period_close_checks(session, "c-rev-cross", "2026-08")
+        aug = next(c for c in checks_aug["checks"] if c["code"] == "LEDGER_TO_LEDGER")
+        assert Decimal(aug["credit"]) == Decimal("100.10"), "8 月冲销凭证保留"

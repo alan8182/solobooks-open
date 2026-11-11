@@ -611,7 +611,10 @@ async def compare_with_baseline(
         posted_entries_for_reports,
     )
     from services.account_service import get_user_profile
-    from services.opening_balance_service import get_opening_balances
+    from services.opening_balance_service import (
+        get_opening_balances,
+        get_opening_partner_balances,
+    )
 
     if report not in {k["value"] for k in REPORT_KINDS}:
         raise _err(INVALID_REPORT_LINE_RULE, "report 只能是 profit 或 balance", report=report)
@@ -624,7 +627,13 @@ async def compare_with_baseline(
     opening_items = await get_opening_balances(
         company_id, period_range.start.year, session=session,
     )
-    data = build_statement_data_from_entries(entries, opening_items, period_range, company)
+    opening_partner_items = await get_opening_partner_balances(
+        company_id, period_range.start.year, session=session,
+    )
+    data = build_statement_data_from_entries(
+        entries, opening_items, period_range, company,
+        opening_partner_items=opening_partner_items,
+    )
 
     if report == "profit":
         baseline = dict(data.profit_current)
@@ -635,15 +644,24 @@ async def compare_with_baseline(
     # 贷方科目为负。这里直接复用报表内部的 current/opening 计算结果。
     from services.tax_filing_export_service import (
         _account_movements,
+        _apply_partner_reclass,
         _current_balance_map,
         _opening_balance_map,
+        _partner_balance_map,
+        _partner_bucket_map,
     )
 
     opening = _opening_balance_map(opening_items)
     movements_ytd = _account_movements(
         entries, period_range.fiscal_year_start, period_range.end, include_ytd_opening=True,
     )
-    current = _current_balance_map(opening, movements_ytd)
+    # 与报表同一口径：往来科目按客商方向重分类后再对比，否则规则永远差一笔
+    current = _apply_partner_reclass(
+        _current_balance_map(opening, movements_ytd),
+        _partner_balance_map(
+            _partner_bucket_map(opening_partner_items, opening), movements_ytd,
+        ),
+    )
 
     rules = await list_rules(session, company_id, report)
     result = diff_report_lines(rules, baseline, current, report=report)

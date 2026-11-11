@@ -56,16 +56,18 @@ describe('remoteConfig', () => {
 })
 
 describe('工具清单与后端白名单一致', () => {
-  it('总数 = 只读 + 草稿 = 24', () => {
+  it('总数 = 只读 + 草稿 = 27', () => {
     expect(READ_TOOL_COUNT + WRITE_TOOLS.length).toBe(TOOL_TOTAL)
-    expect(TOOL_TOTAL).toBe(24)
+    expect(TOOL_TOTAL).toBe(27)
   })
 
-  it('写入工具全部是 propose_ 前缀（对应后端 MCP_WRITE_TOOLS）', () => {
-    expect(WRITE_TOOLS.every((name) => name.startsWith('propose_'))).toBe(true)
+  it('写入工具只包含草稿类工具（对应后端 MCP_WRITE_TOOLS）', () => {
+    expect(
+      WRITE_TOOLS.every((name) => name.startsWith('propose_') || name === 'record_private_expense'),
+    ).toBe(true)
   })
 
-  it('24 个工具名互不重复', () => {
+  it('27 个工具名互不重复', () => {
     const all = [...READ_TOOL_GROUPS.flatMap((g) => g.tools), ...WRITE_TOOLS]
     expect(all).toHaveLength(TOOL_TOTAL)
     expect(new Set(all).size).toBe(all.length)

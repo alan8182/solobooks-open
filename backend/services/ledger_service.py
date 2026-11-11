@@ -17,6 +17,7 @@ from core.money import ZERO, money, money_text
 from db.models import ChartAccount, JournalEntry, JournalLine
 from db.session import session_scope
 from services.account_mapper import PAYER_BOSS, PAYER_COMPANY, normalize_payer
+from services.reversal_pairs import same_period_reversal_exclusions
 
 POSTED_STATUSES = ("posted", "reversed")
 
@@ -509,10 +510,15 @@ async def get_balance_summary(company_id: str, month: str) -> dict[str, Any]:
     }
 
     # 期初取记账期间早于本月所有过账分录的累计净额，期末 = 期初 + 本期借贷（借余为正的符号约定）
+    # 发生额口径：同期间冲销对不计入借贷发生额，否则一次「冲销重记」就把当期
+    # 发生额成倍虚增（期初重设场景实测 3 倍）；余额是净额，不受影响。
+    excluded_entry_ids = same_period_reversal_exclusions({entry for entry, _ in rows})
     accounts: dict[str, dict[str, Any]] = {}
     # 数量结存（P1 WP-D）：借方=收、贷方=发，跨期累计，方向恒按借正
     quantities: dict[str, dict[str, Decimal]] = {}
     for entry, line in rows:
+        if entry.id in excluded_entry_ids:
+            continue
         bucket = accounts.setdefault(
             line.account_code,
             {"name": line.account_name, "opening": ZERO, "debit": ZERO, "credit": ZERO},

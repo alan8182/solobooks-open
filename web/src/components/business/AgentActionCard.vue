@@ -1,12 +1,10 @@
 <!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { computed, reactive, watch } from 'vue'
-import { useRouter } from 'vue-router'
 import { accountingErrorText } from '@/utils/errors'
 import { NButton, NCheckbox, NInput, NModal, NSelect, NTag, useMessage } from 'naive-ui'
 import { approveAgentAction, rejectAgentAction, type AgentActionItem } from '@/api/agent'
 import { getBackfillTarget } from '@/api/accounting'
-import { requestStepUp, sendPhoneCode } from '@/api/auth'
 import { useAuthStore } from '@/stores/auth'
 import { usePayeeEmployees } from '@/composables/usePayeeEmployees'
 import { guideStartDate } from '@/composables/startDateGuide'
@@ -28,6 +26,8 @@ interface VoucherRow {
   payer?: string
   merchant?: string
   note?: string
+  statementId?: string
+  sourceType?: string
 }
 
 const props = defineProps<{
@@ -39,7 +39,6 @@ const emit = defineEmits<{
 }>()
 
 const message = useMessage()
-const router = useRouter()
 const authStore = useAuthStore()
 const busy = reactive({ approving: false, rejecting: false })
 const local = reactive({
@@ -47,18 +46,38 @@ const local = reactive({
   result: props.action.result,
 })
 
+watch(
+  () => props.action,
+  (action) => {
+    local.status = action.status
+    local.result = action.result
+  },
+  { deep: true },
+)
+
 const payload = computed(() => props.action.payload || {})
 const isCompanySetup = computed(() => props.action.actionType === 'propose_company_setup')
-const isOpeningBalance = computed(() => props.action.actionType === 'propose_opening_balance')
 const isBatch = computed(
   () =>
     !isCompanySetup.value &&
-    !isOpeningBalance.value &&
     Array.isArray(payload.value.items) &&
     payload.value.items.length > 0,
 )
+const isBankStatementBatch = computed(
+  () =>
+    isBatch.value &&
+    (payload.value.items as VoucherRow[]).some(
+      (item) => item.sourceType === 'bank_statement' || Boolean(item.statementId),
+    ),
+)
 const isMatch = computed(() => props.action.actionType === 'propose_match')
 const isAccrual = computed(() => props.action.actionType === 'propose_accrual')
+const closingBinding = computed(() => props.action.closingBinding || null)
+const statusText = computed(() =>
+  local.status === 'approved' && closingBinding.value
+    ? '已执行'
+    : STATUS_TAG[local.status]?.text || local.status,
+)
 
 // ── 主体建账信息确认卡 ──────────────────────────────────────────
 const companyForm = reactive({
@@ -85,167 +104,6 @@ const TAXPAYER_OPTIONS = [
   { label: '小规模纳税人', value: '小规模纳税人' },
   { label: '一般纳税人', value: '一般纳税人' },
 ]
-
-// ── 期初余额导入确认卡 ──────────────────────────────────────────
-interface OpeningCardItem {
-  account_code: string
-  account_name: string
-  debit_balance: string | number
-  credit_balance: string | number
-  partner_name?: string
-}
-const openingState = reactive({
-  fiscalYear: Number(payload.value.fiscalYear || new Date().getFullYear()),
-  startPeriod: String(payload.value.startPeriod || ''),
-  items: (Array.isArray(payload.value.items) ? payload.value.items : []).map((it: any) => ({
-    account_code: String(it.account_code || ''),
-    account_name: String(it.account_name || ''),
-    debit_balance: String(it.debit_balance ?? '0.00'),
-    credit_balance: String(it.credit_balance ?? '0.00'),
-    partner_name: String(it.partner_name || ''),
-  })) as OpeningCardItem[],
-  ytdItems: (Array.isArray(payload.value.ytdItems) ? payload.value.ytdItems : []).map((it: any) => ({
-    account_code: String(it.account_code || ''),
-    account_name: String(it.account_name || ''),
-    debit_balance: String(it.debit_balance ?? '0.00'),
-    credit_balance: String(it.credit_balance ?? '0.00'),
-  })) as OpeningCardItem[],
-  taxMemory: (payload.value.taxMemory || {}) as Record<string, unknown>,
-})
-
-const openingTotals = computed(() => {
-  const debit =
-    Math.round(
-      openingState.items.reduce((s, it) => s + (parseFloat(String(it.debit_balance)) || 0), 0) * 100,
-    ) / 100
-  const credit =
-    Math.round(
-      openingState.items.reduce((s, it) => s + (parseFloat(String(it.credit_balance)) || 0), 0) * 100,
-    ) / 100
-  const diff = Math.round((debit - credit) * 100) / 100
-  return {
-    totalDebit: debit,
-    totalCredit: credit,
-    diff,
-    absDiff: Math.abs(diff),
-    balanced: debit > 0 && Math.abs(diff) <= 0.01,
-  }
-})
-
-function plugOpeningDifference() {
-  const diff = openingTotals.value.diff
-  if (Math.abs(diff) <= 0.01) return
-  const existing = openingState.items.find((i) => i.account_code === '3104006')
-  if (existing) {
-    const net =
-      (parseFloat(String(existing.credit_balance)) || 0) -
-      (parseFloat(String(existing.debit_balance)) || 0) +
-      diff
-    if (net >= 0) {
-      existing.credit_balance = net.toFixed(2)
-      existing.debit_balance = '0.00'
-    } else {
-      existing.debit_balance = Math.abs(net).toFixed(2)
-      existing.credit_balance = '0.00'
-    }
-  } else {
-    openingState.items.push({
-      account_code: '3104006',
-      account_name: '未分配利润',
-      debit_balance: diff < 0 ? Math.abs(diff).toFixed(2) : '0.00',
-      credit_balance: diff > 0 ? diff.toFixed(2) : '0.00',
-      partner_name: '',
-    })
-  }
-  message.success('已将借贷差额计入「3104006 未分配利润」自动配平')
-}
-
-function openInOpeningWorkbench() {
-  try {
-    sessionStorage.setItem(
-      'solobooks:ai_opening_draft',
-      JSON.stringify({
-        fiscalYear: openingState.fiscalYear,
-        startPeriod: openingState.startPeriod,
-        items: openingState.items,
-        ytdItems: openingState.ytdItems,
-        taxMemory: openingState.taxMemory,
-      }),
-    )
-  } catch {
-    /* ignore */
-  }
-  router.push('/mine/opening')
-}
-
-const stepUpModal = reactive({
-  show: false,
-  phone: '',
-  code: '',
-  bizId: '',
-  sending: false,
-})
-
-function openOpeningStepUp() {
-  if (!openingTotals.value.balanced) {
-    message.warning('当前借贷尚未平衡，请先点击「差额计入未分配利润配平」或「去期初工作台细调」')
-    return
-  }
-  stepUpModal.phone = authStore.user?.phone || ''
-  stepUpModal.code = ''
-  stepUpModal.show = true
-}
-
-async function sendStepUpSms() {
-  if (!stepUpModal.phone.trim()) {
-    message.warning('请输入当前绑定手机号')
-    return
-  }
-  stepUpModal.sending = true
-  try {
-    const res = await sendPhoneCode({ phone: stepUpModal.phone.trim() })
-    stepUpModal.bizId = res.biz_id || ''
-    message.success('验证码已发送')
-  } catch (err) {
-    message.error(accountingErrorText(err))
-  } finally {
-    stepUpModal.sending = false
-  }
-}
-
-async function confirmOpeningStepUp() {
-  if (!stepUpModal.phone.trim() || !stepUpModal.code.trim()) {
-    message.warning('请填写手机号与短信验证码')
-    return
-  }
-  busy.approving = true
-  try {
-    const step = await requestStepUp({
-      action: 'adjust_opening_balance',
-      phone: stepUpModal.phone.trim(),
-      code: stepUpModal.code.trim(),
-      bizId: stepUpModal.bizId || undefined,
-    })
-    stepUpModal.show = false
-    await doApprove({
-      edits: {
-        '0': {
-          fiscalYear: openingState.fiscalYear,
-          startPeriod: openingState.startPeriod,
-          items: openingState.items,
-          ytdItems: openingState.ytdItems,
-          taxMemory: openingState.taxMemory,
-        },
-      },
-      stepUpToken: step.stepUpToken,
-    })
-    message.success('期初余额已正式入账！')
-  } catch (err) {
-    message.error(accountingErrorText(err))
-  } finally {
-    busy.approving = false
-  }
-}
 
 const matchData = computed(() => ({
   statement: (payload.value.statement || {}) as Record<string, unknown>,
@@ -332,6 +190,12 @@ if (!isBatch.value) {
 const isIncome = computed(() => String(payload.value.direction) === 'income')
 const cardBadges = computed(() => {
   const badges: Array<{ text: string; type: 'info' | 'warning' | 'default' | 'success' }> = []
+  if (closingBinding.value) {
+    badges.push({
+      text: `结账快照 · ${closingBinding.value.month}`,
+      type: 'info',
+    })
+  }
   const note = String(props.action.evidence?.note || '')
   if (
     note.includes('未开票') ||
@@ -342,6 +206,9 @@ const cardBadges = computed(() => {
   }
   if (payer.kind === 'receivable') {
     badges.push({ text: '待流水核销', type: 'warning' })
+  }
+  if (isBankStatementBatch.value) {
+    badges.push({ text: '银行流水原始金额', type: 'info' })
   }
   return badges
 })
@@ -379,7 +246,13 @@ function amountText(v: unknown) {
 }
 function rowAmount(row: VoucherRow) {
   const amount = Number(row.amount ?? 0)
-  return `${row.direction === 'income' ? '+' : '−'}¥ ${amountText(Math.abs(amount))}`
+  const sign = row.direction === 'owner_transfer' ? (amount >= 0 ? '+' : '−') : row.direction === 'income' ? '+' : '−'
+  return `${sign}¥ ${amountText(Math.abs(amount))}`
+}
+
+function rowDotStatus(index: number) {
+  if (local.status === 'rejected' || local.status === 'expired') return 'excluded'
+  return String(batchResults.value?.[index]?.status || 'pending')
 }
 
 const includedIndexes = computed(() =>
@@ -404,6 +277,12 @@ async function doApprove(opts: Parameters<typeof approveAgentAction>[1] = {}) {
     emit('resolved')
   } catch (err) {
     if (guideStartDate(err)) return
+    const detail = (err as any)?.response?.data?.detail
+    if (detail?.code === 'CLOSING_SNAPSHOT_STALE') {
+      local.status = 'expired'
+      local.result = detail as Record<string, unknown>
+      emit('resolved')
+    }
     message.error(accountingErrorText(err))
   } finally {
     busy.approving = false
@@ -416,12 +295,22 @@ async function approveSingle() {
       message.warning('请填写公司全称')
       return
     }
+    // 与「新增主体」表单同口径：税号是申报与报表报送的必填项，建账时就要填全。
+    const rawTaxId = companyForm.taxId.trim().toUpperCase()
+    if (!rawTaxId) {
+      message.warning('请填写统一社会信用代码')
+      return
+    }
+    if (!/^[0-9A-Z]{15}$|^[0-9A-Z]{17}$|^[0-9A-Z]{18}$|^[0-9A-Z]{20}$/.test(rawTaxId)) {
+      message.warning('统一社会信用代码格式不正确（15/17/18/20 位字母数字）')
+      return
+    }
     return doApprove({
       edits: {
         '0': {
           onboardingType: companyForm.onboardingType,
           name: companyForm.name.trim(),
-          taxId: companyForm.taxId.trim().toUpperCase(),
+          taxId: rawTaxId,
           type: companyForm.type,
           taxpayerType: companyForm.taxpayerType,
           startDate: companyForm.startDate.trim(),
@@ -430,10 +319,6 @@ async function approveSingle() {
         },
       },
     })
-  }
-  if (isOpeningBalance.value) {
-    openOpeningStepUp()
-    return
   }
   if (isMatch.value || isAccrual.value) return doApprove()
   if (payer.kind === 'employee_personal' && !payer.employeeName.trim()) {
@@ -585,7 +470,6 @@ function summarizeAssetClosureResult(result: unknown): string {
 
 const approveText = computed(() => {
   if (isCompanySetup.value) return payload.value.isFromDemo ? '确认创建正式账套' : '确认保存建账信息'
-  if (isOpeningBalance.value) return '验证并生成期初凭证'
   if (isMatch.value) return '确认对账'
   if (isAssetClosure.value) return '确认处理'
   if (isAccrual.value) return '确认计提'
@@ -603,12 +487,10 @@ const approveText = computed(() => {
             ? companyForm.onboardingType === 'migration'
               ? '代账/旧账迁入 · 主体建账确认'
               : '新公司从零记账 · 主体建账确认'
-            : isOpeningBalance
-              ? `期初余额导入确认（${openingState.startPeriod || openingState.fiscalYear}）`
-              : isMatch
-                ? '银行流水对账建议'
-                : isAccrual
-                  ? `${accrualKindText}（${accrualData.month}）`
+            : isMatch
+              ? '银行流水对账建议'
+              : isAccrual
+                ? `${accrualKindText}（${accrualData.month}）`
                   : isBatch
                     ? `批量记账（${(payload.items as VoucherRow[]).length} 笔）`
                     : action.title || '记账草稿'
@@ -628,7 +510,7 @@ const approveText = computed(() => {
           {{
             local.status === 'approved' && isCompanySetup
               ? '已建账'
-              : STATUS_TAG[local.status]?.text || local.status
+              : statusText
           }}
         </NTag>
       </div>
@@ -670,13 +552,13 @@ const approveText = computed(() => {
           <span v-else class="field-value">{{ companyForm.name }}</span>
         </div>
         <div class="field">
-          <span class="field-label">统一社会信用代码（18位）</span>
+          <span class="field-label">统一社会信用代码（必填）</span>
           <NInput
             v-if="local.status === 'pending'"
             v-model:value="companyForm.taxId"
             size="tiny"
-            maxlength="18"
-            placeholder="可稍后补填"
+            maxlength="20"
+            placeholder="15/17/18/20 位字母数字"
           />
           <span v-else class="field-value">{{ companyForm.taxId || '暂未填' }}</span>
         </div>
@@ -721,70 +603,8 @@ const approveText = computed(() => {
     </template>
 
     <!-- 期初余额导入确认卡 -->
-    <template v-else-if="isOpeningBalance">
-      <div class="opening-summary-bar">
-        <div class="opening-stat">
-          <span class="field-label">借方合计（资产）</span>
-          <span class="field-value amount">¥ {{ amountText(openingTotals.totalDebit) }}</span>
-        </div>
-        <div class="opening-stat">
-          <span class="field-label">贷方合计（负债+权益）</span>
-          <span class="field-value amount">¥ {{ amountText(openingTotals.totalCredit) }}</span>
-        </div>
-        <div class="opening-stat">
-          <span class="field-label">试算状态</span>
-          <NTag
-            size="small"
-            :type="openingTotals.balanced ? 'success' : 'warning'"
-            :bordered="false"
-          >
-            {{
-              openingTotals.balanced
-                ? '借贷已平衡 ✓'
-                : `差额 ¥${amountText(openingTotals.absDiff)}`
-            }}
-          </NTag>
-        </div>
-      </div>
-
-      <div class="batch-list opening-item-list">
-        <div v-for="(it, idx) in openingState.items" :key="`ob-${idx}`" class="batch-row">
-          <div class="row-head">
-            <span class="match-side">{{ it.account_code }}</span>
-            <span class="row-title">
-              {{ it.account_name }}
-              <span v-if="it.partner_name" class="muted">（{{ it.partner_name }}）</span>
-            </span>
-            <span class="row-amount" v-if="parseFloat(String(it.debit_balance)) > 0">
-              借 ¥ {{ amountText(it.debit_balance) }}
-            </span>
-            <span class="row-amount is-income" v-else>
-              贷 ¥ {{ amountText(it.credit_balance) }}
-            </span>
-          </div>
-        </div>
-        <div v-if="openingState.ytdItems.length" class="opening-ytd-note">
-          含年中本年损益累计发生额 {{ openingState.ytdItems.length }} 项
-        </div>
-      </div>
-
-      <div
-        v-if="local.status === 'pending' && !openingTotals.balanced && openingTotals.absDiff > 0"
-        class="opening-plug-bar"
-      >
-        <span>借贷存在差额 ¥{{ amountText(openingTotals.absDiff) }}，可一键归入未分配利润配平，或前往期初工作台细调：</span>
-        <NButton size="tiny" secondary type="warning" @click="plugOpeningDifference">
-          差额计入未分配利润(3104006)配平
-        </NButton>
-      </div>
-
-      <div class="card-result" v-if="local.status === 'approved'">
-        期初余额凭证已生成（凭证号 {{ (local.result as any)?.opening?.voucherNo || '已过账' }}）✓
-      </div>
-    </template>
-
     <!-- 对账建议 -->
-    <template v-if="isMatch">
+    <template v-else-if="isMatch">
       <div class="match-block">
         <div class="match-row">
           <span class="match-side">流水</span>
@@ -922,7 +742,7 @@ const approveText = computed(() => {
             v-model:checked="r.include"
             size="small"
           />
-          <span v-else class="row-dot" :class="String(batchResults?.[i]?.status || 'booked')" />
+          <span v-else class="row-dot" :class="rowDotStatus(i)" />
           <span class="row-title">{{ r.row.title }}</span>
           <span class="row-amount" :class="r.row.direction === 'income' ? 'is-income' : ''">
             {{ rowAmount(r.row) }}
@@ -1008,11 +828,25 @@ const approveText = computed(() => {
       {{ action.evidence.note }}
     </div>
 
-    <div class="card-result" v-if="local.status === 'approved' && !isBatch && !isMatch && !isAccrual && !isCompanySetup && !isOpeningBalance && local.result">
+    <div class="card-result" v-if="local.status === 'approved' && !isBatch && !isMatch && !isAccrual && !isCompanySetup && local.result">
       已记入账簿，凭证号 {{ (local.result as Record<string, unknown>).voucherRef || '—' }}
       <span v-if="payer.kind === 'receivable'" class="muted" style="margin-left: 6px;">
         （已挂入应收账款，后续导入银行流水时直接对账核销）
       </span>
+    </div>
+    <div class="card-result rejected" v-if="local.status === 'rejected'">
+      {{
+        isBankStatementBatch
+          ? '该待确认动作已放弃，没有执行任何写入；银行流水保持原状态。'
+          : '该待确认动作已放弃，没有执行任何记账。'
+      }}
+    </div>
+    <div class="card-result rejected" v-else-if="local.status === 'expired'">
+      {{
+        closingBinding
+          ? '结账数据已变化，此修复动作已过期；请重新运行结账检查后再发起，本次没有执行任何写入。'
+          : '清单已过期，没有执行记账。'
+      }}
     </div>
     <div class="card-result" v-else-if="local.status === 'approved' && isBatch && !batchResults?.some((r) => r.status === 'booked')">
       未入账任何一笔
@@ -1023,15 +857,6 @@ const approveText = computed(() => {
         放弃
       </NButton>
       <NButton
-        v-if="isOpeningBalance"
-        size="small"
-        secondary
-        :disabled="busy.approving"
-        @click="openInOpeningWorkbench"
-      >
-        去期初工作台细调
-      </NButton>
-      <NButton
         size="small"
         type="primary"
         :loading="busy.approving"
@@ -1040,37 +865,6 @@ const approveText = computed(() => {
         {{ approveText }}
       </NButton>
     </div>
-
-    <NModal
-      v-model:show="stepUpModal.show"
-      preset="card"
-      title="安全验证 · 生成正式期初凭证"
-      style="max-width: 420px;"
-      :mask-closable="false"
-    >
-      <div class="backfill-copy">
-        <p class="muted">
-          期初余额直接决定资产负债表基数，需验证账号绑定手机号后生成正式期初凭证。
-        </p>
-        <div class="stepup-form">
-          <NInput v-model:value="stepUpModal.phone" size="small" placeholder="绑定手机号" />
-          <div class="stepup-code-row">
-            <NInput v-model:value="stepUpModal.code" size="small" placeholder="短信验证码" />
-            <NButton size="small" secondary :loading="stepUpModal.sending" @click="sendStepUpSms">
-              获取验证码
-            </NButton>
-          </div>
-        </div>
-      </div>
-      <template #footer>
-        <div class="backfill-actions">
-          <NButton size="small" quaternary @click="stepUpModal.show = false">取消</NButton>
-          <NButton size="small" type="primary" :loading="busy.approving" @click="confirmOpeningStepUp">
-            确认并生成期初凭证
-          </NButton>
-        </div>
-      </template>
-    </NModal>
 
     <NModal
       v-model:show="backfill.show"
@@ -1203,8 +997,14 @@ const approveText = computed(() => {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--solo-income, #0f7354);
+  background: var(--solo-primary, #1747b0);
   flex-shrink: 0;
+}
+.row-dot.booked {
+  background: var(--solo-income, #0f7354);
+}
+.row-dot.pending {
+  background: var(--solo-primary, #1747b0);
 }
 .row-dot.excluded {
   background: var(--solo-text-muted, #636e7c);
@@ -1256,6 +1056,9 @@ const approveText = computed(() => {
   margin-top: 8px;
   font-size: 12px;
   color: var(--solo-income, #0f7354);
+}
+.card-result.rejected {
+  color: var(--solo-text-muted, #636e7c);
 }
 .card-actions {
   display: flex;
@@ -1321,52 +1124,5 @@ const approveText = computed(() => {
 
 .field-span-2 {
   grid-column: span 2;
-}
-.opening-summary-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 8px 10px;
-  margin-bottom: 8px;
-  border-radius: 6px;
-  background: var(--solo-bg-page, #f6f7f9);
-  border: 1px solid var(--solo-border, #dde3ea);
-}
-.opening-stat {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-.opening-item-list {
-  max-height: 220px;
-}
-.opening-ytd-note {
-  font-size: 12px;
-  color: var(--solo-text-muted, #636e7c);
-  padding: 2px 4px;
-}
-.opening-plug-bar {
-  margin-top: 8px;
-  padding: 8px 10px;
-  border-radius: 6px;
-  background: var(--solo-warning-bg, #fff5e8);
-  color: var(--solo-warning, #a05c10);
-  font-size: 12px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-.stepup-form {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-top: 8px;
-}
-.stepup-code-row {
-  display: flex;
-  gap: 8px;
 }
 </style>

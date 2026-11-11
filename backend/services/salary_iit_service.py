@@ -200,3 +200,133 @@ async def preview_individual_income_tax(
         "taxDue": str(due),
         "monthlySpecialAdditional": str(monthly_special),
     }
+
+
+async def preview_sheet_individual_income_tax(
+    company_id: str,
+    month: str,
+    items: list[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """批量试算整张工资表员工在指定月份应预扣的个税。"""
+    if not items:
+        return {"items": [], "totalTaxDue": "0.00"}
+
+    employee_ids = [str(item["employeeId"]) for item in items if item.get("employeeId")]
+    if not employee_ids:
+        return {"items": [], "totalTaxDue": "0.00"}
+
+    placeholders = ", ".join("?" for _ in employee_ids)
+    year = month.split("-")[0]
+    january = f"{year}-01"
+    statuses = ", ".join("?" for _ in COUNTED_STATUSES)
+
+    conn = await get_conn()
+    try:
+        cursor = await conn.execute(
+            f"SELECT id, name, hire_date, special_additional_deduction FROM employees "
+            f"WHERE company_id = ? AND id IN ({placeholders})",
+            (company_id, *employee_ids),
+        )
+        emp_rows = await cursor.fetchall()
+        employees_by_id = {str(row["id"]): dict(row) for row in emp_rows}
+
+        cursor = await conn.execute(
+            "SELECT sr.employee_id, "
+            "       COALESCE(SUM(sr.base_salary + sr.bonus + sr.allowance - sr.deduction), 0) AS gross, "
+            "       COALESCE(SUM(sr.personal_social_security), 0) AS withheld, "
+            "       COALESCE(SUM(sr.personal_tax), 0) AS tax, "
+            "       MIN(ss.month) AS first_month "
+            "FROM salary_records sr JOIN salary_sheets ss ON ss.id = sr.sheet_id "
+            f"WHERE ss.company_id = ? AND sr.employee_id IN ({placeholders}) "
+            f"      AND ss.month >= ? AND ss.month < ? AND ss.status IN ({statuses}) "
+            "GROUP BY sr.employee_id",
+            (company_id, *employee_ids, january, month, *COUNTED_STATUSES),
+        )
+        hist_rows = await cursor.fetchall()
+        history_by_id = {str(row["employee_id"]): dict(row) for row in hist_rows}
+    finally:
+        await conn.close()
+
+    result_items: list[Dict[str, Any]] = []
+    total_due = ZERO
+
+    for item in items:
+        eid = str(item.get("employeeId") or "")
+        emp = employees_by_id.get(eid)
+        if not emp:
+            continue
+        hist = history_by_id.get(eid) or {}
+
+        stored_special = money(emp.get("special_additional_deduction") or ZERO, allow_negative=False)
+        special_param = item.get("specialAdditional")
+        monthly_special = (
+            stored_special if special_param is None
+            else money(special_param, allow_negative=False)
+        )
+        monthly_other = money(item.get("otherDeduction") or ZERO, allow_negative=False)
+
+        prior_gross = money(hist.get("gross") if hist else ZERO, allow_negative=False)
+        prior_withheld = money(hist.get("withheld") if hist else ZERO, allow_negative=False)
+        prior_tax = money(hist.get("tax") if hist else ZERO, allow_negative=False)
+
+        current_gross = money(item.get("gross") or ZERO, allow_negative=False)
+        current_withheld = money(item.get("withheld") or ZERO, allow_negative=False)
+
+        start_month = resolve_start_month(
+            month,
+            emp.get("hire_date"),
+            str(hist.get("first_month")) if hist and hist.get("first_month") else None,
+        )
+        months = _months_inclusive(start_month, month)
+
+        cumulative_income = money(prior_gross + current_gross)
+        cumulative_basic = money(BASIC_DEDUCTION * months)
+        cumulative_withheld = money(prior_withheld + current_withheld)
+        cumulative_special = money(monthly_special * months)
+        cumulative_other = money(monthly_other * months)
+        taxable = money(
+            cumulative_income
+            - cumulative_basic
+            - cumulative_withheld
+            - cumulative_special
+            - cumulative_other
+        )
+        if taxable < ZERO:
+            taxable = ZERO
+
+        cumulative_taxable_amount, tax_rate, quick_deduction = cumulative_tax(taxable)
+        due = money(cumulative_taxable_amount - prior_tax)
+        if due < ZERO:
+            due = ZERO
+
+        total_due = money(total_due + due)
+        result_items.append({
+            "employeeId": eid,
+            "employeeName": str(emp["name"]),
+            "month": month,
+            "months": months,
+            "startMonth": start_month,
+            "hireDateMissing": not str(emp.get("hire_date") or "").strip(),
+            "currentGross": str(current_gross),
+            "currentWithheld": str(current_withheld),
+            "priorGross": str(prior_gross),
+            "priorWithheld": str(prior_withheld),
+            "priorTax": str(prior_tax),
+            "cumulativeIncome": str(cumulative_income),
+            "cumulativeBasicDeduction": str(cumulative_basic),
+            "cumulativeSpecialDeduction": str(cumulative_withheld),
+            "cumulativeAdditionalDeduction": str(cumulative_special),
+            "cumulativeOtherDeduction": str(cumulative_other),
+            "taxableIncome": str(taxable),
+            "taxRate": str(tax_rate),
+            "quickDeduction": str(quick_deduction),
+            "cumulativeTax": str(cumulative_taxable_amount),
+            "prepaidTax": str(prior_tax),
+            "taxDue": str(due),
+            "monthlySpecialAdditional": str(monthly_special),
+        })
+
+    return {
+        "items": result_items,
+        "totalTaxDue": str(total_due),
+    }

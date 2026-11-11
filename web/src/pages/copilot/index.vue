@@ -4,28 +4,32 @@ import { usePageRefresh } from '@/composables/usePageRefresh'
 import { accountingErrorText } from '@/utils/errors'
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NButton, NCard, NInput, NSpin, useMessage } from 'naive-ui'
+import { NButton, NCard, NInput, NSpin, NTooltip, useMessage } from 'naive-ui'
 import {
   chatAgentStream,
+  getAgentAction,
   listAgentActions,
   type AgentActionItem,
   type AgentStreamEvent,
+  type ClosingLink,
 } from '@/api/agent'
-import * as XLSX from 'xlsx'
-import apiClient from '@/api/client'
 import { recordReceipt, recordSpeech } from '@/api/record'
-import { parseOpeningWorkbook } from '@/utils/openingBalanceImport'
+import { useAuthStore } from '@/stores/auth'
 import { useEntryStore } from '@/stores/entry'
 import { useWorkspaceViewStore } from '@/stores/workspaceView'
+import { clearCopilotChat, loadCopilotChat, saveCopilotChat } from '@/utils/copilotChat'
 import AgentActionCard from '@/components/business/AgentActionCard.vue'
 import { renderMarkdown } from '@/utils/markdown'
+import { linkifyClosingWizardRoutes, localClosingWizardPath } from '@/utils/assistantLinks'
 import { copyToClipboard } from '@/utils/clipboard'
+import type { CompanyOnboardingType } from '@/utils/companyOnboarding'
 import CopilotEvidenceBoard from '@/components/business/CopilotEvidenceBoard.vue'
 
 const route = useRoute()
 const router = useRouter()
 const message = useMessage()
 const entryStore = useEntryStore()
+const authStore = useAuthStore()
 const viewStore = useWorkspaceViewStore()
 
 interface ToolStep {
@@ -46,6 +50,7 @@ interface ChatMessage {
   streaming?: boolean
   failed?: boolean
   imageUrl?: string
+  closingLink?: ClosingLink
 }
 
 const TOOL_LABELS: Record<string, string> = {
@@ -59,10 +64,20 @@ const TOOL_LABELS: Record<string, string> = {
   get_company_profile: '读取公司画像',
   propose_voucher: '创建记账草稿',
   propose_vouchers: '批量创建记账草稿',
+  propose_statement_vouchers: '按银行流水创建待确认记账',
   propose_company_setup: '创建主体建账确认卡',
-  propose_opening_balance: '创建期初余额确认卡',
   preview_asset_actions: '检查资产处理事项',
   propose_asset_closure: '发起资产处理确认',
+  run_close_checks: '运行结账五项检查',
+  list_unmatched: '查找票流账差异',
+  preview_accruals: '查看计提状态',
+  propose_match: '发起对账确认',
+  propose_accrual: '发起计提确认',
+  generate_close_report: '生成结账检查报告',
+  get_entry_detail: '查看条目详情',
+  get_filing_deadlines: '查询申报期限',
+  generate_filing_package: '生成申报作业包',
+  search_tax_policy: '检索税务政策',
   list_private_expenses: '查询小私账',
   record_private_expense: '记入小私账',
 }
@@ -75,9 +90,17 @@ const pendingActions = ref<AgentActionItem[]>([])
 const showRightBoard = ref(true)
 const lastReceiptImage = ref<{ url: string; name: string; receipt?: Record<string, unknown> } | null>(null)
 const chatCardRef = ref<InstanceType<typeof NCard> | null>(null)
+// ── 贴底跟随：流式输出时只有用户停在底部附近才自动滚底 ──
+// 用户上翻（scrollTop 减小）即暂停跟随，滚回底部附近 / 点「回到底部」/ 发新消息恢复。
+// 不用「距底距离」判上翻：内容增长会拉大距离，会把没上翻的用户误判成上翻。
+const followBottom = ref(true)
+const SCROLL_FOLLOW_THRESHOLD = 80
+let lastScrollTop = 0
+let lastScrollHeight = 0
+let boundScrollEl: HTMLElement | null = null
 let abortController: AbortController | null = null
 const conversationId = ref(`copilot-${Date.now().toString(36)}`)
-const STORAGE_KEY = 'solobooks:copilot_last_chat'
+// 聊天记录按账套隔离，键名派生与读写统一在 utils/copilotChat.ts
 
 const copiedMessageIndex = ref<number | null>(null)
 let copyTimer: ReturnType<typeof setTimeout> | null = null
@@ -110,7 +133,7 @@ const examplePrompts = computed(() => (
         '这个月赚了多少？钱主要花在哪？',
         '我现在还欠别人多少钱？别人还欠我多少？',
         '这个月要交多少税？什么时候截止？',
-        '帮我记几笔：1) 9月25日买电脑椅 499 元对公；2) 9月26日打车 32 元私账；3) 9月28日收到咨询服务费 3000 元',
+        '公司买台电脑，这笔钱能抵税吗？',
       ]
     : [
         '查一下本月未过账凭证和异常分录',
@@ -122,69 +145,12 @@ const examplePrompts = computed(() => (
 
 // ── 图片附件（发票/单据识别 → 交给 agent 起草）─────────────────────
 const imageInput = ref<HTMLInputElement | null>(null)
-const excelInput = ref<HTMLInputElement | null>(null)
+
 const attaching = ref(false)
-const parsingExcel = ref(false)
 
 function pickImage() {
   if (streaming.value || attaching.value) return
   imageInput.value?.click()
-}
-
-function pickOpeningExcel() {
-  if (streaming.value || parsingExcel.value) return
-  excelInput.value?.click()
-}
-
-async function onOpeningExcelPicked(event: Event) {
-  const picker = event.target as HTMLInputElement
-  const file = picker.files?.[0]
-  picker.value = ''
-  if (!file || streaming.value) return
-  parsingExcel.value = true
-  try {
-    const [buf, balResp] = await Promise.all([
-      file.arrayBuffer(),
-      apiClient
-        .get('/api/opening/balances', { params: { fiscal_year: new Date().getFullYear() } })
-        .catch(() => ({ items: [], ytd_items: [] })),
-    ])
-    const wb = XLSX.read(buf, { type: 'array' })
-    const allAccounts = [
-      ...(((balResp as any)?.items as any[]) || []),
-      ...(((balResp as any)?.ytd_items as any[]) || []),
-    ]
-    const parsed = parseOpeningWorkbook(wb, allAccounts)
-    const filledItems = parsed.items.filter((i) => i.debit_balance > 0 || i.credit_balance > 0)
-    const filledYtd = parsed.ytdItems.filter((i) => i.debit_balance > 0 || i.credit_balance > 0)
-    if (!filledItems.length && !filledYtd.length) {
-      message.warning(parsed.warnings[0] || '未能从该表格中识别出有效的期初科目余额，请检查表头或直接口述余额')
-      return
-    }
-    const lines = [
-      `我上传了期初科目余额表《${file.name}》，识别到以下期初数据，请直接调用 propose_opening_balance 为我生成期初余额确认卡：`,
-      '【资产/负债/权益期初余额】',
-      ...filledItems.map(
-        (i) =>
-          `- account_code=${i.account_code}, account_name=${i.account_name}, debit_balance=${i.debit_balance}, credit_balance=${i.credit_balance}${i.partner_name ? `, partner_name=${i.partner_name}` : ''}`,
-      ),
-    ]
-    if (filledYtd.length) {
-      lines.push(
-        '【本年损益累计发生额 ytd_items】',
-        ...filledYtd.map(
-          (i) =>
-            `- account_code=${i.account_code}, account_name=${i.account_name}, debit_balance=${i.debit_balance}, credit_balance=${i.credit_balance}`,
-        ),
-      )
-    }
-    input.value = lines.join('\n')
-    await send()
-  } catch (err) {
-    message.error(accountingErrorText(err))
-  } finally {
-    parsingExcel.value = false
-  }
 }
 
 function receiptMessage(r: Record<string, unknown>): string {
@@ -266,12 +232,58 @@ async function toggleRecording() {
 
 onBeforeUnmount(() => {
   if (recording.value) mediaRecorder?.stop()
+  boundScrollEl?.removeEventListener('scroll', onChatScroll)
+  boundScrollEl = null
 })
 
+function chatScrollEl(): HTMLElement | undefined {
+  return (chatCardRef.value?.$el as HTMLElement | undefined) ?? undefined
+}
+
+function distanceFromBottom(el: HTMLElement): number {
+  return el.scrollHeight - el.scrollTop - el.clientHeight
+}
+
+function markScrolled(el: HTMLElement) {
+  lastScrollTop = el.scrollTop
+  lastScrollHeight = el.scrollHeight
+}
+
+function onChatScroll() {
+  const el = chatScrollEl()
+  if (!el) return
+  // scrollTop 减小 = 用户主动上翻（程序化钉底是增大；内容收缩的钳位伴随 scrollHeight 同减，排除）
+  const shrunk = el.scrollHeight < lastScrollHeight - 1
+  if (!shrunk && el.scrollTop < lastScrollTop - 1) {
+    followBottom.value = false
+  } else if (distanceFromBottom(el) <= SCROLL_FOLLOW_THRESHOLD) {
+    followBottom.value = true
+  }
+  markScrolled(el)
+}
+
+// 流式事件驱动：用户已上翻阅读时不打扰
 function scrollBottom() {
+  if (!followBottom.value) return
   nextTick(() => {
-    const el = chatCardRef.value?.$el as HTMLElement | undefined
-    if (el) el.scrollTop = el.scrollHeight
+    if (!followBottom.value) return
+    const el = chatScrollEl()
+    if (el) {
+      el.scrollTop = el.scrollHeight
+      markScrolled(el)
+    }
+  })
+}
+
+// 用户主动行为（发送消息、点「回到底部」、载入历史会话）：无条件回底并恢复跟随
+function forceScrollBottom() {
+  followBottom.value = true
+  nextTick(() => {
+    const el = chatScrollEl()
+    if (el) {
+      el.scrollTop = el.scrollHeight
+      markScrolled(el)
+    }
   })
 }
 
@@ -300,7 +312,8 @@ function handleEvent(ev: AgentStreamEvent, target: ChatMessage) {
       scrollBottom()
       break
     case 'token':
-      if (target.reasoning && target.reasoningCollapsed === undefined) {
+      // 用户上翻阅读时不自动折叠思考框，避免高度骤缩把阅读位置顶跳
+      if (target.reasoning && target.reasoningCollapsed === undefined && followBottom.value) {
         target.reasoningCollapsed = true
       }
       target.content += ev.content || ''
@@ -323,8 +336,15 @@ function handleEvent(ev: AgentStreamEvent, target: ChatMessage) {
         step.status = ev.ok ? 'ok' : 'fail'
         step.summary = ev.summary || ''
       }
+      scrollBottom()
       break
     }
+    case 'closing_link':
+      if (ev.closingLink) {
+        target.closingLink = ev.closingLink
+        scrollBottom()
+      }
+      break
     case 'action':
       if (ev.action) {
         target.actions = target.actions || []
@@ -342,6 +362,28 @@ function handleEvent(ev: AgentStreamEvent, target: ChatMessage) {
   }
 }
 
+function renderCopilotMarkdown(raw: string): string {
+  return renderMarkdown(linkifyClosingWizardRoutes(raw))
+}
+
+function openClosingLink(link?: ClosingLink) {
+  const path = localClosingWizardPath(link?.url || '')
+  if (!path) {
+    message.error('结账入口已失效，请重新运行结账检查')
+    return
+  }
+  router.push(path)
+}
+
+function handleMarkdownClick(event: MouseEvent) {
+  const anchor = (event.target as HTMLElement | null)?.closest('a')
+  if (!anchor) return
+  const path = localClosingWizardPath(anchor.getAttribute('href') || '')
+  if (!path) return
+  event.preventDefault()
+  router.push(path)
+}
+
 async function send(imageUrl?: string) {
   const text = input.value.trim()
   if (!text || streaming.value) return
@@ -352,7 +394,7 @@ async function send(imageUrl?: string) {
 
   const assistant = reactive<ChatMessage>({ role: 'assistant', content: '', steps: [], streaming: true })
   messages.value.push(assistant)
-  scrollBottom()
+  forceScrollBottom()
 
   abortController = new AbortController()
   try {
@@ -378,6 +420,7 @@ async function send(imageUrl?: string) {
     abortController = null
     saveChatToStorage()
     await refreshPending()
+    // 生成结束时若用户已上翻阅读，这里保持条件跟随，不强行拽回底部
     scrollBottom()
   }
 }
@@ -387,33 +430,56 @@ function handleQuickAsk(prompt: string) {
   send()
 }
 
-function saveChatToStorage() {
-  try {
-    const serializable = messages.value.slice(-30).map((m) => ({
+/**
+ * 建账引导直接开「新增主体」表单。
+ * 空聊天里没有公司名/税号/启用日期可提取，走对话只会先被追问一两轮，
+ * 比结构化表单更慢；对话建账仍可用自然语言触发。
+ */
+function startCompanySetup(onboardingType: CompanyOnboardingType) {
+  router.push({ path: '/mine/companies', query: { create: onboardingType } })
+}
+
+function saveChatToStorage(companyId: string | null = authStore.currentCompanyId) {
+  saveCopilotChat(
+    companyId,
+    messages.value.slice(-30).map((m) => ({
       role: m.role,
       content: m.content,
       imageUrl: m.imageUrl,
       actions: m.actions,
       reasoning: m.reasoning,
-    }))
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(serializable))
-  } catch {
-    /* 静默 */
-  }
+      closingLink: m.closingLink,
+    })),
+  )
 }
 
 function loadChatFromStorage() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (raw) {
-      const parsed = JSON.parse(raw)
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        messages.value = parsed
-      }
-    }
-  } catch {
-    /* 静默 */
+  const records = loadCopilotChat(authStore.currentCompanyId)
+  if (records.length > 0) {
+    messages.value = records
+    void refreshActionStates(messages.value)
+    // 恢复历史会话直接落在最新一条，并复位为跟随模式
+    forceScrollBottom()
   }
+}
+
+async function refreshActionStates(source: ChatMessage[]) {
+  const actionIds = [
+    ...new Set(
+      source.flatMap((message) => message.actions?.map((action) => action.id) ?? []),
+    ),
+  ]
+  if (!actionIds.length) return
+  const settled = await Promise.allSettled(actionIds.map((id) => getAgentAction(id)))
+  const latest = new Map<string, AgentActionItem>()
+  settled.forEach((result) => {
+    if (result.status === 'fulfilled') latest.set(result.value.id, result.value)
+  })
+  if (!latest.size) return
+  source.forEach((message) => {
+    if (!message.actions?.length) return
+    message.actions = message.actions.map((action) => latest.get(action.id) || action)
+  })
 }
 
 function retryLast() {
@@ -433,22 +499,29 @@ function stopStream() {
 }
 
 async function onPendingResolved() {
-  await Promise.all([refreshPending(), entryStore.fetchEntries()])
+  await Promise.all([
+    refreshPending(),
+    entryStore.fetchEntries(),
+    refreshActionStates(messages.value),
+  ])
+  saveChatToStorage()
 }
 
 function clearChat() {
   if (streaming.value) return
   messages.value = []
   lastReceiptImage.value = null
-  try {
-    localStorage.removeItem(STORAGE_KEY)
-  } catch {
-    /* 静默 */
-  }
+  clearCopilotChat(authStore.currentCompanyId)
   conversationId.value = `copilot-${Date.now().toString(36)}`
+  followBottom.value = true
 }
 
+let consumingRouteQuery = false
+
 async function consumeRouteQuery() {
+  if (consumingRouteQuery) return
+
+  // router.replace 会立刻改变响应式 route.query，先快照本次跳转参数再消费。
   const mode = route.query.mode
   const scene = route.query.scene
   const q = route.query.q
@@ -456,39 +529,60 @@ async function consumeRouteQuery() {
 
   if (!mode && !scene && !q && !autoSend) return
 
-  // 消费完后立即清除 URL 参数，避免刷新页面时重复提问或反复弹出附件选择器
-  await router.replace({ path: route.path, query: {} })
-
-  if (mode === 'receipt') {
-    nextTick(() => {
-      pickImage()
-    })
-  }
-
-  if (scene === 'new') {
-    handleQuickAsk('我是新成立的公司，刚开始记账，请带我完成建账初始化。')
-    return
-  }
-  if (scene === 'migration') {
-    handleQuickAsk('我之前在其他代账公司/财务软件记账，现在想转到梭罗记账，请带我办理账套交接和期初余额导入。')
-    return
-  }
-  if (scene === 'onboarding') {
-    handleQuickAsk('你好，我准备开始在梭罗记账，请引导我选择「新公司从零建账」还是「从其他代账转入」，并帮我完成初始化。')
-    return
-  }
-
-  if (typeof q === 'string' && q.trim()) {
-    input.value = q.trim()
-    if (autoSend === '1') {
-      send()
+  consumingRouteQuery = true
+  try {
+    if (scene === 'closing') {
+      const month = String(route.query.month || '')
+      await router.replace({
+        path: '/closing-wizard',
+        query: {
+          ...( /^\d{4}-(0[1-9]|1[0-2])$/.test(month) ? { month } : {}),
+          step: 3,
+        },
+      })
+      return
     }
+
+    // 消费完后立即清除 URL 参数，避免刷新页面时重复提问或反复弹出附件选择器
+    await router.replace({ path: route.path, query: {} })
+
+    if (mode === 'receipt') {
+      nextTick(() => {
+        pickImage()
+      })
+      return
+    }
+
+    // 旧的 ?scene=new|migration 深链同样直达建账表单：对话里没有主体信息可提取，
+    // 多轮追问比一次填表慢；AI 引导仍保留 ?scene=onboarding。
+    if (scene === 'new' || scene === 'migration') {
+      await router.replace({ path: '/mine/companies', query: { create: scene } })
+      return
+    }
+    if (scene === 'onboarding') {
+      handleQuickAsk('你好，我准备开始在梭罗记账，请引导我选择「新公司从零建账」还是「从其他代账转入」，并帮我完成初始化。')
+      return
+    }
+
+    if (typeof q === 'string' && q.trim()) {
+      input.value = q.trim()
+      if (autoSend === '1') {
+        await send()
+      }
+    }
+  } finally {
+    consumingRouteQuery = false
   }
 }
 
 onMounted(async () => {
   if (typeof window !== 'undefined') {
     showRightBoard.value = window.innerWidth >= 1024
+  }
+  const el = chatCardRef.value?.$el as HTMLElement | null | undefined
+  if (el) {
+    boundScrollEl = el
+    el.addEventListener('scroll', onChatScroll, { passive: true })
   }
   loadChatFromStorage()
   await Promise.all([refreshPending(), entryStore.fetchEntries()])
@@ -504,6 +598,23 @@ watch(
   },
 )
 
+// 本页被 KeepAlive 缓存，账套切换不会重新 mount，必须监听 currentCompanyId
+// 重载对应账套的聊天记录；整页刷新时公司 ID 从 null 异步水合也走同一条路径
+watch(
+  () => authStore.currentCompanyId,
+  (next, prev) => {
+    if (next === prev) return
+    if (streaming.value) {
+      // 先把被打断的半截回复留在原账套名下，再切走
+      stopStream()
+      saveChatToStorage(prev)
+    }
+    lastReceiptImage.value = null
+    conversationId.value = `copilot-${Date.now().toString(36)}`
+    loadChatFromStorage()
+  },
+)
+
 // 从别的标签切回来时静默重拉，避免对着旧数字干活
 usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
 </script>
@@ -512,8 +623,16 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
   <div class="copilot-page">
     <div class="page-header">
       <div class="header-titles">
-        <h2>AI 会计 · 交互工作台</h2>
-        <span class="header-badge-tag">数字员工 · 安全确认</span>
+        <h2>AI CFO · 交互工作台</h2>
+        <NTooltip trigger="hover" placement="bottom-start" :style="{ maxWidth: '340px' }">
+          <template #trigger>
+            <span class="header-badge-tag">
+              数字员工 · 安全确认
+              <i class="ri-information-line badge-info-icon" />
+            </span>
+          </template>
+          AI 生成内容仅供参考；所有入账以人工确认为准，申报以税务局口径为准。
+        </NTooltip>
       </div>
       <div class="header-actions">
         <NButton
@@ -540,7 +659,7 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
         <NCard :bordered="false" class="chat-card" ref="chatCardRef">
           <div class="chat-messages" v-if="messages.length > 0">
             <div v-for="(msg, i) in messages" :key="i" class="message" :class="[msg.role, { streaming: msg.streaming }]">
-              <div class="msg-avatar" :class="{ 'is-streaming': msg.streaming }" :title="msg.role === 'user' ? '我' : '梭罗 · AI 会计'">
+              <div class="msg-avatar" :class="{ 'is-streaming': msg.streaming }" :title="msg.role === 'user' ? '我' : '梭罗 · AI CFO'">
                 <i v-if="msg.role === 'user'" class="ri-user-3-fill" />
                 <img v-else src="/solo-logo.png" alt="梭罗" class="avatar-logo" />
               </div>
@@ -591,7 +710,12 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
                         <span></span>
                         <span></span>
                       </div>
-                      <div v-if="msg.content" class="md-body" v-html="renderMarkdown(msg.content)"></div>
+                      <div
+                        v-if="msg.content"
+                        class="md-body"
+                        v-html="renderCopilotMarkdown(msg.content)"
+                        @click="handleMarkdownClick"
+                      ></div>
                       <span class="cursor-caret" v-if="msg.streaming && msg.content" />
                     </template>
                     <div v-if="msg.failed && !streaming" class="retry-hint">
@@ -612,6 +736,29 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
                   </button>
                 </div>
 
+                <div
+                  v-if="msg.closingLink && !msg.streaming"
+                  class="closing-link-card"
+                  :class="`is-${msg.closingLink.status}`"
+                >
+                  <div class="closing-link-copy">
+                    <span class="closing-link-icon"><i class="ri-calendar-check-line" /></span>
+                    <div>
+                      <strong>{{ msg.closingLink.label }}</strong>
+                      <p>{{ msg.closingLink.message }}</p>
+                    </div>
+                  </div>
+                  <NButton
+                    type="primary"
+                    size="small"
+                    class="closing-link-button"
+                    @click="openClosingLink(msg.closingLink)"
+                  >
+                    <template #icon><i class="ri-arrow-right-line" /></template>
+                    打开结账向导
+                  </NButton>
+                </div>
+
                 <!-- 待确认动作卡片 -->
                 <div class="msg-actions" v-if="msg.actions && msg.actions.length > 0">
                   <AgentActionCard
@@ -626,13 +773,13 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
           </div>
 
           <div v-else class="chat-empty">
-            <div class="empty-icon"><i class="ri-sparkling-2-fill"></i></div>
-            <p>你好，我是梭罗，你的 AI 会计。刚开始用？可以先选你的建账情况：</p>
+            <div class="empty-icon"><i class="ri-chat-3-line"></i></div>
+            <p>你好，我是梭罗，你的 AI CFO。刚开始用？可以先选你的建账情况：</p>
             <div class="onboarding-entry-cards">
               <button
                 type="button"
                 class="onboarding-entry-card is-new"
-                @click="handleQuickAsk('我是新成立的公司，刚开始记账，请带我完成建账初始化。')"
+                @click="startCompanySetup('new')"
               >
                 <div class="onboarding-card-head">
                   <i class="ri-seedling-line" />
@@ -643,16 +790,16 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
               <button
                 type="button"
                 class="onboarding-entry-card is-migration"
-                @click="handleQuickAsk('我之前在其他代账公司/财务软件记账，现在想转到梭罗记账，请带我办理账套交接和期初余额导入。')"
+                @click="startCompanySetup('migration')"
               >
                 <div class="onboarding-card-head">
                   <i class="ri-exchange-box-line" />
                   <strong>已记账公司 · 从其他代账/软件转入</strong>
                 </div>
-                <span>支持直接说余额或上传科目余额表 Excel，无缝衔接旧账</span>
+                <span>填一次主体信息，到期初建账页导入原代账的科目余额表 Excel</span>
               </button>
             </div>
-            <p class="empty-sub-label">或者直接问我日常账务问题：</p>
+            <p class="empty-sub-label">或者直接问我公司的财税问题：</p>
             <div class="prompt-list">
               <button
                 v-for="prompt in examplePrompts"
@@ -663,8 +810,22 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
                 {{ prompt }}
               </button>
             </div>
-            <p class="empty-note">查账、记账、找发票、看风险，直接说人话就行。</p>
+            <p class="empty-note">不用记会计术语，照平时的说法问就行。</p>
           </div>
+
+          <!-- 上翻阅读时的回底按钮：sticky 吸在滚动容器底部，恢复跟随用 -->
+          <transition name="fade-up">
+            <button
+              v-if="!followBottom && messages.length > 0"
+              type="button"
+              class="scroll-bottom-btn"
+              title="回到最新消息"
+              @click="forceScrollBottom"
+            >
+              <i class="ri-arrow-down-line" />
+              回到底部
+            </button>
+          </transition>
         </NCard>
 
         <!-- 输入区 -->
@@ -675,13 +836,6 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
             accept="image/png,image/jpeg,image/jpg,image/bmp"
             style="display: none"
             @change="onImagePicked"
-          />
-          <input
-            ref="excelInput"
-            type="file"
-            accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel"
-            style="display: none"
-            @change="onOpeningExcelPicked"
           />
           <NButton
             size="small"
@@ -696,18 +850,8 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
           <NButton
             size="small"
             quaternary
-            title="上传原代账导出的期初科目余额表 Excel (.xlsx/.xls)"
-            :disabled="streaming || parsingExcel"
-            :loading="parsingExcel"
-            @click="pickOpeningExcel"
-          >
-            <i class="ri-file-excel-2-line" />
-          </NButton>
-          <NButton
-            size="small"
-            quaternary
             :type="recording ? 'error' : 'default'"
-            :title="recording ? '点击结束录音' : '语音记账：点击开始/结束'"
+            :title="recording ? '点击结束录音' : '语音提问：点击开始/结束'"
             :disabled="streaming || transcribing"
             :loading="transcribing"
             @click="toggleRecording"
@@ -733,14 +877,13 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
             v-model:value="input"
             type="textarea"
             :autosize="{ minRows: 1, maxRows: 6 }"
-            placeholder="例如：记一笔 昨天打车 58 元；这个月支出多少？（支持语音/发票图片）"
+            placeholder="例如：这个月赚了多少？这笔收入要交哪些税？"
             :disabled="streaming"
             @keydown.enter.prevent="(!($event as KeyboardEvent).shiftKey && send())"
           />
           <NButton v-if="streaming" type="warning" secondary @click="stopStream">停止</NButton>
           <NButton v-else type="primary" :disabled="!canSend" @click="() => send()">发送</NButton>
         </div>
-        <p class="disclaimer">AI 生成内容仅供参考；所有入账以人工确认为准，申报以税务局口径为准。</p>
       </section>
 
       <!-- 右栏：业务工作板（单据原件核对 + 待确认草稿池 + 财务脉搏） -->
@@ -762,7 +905,7 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
 
 <style scoped>
 .copilot-page {
-  max-width: 1400px;
+  max-width: var(--page-width);
   margin: 0 auto;
   display: flex;
   flex-direction: column;
@@ -799,6 +942,12 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
   padding: 1px 6px;
   border-radius: 4px;
   line-height: 16px;
+  cursor: help;
+}
+.badge-info-icon {
+  margin-left: 2px;
+  font-size: 12px;
+  vertical-align: -2px;
 }
 .header-actions {
   display: flex;
@@ -852,7 +1001,7 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
   border: 1px solid var(--solo-border, #dde3ea);
   flex: 1;
   overflow-y: auto;
-  margin-bottom: 10px;
+  margin-bottom: 16px;
   background: var(--solo-bg-card, #ffffff);
 }
 .msg-image-thumb {
@@ -872,6 +1021,39 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
   display: flex;
   flex-direction: column;
   gap: 14px;
+  padding: 4px 2px 20px;
+}
+/* 上翻阅读时吸底的「回到底部」按钮：sticky 在滚动容器（.chat-card）内 */
+.scroll-bottom-btn {
+  position: sticky;
+  bottom: 16px;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: fit-content;
+  margin: 0 auto;
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--solo-border);
+  background: var(--solo-bg-card);
+  color: var(--solo-text-primary);
+  font-size: 12px;
+  cursor: pointer;
+  box-shadow: var(--solo-shadow-lg);
+}
+.scroll-bottom-btn:hover {
+  color: var(--solo-primary);
+  border-color: var(--solo-primary);
+}
+.fade-up-enter-active,
+.fade-up-leave-active {
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+.fade-up-enter-from,
+.fade-up-leave-to {
+  opacity: 0;
+  transform: translateY(8px);
 }
 .message {
   display: flex;
@@ -976,6 +1158,12 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
 .message.assistant .msg-bubble :deep(.md-body li) {
   margin: 2px 0;
 }
+.message.assistant .msg-bubble :deep(.md-body a) {
+  color: var(--solo-primary);
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
 .message.assistant .msg-bubble :deep(.md-body code) {
   padding: 1px 5px;
   border-radius: 4px;
@@ -990,6 +1178,52 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
 .message.assistant .msg-bubble :deep(.md-body td) {
   border: 1px solid rgba(0, 0, 0, 0.1);
   padding: 4px 8px;
+}
+
+.closing-link-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 14px;
+  border: 1px solid rgba(23, 71, 176, 0.18);
+  border-radius: 10px;
+  background: var(--solo-bg-page);
+}
+.closing-link-card.is-action_required {
+  border-color: rgba(214, 137, 16, 0.28);
+}
+.closing-link-copy {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+}
+.closing-link-copy strong {
+  display: block;
+  color: var(--solo-text-primary);
+  font-size: 13px;
+  line-height: 1.4;
+}
+.closing-link-copy p {
+  margin: 3px 0 0;
+  color: var(--solo-text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.closing-link-icon {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  border-radius: 8px;
+  color: var(--solo-primary);
+  background: rgba(23, 71, 176, 0.08);
+  font-size: 17px;
+}
+.closing-link-button {
+  flex: 0 0 auto;
 }
 
 /* 流光打字光标 */
@@ -1326,12 +1560,6 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
 }
 .input-bar .n-input {
   flex: 1;
-}
-.disclaimer {
-  margin: 6px 0 0;
-  font-size: 11px;
-  color: var(--solo-text-muted);
-  text-align: center;
 }
 .input-bar .n-button i {
   font-size: 16px;

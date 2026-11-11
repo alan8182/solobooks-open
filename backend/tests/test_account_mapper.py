@@ -169,7 +169,7 @@ class TestGetVoucherHint:
         hint = get_voucher_hint("income", "往来款", Decimal("500"))
         assert hint["debit"][0]["accountCode"] == "1002"
         assert hint["credit"][0]["accountCode"] == "2241"
-        assert hint["credit"][0]["accountName"] == "其他应付款-其他"
+        assert hint["credit"][0]["accountName"] == "其他应付款"
 
     def test_alipay_settlement_hint(self):
         hint = get_voucher_hint("income", "支付宝结算", 100.00)
@@ -184,23 +184,24 @@ class TestGetVoucherHint:
 
     def test_expense_boss_personal(self):
         hint = get_voucher_hint("expense", "办公费", 500, payer="boss_personal")
-        assert hint["credit"][0]["accountCode"] == "2241"  # 其他应付款-股东
-        assert hint["credit"][0]["accountName"] == "其他应付款-股东"
+        assert hint["credit"][0]["accountCode"] == "2241"
+        # 科目名只取科目表（2241 单一末级），垫付人身份不再拼进名字
+        assert hint["credit"][0]["accountName"] == "其他应付款"
 
     def test_expense_employee_personal(self):
         hint = get_voucher_hint("expense", "办公费", 500, payer="employee_personal:张三")
         assert hint["credit"][0]["accountCode"] == "2241"
-        assert hint["credit"][0]["accountName"] == "其他应付款-员工往来(张三)"
+        assert hint["credit"][0]["accountName"] == "其他应付款"
 
         hint2 = get_voucher_hint("expense", "差旅费", 300, payer="employee_personal")
         assert hint2["credit"][0]["accountCode"] == "2241"
-        assert hint2["credit"][0]["accountName"] == "其他应付款-员工往来"
+        assert hint2["credit"][0]["accountName"] == "其他应付款"
 
     def test_legacy_payer_personal_means_boss_advance(self):
         """早期 agent 参数枚举给的 personal 也必须是老板垫付，不能贷银行存款。"""
         hint = get_voucher_hint("expense", "办公费", 500, payer="personal")
         assert hint["credit"][0]["accountCode"] == "2241"
-        assert hint["credit"][0]["accountName"] == "其他应付款-股东"
+        assert hint["credit"][0]["accountName"] == "其他应付款"
 
     def test_normalize_payer(self):
         from services.account_mapper import normalize_payer
@@ -220,18 +221,18 @@ class TestGetVoucherHint:
 
         assert hint["debit"][0]["accountCode"] == "5602999"
         assert hint["credit"][0]["accountCode"] == "2241"
-        assert hint["credit"][0]["accountName"] == "其他应付款-员工往来(杨云飞)"
+        assert hint["credit"][0]["accountName"] == "其他应付款"
 
     def test_reimbursement_owner_transfer(self):
         hint = get_voucher_hint("owner_transfer", "股东垫付报销", 500, payer="boss_personal")
         assert hint["debit"][0]["accountCode"] == "2241"
-        assert hint["debit"][0]["accountName"] == "其他应付款-股东"
+        assert hint["debit"][0]["accountName"] == "其他应付款"
         assert hint["credit"][0]["accountCode"] == "1002"
         assert hint["credit"][0]["accountName"] == "银行存款"
 
         hint2 = get_voucher_hint("owner_transfer", "员工垫付报销", 600, payer="employee_personal:李四")
         assert hint2["debit"][0]["accountCode"] == "2241"
-        assert hint2["debit"][0]["accountName"] == "其他应付款-员工往来(李四)"
+        assert hint2["debit"][0]["accountName"] == "其他应付款"
         assert hint2["credit"][0]["accountCode"] == "1002"
         assert hint2["credit"][0]["accountName"] == "银行存款"
 

@@ -15,7 +15,7 @@ import { onKeyStroke, useMediaQuery, useStorage } from '@vueuse/core'
 import { NDrawer, NDrawerContent } from 'naive-ui'
 import { useAuthStore } from '@/stores/auth'
 import { useEntryStore } from '@/stores/entry'
-import { daysSince, EXPAND_WINDOW_DAYS, useGuideStateStore } from '@/stores/guideState'
+import { shouldOpenL0Modal, useGuideStateStore } from '@/stores/guideState'
 import { useTabsStore } from '@/stores/tabs'
 import { resolveActiveTab } from '@/utils/tabPages'
 import SetupWelcomeModal from '@/components/business/SetupWelcomeModal.vue'
@@ -35,7 +35,7 @@ const isMobile = useMediaQuery('(max-width: 1024px)')
 const initializing = ref(true)
 const showSearch = ref(false)
 
-const ONBOARDING_HINT_KEY = 'solo:setup-password-hint'
+const L0_USER_SEEN_PREFIX = 'solo:l0-seen:'
 const L0_REPLAY_KEY = 'solo:l0-replay'
 const L0_SHOWN_KEY = 'solo:l0-shown'
 const LEGACY_DISMISS_PREFIX = 'solo:setup-hint-dismissed:'
@@ -78,35 +78,57 @@ function viewKey(name: unknown, path: string): string {
 }
 
 /**
- * L0 起跑线：首次登录唯一的一次引导（昵称/密码已并入其中一步）。
+ * L0 起跑线：首次登录时的欢迎与分流引导。
  *
- * 三种触发：登录页埋的「账号待完善」信号、/guide 的「重看新手引导」、
- * 以及账号没看过且公司建了不到 14 天。老账套升级上来的用户不会被打扰。
- * 打开即记 l0SeenAt——不是关闭才记，否则按 Esc 下次登录又要弹一遍。
+ * 仅两种合法触发：
+ * 1. /guide 的「重看新手引导」（主动触发）
+ * 2. 纯演示账套且未建立任何真实账套的新用户在 14 天内首次访问（被动分流）
+ * 若用户已经手动设置了真实账套，绝不再单独强弹分流卡片。
  */
 function maybeOpenL0() {
-  if (sessionStorage.getItem(L0_REPLAY_KEY) === '1') {
+  try {
+    sessionStorage.removeItem('solo:setup-password-hint')
+  } catch { /* ignore */ }
+
+  const isReplay = sessionStorage.getItem(L0_REPLAY_KEY) === '1'
+  if (isReplay) {
     sessionStorage.removeItem(L0_REPLAY_KEY)
     showWelcome.value = true
     return
   }
-  if (sessionStorage.getItem(ONBOARDING_HINT_KEY) === '1') {
-    sessionStorage.removeItem(ONBOARDING_HINT_KEY)
-    guideStore.markL0Seen()
-    showWelcome.value = true
-    return
-  }
+
   guideStore.load()
-  if (guideStore.state.l0SeenAt) return
+  const userId = authStore.user?.user_id || authStore.userId || ''
+  const currentCompany = authStore.companies.find((item) => item.company_id === authStore.currentCompanyId)
+  const hasManualCompany = authStore.companies.some((item) => !item.isDemo)
+  const isCurrentDemo = Boolean(currentCompany?.isDemo)
+
+  let userL0Seen = false
+  let legacyDismissed = false
   try {
-    // 兼容旧键：以前关过「完善账号信息」的账号不再被新引导打扰
-    if (localStorage.getItem(`${LEGACY_DISMISS_PREFIX}${authStore.user?.user_id || ''}`) === '1') return
-  } catch { /* localStorage 不可用时按未关过处理 */ }
-  if (sessionStorage.getItem(L0_SHOWN_KEY) === '1') return
-  const company = authStore.companies.find((item) => item.company_id === authStore.currentCompanyId)
-  const age = daysSince(company?.created_at)
-  if (age === null || age >= EXPAND_WINDOW_DAYS) return
+    userL0Seen = Boolean(userId && localStorage.getItem(`${L0_USER_SEEN_PREFIX}${userId}`) === '1')
+    legacyDismissed = Boolean(userId && localStorage.getItem(`${LEGACY_DISMISS_PREFIX}${userId}`) === '1')
+  } catch { /* ignore */ }
+
+  const sessionShown = sessionStorage.getItem(L0_SHOWN_KEY) === '1'
+
+  const shouldOpen = shouldOpenL0Modal({
+    isReplay: false,
+    hasManualCompany,
+    isCurrentDemo,
+    l0SeenAt: guideStore.state.l0SeenAt,
+    userL0Seen,
+    legacyDismissed,
+    sessionShown,
+    companyCreatedAt: currentCompany?.created_at,
+  })
+
+  if (!shouldOpen) return
+
   guideStore.markL0Seen()
+  try {
+    if (userId) localStorage.setItem(`${L0_USER_SEEN_PREFIX}${userId}`, '1')
+  } catch { /* ignore */ }
   sessionStorage.setItem(L0_SHOWN_KEY, '1')
   showWelcome.value = true
 }

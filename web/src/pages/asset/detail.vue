@@ -415,7 +415,7 @@ onMounted(load)
 
 <style scoped>
 .detail-page {
-  max-width: 1240px;
+  max-width: var(--page-width);
   margin: 0 auto;
   padding: 16px 0 48px 0;
 }

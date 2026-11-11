@@ -5,8 +5,6 @@ import {
   NButton,
   NInput,
   NModal,
-  NRadioButton,
-  NRadioGroup,
   NSpace,
   NTabPane,
   NTabs,
@@ -17,6 +15,7 @@ import {
   type TaxRegistrationRow,
 } from '@/api/tax-registration'
 import { SoloEmpty } from '@/components/ui'
+import GuideTrigger from '@/components/business/GuideTrigger.vue'
 import { accountingErrorText } from '@/utils/errors'
 import {
   TAX_REGISTRATION_COLUMNS,
@@ -135,8 +134,9 @@ defineExpose({
       <i class="ri-compass-3-line banner-icon" />
       <span>
         <strong>电子税务局快捷路径：</strong>
-        登录电子税务局 ➔【热门服务】➔【税务数字账户】➔【账户查询】➔【税费种认定信息】
+        登录电子税务局 ➔【热门服务】➔【税务数字账户】➔【账户查询】➔【纳税人信息查询】➔【税费种认定信息】
       </span>
+      <GuideTrigger class="banner-guide" guide="tax-registration" label="看截图示例" />
     </div>
 
     <NTabs v-model:value="importTab" type="line" animated>
@@ -219,10 +219,6 @@ defineExpose({
 
     <template #footer>
       <div class="import-footer">
-        <NRadioGroup v-model:value="importMode" size="small">
-          <NRadioButton value="merge">合并更新（仅更新出现税种）</NRadioButton>
-          <NRadioButton value="replace">全量替换（未出现税种置为停用）</NRadioButton>
-        </NRadioGroup>
         <NSpace :size="8">
           <NButton size="small" @click="handleClose">取消</NButton>
           <NButton
@@ -252,6 +248,11 @@ defineExpose({
   padding: 8px 12px;
   font-size: 12px;
   margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+.banner-guide {
+  margin-left: auto;
+  flex-shrink: 0;
 }
 .banner-icon {
   font-size: 16px;
@@ -333,7 +334,7 @@ defineExpose({
 .import-footer {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 12px;
 }
 </style>

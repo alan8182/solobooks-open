@@ -4,7 +4,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { amountSignForDirection, generateVoucherLines } from '@/utils/accounting'
+import { amountSignForDirection, generateVoucherLines, normalizeVoucherLines } from '@/utils/accounting'
 import { EXPENSE_CATEGORIES, OWNER_TRANSFER_CATEGORIES } from '@/utils/constants'
 
 describe('generateVoucherLines', () => {
@@ -66,8 +66,39 @@ describe('generateVoucherLines', () => {
 
     expect(lines).toEqual([
       { code: '5602015', name: '管理费用-信息技术服务费', side: 'debit', amount: 300 },
-      { code: '2241', name: '其他应付款-员工往来(杨云飞)', side: 'credit', amount: 300 },
+      // 科目名只取科目表；员工身份落在往来单位（仅展示，落库由服务端回填）
+      { code: '2241', name: '其他应付款', side: 'credit', amount: 300, auxiliary: { partner_name: '杨云飞' } },
     ])
+  })
+
+  it('credits the standard payable with a display-only partner for boss payments', () => {
+    const lines = generateVoucherLines({
+      type: 'expense',
+      category: '办公费',
+      amount: 100,
+      payer: 'boss_personal',
+    })
+
+    expect(lines[1]).toEqual({
+      code: '2241',
+      name: '其他应付款',
+      side: 'credit',
+      amount: 100,
+      auxiliary: { partner_name: '股东' },
+    })
+  })
+
+  it('keeps line auxiliary when normalizing server voucher lines', () => {
+    const lines = normalizeVoucherLines({
+      credit: [{
+        accountCode: '2241',
+        accountName: '其他应付款',
+        amount: '100.00',
+        auxiliary: { partner_id: 'pt-1', partner_name: '张三' },
+      }],
+    })
+
+    expect(lines[0].auxiliary).toEqual({ partner_id: 'pt-1', partner_name: '张三' })
   })
 
   it('maps 股东投入 to bank debit and paid-in capital credit', () => {

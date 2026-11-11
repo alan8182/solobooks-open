@@ -112,7 +112,7 @@ def test_rd_confirmation_requires_project_and_allocation_basis(client, auth_head
         json={
             "direction": "expense",
             "amount": "100.00",
-            "title": "研发材料",
+            "title": "研发预付款",
             "category": "研发支出-费用化支出",
             "occurDate": "2026-06-16",
         },
@@ -327,3 +327,114 @@ def test_draft_reclassification_rebuilds_voucher_with_rd_detail(client, auth_hea
     assert rd_line["accountCode"] == "430100106"
     assert rd_line["rdDetail"]["projectId"] == project["id"]
     assert rd_line["rdDetail"]["allocationBasis"] == "技术开发合同 RD-2026-01"
+
+
+def test_posted_reclassification_applies_rd_detail_via_reversal_repost(client, auth_headers):
+    """已过账凭证改挂研发：必须走显式红冲重记，且重记后带上研发明细。
+
+    结账向导第二步对已过账凭证不提供内联归集，统一走「详细记账」的显式确认，
+    因此这条重记路径必须真的能落研发明细，否则用户看到的入口点不通。
+    """
+    project = _active_project(client, auth_headers, start="2026-01-01", end="2026-12-31")
+    entry_id = "rd-posted-" + uuid4().hex[:10]
+    created = client.post(
+        "/api/record/confirm",
+        headers={**auth_headers, "Idempotency-Key": f"confirm:{entry_id}"},
+        json={
+            "id": entry_id,
+            "direction": "expense",
+            "amount": "1200.00",
+            "title": "云服务费",
+            "category": "信息技术服务费",
+            "occurDate": "2026-06-15",
+            "payer": "company_account",
+            "sourceType": "integration_test",
+            "dedupFingerprint": entry_id,
+        },
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["entry"]["voucherStatus"] == "posted"
+
+    reposted = client.patch(
+        f"/api/record/entries/{entry_id}",
+        headers={**auth_headers, "Idempotency-Key": f"repost:{entry_id}"},
+        json={
+            "category": "研发支出-费用化支出",
+            "rdProjectId": project["id"],
+            "rdExpenseType": "direct_input",
+            "rdOriginalAmount": "1200.00",
+            "rdAllocationMethod": "direct",
+            "autoReverseRepost": True,
+        },
+    )
+    assert reposted.status_code == 200, reposted.text
+    new_entry = reposted.json()["entry"]
+    assert new_entry["id"] != entry_id
+    assert new_entry["voucherStatus"] == "posted"
+    rd_line = new_entry["voucherLines"]["debit"][0]
+    assert rd_line["accountCode"] == "430100102"
+    assert rd_line["rdDetail"]["projectId"] == project["id"]
+
+    entries = client.get("/api/record/entries", headers=auth_headers).json()["entries"]
+    original = next(item for item in entries if item["id"] == entry_id)
+    assert original["voucherStatus"] == "reversed"
+
+
+def test_posting_same_rd_detail_again_does_not_reverse_twice(client, auth_headers):
+    """重复提交同一份研发明细不该再冲一次：已过账凭证保持原样。
+
+    结账向导会重算并回填研发字段，用户多点一次「认可入账」不能变成
+    「冲销：冲销：」链——A 档不变量要求冲销唯一且不叠加。
+    """
+    project = _active_project(client, auth_headers, start="2026-01-01", end="2026-12-31")
+    entry_id = "rd-idem-" + uuid4().hex[:10]
+    marker = "研发材料-" + uuid4().hex[:8]
+    rd_payload = {
+        "category": "研发支出-费用化支出",
+        "rdProjectId": project["id"],
+        "rdExpenseType": "direct_input",
+        "rdOriginalAmount": "600.00",
+        "rdAllocationMethod": "direct",
+    }
+    created = client.post(
+        "/api/record/confirm",
+        headers={**auth_headers, "Idempotency-Key": f"confirm:{entry_id}"},
+        json={
+            "id": entry_id,
+            "direction": "expense",
+            "amount": "600.00",
+            "title": marker,
+            "category": "其他支出",
+            "occurDate": "2026-06-15",
+            "payer": "company_account",
+            "sourceType": "integration_test",
+            "dedupFingerprint": entry_id,
+        },
+    )
+    assert created.status_code == 200, created.text
+
+    first = client.patch(
+        f"/api/record/entries/{entry_id}",
+        headers={**auth_headers, "Idempotency-Key": f"repost:{entry_id}:1"},
+        json={**rd_payload, "autoReverseRepost": True},
+    )
+    assert first.status_code == 200, first.text
+    reposted_id = first.json()["entry"]["id"]
+    assert reposted_id != entry_id
+
+    # 同一份明细再提交一次：新凭证保持 posted，不产生第二张冲销凭证
+    again = client.patch(
+        f"/api/record/entries/{reposted_id}",
+        headers={**auth_headers, "Idempotency-Key": f"repost:{entry_id}:2"},
+        json={**rd_payload, "autoReverseRepost": True},
+    )
+    assert again.status_code == 200, again.text
+    assert again.json()["entry"]["id"] == reposted_id
+    assert again.json()["entry"]["voucherStatus"] == "posted"
+
+    entries = client.get("/api/record/entries", headers=auth_headers).json()["entries"]
+    # 本次测试自己的凭证链：只有一张冲销（同文件其它用例也会产生冲销，不能全局计数）
+    chain = [item for item in entries if marker in str(item.get("summary") or item.get("title") or "")]
+    reversals = [item for item in chain if item.get("entryType") == "reversal"]
+    assert len(reversals) == 1, [item["id"] for item in reversals]
+    assert len(chain) == 3, [item["id"] for item in chain]

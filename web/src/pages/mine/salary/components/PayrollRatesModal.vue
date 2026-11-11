@@ -1,11 +1,14 @@
 <!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { ref, watch, onMounted, onUnmounted } from 'vue'
 import {
   NModal, NSpin, NForm, NFormItem, NInputNumber, NSwitch,
-  NSpace, NButton, useMessage,
+  NSpace, NButton, NTag, useMessage,
 } from 'naive-ui'
-import { getPayrollRates, updatePayrollRates, type PayrollRates } from '@/api/salary'
+import {
+  getPayrollRates, updatePayrollRates, parsePayrollRatesScreenshot,
+  type PayrollRates, type ParsedTaxRatesResult,
+} from '@/api/salary'
 
 const props = defineProps<{
   show: boolean
@@ -21,6 +24,10 @@ const emit = defineEmits<{
 const message = useMessage()
 const loading = ref(false)
 const saving = ref(false)
+const recognizing = ref(false)
+const recognizedInfo = ref<ParsedTaxRatesResult | null>(null)
+const fileInputRef = ref<HTMLInputElement | null>(null)
+const isDragging = ref(false)
 const localRates = ref<PayrollRates | null>(null)
 const ratesRecalculate = ref(true)
 
@@ -31,21 +38,28 @@ const form = ref({
   housingCompany: 8,
 })
 
+function toPercentNumber(rateValue: any): number {
+  const n = Number(rateValue)
+  if (Number.isNaN(n)) return 0
+  return Number((n * 100).toFixed(4).replace(/\.?0+$/, ''))
+}
+
 function ratesPercent(value: number) {
-  return `${(value * 100).toFixed(2).replace(/\.?0+$/, '')}%`
+  return `${Number((value * 100).toFixed(2))}%`
 }
 
 watch(() => props.show, async (visible) => {
   if (visible) {
     loading.value = true
+    recognizedInfo.value = null
     try {
       const data: any = await getPayrollRates()
       localRates.value = data
       form.value = {
-        socialPersonal: Number(data.rates.socialPersonal) * 100,
-        socialCompany: Number(data.rates.socialCompany) * 100,
-        housingPersonal: Number(data.rates.housingPersonal) * 100,
-        housingCompany: Number(data.rates.housingCompany) * 100,
+        socialPersonal: toPercentNumber(data.rates.socialPersonal),
+        socialCompany: toPercentNumber(data.rates.socialCompany),
+        housingPersonal: toPercentNumber(data.rates.housingPersonal),
+        housingCompany: toPercentNumber(data.rates.housingCompany),
       }
     } catch {
       message.error('加载社保公积金比例失败')
@@ -58,6 +72,82 @@ watch(() => props.show, async (visible) => {
 function closeModal() {
   emit('update:show', false)
 }
+
+async function handleFileProcess(file: File) {
+  if (!file.type.startsWith('image/')) {
+    message.warning('请上传图片文件（PNG / JPG / WEBP）')
+    return
+  }
+  recognizing.value = true
+  recognizedInfo.value = null
+  try {
+    const res = await parsePayrollRatesScreenshot(file)
+    recognizedInfo.value = res
+    if (res.socialCompany > 0) {
+      form.value.socialCompany = toPercentNumber(res.socialCompany)
+    }
+    if (res.socialPersonal > 0) {
+      form.value.socialPersonal = toPercentNumber(res.socialPersonal)
+    }
+    if (res.housingCompany > 0) {
+      form.value.housingCompany = toPercentNumber(res.housingCompany)
+    }
+    if (res.housingPersonal > 0) {
+      form.value.housingPersonal = toPercentNumber(res.housingPersonal)
+    }
+    message.success(`已提取${res.province || ''}社保费率，已自动填入下方表单`)
+  } catch (err: any) {
+    message.error(err.response?.data?.detail || '截图识别失败，请手动填写比例')
+  } finally {
+    recognizing.value = false
+  }
+}
+
+function triggerFileInput() {
+  if (recognizing.value) return
+  fileInputRef.value?.click()
+}
+
+function onFileInputChange(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (file) {
+    handleFileProcess(file)
+  }
+  input.value = ''
+}
+
+function onDrop(event: DragEvent) {
+  isDragging.value = false
+  const file = event.dataTransfer?.files?.[0]
+  if (file) {
+    handleFileProcess(file)
+  }
+}
+
+function handlePaste(e: ClipboardEvent) {
+  if (!props.show || recognizing.value) return
+  const items = e.clipboardData?.items
+  if (!items) return
+  for (let i = 0; i < items.length; i++) {
+    if (items[i].type.startsWith('image/')) {
+      const file = items[i].getAsFile()
+      if (file) {
+        e.preventDefault()
+        handleFileProcess(file)
+        return
+      }
+    }
+  }
+}
+
+onMounted(() => {
+  window.addEventListener('paste', handlePaste)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('paste', handlePaste)
+})
 
 async function handleSave() {
   const values = Object.values(form.value)
@@ -93,14 +183,48 @@ async function handleSave() {
     :show="show"
     preset="card"
     title="社保公积金比例（本账套）"
-    style="width: min(540px, 92vw); border-radius: 14px"
+    style="width: min(560px, 92vw); border-radius: 14px"
     @update:show="closeModal"
   >
     <NSpin :show="loading">
-      <p class="modal-hint">
-        公积金比例因城市与单位而异（常见 8% 或 12%）。比例决定代扣拆分为「社保」与「公积金」缴纳凭证的金额，请与当地社保局扣缴端保持一致。
-      </p>
-      <NForm label-placement="left" label-width="96" style="margin-top: 12px">
+      <!-- 智能截图提取区 -->
+      <div
+        class="ocr-dropzone"
+        :class="{ 'is-dragging': isDragging, 'is-recognizing': recognizing }"
+        @dragover.prevent="isDragging = true"
+        @dragleave.prevent="isDragging = false"
+        @drop.prevent="onDrop"
+        @click="triggerFileInput"
+      >
+        <input
+          ref="fileInputRef"
+          type="file"
+          accept="image/*"
+          style="display: none"
+          @change="onFileInputChange"
+        />
+        <NSpin :show="recognizing" size="small">
+          <div class="dropzone-content">
+            <div class="dropzone-title">
+              <span class="icon">📷</span>
+              <span class="text">智能提取：粘贴或上传税务局核定表截图</span>
+            </div>
+            <p class="dropzone-desc">
+              在电子税务局截取社保核定明细后，在此<strong>直接按 Ctrl+V 粘贴</strong>，或点击上传图片，AI 自动对齐并计算比例。
+            </p>
+          </div>
+        </NSpin>
+      </div>
+
+      <!-- 识别成功提示卡片 -->
+      <div v-if="recognizedInfo" class="recognized-banner">
+        <div class="recognized-header">
+          <NTag type="success" size="small" round>已识别：{{ recognizedInfo.province }}标准</NTag>
+          <span class="recognized-summary">{{ recognizedInfo.summary }}</span>
+        </div>
+      </div>
+
+      <NForm label-placement="left" label-width="96" style="margin-top: 14px">
         <NFormItem label="个人社保">
           <NInputNumber v-model:value="form.socialPersonal" :min="0" :max="100" :precision="2" :step="0.5" style="width: 100%">
             <template #suffix>%</template>
@@ -122,8 +246,8 @@ async function handleSave() {
           </NInputNumber>
         </NFormItem>
       </NForm>
-      <p v-if="localRates && !localRates.isCustomized" class="modal-hint muted">
-        当前为系统默认基准：个人社保 {{ ratesPercent(Number(localRates.defaults.socialPersonal)) }} · 个人公积金 {{ ratesPercent(Number(localRates.defaults.housingPersonal)) }}
+      <p v-if="localRates && !localRates.isCustomized && !recognizedInfo" class="modal-hint muted">
+        已按企业注册地（{{ localRates.regionDesc || '系统默认基准' }}）自动预设：单位社保 {{ ratesPercent(Number(localRates.defaults.socialCompany)) }} · 个人社保 {{ ratesPercent(Number(localRates.defaults.socialPersonal)) }}
       </p>
       <div class="rates-recalc-row">
         <NSwitch v-model:value="ratesRecalculate" size="small" />
@@ -140,6 +264,64 @@ async function handleSave() {
 </template>
 
 <style scoped>
+.ocr-dropzone {
+  border: 1px dashed var(--solo-border);
+  border-radius: var(--solo-radius-md);
+  background: var(--solo-bg-hover);
+  padding: 12px 14px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  user-select: none;
+}
+.ocr-dropzone:hover,
+.ocr-dropzone.is-dragging {
+  border-color: var(--solo-primary);
+  background: var(--solo-primary-glow);
+}
+.dropzone-content {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.dropzone-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--solo-text-primary);
+}
+.dropzone-title .icon {
+  font-size: 14px;
+}
+.dropzone-desc {
+  font-size: 12px;
+  color: var(--solo-text-secondary);
+  line-height: 1.45;
+  margin: 0;
+}
+.dropzone-desc strong {
+  color: var(--solo-primary);
+  font-weight: 600;
+}
+.recognized-banner {
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: var(--solo-primary-glow);
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius-md);
+}
+.recognized-header {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.recognized-summary {
+  font-size: 12px;
+  color: var(--solo-text-primary);
+  line-height: 1.4;
+}
 .modal-hint {
   font-size: 12.5px;
   color: var(--solo-text-secondary);
@@ -157,8 +339,8 @@ async function handleSave() {
   gap: 8px;
   margin-top: 14px;
   padding: 10px 12px;
-  background: var(--solo-bg-hover, rgba(0, 0, 0, 0.02));
-  border-radius: var(--solo-radius-md, 8px);
+  background: var(--solo-bg-hover);
+  border-radius: var(--solo-radius-md);
 }
 .recalc-hint {
   font-size: 12px;

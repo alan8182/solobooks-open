@@ -43,11 +43,13 @@ export function useBatchPost(options: {
   const currentVoucherPostingOptions = ref<any>(null)
 
   // 本月待过账的草稿/待复核凭证明细（过账确认弹层用）
+  // 归档底稿（仅归档不记账，如平台手续费发票）是证据不是待过账凭证，不进清单
   const batchPostEntries = computed(() =>
     entryStore.activeEntries
       .filter((e: any) => {
         const status = e.voucherStatus || ''
         return entryPeriod(e) === month.value && (status === 'draft' || status === 'pending_review')
+          && !(e.isArchiveOnly || e.is_archive_only)
       })
       .map((e: any) => ({
         id: e.id,

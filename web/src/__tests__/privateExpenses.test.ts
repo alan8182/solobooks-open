@@ -103,6 +103,7 @@ describe('Private Expenses Page & Calculations', () => {
     // Header check
     expect(wrapper.text()).toContain('小私账')
     expect(wrapper.text()).toContain('老板个人对账')
+    expect(wrapper.text()).toContain('银行授信与投资人尽调')
 
     // 4-stat cards check
     expect(wrapper.text()).toContain('私账垫付')

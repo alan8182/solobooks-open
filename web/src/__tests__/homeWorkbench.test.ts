@@ -16,7 +16,7 @@ describe('home workbench and agent alignment', () => {
     expect(home?.group).toBe('日常')
 
     expect(copilot).toBeDefined()
-    expect(copilot?.label).toBe('AI 会计')
+    expect(copilot?.label).toBe('AI CFO')
     expect(copilot?.group).toBe('日常')
   })
 
@@ -188,6 +188,14 @@ describe('home workbench and agent alignment', () => {
 
     expect(selectDefaultTab(3)).toBe('actions')
     expect(selectDefaultTab(0)).toBe('snapshot')
+  })
+
+  it('keeps boss action card for funds pointing to the unified bank & private workspace', async () => {
+    // 验证首页老板快捷卡片中，资金卡片直达 /bank（公户与私账双 Tab 工作空间）
+    const router = (await import('@/router')).default
+    const fundsRoute = router.resolve('/bank')
+    expect(fundsRoute.matched.length).toBeGreaterThan(0)
+    expect(fundsRoute.meta.workspace).toBeUndefined()
   })
 })
 

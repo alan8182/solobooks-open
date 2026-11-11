@@ -8,6 +8,7 @@ import type { PrivateExpense } from '@/api/private-expense'
 import { formatMoney } from '@/utils/format'
 import { SoloSkeleton } from '@/components/ui'
 import { SoloErrorState } from '@/components/ui'
+import BankBalanceWidget from './BankBalanceWidget.vue'
 
 /** 失败后重试：store 会把失败原因写进 error，成功时自动清空 */
 async function reloadEntries() {
@@ -169,13 +170,14 @@ const periodProfit = computed(() => periodIncome.value - periodExpense.value)
         </span>
       </div>
     </div>
+    <BankBalanceWidget />
   </div>
 </template>
 
 <style scoped>
 .summary-panel {
   display: grid;
-  grid-template-columns: minmax(280px, 0.9fr) minmax(340px, 1.1fr);
+  grid-template-columns: minmax(280px, 1fr) minmax(300px, 1.05fr) minmax(260px, 0.95fr);
   border: 1px solid var(--solo-border);
   border-radius: var(--solo-radius-xl);
   background: #fff;
@@ -328,12 +330,26 @@ const periodProfit = computed(() => periodIncome.value - periodExpense.value)
 .expense .stat-value {
   color: var(--solo-expense);
 }
+@media (max-width: 1024px) {
+  .summary-panel {
+    grid-template-columns: minmax(280px, 1fr) minmax(300px, 1.05fr);
+  }
+  :deep(.bank-balance-widget) {
+    grid-column: 1 / -1;
+    border-left: 0;
+    border-top: 1px solid var(--solo-border-light);
+  }
+}
+
 @media (max-width: 660px) {
   .summary-panel {
     grid-template-columns: 1fr;
   }
   .summary-intro {
     border-right: 0;
+    border-bottom: 1px solid var(--solo-border-light);
+  }
+  .stats-list {
     border-bottom: 1px solid var(--solo-border-light);
   }
   .stat-row {

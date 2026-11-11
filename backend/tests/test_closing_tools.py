@@ -113,9 +113,27 @@ async def test_difference_tool_scopes_suggestions_and_preserves_group(monkeypatc
             {"statementId": "july", "type": "match", "matchedEntryId": "income", "matchedEntryIds": ["income", "fee"], "matchedEntries": [{"id": "income"}, {"id": "fee"}]},
             {"statementId": "june", "type": "match", "matchedEntryId": "other"},
         ]
+    async def snapshot(*_, **__):
+        return {
+            "schemaVersion": "closing.v1",
+            "snapshotHash": "c" * 64,
+            "periodVersion": 1,
+            "generatedAt": "2026-07-31T00:00:00+00:00",
+            "findings": [],
+        }
+    async def valid_snapshot(*_, **__):
+        return await snapshot()
     monkeypatch.setattr("services.bank_service.get_statements", statements)
     monkeypatch.setattr("services.bank_service.get_difference_report", diff)
     monkeypatch.setattr("services.bank_service.ai_suggest_matches", suggestions)
+    monkeypatch.setattr(
+        "services.closing_workflow_service.get_closing_snapshot",
+        snapshot,
+    )
+    monkeypatch.setattr(
+        "services.closing_workflow_service.validate_snapshot_hash",
+        valid_snapshot,
+    )
     result = await tools._list_unmatched(tools.ToolContext("owner", "c-tools"), "2026-07")
     assert [row["statementId"] for row in result["unmatchedStatements"]] == ["july"]
     assert len(result["aiSuggestions"]) == 1
@@ -133,9 +151,27 @@ async def test_difference_tool_surfaces_suggestion_failure(monkeypatch):
         return {"bank_only_count": 1}
     async def broken(*_, **__):
         raise RuntimeError("llm unavailable")
+    async def snapshot(*_, **__):
+        return {
+            "schemaVersion": "closing.v1",
+            "snapshotHash": "d" * 64,
+            "periodVersion": 1,
+            "generatedAt": "2026-07-31T00:00:00+00:00",
+            "findings": [],
+        }
+    async def valid_snapshot(*_, **__):
+        return await snapshot()
     monkeypatch.setattr("services.bank_service.get_statements", statements)
     monkeypatch.setattr("services.bank_service.get_difference_report", diff)
     monkeypatch.setattr("services.bank_service.ai_suggest_matches", broken)
+    monkeypatch.setattr(
+        "services.closing_workflow_service.get_closing_snapshot",
+        snapshot,
+    )
+    monkeypatch.setattr(
+        "services.closing_workflow_service.validate_snapshot_hash",
+        valid_snapshot,
+    )
     result = await tools._list_unmatched(tools.ToolContext("owner", "c-tools"), "2026-07")
     assert result["aiSuggestions"] == []
     assert "生成失败" in result["aiSuggestionsError"]
@@ -145,31 +181,57 @@ async def test_difference_tool_surfaces_suggestion_failure(monkeypatch):
 @pytest.mark.asyncio
 async def test_report_does_not_treat_query_failure_as_no_differences(monkeypatch):
     async def checks(*_):
-        return {"canClose": True, "periodStatus": "open", "blockingCount": 0, "checks": []}
-    async def unavailable(*_):
+        return {
+            "schemaVersion": "closing.v1",
+            "snapshotHash": "a" * 64,
+            "periodVersion": 1,
+            "canClose": True,
+            "periodStatus": "open",
+            "blockingCount": 0,
+            "checks": [],
+        }
+    async def unavailable(*_, **__):
         raise RuntimeError("database unavailable")
-    async def accruals(*_):
+    async def accruals(*_, **__):
         return {}
     async def audit(*_):
         pass
+    async def stable_snapshot(*_, **__):
+        return {"snapshotHash": "a" * 64}
     monkeypatch.setattr(tools, "_run_close_checks", checks)
     monkeypatch.setattr(tools, "_list_unmatched", unavailable)
     monkeypatch.setattr(tools, "_preview_accruals", accruals)
     monkeypatch.setattr("services.audit_service.log_action", audit)
+    monkeypatch.setattr(
+        "services.closing_workflow_service.validate_snapshot_hash",
+        stable_snapshot,
+    )
     result = await tools._generate_close_report(tools.ToolContext("owner", "c-tools"), "2026-07")
     assert result["differenceStatus"] == "unavailable"
     assert result["canClose"] is False
     assert "未完成核验" in result["report"]
     assert "不能将查询失败理解为没有差异" in result["report"]
+    assert result["manualClose"]["url"].endswith(
+        "/closing-wizard?month=2026-07&step=3"
+    )
+    assert result["manualClose"]["url"] in result["report"]
 
 
 @pytest.mark.asyncio
 async def test_report_includes_amortization_and_depreciation(monkeypatch):
     async def checks(*_):
-        return {"canClose": True, "periodStatus": "open", "blockingCount": 0, "checks": []}
-    async def diff(*_):
+        return {
+            "schemaVersion": "closing.v1",
+            "snapshotHash": "b" * 64,
+            "periodVersion": 1,
+            "canClose": True,
+            "periodStatus": "open",
+            "blockingCount": 0,
+            "checks": [],
+        }
+    async def diff(*_, **__):
         return {"status": "available", "unmatchedStatements": [], "aiSuggestions": []}
-    async def accruals(*_):
+    async def accruals(*_, **__):
         return {
             "depreciation": {"pendingCount": 2, "pendingTotal": 1200.0},
             "amortization": {"pendingCount": 1, "pendingTotal": 500.0},
@@ -177,14 +239,21 @@ async def test_report_includes_amortization_and_depreciation(monkeypatch):
         }
     async def audit(*_):
         pass
+    async def stable_snapshot(*_, **__):
+        return {"snapshotHash": "b" * 64}
     monkeypatch.setattr(tools, "_run_close_checks", checks)
     monkeypatch.setattr(tools, "_list_unmatched", diff)
     monkeypatch.setattr(tools, "_preview_accruals", accruals)
     monkeypatch.setattr("services.audit_service.log_action", audit)
+    monkeypatch.setattr(
+        "services.closing_workflow_service.validate_snapshot_hash",
+        stable_snapshot,
+    )
     result = await tools._generate_close_report(tools.ToolContext("owner", "c-tools"), "2026-07")
     assert "- 折旧：待计提 2 项，合计 1200.0 元" in result["report"]
     assert "- 摊销：待计提 1 项，合计 500.0 元" in result["report"]
     assert "- 工资：工资表已审核" in result["report"]
+    assert "## 网页锁账入口" in result["report"]
 
 
 @pytest.mark.asyncio

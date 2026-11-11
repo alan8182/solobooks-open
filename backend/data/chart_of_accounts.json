@@ -274,6 +274,12 @@
         "direction": "credit",
         "parentCode": "2211"
       },
+      "221105": {
+        "name": "应付职工薪酬-住房公积金",
+        "type": "流动负债",
+        "direction": "credit",
+        "parentCode": "2211"
+      },
       "2221": {
         "name": "应交税费",
         "type": "流动负债",
@@ -639,43 +645,43 @@
         "isLeaf": false
       },
       "430100101": {
-        "name": "研发支出-人员人工",
+        "name": "研发支出-费用化支出-人员人工",
         "type": "成本",
         "direction": "debit",
         "parentCode": "4301001"
       },
       "430100102": {
-        "name": "研发支出-直接投入",
+        "name": "研发支出-费用化支出-直接投入",
         "type": "成本",
         "direction": "debit",
         "parentCode": "4301001"
       },
       "430100103": {
-        "name": "研发支出-折旧与摊销",
+        "name": "研发支出-费用化支出-折旧与摊销",
         "type": "成本",
         "direction": "debit",
         "parentCode": "4301001"
       },
       "430100104": {
-        "name": "研发支出-设计费",
+        "name": "研发支出-费用化支出-设计费",
         "type": "成本",
         "direction": "debit",
         "parentCode": "4301001"
       },
       "430100105": {
-        "name": "研发支出-试验费",
+        "name": "研发支出-费用化支出-试验费",
         "type": "成本",
         "direction": "debit",
         "parentCode": "4301001"
       },
       "430100106": {
-        "name": "研发支出-委外研发费",
+        "name": "研发支出-费用化支出-委外研发费",
         "type": "成本",
         "direction": "debit",
         "parentCode": "4301001"
       },
       "430100199": {
-        "name": "研发支出-其他研发费用",
+        "name": "研发支出-费用化支出-其他研发费用",
         "type": "成本",
         "direction": "debit",
         "parentCode": "4301001"
@@ -888,6 +894,12 @@
       },
       "5602016": {
         "name": "管理费用-单位社保",
+        "type": "费用",
+        "direction": "debit",
+        "parentCode": "5602"
+      },
+      "5602017": {
+        "name": "管理费用-住房公积金",
         "type": "费用",
         "direction": "debit",
         "parentCode": "5602"

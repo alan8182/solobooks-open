@@ -48,6 +48,7 @@ RETURN_GROUP_ORDER = (
     "business_income_iit_prepay",
     "business_income_iit_annual",
     "iit_withholding",
+    "social_insurance",
     "stamp_duty",
     "culture_fee",
     "disability_fund",
@@ -82,6 +83,12 @@ TAX_KINDS: Dict[str, Dict[str, str]] = {
         "name": "个税扣缴",
         "freq": "month",
         "guide": "自然人电子税务局（扣缴端，桌面客户端）申报。每月必须申报；无员工或无工资发放时，需至少添加一人（如法定代表人）完成零申报。",
+    },
+    # 社保费只由 expected_schedule 按工资表逐月物化，内置清单不铺（_legacy_periods 不认这个 freq）。
+    "social_insurance": {
+        "name": "社保费申报缴纳",
+        "freq": "same_month_15",
+        "guide": "电子税务局的社保费模块（各地菜单名称不同）。社保费由用人单位自行向税务部门申报缴纳，个人部分由单位代扣代缴。截止日按每月 15 日前提示（浙江、上海等地口径），天津等地为当月最后一日前，以所在地公告为准。",
     },
     "annual_report": {
         "name": "工商年报（市监局）",
@@ -191,6 +198,14 @@ def compute_due_date(tax_kind: str, period: str) -> Optional[date]:
 
     if freq == "month":
         return _month_due_date(period, overrides)
+
+    if freq == "same_month_15":
+        # 社保费缴的是当月的费款，截止在所属月内，不是个税那样的次月 15 日。
+        # 各地 15 日至月末不等，取已核实口径里最早的一个；不做周末顺延，宁早勿晚。
+        try:
+            return date(int(period[:4]), int(period[5:7]), 15)
+        except (TypeError, ValueError):
+            return None
 
     if freq == "annual_iit":
         # 经营所得汇算清缴（B 表）：次年 3 月 31 日。
@@ -477,7 +492,7 @@ async def effective_iit_cycle(company_id: str) -> str:
     return await _company_iit_cycle(company_id)
 
 
-AUTO_WAIVE_REASONS = frozenset({"filing_cycle_changed", "registration_changed"})
+AUTO_WAIVE_REASONS = frozenset({"filing_cycle_changed", "registration_changed", "salary_social_changed"})
 
 
 def _auto_waived(row: FilingDeadline) -> bool:
@@ -514,8 +529,11 @@ def _reconcile_rows(
         if row.status != "pending":
             continue
         row.status = "waived"
+        # 社保事项随工资表增减（如计提被冲销），豁免理由与税种周期变化分开；
+        # 重新计提后的恢复由 AUTO_WAIVE_REASONS 覆盖。
+        row_reason = "salary_social_changed" if row.tax_kind == "social_insurance" else reason
         row.filed_evidence = {
-            "reason": reason,
+            "reason": row_reason,
             "auto": True,
             "waivedAt": datetime.utcnow().isoformat(),
         }
@@ -623,9 +641,26 @@ async def expected_schedule(company_id: str, year: Optional[int] = None) -> Dict
                 if due:
                     items[(tax_kind, period)] = due
 
+    # 社保费：工资表该月已计提社保才有申报义务（口径见 social_insurance_month_summary）。
+    # 认定表分组里没有社保（map_return_group 不产出该组），所以独立于上面两个分支。
+    social_signal_ok = True
+    try:
+        from services import salary_service
+
+        social_months = await salary_service.social_insurance_month_summary(company_id, year)
+    except Exception:  # noqa: BLE001 —— 工资表读取失败不拖垮其他税种的征期
+        logger.exception("social insurance month summary failed company=%s", company_id)
+        social_months = {}
+        social_signal_ok = False
+    for month in social_months:
+        due = compute_due_date("social_insurance", month)
+        if due:
+            items[("social_insurance", month)] = due
+
     return {
         "year": year,
         "items": items,
+        "socialSignalOk": social_signal_ok,
         "cycles": cycles,
         "source": source,
         "registrations": registrations,
@@ -693,7 +728,11 @@ async def refresh_deadlines(company_id: str, year: Optional[int] = None) -> Dict
                 )
             )
             created += 1
-        auto_waived += _reconcile_rows(existing, items, schedule["source"])
+        # 工资表没读到不等于没人交社保：此时不动社保行，否则一次读取失败会把待办全部豁免
+        reconcilable = existing if schedule["socialSignalOk"] else {
+            key: row for key, row in existing.items() if key[0] != "social_insurance"
+        }
+        auto_waived += _reconcile_rows(reconcilable, items, schedule["source"])
 
     return {
         "year": year,

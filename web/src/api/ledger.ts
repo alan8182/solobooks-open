@@ -159,6 +159,8 @@ export interface LedgerDetailLine {
   period: string
   voucherRef: string | null
   summary: string
+  partnerId?: string | null
+  partnerName?: string | null
   debit: string
   credit: string
   balance: string
@@ -196,6 +198,8 @@ export interface LedgerChronologicalRow {
   period: string
   date: string
   summary: string
+  partnerId?: string | null
+  partnerName?: string | null
   accountCode: string
   accountName: string
   direction: 'debit' | 'credit'

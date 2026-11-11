@@ -117,6 +117,7 @@ describe('ReportPage Dual-View UX (Boss vs Accounting)', () => {
     // 标题与副标题脱敏
     expect(wrapper.text()).toContain('经营概览')
     expect(wrapper.text()).toContain('企业实时收支、手头现钱与往来账款')
+    expect(wrapper.text()).toContain('建立老板财务直觉')
 
     // 4 宫格核心人话标题
     expect(wrapper.text()).toContain('收入')

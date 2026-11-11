@@ -13,6 +13,8 @@ import type {
   ConfirmResponse,
   Entry,
   EntryUpdateRequest,
+  VoucherPreview,
+  VoucherPreviewRequest,
 } from './types'
 
 export function recordText(data: RecordTextRequest): Promise<RecordTextResponse> {
@@ -51,6 +53,17 @@ export function getEntries(): Promise<{ entries: Entry[] }> {
 
 export function updateEntry(entryId: string, data: EntryUpdateRequest): Promise<{ entry: Entry }> {
   return apiClient.patch(`/api/record/entries/${entryId}`, data, { headers: idempotencyHeaders() })
+}
+
+/**
+ * 结账向导第二步：预览这笔单子按当前付款方式/分类将落哪个科目。
+ * 只读接口，与「认可入账」共用后端同一条规则路径。
+ */
+export function previewEntryVoucher(
+  entryId: string,
+  data: VoucherPreviewRequest,
+): Promise<VoucherPreview> {
+  return apiClient.post(`/api/record/entries/${entryId}/voucher-preview`, data, { timeout: 30000 })
 }
 
 export function deleteEntry(entryId: string): Promise<{ ok: boolean }> {

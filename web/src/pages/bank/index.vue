@@ -6,6 +6,7 @@ import { useRouter } from 'vue-router'
 import {
   NCard, NButton, NTag, NSpace, useMessage, NSpin,
   NInput, NModal, NDataTable, NSelect, NDatePicker, useDialog,
+  NCollapse, NCollapseItem,
 } from 'naive-ui'
 import apiClient from '@/api/client'
 import { getRdExpenseTypes, getRdProjects } from '@/api/rd'
@@ -18,12 +19,20 @@ import {
   parseBankWorkbookData,
   bankColumnDescriptionRole,
   extractStatementCounterparty,
+  isBankCounterpartySourceBlocked,
 } from '@/utils/bankImport'
 import { SoloDrawer, SoloEmpty, SoloStatusBadge } from '@/components/ui'
+import FileDropzone from '@/components/business/FileDropzone.vue'
+import GuideTrigger from '@/components/business/GuideTrigger.vue'
+import MailInboxCard from '@/components/business/MailInboxCard.vue'
+import BossTrackNav from '@/components/business/BossTrackNav.vue'
+import BankCategoryRulesDrawer from './components/BankCategoryRulesDrawer.vue'
+import { useWorkspaceViewStore } from '@/stores/workspaceView'
 
 const router = useRouter()
 const message = useMessage()
 const dialog = useDialog()
+const viewStore = useWorkspaceViewStore()
 const { confirmDelete } = useDeleteConfirm()
 
 const loading = ref(false)
@@ -41,6 +50,7 @@ const tablePageSize = ref(20)
 const checkedRowKeys = ref<Array<string | number>>([])
 const batchDeleting = ref(false)
 const repairingEffects = ref<Record<string, boolean>>({})
+const showCategoryRules = ref(false)
 
 const balanceSummary = computed(() => diffReport.value?.balance_reconciliation || null)
 const matchedEffectIssues = computed<any[]>(() => diffReport.value?.matched_effect_issues || [])
@@ -180,12 +190,136 @@ const excelColumns = ref<string[]>([])
 const excelFileName = ref('')
 const excelImporting = ref(false)
 const columnMapping = ref<Record<string, string>>({})
+const advancedPanels = ref<string[]>([])
+
+// 预览与真正提交的数据必须同源：解析一次，核对和导入都用它，改映射即时重算
+const importPreview = computed(() => buildBankRows(excelRows.value, columnMapping.value))
+const PREVIEW_ROW_COUNT = 8
+const previewRows = computed(() => importPreview.value.rows.slice(0, PREVIEW_ROW_COUNT))
+
+const DESCRIPTION_FIELDS = ['description', 'comment', 'counterparty_name', 'payee_name', 'payer_name']
+
+interface KeyFieldRow {
+  field: string
+  label: string
+  columns: string[]
+  detected: boolean
+  required: boolean
+  sourceText: string
+  /** 字段来自多列（摘要拼接、收入/支出分列）时不给单列下拉，交给下方全部列 */
+  editable: boolean
+  splitMode?: boolean
+}
+
+// 识别结果只反查真正需要人确认的五个字段，其余列一律视为自动处理
+const keyFieldRows = computed<KeyFieldRow[]>(() => {
+  const colsOf = (fields: string[]) =>
+    excelColumns.value.filter(col => fields.includes(columnMapping.value[col] || ''))
+  const join = (cols: string[]) => cols.join('、')
+  const date = colsOf(['transaction_date'])
+  const time = colsOf(['transaction_time'])
+  const desc = colsOf(['description'])
+  const descSupport = colsOf(DESCRIPTION_FIELDS.filter(f => f !== 'description'))
+  const amount = colsOf(['amount'])
+  const split = colsOf(['income_amount', 'expense_amount'])
+  const balance = colsOf(['balance'])
+  return [
+    {
+      field: 'transaction_date', label: '日期', columns: date, required: true,
+      detected: date.length > 0, sourceText: date.length ? join(date) : '未识别',
+      editable: date.length <= 1,
+    },
+    {
+      field: 'transaction_time', label: '交易时间', columns: time, required: false,
+      detected: time.length > 0, sourceText: time.length ? join(time) : '未使用',
+      editable: time.length <= 1,
+    },
+    {
+      field: 'description', label: '摘要', columns: desc, required: false,
+      detected: desc.length > 0 || descSupport.length > 0,
+      sourceText: desc.length
+        ? join(desc)
+        : descSupport.length ? `附言/户名自动拼接（${descSupport.length} 列）` : '未使用',
+      editable: desc.length <= 1,
+    },
+    {
+      field: 'amount', label: '金额', columns: amount, required: true,
+      detected: amount.length > 0 || split.length > 0,
+      sourceText: amount.length
+        ? join(amount)
+        : split.length ? `收入/支出两列（${join(split)}）` : '未识别',
+      editable: amount.length <= 1 && split.length === 0,
+      splitMode: split.length > 0,
+    },
+    {
+      field: 'balance', label: '余额', columns: balance, required: false,
+      detected: balance.length > 0, sourceText: balance.length ? join(balance) : '未识别',
+      editable: balance.length <= 1,
+    },
+  ]
+})
+
+const unrecognizedRequired = computed(() => keyFieldRows.value.filter(row => row.required && !row.detected))
+
+// 换来源列：清掉同字段旧列；金额的三种来源互斥，选了单金额列就撤掉收支拆分
+function setFieldSource(field: string, column: string) {
+  const targets = field === 'amount' ? ['amount', 'income_amount', 'expense_amount'] : [field]
+  for (const col of excelColumns.value) {
+    if (col !== column && targets.includes(columnMapping.value[col] || '')) columnMapping.value[col] = ''
+  }
+  if (column) columnMapping.value[column] = field
+}
+
+const importPreviewColumns = [
+  {
+    title: '日期 / 时间', key: 'transaction_date', width: 132,
+    render: (row: any) => {
+      const raw = String(row.transaction_date || '')
+      return h('div', { style: 'line-height: 1.35;' }, [
+        h('div', raw.slice(0, 10) || '-'),
+        raw.length > 10
+          ? h('div', { style: 'font-size: 11px; color: var(--solo-text-muted);' }, raw.slice(11))
+          : null,
+      ])
+    },
+  },
+  { title: '摘要', key: 'description', ellipsis: { tooltip: true } },
+  {
+    title: '金额', key: 'amount', width: 96, align: 'right' as const,
+    render: (row: any) => h('span', {
+      style: {
+        color: row.amount < 0
+          ? 'var(--solo-expense, #bd3d3d)'
+          : row.amount > 0 ? 'var(--solo-income)' : 'var(--solo-text-muted)',
+        fontVariantNumeric: 'tabular-nums',
+      },
+    }, Number(row.amount || 0).toFixed(2)),
+  },
+  {
+    title: '余额', key: 'balance', width: 100, align: 'right' as const,
+    render: (row: any) => h('span', { style: 'font-variant-numeric: tabular-nums;' },
+      Number(row.balance || 0).toFixed(2)),
+  },
+]
 
 
 const statementColumns = [
   { type: 'selection' as const },
   {
     title: '日期', key: 'transaction_date', width: 110,
+    // 网银把日期与时间拆两列时前端会并成 'YYYY-MM-DD HH:mm:ss'；表格里日期为主、
+    // 时间用次级颜色另起一行，同日多笔同额手续费靠时间分辨先后。
+    render: (row: any) => {
+      const raw = String(row.transaction_date || '')
+      const day = raw.slice(0, 10)
+      const time = raw.slice(11)
+      return h('div', { style: 'line-height: 1.35;' }, [
+        h('div', day || '-'),
+        time
+          ? h('div', { style: 'font-size: 11px; color: var(--solo-text-muted);' }, time)
+          : null,
+      ])
+    },
     sorter: (a: any, b: any) => String(a.transaction_date || '').localeCompare(String(b.transaction_date || '')),
     defaultSortOrder: 'descend' as const,
   },
@@ -405,21 +539,16 @@ function getConfidenceLabel(conf: number): string {
   return '低'
 }
 
-function triggerFilePicker() {
-  const input = document.createElement('input')
-  input.type = 'file'
-  input.accept = '.xlsx,.xls,.csv'
-  input.style.display = 'none'
-  input.addEventListener('change', handleFileUpload)
-  document.body.appendChild(input)
-  input.click()
-  document.body.removeChild(input)
+// 邮件收件箱「导入」：只接受流水类附件（卡片已按 kinds 过滤，这里是最后防线）
+function handleInboxImport({ kind, file }: { kind: string; file: File }) {
+  if (kind !== 'bank') {
+    message.warning('这份附件不是银行流水，请在月度结账向导里导入')
+    return
+  }
+  handleFile(file)
 }
 
-function handleFileUpload(e: Event) {
-  const input = e.target as HTMLInputElement
-  const file = input.files?.[0]
-  if (!file) return
+function handleFile(file: File) {
   excelFileName.value = file.name
   const reader = new FileReader()
   reader.onload = (ev) => {
@@ -433,17 +562,17 @@ function handleFileUpload(e: Event) {
       excelColumns.value = Object.keys(json[0] as any)
       excelRows.value = json as any[]
       columnMapping.value = detectBankColumnMapping(excelColumns.value)
+      advancedPanels.value = []
       excelStep.value = 'preview'
     } catch {
       message.error('解析文件失败')
     }
   }
   reader.readAsArrayBuffer(file)
-  input.value = '' // reset
 }
 
 async function handleExcelImport() {
-  const { rows: importable, skippedInvalidDate } = buildBankRows(excelRows.value, columnMapping.value)
+  const { rows: importable, skippedInvalidDate } = importPreview.value
   if (importable.length === 0) {
     message.error('未在文件中解析到带有效交易日期的流水行')
     return
@@ -516,6 +645,7 @@ function openExcelImport() {
   excelColumns.value = []
   excelFileName.value = ''
   columnMapping.value = {}
+  advancedPanels.value = []
   showExcelImport.value = true
 }
 
@@ -526,15 +656,17 @@ usePageRefresh(loadStatements)
 
 <template>
   <div class="bank-page">
+    <BossTrackNav />
     <div class="page-header">
       <div class="header-left">
         <div class="title-section">
-          <h2>银行对账</h2>
-          <p class="subtitle">核对银行流水并匹配系统记账凭证，所有匹配都需手动确认</p>
+          <h2>{{ viewStore.isBoss ? '公户流水与对账' : '银行对账' }}</h2>
+          <p class="subtitle">{{ viewStore.isBoss ? '告别传统代账“只抄发票不对流水”。把每一笔公户流水 100% 勾稽配平，你的报表才具备真实的授信与尽调含金量' : '核对银行流水并 100% 匹配系统记账凭证，确保账实相符、随时经得起审计与尽调核查' }}</p>
         </div>
       </div>
       <div class="header-right">
         <NSpace>
+          <NButton size="small" @click="showCategoryRules = true">分类规则</NButton>
           <NButton size="small" :loading="matching" @click="handleMatch">生成匹配候选</NButton>
           <NButton size="small" @click="openExcelImport">导入文件</NButton>
         </NSpace>
@@ -614,6 +746,7 @@ usePageRefresh(loadStatements)
           <template #action>
             <div class="empty-actions">
               <NButton type="primary" size="small" @click="openExcelImport">导入文件</NButton>
+              <GuideTrigger guide="bank-statement" label="不知道去哪下载？" />
             </div>
           </template>
         </SoloEmpty>
@@ -789,7 +922,7 @@ usePageRefresh(loadStatements)
             <span>AI 将只用于分析剩余流水，并可能建议新建记账草稿。</span>
           </div>
           <NButton type="primary" secondary size="small" :loading="aiLoading" @click="handleAiSuggest">
-            <template #icon><i class="ri-sparkling-2-line" /></template>
+            <template #icon><i class="ri-search-eye-line" /></template>
             AI 分析剩余流水
           </NButton>
         </div>
@@ -857,72 +990,185 @@ usePageRefresh(loadStatements)
       </NSpin>
     </SoloDrawer>
 
+    <BankCategoryRulesDrawer v-model:show="showCategoryRules" />
+
     <!-- Import Modal（CSV/Excel 统一走前端解析，CSV 弹窗已移除） -->
-    <NModal v-model:show="showExcelImport" title="导入银行流水文件" preset="card" style="width: 700px;">
+    <NModal v-model:show="showExcelImport" title="导入银行流水文件" preset="card" style="width: min(760px, 92vw);">
       <template v-if="excelStep === 'upload'">
-        <div class="upload-area">
-          <p>选择银行流水文件（.xlsx / .xls / .csv）</p>
-          <NButton type="primary" @click="triggerFilePicker">选择文件</NButton>
+        <MailInboxCard collapsible :kinds="['bank']" @import="handleInboxImport" @error="message.error($event)" />
+        <FileDropzone
+          accept=".xlsx,.xls,.csv"
+          icon="ri-bank-line"
+          title="点击或拖拽银行流水文件上传"
+          subtitle="支持网银导出的 .xlsx / .xls / .csv，上传后先预览解析结果，确认后才写入流水"
+          @file="handleFile"
+          @error="message.error($event)"
+        />
+        <div class="upload-tip">
+          <h4>导入说明</h4>
+          <ul>
+            <li>使用网银「交易明细 / 流水」导出的文件即可，系统会自动识别日期、金额、余额等关键列。</li>
+            <li>上传后先展示解析预览，核对无误再确认导入。</li>
+            <li>重复流水会自动跳过，同一份文件重复导入不会重复入库。</li>
+          </ul>
+          <GuideTrigger guide="bank-statement" label="不知道去哪下载？" hint="手机银行导出步骤" />
         </div>
       </template>
 
       <template v-if="excelStep === 'preview'">
         <p class="excel-info">文件：{{ excelFileName }} · 共 {{ excelRows.length }} 行</p>
 
-        <h4 class="section-title">列映射</h4>
-        <p class="mapping-hint">附言、对手方户名等辅助列无需映射，导入时会自动并入交易描述，供收支识别参考。</p>
-        <div class="mapping-grid">
-          <div v-for="col in excelColumns" :key="col" class="mapping-row">
-            <span class="mapping-col">{{ col }}</span>
-            <span class="mapping-arrow">→</span>
-            <!-- 描述增强列（附言/对手方户名等）不参与映射，自动并入描述；显示角色让用户所见即所得 -->
-            <NTag
-              v-if="columnMapping[col] === '' && bankColumnDescriptionRole(col)"
-              size="small"
-              type="info"
-              :bordered="false"
-              class="mapping-auto-tag"
-            >
-              自动并入描述 · {{ bankColumnDescriptionRole(col) }}
-            </NTag>
-            <NSelect
-              v-else
-              :value="columnMapping[col]"
-              @update:value="(v: string) => columnMapping[col] = v"
-              :options="[
-                { label: '忽略', value: '' },
-                { label: '日期', value: 'transaction_date' },
-                { label: '摘要/描述', value: 'description' },
-                { label: '对方户名', value: 'counterparty_name' },
-                { label: '收款人户名', value: 'payee_name' },
-                { label: '付款人户名', value: 'payer_name' },
-                { label: '附言/备注', value: 'comment' },
-                { label: '金额(收支单列)', value: 'amount' },
-                { label: '存入(收入)金额', value: 'income_amount' },
-                { label: '支取(支出)金额', value: 'expense_amount' },
-                { label: '余额', value: 'balance' },
-              ]"
-              style="width: 160px;"
-              size="small"
-            />
-          </div>
+        <div class="detect-row">
+          <button
+            v-for="row in keyFieldRows"
+            :key="row.field"
+            type="button"
+            class="detect-chip"
+            :class="{
+              'is-missing': row.required && !row.detected,
+              'is-optional': !row.required && !row.detected,
+            }"
+            :title="`来源列：${row.sourceText}`"
+            @click="advancedPanels = ['mapping']"
+          >
+            <span class="detect-mark">{{ row.detected ? '✓' : row.required ? '!' : '–' }}</span>
+            <span class="detect-label">{{ row.label }}</span>
+            <span class="detect-source">{{ row.sourceText }}</span>
+          </button>
         </div>
 
-        <h4 class="section-title" style="margin-top: 16px;">预览（前 5 行）</h4>
-        <NDataTable
-          :columns="excelColumns.map(c => ({ title: c, key: c }))"
-          :data="excelRows.slice(0, 5)"
-          :bordered="false"
-          :single-line="true"
-          size="small"
+        <p v-if="unrecognizedRequired.length" class="preview-warning">
+          没有识别到{{ unrecognizedRequired.map(r => r.label).join('、') }}，请展开下方「字段来源不对？」指定对应列。
+        </p>
+        <p v-else-if="importPreview.skippedInvalidDate > 0" class="preview-warning">
+          {{ importPreview.skippedInvalidDate }} 行没有可识别的交易日，已跳过。
+        </p>
+
+        <template v-if="previewRows.length">
+          <div class="preview-head">
+            <h4 class="section-title">解析预览</h4>
+            <span class="preview-count">
+              前 {{ previewRows.length }} 行 · 共 {{ importPreview.rows.length }} 条可导入
+            </span>
+          </div>
+          <NDataTable
+            :columns="importPreviewColumns"
+            :data="previewRows"
+            :bordered="false"
+            :single-line="true"
+            size="small"
+            :max-height="260"
+          />
+          <p class="preview-footnote">导入后每笔流水的摘要、金额、余额将与上表一致，重复流水会自动跳过。</p>
+        </template>
+        <SoloEmpty
+          v-else
+          title="没有解析出可导入的流水"
+          :description="unrecognizedRequired.length
+            ? '展开下方「字段来源不对？」指定缺失字段对应的列，这里会立即显示解析结果。'
+            : '文件中的交易日无法识别，已全部跳过。可展开下方字段来源确认日期列。'"
+          icon="ri-file-warning-line"
         />
+
+        <NCollapse v-model:expanded-names="advancedPanels" class="advanced-mapping">
+          <NCollapseItem name="mapping" title="字段来源不对？调整列映射">
+            <div class="key-field-list">
+              <div v-for="row in keyFieldRows" :key="row.field" class="key-field-row">
+                <span class="key-field-label">
+                  {{ row.label }}<em v-if="row.required">*</em>
+                </span>
+                <span class="mapping-arrow">←</span>
+                <NSelect
+                  v-if="row.editable"
+                  size="small"
+                  style="width: 260px;"
+                  :value="row.columns[0] || ''"
+                  :options="[
+                    { label: '忽略', value: '' },
+                    ...excelColumns.map(col => ({ label: col, value: col })),
+                  ]"
+                  @update:value="(v: string) => setFieldSource(row.field, v)"
+                />
+                <span v-else class="key-field-static">
+                  {{ row.splitMode ? '收入 / 支出分两列，见下方全部列' : `${row.columns.length} 列拼接，见下方全部列` }}
+                </span>
+              </div>
+            </div>
+
+            <p class="mapping-hint">其余列无需处理：附言、对方户名会自动并入摘要；开户行、账号类列自动忽略。</p>
+
+            <div class="mapping-grid">
+              <div v-for="col in excelColumns" :key="col" class="mapping-row">
+                <span class="mapping-col">{{ col }}</span>
+                <span class="mapping-arrow">→</span>
+                <!-- 描述增强列自动并入描述；开户行/账号类列锁死为忽略，防止误映射成交易对手 -->
+                <NTag
+                  v-if="isBankCounterpartySourceBlocked(col)"
+                  size="small"
+                  type="warning"
+                  :bordered="false"
+                  class="mapping-auto-tag"
+                >
+                  已忽略 · 账户/开户字段
+                </NTag>
+                <NTag
+                  v-else-if="columnMapping[col] === '' && bankColumnDescriptionRole(col)"
+                  size="small"
+                  type="info"
+                  :bordered="false"
+                  class="mapping-auto-tag"
+                >
+                  自动并入描述 · {{ bankColumnDescriptionRole(col) }}
+                </NTag>
+                <NSelect
+                  v-else
+                  :value="columnMapping[col]"
+                  @update:value="(v: string) => columnMapping[col] = v"
+                  :options="[
+                    { label: '忽略', value: '' },
+                    { label: '日期', value: 'transaction_date' },
+                    { label: '交易时间', value: 'transaction_time' },
+                    { label: '交易流水号', value: 'transaction_reference' },
+                    { label: '摘要/描述', value: 'description' },
+                    { label: '对方户名', value: 'counterparty_name' },
+                    { label: '收款人户名', value: 'payee_name' },
+                    { label: '付款人户名', value: 'payer_name' },
+                    { label: '附言/备注', value: 'comment' },
+                    { label: '金额(收支单列)', value: 'amount' },
+                    { label: '存入(收入)金额', value: 'income_amount' },
+                    { label: '支取(支出)金额', value: 'expense_amount' },
+                    { label: '余额', value: 'balance' },
+                  ]"
+                  style="width: 160px;"
+                  size="small"
+                />
+              </div>
+            </div>
+
+            <h4 class="section-title" style="margin-top: 16px;">原始文件预览（前 5 行）</h4>
+            <NDataTable
+              :columns="excelColumns.map(c => ({ title: c, key: c }))"
+              :data="excelRows.slice(0, 5)"
+              :bordered="false"
+              :single-line="true"
+              size="small"
+              :max-height="220"
+            />
+          </NCollapseItem>
+        </NCollapse>
       </template>
 
       <template #footer>
         <NSpace justify="end">
           <NButton @click="showExcelImport = false">取消</NButton>
-          <NButton v-if="excelStep === 'preview'" type="primary" :loading="excelImporting" @click="handleExcelImport">
-            确认导入 ({{ excelRows.length }} 条)
+          <NButton
+            v-if="excelStep === 'preview'"
+            type="primary"
+            :loading="excelImporting"
+            :disabled="importPreview.rows.length === 0"
+            @click="handleExcelImport"
+          >
+            确认导入 ({{ importPreview.rows.length }} 条)
           </NButton>
         </NSpace>
       </template>
@@ -938,7 +1184,7 @@ usePageRefresh(loadStatements)
 }
 
 .bank-page {
-  max-width: 1240px;
+  max-width: var(--page-width);
   margin: 0 auto;
   width: 100%;
   box-sizing: border-box;
@@ -1195,6 +1441,163 @@ usePageRefresh(loadStatements)
   justify-content: center;
   font-size: 12px;
 }
+.upload-tip {
+  margin-top: 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--solo-border-light);
+  border-radius: var(--solo-radius);
+  background: var(--solo-bg-soft);
+}
+.upload-tip h4 {
+  margin: 0 0 6px;
+  color: var(--solo-text-primary);
+  font-size: 13px;
+  font-weight: 600;
+}
+.upload-tip ul {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--solo-text-secondary);
+  font-size: 12px;
+  line-height: 1.7;
+}
+.excel-info {
+  margin: 0 0 10px;
+  color: var(--solo-text-secondary);
+  font-size: 13px;
+}
+
+/* 识别结果：一眼确认五个关键字段是否对齐，点任意 chip 展开映射 */
+.detect-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.detect-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  max-width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius-control);
+  background: var(--solo-bg-card);
+  color: var(--solo-text-primary);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+}
+.detect-chip:hover {
+  border-color: var(--solo-primary-light);
+}
+.detect-mark {
+  color: var(--solo-income);
+  font-weight: 600;
+}
+.detect-chip.is-missing {
+  border-color: var(--solo-expense);
+  background: var(--solo-expense-bg);
+}
+.detect-chip.is-missing .detect-mark {
+  color: var(--solo-expense);
+}
+.detect-chip.is-optional .detect-mark {
+  color: var(--solo-text-muted);
+}
+.detect-label {
+  font-weight: 600;
+}
+.detect-source {
+  min-width: 0;
+  max-width: 240px;
+  overflow: hidden;
+  color: var(--solo-text-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.preview-warning {
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--solo-warning);
+  border-radius: var(--solo-radius-sm);
+  background: var(--solo-warning-bg);
+  color: var(--solo-warning);
+  font-size: 12px;
+}
+.preview-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.preview-head .section-title {
+  margin: 0;
+}
+.preview-count {
+  color: var(--solo-text-muted);
+  font-size: 12px;
+}
+.preview-footnote {
+  margin: 8px 0 0;
+  color: var(--solo-text-muted);
+  font-size: 12px;
+}
+.advanced-mapping {
+  margin-top: 16px;
+}
+.key-field-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.key-field-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.key-field-label {
+  min-width: 76px;
+  font-size: 13px;
+}
+.key-field-label em {
+  margin-left: 2px;
+  color: var(--solo-expense);
+  font-style: normal;
+}
+.key-field-static {
+  color: var(--solo-text-muted);
+  font-size: 12px;
+}
+.mapping-grid {
+  display: flex;
+  max-height: 220px;
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.mapping-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.mapping-col {
+  width: 220px;
+  overflow: hidden;
+  color: var(--solo-text-secondary);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mapping-arrow {
+  flex-shrink: 0;
+  color: var(--solo-text-muted);
+}
 .diff-table {
   width: 100%;
   border-collapse: collapse;
@@ -1266,6 +1669,15 @@ usePageRefresh(loadStatements)
   .effect-issues-heading {
     align-items: flex-start;
     flex-direction: column;
+  }
+  .key-field-row {
+    flex-wrap: wrap;
+  }
+  .detect-source {
+    max-width: 150px;
+  }
+  .mapping-col {
+    width: 130px;
   }
 }
 .ai-next-step div {
