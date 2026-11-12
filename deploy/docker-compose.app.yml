@@ -10,7 +10,7 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: 80
-      CORS_ORIGINS: "http://106.12.136.155:8080,http://localhost:8080"
+      CORS_ORIGINS: "http://YOUR_SERVER_IP:8080,http://localhost:8080"
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_APP_USER}:${POSTGRES_APP_PASSWORD}@postgres:5432/${POSTGRES_DB}
       MIGRATION_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       JWT_SECRET: ${JWT_SECRET}

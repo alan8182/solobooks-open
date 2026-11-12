@@ -66,8 +66,7 @@ if [ "$SKIP_TESTS" = 0 ]; then
 fi
 # 构建与预渲染不可跳：预渲染过期只会在服务器构建镜像时才失败，
 # 那时代码已同步、后端镜像已构建完（2026-11-06，D-005）
-# 路由白名单校验同样不可跳：新增一级路由漏同步 nginx 白名单时，直连访问 404
-# （2026-11-11 /tax-copilot 即因此带上线，D-020）；放构建前先拦，避免白跑构建
+# 路由白名单校验同样不可跳：新增一级路由漏同步 nginx 白名单时，直连访问 404（D-020）；放构建前先拦，避免白跑构建
 STEPS+=("路由白名单|nginx-routes|node scripts/check-nginx-routes.mjs" "生产构建|build|npm run build" "预渲染|prerender|npm run prerender" "预渲染新鲜度|prerender-check|node scripts/check-prerender.mjs")
 
 web_failed=0
