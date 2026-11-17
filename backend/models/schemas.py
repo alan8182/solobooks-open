@@ -588,9 +588,10 @@ class CitAssistRequest(StrictRequestModel):
     acceleratedDepreciationReduction: Decimal = Decimal("0")
     exemptDeduction: Decimal = Decimal("0")
     incomeExemption: Decimal = Decimal("0")
-    priorYearLoss: Decimal = Decimal("0")
+    # 未传时回退期初税务备忘的第 24/30 行；显式传 0 表示「本期不抵扣/未预缴」
+    priorYearLoss: Optional[Decimal] = None
     taxCredit: Decimal = Decimal("0")
-    prepaidTax: Decimal = Decimal("0")
+    prepaidTax: Optional[Decimal] = None
     specialBusinessPrepaidTax: Decimal = Decimal("0")
     employeeCountStart: Optional[int] = None
     employeeCountEnd: Optional[int] = None
@@ -1270,6 +1271,128 @@ class ComparisonResponse(BaseModel):
     expense_change_percent: Optional[Decimal] = None
     profit_change_percent: Optional[Decimal] = None
     category_breakdown: List[ComparisonItem]
+
+
+# ── 现金流滚动预测与业务归因分析 ──
+
+class ManualCashEventPayload(BaseModel):
+    id: str = ""
+    name: str = Field(..., max_length=100)
+    type: Literal["inflow", "outflow"] = "outflow"
+    amount: Decimal = Field(..., ge=0)
+    date: str = ""
+    repeat: Literal["none", "monthly", "quarterly", "yearly"] = "none"
+    repeatDay: Optional[int] = Field(default=None, ge=1, le=31)
+    confidence: Literal["high", "medium", "low"] = "high"
+    enabled: bool = True
+
+
+class CashForecastConfigPayload(StrictRequestModel):
+    defaultArDays: int = 30
+    defaultApDays: int = 30
+    partnerCreditDays: dict[str, int] = Field(default_factory=dict)
+    safetyCashThreshold: Optional[Decimal] = None
+    manualCashEvents: List[ManualCashEventPayload] = Field(default_factory=list)
+
+
+class CashForecastRequest(StrictRequestModel):
+    as_of: str = ""
+    horizon_days: int = 60
+    scenario: Literal["neutral", "optimistic", "pessimistic"] = "neutral"
+
+
+class DailyCashPoint(BaseModel):
+    date: str
+    inflow: Decimal
+    outflow: Decimal
+    net: Decimal
+    balance: Decimal
+
+
+class OverdueReceivableItem(BaseModel):
+    partnerId: str
+    partnerName: str
+    amount: Decimal
+    daysOverdue: int
+    oldestDate: str
+
+
+class TimelineCashEvent(BaseModel):
+    id: str
+    date: str
+    name: str
+    type: str
+    amount: Decimal
+    confidence: str = "high"
+    repeat: str = "none"
+    source: str = "manual"
+    enabled: bool = True
+
+
+class CashForecastResponse(BaseModel):
+    asOf: str
+    horizonDays: int
+    scenario: str
+    currentCash: Decimal
+    endingCash: Decimal
+    minBalance: Decimal
+    minBalanceDate: str
+    safetyThreshold: Decimal
+    runwayMonths: Optional[Decimal] = None
+    isDeficitProjected: bool = False
+    deficitDate: Optional[str] = None
+    dailyPoints: List[DailyCashPoint]
+    overdueReceivables: List[OverdueReceivableItem]
+    timelineEvents: List[TimelineCashEvent] = Field(default_factory=list)
+    monthlyBurnRate: Decimal = Decimal("0.00")
+    scenarioSummary: str
+
+
+class DriverItem(BaseModel):
+    key: str
+    name: str
+    baseAmount: Decimal
+    compareAmount: Decimal
+    deltaAmount: Decimal
+    changePercent: Optional[Decimal] = None
+    tag: str = ""
+
+
+class AnomalyItem(BaseModel):
+    category: str
+    title: str
+    amount: Decimal
+    historyAvgAmount: Decimal
+    growthRate: Optional[Decimal] = None
+    reason: str
+
+
+class BridgeStep(BaseModel):
+    name: str
+    amount: Decimal
+    type: Literal["profit", "add", "sub", "cash"]
+    note: str
+
+
+class BusinessAttributionRequest(StrictRequestModel):
+    base_month: str
+    compare_mode: Literal["mom", "yoy"] = "mom"
+
+
+class BusinessAttributionResponse(BaseModel):
+    baseMonth: str
+    compareMonth: str
+    baseProfit: Decimal
+    compareProfit: Decimal
+    profitDelta: Decimal
+    topIncomeDrivers: List[DriverItem]
+    topExpenseDrivers: List[DriverItem]
+    anomalies: List[AnomalyItem]
+    netProfit: Decimal
+    netCashFlow: Decimal
+    profitToCashDiscrepancy: Decimal
+    bridgeSteps: List[BridgeStep]
+    plainSummary: str
 
 
 # ── 无形资产 ──

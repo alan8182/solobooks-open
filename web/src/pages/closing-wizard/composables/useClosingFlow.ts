@@ -4,7 +4,7 @@
  */
 /**
  * 结账域（closing-wizard Step 3→5）：执行结账（含批量过账合并路径）、已结账
- * 指标拉取、AI CFO 诊断、下载提示。从 index.vue 拆出。
+ * 指标拉取、AI 财务官诊断、下载提示。从 index.vue 拆出。
  *
  * 依赖注入口径：阻断判断（工资/零申报月/对账风险/批量过账）与期间状态
  * （periodCloseChecks/currentStep）由父页传入 Ref 或回调——结账是各域的

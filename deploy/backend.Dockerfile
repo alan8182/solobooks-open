@@ -28,4 +28,6 @@ COPY backend/ .
 
 EXPOSE 80
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80"]
+# 信任 nginx 转发头：否则 request.client.host 是 Docker 网关 IP，短信/登录限流
+# 会被所有用户共用（详见 deploy/docker-compose.yml 注释）。
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80", "--proxy-headers", "--forwarded-allow-ips=127.0.0.1,172.16.0.0/12"]

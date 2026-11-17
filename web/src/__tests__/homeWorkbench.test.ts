@@ -16,7 +16,7 @@ describe('home workbench and agent alignment', () => {
     expect(home?.group).toBe('日常')
 
     expect(copilot).toBeDefined()
-    expect(copilot?.label).toBe('AI CFO')
+    expect(copilot?.label).toBe('AI 财务官')
     expect(copilot?.group).toBe('日常')
   })
 

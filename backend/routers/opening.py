@@ -42,6 +42,25 @@ class TaxOpeningMemory(BaseModel):
     migration_note: str = ""
 
 
+class TrialBalanceItem(BaseModel):
+    """导入原表的只读快照行；只落 metadata 供核对，不参与凭证生成。"""
+    model_config = ConfigDict(extra="ignore")
+    row_no: int = 0
+    original_code: str = ""
+    original_name: str = ""
+    partner_name: str = ""
+    year_start_debit: Optional[Decimal] = None
+    year_start_credit: Optional[Decimal] = None
+    ytd_debit: Optional[Decimal] = None
+    ytd_credit: Optional[Decimal] = None
+    ending_debit: Optional[Decimal] = None
+    ending_credit: Optional[Decimal] = None
+    target_code: str = ""
+    target_name: str = ""
+    status: str = "unmatched"
+    note: str = ""
+
+
 class SaveOpeningRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
     fiscal_year: int
@@ -50,8 +69,13 @@ class SaveOpeningRequest(BaseModel):
     ytd_items: Optional[List[OpeningBalanceItem]] = None  # 年中建账损益本年累计发生额
     # 年初（1 月 1 日）余额快照：只填报表「年初余额」列，不进凭证
     year_start_items: Optional[List[OpeningBalanceItem]] = None
+    # 全 0 的年初快照也要标记为「已知」，否则当年成立的公司会被当成无从得知
+    year_start_known: Optional[bool] = None
     tax_memory: Optional[TaxOpeningMemory] = None
     fixed_assets: Optional[List[dict]] = None
+    # 导入原表快照：随期初凭证 metadata 落库，供事后核对，不参与分录
+    trial_balance_items: Optional[List[TrialBalanceItem]] = None
+    trial_balance_columns: Optional[dict[str, str]] = None
 
 
 class ResetOpeningRequest(BaseModel):
@@ -103,8 +127,15 @@ async def save_balances(
         year_start_items=(
             [item.model_dump() for item in req.year_start_items] if req.year_start_items else None
         ),
+        year_start_known=req.year_start_known,
         tax_memory=req.tax_memory.model_dump() if req.tax_memory else None,
         fixed_assets=req.fixed_assets,
+        trial_balance_items=(
+            [item.model_dump() for item in req.trial_balance_items]
+            if req.trial_balance_items
+            else None
+        ),
+        trial_balance_columns=req.trial_balance_columns,
         session=session,
     )
     response = {"ok": True, "entry": entry}

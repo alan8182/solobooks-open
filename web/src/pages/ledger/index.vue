@@ -406,7 +406,7 @@ usePageRefresh(() => entryStore.fetchEntries())
     <div class="page-header">
       <div>
         <h2>经营账本</h2>
-        <p>流水清晰可查，所有账目均由 AI CFO 实时分类归集</p>
+        <p>流水清晰可查，所有账目均由 AI 财务官实时分类归集</p>
       </div>
       <NSpace>
         <NButton :disabled="filteredEntries.length === 0" @click="handleExportExcel">

@@ -11,7 +11,8 @@
 import { ref } from 'vue'
 import { NButton, NInput, NModal, useMessage } from 'naive-ui'
 import { reopenPeriod } from '@/api/accounting'
-import { requestStepUp, sendPhoneCode } from '@/api/auth'
+import { requestStepUp } from '@/api/auth'
+import { sendVerificationCode } from '@/utils/verificationCode'
 
 const props = defineProps<{ month: string }>()
 const emit = defineEmits<{ reopened: [] }>()
@@ -26,17 +27,10 @@ const sending = ref(false)
 const submitting = ref(false)
 
 async function sendCode() {
-  if (!phone.value) {
-    message.warning('请输入账号绑定的手机号')
-    return
-  }
   sending.value = true
   try {
-    const result = await sendPhoneCode({ phone: phone.value })
-    bizId.value = (result as any).biz_id || ''
-    message.success('验证码已发送')
-  } catch {
-    message.error('验证码发送失败')
+    const outcome = await sendVerificationCode(message, phone.value, '请输入账号绑定的手机号')
+    if (outcome.ok) bizId.value = outcome.bizId
   } finally {
     sending.value = false
   }

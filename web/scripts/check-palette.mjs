@@ -35,8 +35,8 @@ const OWN_SCALE_SURFACES = [
   // 它是对外营销/接入文档页，硬套产品内 3 档灰会把代码块压平；语义色仍纳入检查。
   'pages/mcp-guide/index.vue',
   'pages/mcp-guide/CodeBlock.vue',
-  // 官网升维版 v2（968d6e3）：与落地页同一套 slate 灰阶的营销页，当年漏登记进豁免名单。
-  'pages/landing/v2.vue',
+  // 旧版官网首页（现迁至 /landing-old）：与新版同一套 slate 灰阶的营销页。
+  'pages/landing/legacy.vue',
   // AI 账本体检器（968d6e3）：免登录对外获客页（requiresAuth: false），报告版式沿用
   // slate 灰阶 + 深色页头，性质与落地页同类；语义色仍纳入检查。
   'pages/audit-scan/index.vue',

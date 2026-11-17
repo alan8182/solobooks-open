@@ -88,6 +88,16 @@ export interface paths {
      */
     patch: operations["patch_entry_api_record_entries__entry_id__patch"];
   };
+  "/api/record/entries/{entry_id}/voucher-preview": {
+    /**
+     * Preview Entry Voucher
+     * @description 结账向导第二步：确认付款方式后预览将落账的借贷行（只读，不写库）。
+     *
+     * 预览与「认可入账」共用 _normalize_voucher_lines/get_voucher_hint，
+     * 保证看到的科目就是落账的科目。
+     */
+    post: operations["preview_entry_voucher_api_record_entries__entry_id__voucher_preview_post"];
+  };
   "/api/record/entries/{entry_id}/voucher-lines": {
     /**
      * Adjust Entry Voucher Lines
@@ -297,7 +307,7 @@ export interface paths {
   "/api/report/archive-checklist": {
     /**
      * Archive Checklist
-     * @description 单据归档清单
+     * @description 单据归档清单：检查凭证单据的完备度与合规度，辅助档案装订与汇算清缴排查。
      */
     post: operations["archive_checklist_api_report_archive_checklist_post"];
   };
@@ -314,8 +324,8 @@ export interface paths {
      * @description 资产负债表：与税务报表共用已过账复式分录及科目余额口径；支持月报/季报。
      *
      * 同一份数据返回两种视图：boss（非零科目明细）与 standard（会小企01表全量行次，
-     * 含年初/期末两列）。年初余额取自 balance_opening——有显式期初凭证用期初，
-     * 否则从历史分录派生（见 opening_balance_service 跨年连续性）。
+     * 含年初/期末两列）。年初余额取自 balance_opening——优先用期初导入时存的年初快照，
+     * 1 月建账没有快照时用期初本身（见 opening_balance_service.get_year_start_balances）。
      */
     post: operations["balance_sheet_api_report_balance_sheet_post"];
   };
@@ -346,6 +356,32 @@ export interface paths {
      * @description AI 财务经理经营诊断
      */
     post: operations["ai_diagnosis_api_report_ai_diagnosis_post"];
+  };
+  "/api/report/cash-forecast": {
+    /**
+     * Cash Forecast
+     * @description 滚动现金流预测（30 / 60 / 90 天，支持乐观/基准/悲观压力测试）。
+     */
+    post: operations["cash_forecast_api_report_cash_forecast_post"];
+  };
+  "/api/report/cash-forecast-config": {
+    /**
+     * Get Forecast Config
+     * @description 获取公司的现金流预测与周期性收支配置。
+     */
+    get: operations["get_forecast_config_api_report_cash_forecast_config_get"];
+    /**
+     * Update Forecast Config
+     * @description 更新公司的现金流预测与周期性收支配置。
+     */
+    put: operations["update_forecast_config_api_report_cash_forecast_config_put"];
+  };
+  "/api/report/attribution": {
+    /**
+     * Business Attribution
+     * @description 业务波动归因分析与利现差额桥（Profit-to-Cash Bridge）。
+     */
+    post: operations["business_attribution_api_report_attribution_post"];
   };
   "/api/ledger/voucher": {
     /**
@@ -830,6 +866,18 @@ export interface paths {
      */
     post: operations["repair_effect_api_bank_repair_effect_post"];
   };
+  "/api/bank/reconciliations/resync/{statement_id}": {
+    /**
+     * Resync Statement Reconciliation
+     * @description 重建流水 ↔ 凭证的核心对账链接（幂等自愈）。
+     *
+     * 个别入账路径只回写 matched_entry_id 指针、漏掉 sync_bank_reconciliation，
+     * 造成"第二步已认领、第三步银行核对却说未配对"的分裂。此处以指针与
+     * bank_statement_matches 为准重建核心链接；流水本就无指针时返回
+     * resynced=False（真未配对，应到第二步走确认配对/认可入账）。
+     */
+    post: operations["resync_statement_reconciliation_api_bank_reconciliations_resync__statement_id__post"];
+  };
   "/api/bank/statement-ids": {
     /**
      * List Statement Ids
@@ -864,6 +912,19 @@ export interface paths {
      * @description 只读对账健康检查，用于月结前阻断高风险对账问题。
      */
     get: operations["reconciliation_health_api_bank_reconciliation_health_get"];
+  };
+  "/api/bank/category-rules": {
+    /**
+     * List Category Rules
+     * @description 当前账套的银行流水分类规则。
+     */
+    get: operations["list_category_rules_api_bank_category_rules_get"];
+  };
+  "/api/bank/category-rules/{rule_id}": {
+    /** Remove Category Rule */
+    delete: operations["remove_category_rule_api_bank_category_rules__rule_id__delete"];
+    /** Patch Category Rule */
+    patch: operations["patch_category_rule_api_bank_category_rules__rule_id__patch"];
   };
   "/api/bank/batch-confirm-rules": {
     /**
@@ -1172,6 +1233,20 @@ export interface paths {
      * @description 按累计预扣法试算本期应扣个税（结果仅供参考，以扣缴端申报数为准）。
      */
     post: operations["preview_tax_api_salary_tax_preview_post"];
+  };
+  "/api/salary/tax/preview-batch": {
+    /**
+     * Preview Tax Batch
+     * @description 批量试算整张工资表员工在指定月份应预扣的个税。
+     */
+    post: operations["preview_tax_batch_api_salary_tax_preview_batch_post"];
+  };
+  "/api/salary/rates/parse-screenshot": {
+    /**
+     * Parse Rates Screenshot
+     * @description 上传或粘贴税务局社保核定表/明细截图 → 多模态视觉大模型提取费率。
+     */
+    post: operations["parse_rates_screenshot_api_salary_rates_parse_screenshot_post"];
   };
   "/api/salary/sheets/{month}/records": {
     /**
@@ -1708,6 +1783,19 @@ export interface paths {
      */
     get: operations["usage_recent_api_admin_usage_recent_get"];
   };
+  "/api/admin/industry-templates": {
+    /**
+     * Admin Industry Templates
+     * @description 行业模板目录：管理员可看到隐藏、停用和自定义模板。
+     */
+    get: operations["admin_industry_templates_api_admin_industry_templates_get"];
+    /** Admin Create Industry Template */
+    post: operations["admin_create_industry_template_api_admin_industry_templates_post"];
+  };
+  "/api/admin/industry-templates/{template_id}": {
+    /** Admin Update Industry Template */
+    put: operations["admin_update_industry_template_api_admin_industry_templates__template_id__put"];
+  };
   "/api/admin/users": {
     /**
      * Admin Users
@@ -1718,9 +1806,9 @@ export interface paths {
   "/api/admin/users/{user_id}": {
     /**
      * Admin Patch User
-     * @description 禁用/启用用户、授予/撤销平台管理员（禁用即时生效：require_auth 每请求查库）。
+     * @description 禁用/启用用户、授予/撤销平台管理员、切换商业套餐/锚点日期/赠送额度。
      *
-     * 禁止管理员修改自己的标记，避免自锁。
+     * 禁止管理员修改自己的禁用/管理员标记，避免自锁。
      */
     patch: operations["admin_patch_user_api_admin_users__user_id__patch"];
   };
@@ -1785,6 +1873,13 @@ export interface paths {
     /** Revoke Token */
     delete: operations["revoke_token_api_mcp_tokens__token_id__delete"];
   };
+  "/api/usage/me": {
+    /**
+     * My Usage
+     * @description 本人 AI 用量汇总：本月/上月、分场景、近 N 天日序列。
+     */
+    get: operations["my_usage_api_usage_me_get"];
+  };
   "/api/setup/readiness": {
     /**
      * Get Readiness
@@ -1811,6 +1906,10 @@ export interface paths {
      * @description 删除演示账套。只允许删自己的、且带 ``isDemo`` 标记的账套。
      */
     delete: operations["delete_demo_book_api_setup_demo__company_id__delete"];
+  };
+  "/api/industry-templates": {
+    /** Get Industry Templates */
+    get: operations["get_industry_templates_api_industry_templates_get"];
   };
   "/api/audit-shares": {
     /** List Shares */
@@ -1855,6 +1954,88 @@ export interface paths {
     get: operations["public_list_annotations_api_share__token__annotations_get"];
     /** Public Add Annotation */
     post: operations["public_add_annotation_api_share__token__annotations_post"];
+  };
+  "/api/health-scan/analyze": {
+    /**
+     * Analyze Health Scan
+     * @description 公开免登录：执行 AI 账本体检分析，免存即焚。
+     */
+    post: operations["analyze_health_scan_api_health_scan_analyze_post"];
+  };
+  "/api/mailbox": {
+    /**
+     * Get Mailbox
+     * @description 专属收件地址（幂等：首次访问生成；优先用用户手机号作为地址码）。
+     */
+    get: operations["get_mailbox_api_mailbox_get"];
+  };
+  "/api/mailbox/address/reset": {
+    /**
+     * Reset Mailbox Address
+     * @description 重置专属地址：旧地址随之失效。
+     */
+    post: operations["reset_mailbox_address_api_mailbox_address_reset_post"];
+  };
+  "/api/mailbox/documents": {
+    /** List Documents */
+    get: operations["list_documents_api_mailbox_documents_get"];
+  };
+  "/api/mailbox/documents/{document_id}/file": {
+    /**
+     * Download Document
+     * @description 附件内容：前端拉取后构造 File 走现有导入向导；浏览器直接打开则为下载。
+     */
+    get: operations["download_document_api_mailbox_documents__document_id__file_get"];
+  };
+  "/api/mailbox/documents/{document_id}/consumed": {
+    /** Mark Document Consumed */
+    post: operations["mark_document_consumed_api_mailbox_documents__document_id__consumed_post"];
+  };
+  "/api/mailbox/documents/{document_id}": {
+    /** Delete Document */
+    delete: operations["delete_document_api_mailbox_documents__document_id__delete"];
+  };
+  "/api/billing/pricing": {
+    /**
+     * Billing Pricing
+     * @description 售卖目录：价格为后端唯一真相（core/plans.py），前端禁止自写价格。
+     */
+    get: operations["billing_pricing_api_billing_pricing_get"];
+  };
+  "/api/billing/orders": {
+    /**
+     * Billing List Orders
+     * @description 本人订单列表（我的页面展示 + 回跳轮询兜底）。
+     */
+    get: operations["billing_list_orders_api_billing_orders_get"];
+    /**
+     * Billing Create Order
+     * @description 创建待支付订单，返回收银台跳转 URL（前端 location.href 即可）。
+     */
+    post: operations["billing_create_order_api_billing_orders_post"];
+  };
+  "/api/billing/orders/{order_no}": {
+    /**
+     * Billing Get Order
+     * @description 订单详情（按商户订单号，仅本人可见）：收银台同步回跳后的轮询端点。
+     */
+    get: operations["billing_get_order_api_billing_orders__order_no__get"];
+  };
+  "/api/billing/alipay/notify": {
+    /**
+     * Alipay Notify
+     * @description 异步通知：验签 → 幂等处理 → 落档。永远 200 + 纯文本，防支付宝误判网络异常。
+     */
+    post: operations["alipay_notify_api_billing_alipay_notify_post"];
+  };
+  "/api/billing/alipay/return": {
+    /**
+     * Alipay Return
+     * @description 同步跳转：支付完成后浏览器回到这里，302 到产品页由前端轮询订单状态。
+     *
+     * 同步跳转不可信（任何人可构造），只做展示引导；权益以 notify 为准。
+     */
+    get: operations["alipay_return_api_billing_alipay_return_get"];
   };
   "/api/health": {
     /** Health */
@@ -1929,6 +2110,35 @@ export interface components {
        * @default []
        */
       children?: components["schemas"]["AccountNode"][];
+    };
+    /** AccountPreset */
+    AccountPreset: {
+      /** Code */
+      code: string;
+      /** Name */
+      name: string;
+      /** Parentcode */
+      parentCode: string;
+      /**
+       * Type
+       * @default
+       */
+      type?: string;
+      /**
+       * Category
+       * @default
+       */
+      category?: string;
+      /**
+       * Direction
+       * @default
+       */
+      direction?: string;
+      /**
+       * Isleaf
+       * @default true
+       */
+      isLeaf?: boolean;
     };
     /** AccountUpdate */
     AccountUpdate: {
@@ -2015,6 +2225,14 @@ export interface components {
       isDisabled?: boolean | null;
       /** Isplatformadmin */
       isPlatformAdmin?: boolean | null;
+      /** Plancode */
+      planCode?: string | null;
+      /** Plananchorat */
+      planAnchorAt?: string | null;
+      /** Planexpiresat */
+      planExpiresAt?: string | null;
+      /** Quotabonustokens */
+      quotaBonusTokens?: number | null;
     };
     /**
      * AgentActionApproveRequest
@@ -2411,6 +2629,21 @@ export interface components {
       /** Resolutionnote */
       resolutionNote?: string | null;
     };
+    /** AnomalyItem */
+    AnomalyItem: {
+      /** Category */
+      category: string;
+      /** Title */
+      title: string;
+      /** Amount */
+      amount: string;
+      /** Historyavgamount */
+      historyAvgAmount: string;
+      /** Growthrate */
+      growthRate?: string | null;
+      /** Reason */
+      reason: string;
+    };
     /** ArchiveChecklistRequest */
     ArchiveChecklistRequest: {
       /** Month */
@@ -2428,21 +2661,55 @@ export interface components {
       missingCount: number;
       /** Totalcount */
       totalCount: number;
+      /**
+       * Compliantamount
+       * @default 0
+       */
+      compliantAmount?: string;
+      /**
+       * Missingamount
+       * @default 0
+       */
+      missingAmount?: string;
+      /**
+       * Totalamount
+       * @default 0
+       */
+      totalAmount?: string;
     };
     /** ArchiveItem */
     ArchiveItem: {
+      /** Id */
+      id?: string | null;
+      /** Voucherno */
+      voucherNo?: string | null;
       /** Date */
       date: string;
       /** Summary */
       summary: string;
       /** Amount */
       amount: string;
+      /** Direction */
+      direction?: string | null;
+      /** Category */
+      category?: string | null;
       /** Doctype */
       docType: string;
+      /** Invoicenumber */
+      invoiceNumber?: string | null;
+      /** Invoicetype */
+      invoiceType?: string | null;
       /** Compliance */
       compliance: string;
+      /** Compliancestatus */
+      complianceStatus?: string | null;
       /** Risktag */
       riskTag?: string | null;
+      /**
+       * Attachmentcount
+       * @default 0
+       */
+      attachmentCount?: number;
       /** Note */
       note?: string | null;
     };
@@ -2515,6 +2782,11 @@ export interface components {
        * @default true
        */
       balanced?: boolean;
+      /**
+       * Openingknown
+       * @default true
+       */
+      openingKnown?: boolean;
     };
     /** BatchConfirmRulesRequest */
     BatchConfirmRulesRequest: {
@@ -2529,6 +2801,11 @@ export interface components {
       allowBackfill?: boolean;
       /** Backfillreason */
       backfillReason?: string | null;
+      /**
+       * Rememberrule
+       * @default false
+       */
+      rememberRule?: boolean;
     };
     /** BatchDeleteRequest */
     BatchDeleteRequest: {
@@ -2649,6 +2926,11 @@ export interface components {
       /** File */
       file: string;
     };
+    /** Body_parse_rates_screenshot_api_salary_rates_parse_screenshot_post */
+    Body_parse_rates_screenshot_api_salary_rates_parse_screenshot_post: {
+      /** File */
+      file: string;
+    };
     /** Body_parse_vouchers_api_legacy_import_vouchers_parse_post */
     Body_parse_vouchers_api_legacy_import_vouchers_parse_post: {
       /** Rows */
@@ -2674,6 +2956,60 @@ export interface components {
     Body_record_speech_api_record_speech_post: {
       /** Audio */
       audio: string;
+    };
+    /** BridgeStep */
+    BridgeStep: {
+      /** Name */
+      name: string;
+      /** Amount */
+      amount: string;
+      /**
+       * Type
+       * @enum {string}
+       */
+      type: "profit" | "add" | "sub" | "cash";
+      /** Note */
+      note: string;
+    };
+    /** BusinessAttributionRequest */
+    BusinessAttributionRequest: {
+      /** Base Month */
+      base_month: string;
+      /**
+       * Compare Mode
+       * @default mom
+       * @enum {string}
+       */
+      compare_mode?: "mom" | "yoy";
+    };
+    /** BusinessAttributionResponse */
+    BusinessAttributionResponse: {
+      /** Basemonth */
+      baseMonth: string;
+      /** Comparemonth */
+      compareMonth: string;
+      /** Baseprofit */
+      baseProfit: string;
+      /** Compareprofit */
+      compareProfit: string;
+      /** Profitdelta */
+      profitDelta: string;
+      /** Topincomedrivers */
+      topIncomeDrivers: components["schemas"]["DriverItem"][];
+      /** Topexpensedrivers */
+      topExpenseDrivers: components["schemas"]["DriverItem"][];
+      /** Anomalies */
+      anomalies: components["schemas"]["AnomalyItem"][];
+      /** Netprofit */
+      netProfit: string;
+      /** Netcashflow */
+      netCashFlow: string;
+      /** Profittocashdiscrepancy */
+      profitToCashDiscrepancy: string;
+      /** Bridgesteps */
+      bridgeSteps: components["schemas"]["BridgeStep"][];
+      /** Plainsummary */
+      plainSummary: string;
     };
     /** CashFlowItem */
     CashFlowItem: {
@@ -2746,6 +3082,87 @@ export interface components {
       /** Balancesheetcashbalanced */
       balanceSheetCashBalanced: boolean;
     };
+    /** CashForecastConfigPayload */
+    CashForecastConfigPayload: {
+      /**
+       * Defaultardays
+       * @default 30
+       */
+      defaultArDays?: number;
+      /**
+       * Defaultapdays
+       * @default 30
+       */
+      defaultApDays?: number;
+      /** Partnercreditdays */
+      partnerCreditDays?: {
+        [key: string]: number;
+      };
+      /** Safetycashthreshold */
+      safetyCashThreshold?: number | string | null;
+      /** Manualcashevents */
+      manualCashEvents?: components["schemas"]["ManualCashEventPayload"][];
+    };
+    /** CashForecastRequest */
+    CashForecastRequest: {
+      /**
+       * As Of
+       * @default
+       */
+      as_of?: string;
+      /**
+       * Horizon Days
+       * @default 60
+       */
+      horizon_days?: number;
+      /**
+       * Scenario
+       * @default neutral
+       * @enum {string}
+       */
+      scenario?: "neutral" | "optimistic" | "pessimistic";
+    };
+    /** CashForecastResponse */
+    CashForecastResponse: {
+      /** Asof */
+      asOf: string;
+      /** Horizondays */
+      horizonDays: number;
+      /** Scenario */
+      scenario: string;
+      /** Currentcash */
+      currentCash: string;
+      /** Endingcash */
+      endingCash: string;
+      /** Minbalance */
+      minBalance: string;
+      /** Minbalancedate */
+      minBalanceDate: string;
+      /** Safetythreshold */
+      safetyThreshold: string;
+      /** Runwaymonths */
+      runwayMonths?: string | null;
+      /**
+       * Isdeficitprojected
+       * @default false
+       */
+      isDeficitProjected?: boolean;
+      /** Deficitdate */
+      deficitDate?: string | null;
+      /** Dailypoints */
+      dailyPoints: components["schemas"]["DailyCashPoint"][];
+      /** Overduereceivables */
+      overdueReceivables: components["schemas"]["OverdueReceivableItem"][];
+      /** Timelineevents */
+      timelineEvents?: components["schemas"]["TimelineCashEvent"][];
+      /**
+       * Monthlyburnrate
+       * @default 0.00
+       */
+      monthlyBurnRate?: string;
+      /** Scenariosummary */
+      scenarioSummary: string;
+    };
     /** CategoryCreate */
     CategoryCreate: {
       /** Name */
@@ -2785,6 +3202,17 @@ export interface components {
       created_at: string;
       /** Updated At */
       updated_at: string;
+    };
+    /** CategoryRuleUpdateRequest */
+    CategoryRuleUpdateRequest: {
+      /** Category */
+      category?: string | null;
+      /** Purposekey */
+      purposeKey?: string | null;
+      /** Enabled */
+      enabled?: boolean | null;
+      /** Confidence */
+      confidence?: number | null;
     };
     /** CategoryUpdate */
     CategoryUpdate: {
@@ -3007,6 +3435,11 @@ export interface components {
        * @default false
        */
       dryRun?: boolean;
+    };
+    /** ClosePeriodRequest */
+    ClosePeriodRequest: {
+      /** Expectedsnapshothash */
+      expectedSnapshotHash: string;
     };
     /**
      * CloudFileRequest
@@ -3265,6 +3698,14 @@ export interface components {
        */
       reason?: string;
     };
+    /** CreateOrderRequest */
+    CreateOrderRequest: {
+      /**
+       * Plancode
+       * @description 套餐编码，见 GET /api/billing/pricing
+       */
+      planCode: string;
+    };
     /** CreateRequest */
     CreateRequest: {
       /** Title */
@@ -3361,6 +3802,19 @@ export interface components {
        * @default 365
        */
       expires_days?: number | null;
+    };
+    /** DailyCashPoint */
+    DailyCashPoint: {
+      /** Date */
+      date: string;
+      /** Inflow */
+      inflow: string;
+      /** Outflow */
+      outflow: string;
+      /** Net */
+      net: string;
+      /** Balance */
+      balance: string;
     };
     /** DeleteCompanyRequest */
     DeleteCompanyRequest: {
@@ -3468,6 +3922,56 @@ export interface components {
       pendingReviewCount: number;
       /** Items */
       items: components["schemas"]["AmortizationRunItem"][];
+    };
+    /** DimensionDetail */
+    DimensionDetail: {
+      /** Code */
+      code: string;
+      /** Name */
+      name: string;
+      /** Score */
+      score: number;
+      /** Weight */
+      weight: number;
+      /** Rawscore */
+      rawScore?: number | null;
+      /** Status */
+      status: string;
+      /** Highlight */
+      highlight: string;
+      /** Tips */
+      tips?: string | null;
+    };
+    /** DirectEvidenceRequest */
+    DirectEvidenceRequest: {
+      /** Taxkind */
+      taxKind: string;
+      /** Period */
+      period: string;
+      /** Reportedamount */
+      reportedAmount: unknown;
+      /** Ticketnumber */
+      ticketNumber?: string | null;
+    };
+    /** DriverItem */
+    DriverItem: {
+      /** Key */
+      key: string;
+      /** Name */
+      name: string;
+      /** Baseamount */
+      baseAmount: string;
+      /** Compareamount */
+      compareAmount: string;
+      /** Deltaamount */
+      deltaAmount: string;
+      /** Changepercent */
+      changePercent?: string | null;
+      /**
+       * Tag
+       * @default
+       */
+      tag?: string;
     };
     /** EmployeeCreate */
     EmployeeCreate: {
@@ -3599,6 +4103,15 @@ export interface components {
       confirmRegenerateVoucher?: boolean | null;
       /** Autoreverserepost */
       autoReverseRepost?: boolean | null;
+    };
+    /** EnvironmentReportRequest */
+    EnvironmentReportRequest: {
+      /** Creditcode */
+      creditCode?: string | null;
+      /** Pagetitle */
+      pageTitle?: string | null;
+      /** Url */
+      url?: string | null;
     };
     /** EquityChangeRequest */
     EquityChangeRequest: {
@@ -3988,29 +4501,100 @@ export interface components {
       /** Detail */
       detail?: components["schemas"]["ValidationError"][];
     };
+    /** HealthPenaltyItem */
+    HealthPenaltyItem: {
+      /** Id */
+      id: string;
+      /** Dimensioncode */
+      dimensionCode: string;
+      /** Title */
+      title: string;
+      /** Description */
+      description: string;
+      /** Deduction */
+      deduction: number;
+      /**
+       * Severity
+       * @enum {string}
+       */
+      severity: "high" | "medium" | "low";
+      /** Targetroute */
+      targetRoute?: string | null;
+      /** Actionlabel */
+      actionLabel?: string | null;
+    };
+    /** HealthScanRequest */
+    HealthScanRequest: {
+      /**
+       * Mode
+       * @description balance 或 quiz
+       */
+      mode: string;
+      /** Rows */
+      rows?: {
+          [key: string]: unknown;
+        }[] | null;
+      /** Answers */
+      answers?: {
+        [key: string]: string;
+      } | null;
+      /** Profile */
+      profile?: {
+        [key: string]: unknown;
+      } | null;
+      /** Balancemeta */
+      balanceMeta?: {
+        [key: string]: unknown;
+      } | null;
+    };
     /** HealthScoreRequest */
     HealthScoreRequest: {
       /** Month */
       month?: string | null;
+      /**
+       * Includediagnosis
+       * @default false
+       */
+      includeDiagnosis?: boolean | null;
     };
     /** HealthScoreResponse */
     HealthScoreResponse: {
+      /** Month */
+      month?: string | null;
       /** Totalscore */
       totalScore: number;
       /** Level */
       level: string;
+      /** Levelcode */
+      levelCode?: string | null;
+      /** Levellabel */
+      levelLabel?: string | null;
+      /** Summary */
+      summary?: string | null;
       /** Dimensions */
       dimensions: {
         [key: string]: unknown;
       };
+      /** Dimensiondetails */
+      dimensionDetails?: components["schemas"]["DimensionDetail"][] | null;
+      /** Penalties */
+      penalties?: components["schemas"]["HealthPenaltyItem"][] | null;
       /** Suggestions */
       suggestions: string[];
+      /** Keymetrics */
+      keyMetrics?: {
+          [key: string]: unknown;
+        }[] | null;
       /** Taxriskscore */
       taxRiskScore?: number | null;
       /** Taxrisklevel */
       taxRiskLevel?: string | null;
       /** Riskitems */
       riskItems?: string[] | null;
+      /** Aidiagnosis */
+      aiDiagnosis?: {
+        [key: string]: unknown;
+      } | null;
     };
     /**
      * IitAnnualRequest
@@ -4147,6 +4731,58 @@ export interface components {
        * @default false
        */
       isSubtotal?: boolean;
+    };
+    /** IndustryTemplateConfig */
+    IndustryTemplateConfig: {
+      /** Accountpresets */
+      accountPresets?: components["schemas"]["AccountPreset"][];
+      /** Modules */
+      modules?: string[];
+      /** Notes */
+      notes?: string[];
+    };
+    /** IndustryTemplateValues */
+    IndustryTemplateValues: {
+      /** Code */
+      code: string;
+      /** Name */
+      name: string;
+      /**
+       * Groupcode
+       * @default
+       */
+      groupCode?: string;
+      /**
+       * Groupname
+       * @default
+       */
+      groupName?: string;
+      /**
+       * Description
+       * @default
+       */
+      description?: string;
+      /**
+       * Restricteddefault
+       * @default false
+       */
+      restrictedDefault?: boolean;
+      /**
+       * Hidden
+       * @default false
+       */
+      hidden?: boolean;
+      /**
+       * Enabled
+       * @default true
+       */
+      enabled?: boolean;
+      /**
+       * Sortorder
+       * @default 0
+       */
+      sortOrder?: number;
+      config?: components["schemas"]["IndustryTemplateConfig"];
     };
     /** IntangibleAmortizationDuePeriod */
     IntangibleAmortizationDuePeriod: {
@@ -4590,6 +5226,48 @@ export interface components {
       /** Expenseentryid */
       expenseEntryId: string;
     };
+    /** ManualCashEventPayload */
+    ManualCashEventPayload: {
+      /**
+       * Id
+       * @default
+       */
+      id?: string;
+      /** Name */
+      name: string;
+      /**
+       * Type
+       * @default outflow
+       * @enum {string}
+       */
+      type?: "inflow" | "outflow";
+      /** Amount */
+      amount: number | string;
+      /**
+       * Date
+       * @default
+       */
+      date?: string;
+      /**
+       * Repeat
+       * @default none
+       * @enum {string}
+       */
+      repeat?: "none" | "monthly" | "quarterly" | "yearly";
+      /** Repeatday */
+      repeatDay?: number | null;
+      /**
+       * Confidence
+       * @default high
+       * @enum {string}
+       */
+      confidence?: "high" | "medium" | "low";
+      /**
+       * Enabled
+       * @default true
+       */
+      enabled?: boolean;
+    };
     /** MarkFiledRequest */
     MarkFiledRequest: {
       /** Evidence */
@@ -4668,6 +5346,21 @@ export interface components {
       credit_balance?: number | string;
       /** Partner Name */
       partner_name?: string | null;
+      /** Partner Id */
+      partner_id?: string | null;
+    };
+    /** OverdueReceivableItem */
+    OverdueReceivableItem: {
+      /** Partnerid */
+      partnerId: string;
+      /** Partnername */
+      partnerName: string;
+      /** Amount */
+      amount: string;
+      /** Daysoverdue */
+      daysOverdue: number;
+      /** Oldestdate */
+      oldestDate: string;
     };
     /** ParseColumnsRequest */
     ParseColumnsRequest: {
@@ -4720,16 +5413,6 @@ export interface components {
       reason: string;
       /** Stepuptoken */
       stepUpToken: string;
-    };
-    /** ClosePeriodRequest */
-    ClosePeriodRequest: {
-      /**
-       * Expectedsnapshothash
-       * @minLength 64
-       * @maxLength 64
-       * @pattern ^[0-9a-f]{64}$
-       */
-      expectedSnapshotHash: string;
     };
     /**
      * PhoneBindRequest
@@ -5109,6 +5792,14 @@ export interface components {
       personal_tax: number | string;
       /** Company Social Security */
       company_social_security: number | string;
+      /** Personal Social Insurance */
+      personal_social_insurance?: number | string | null;
+      /** Personal Housing Fund */
+      personal_housing_fund?: number | string | null;
+      /** Company Social Insurance */
+      company_social_insurance?: number | string | null;
+      /** Company Housing Fund */
+      company_housing_fund?: number | string | null;
     };
     /** RepairEffectRequest */
     RepairEffectRequest: {
@@ -5261,6 +5952,8 @@ export interface components {
       items: components["schemas"]["OpeningBalanceItem"][];
       /** Ytd Items */
       ytd_items?: components["schemas"]["OpeningBalanceItem"][] | null;
+      /** Year Start Items */
+      year_start_items?: components["schemas"]["OpeningBalanceItem"][] | null;
       tax_memory?: components["schemas"]["TaxOpeningMemory"] | null;
       /** Fixed Assets */
       fixed_assets?: {
@@ -5361,6 +6054,16 @@ export interface components {
       /** Text */
       text: string;
     };
+    /** StageCopilotRequest */
+    StageCopilotRequest: {
+      /** Period */
+      period: string;
+      /**
+       * Taxkind
+       * @default all
+       */
+      taxKind?: string | null;
+    };
     /**
      * StandardStatementRow
      * @description 会计视图（准则格式）单行：年初/期末两列金额；kind 区分节标题/小计/总计行。
@@ -5449,6 +6152,35 @@ export interface components {
        */
       migration_note?: string;
     };
+    /** TaxPreviewBatchItem */
+    TaxPreviewBatchItem: {
+      /** Employeeid */
+      employeeId: string;
+      /**
+       * Gross
+       * @default 0
+       */
+      gross?: number | string;
+      /**
+       * Withheld
+       * @default 0
+       */
+      withheld?: number | string;
+      /** Specialadditional */
+      specialAdditional?: number | string | null;
+      /**
+       * Otherdeduction
+       * @default 0
+       */
+      otherDeduction?: number | string;
+    };
+    /** TaxPreviewBatchRequest */
+    TaxPreviewBatchRequest: {
+      /** Month */
+      month: string;
+      /** Items */
+      items: components["schemas"]["TaxPreviewBatchItem"][];
+    };
     /**
      * TaxPreviewRequest
      * @description 个税试算入参：本期应发与代扣由前端带入（草稿可能尚未保存）。
@@ -5480,6 +6212,39 @@ export interface components {
     TemplateRequest: {
       /** Entitytype */
       entityType?: string | null;
+    };
+    /** TimelineCashEvent */
+    TimelineCashEvent: {
+      /** Id */
+      id: string;
+      /** Date */
+      date: string;
+      /** Name */
+      name: string;
+      /** Type */
+      type: string;
+      /** Amount */
+      amount: string;
+      /**
+       * Confidence
+       * @default high
+       */
+      confidence?: string;
+      /**
+       * Repeat
+       * @default none
+       */
+      repeat?: string;
+      /**
+       * Source
+       * @default manual
+       */
+      source?: string;
+      /**
+       * Enabled
+       * @default true
+       */
+      enabled?: boolean;
     };
     /** TodoStateUpdate */
     TodoStateUpdate: {
@@ -5738,6 +6503,28 @@ export interface components {
        * @default false
        */
       resetToSystem?: boolean;
+    };
+    /**
+     * VoucherPreviewRequest
+     * @description 结账向导第二步：按付款方式/分类预览将落账的借贷行，不写库。
+     */
+    VoucherPreviewRequest: {
+      /** Payer */
+      payer?: string | null;
+      /** Paymentstatus */
+      paymentStatus?: ("paid" | "unpaid") | null;
+      /** Category */
+      category?: string | null;
+      /** Rdprojectid */
+      rdProjectId?: string | null;
+      /** Rdexpensetype */
+      rdExpenseType?: ("personnel" | "direct_input" | "depreciation_amortization" | "design" | "testing" | "outsourced" | "other") | null;
+      /** Rdoriginalamount */
+      rdOriginalAmount?: number | string | null;
+      /** Rdallocationmethod */
+      rdAllocationMethod?: ("direct" | "timesheet" | "usage" | "area" | "quantity" | "other") | null;
+      /** Rdallocationbasis */
+      rdAllocationBasis?: string | null;
     };
     /** WaiveRequest */
     WaiveRequest: {
@@ -6163,6 +6950,42 @@ export interface operations {
     requestBody: {
       content: {
         "application/json": components["schemas"]["EntryUpdateRequest"];
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /**
+   * Preview Entry Voucher
+   * @description 结账向导第二步：确认付款方式后预览将落账的借贷行（只读，不写库）。
+   *
+   * 预览与「认可入账」共用 _normalize_voucher_lines/get_voucher_hint，
+   * 保证看到的科目就是落账的科目。
+   */
+  preview_entry_voucher_api_record_entries__entry_id__voucher_preview_post: {
+    parameters: {
+      header?: {
+        authorization?: string | null;
+      };
+      path: {
+        entry_id: string;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["VoucherPreviewRequest"];
       };
     };
     responses: {
@@ -6999,7 +7822,7 @@ export interface operations {
   };
   /**
    * Archive Checklist
-   * @description 单据归档清单
+   * @description 单据归档清单：检查凭证单据的完备度与合规度，辅助档案装订与汇算清缴排查。
    */
   archive_checklist_api_report_archive_checklist_post: {
     parameters: {
@@ -7062,8 +7885,8 @@ export interface operations {
    * @description 资产负债表：与税务报表共用已过账复式分录及科目余额口径；支持月报/季报。
    *
    * 同一份数据返回两种视图：boss（非零科目明细）与 standard（会小企01表全量行次，
-   * 含年初/期末两列）。年初余额取自 balance_opening——有显式期初凭证用期初，
-   * 否则从历史分录派生（见 opening_balance_service 跨年连续性）。
+   * 含年初/期末两列）。年初余额取自 balance_opening——优先用期初导入时存的年初快照，
+   * 1 月建账没有快照时用期初本身（见 opening_balance_service.get_year_start_balances）。
    */
   balance_sheet_api_report_balance_sheet_post: {
     parameters: {
@@ -7201,6 +8024,121 @@ export interface operations {
       200: {
         content: {
           "application/json": unknown;
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /**
+   * Cash Forecast
+   * @description 滚动现金流预测（30 / 60 / 90 天，支持乐观/基准/悲观压力测试）。
+   */
+  cash_forecast_api_report_cash_forecast_post: {
+    parameters: {
+      header?: {
+        authorization?: string | null;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["CashForecastRequest"];
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": components["schemas"]["CashForecastResponse"];
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /**
+   * Get Forecast Config
+   * @description 获取公司的现金流预测与周期性收支配置。
+   */
+  get_forecast_config_api_report_cash_forecast_config_get: {
+    parameters: {
+      header?: {
+        authorization?: string | null;
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /**
+   * Update Forecast Config
+   * @description 更新公司的现金流预测与周期性收支配置。
+   */
+  update_forecast_config_api_report_cash_forecast_config_put: {
+    parameters: {
+      header?: {
+        authorization?: string | null;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["CashForecastConfigPayload"];
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /**
+   * Business Attribution
+   * @description 业务波动归因分析与利现差额桥（Profit-to-Cash Bridge）。
+   */
+  business_attribution_api_report_attribution_post: {
+    parameters: {
+      header?: {
+        authorization?: string | null;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["BusinessAttributionRequest"];
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": components["schemas"]["BusinessAttributionResponse"];
         };
       };
       /** @description Validation Error */
@@ -9663,6 +10601,39 @@ export interface operations {
     };
   };
   /**
+   * Resync Statement Reconciliation
+   * @description 重建流水 ↔ 凭证的核心对账链接（幂等自愈）。
+   *
+   * 个别入账路径只回写 matched_entry_id 指针、漏掉 sync_bank_reconciliation，
+   * 造成"第二步已认领、第三步银行核对却说未配对"的分裂。此处以指针与
+   * bank_statement_matches 为准重建核心链接；流水本就无指针时返回
+   * resynced=False（真未配对，应到第二步走确认配对/认可入账）。
+   */
+  resync_statement_reconciliation_api_bank_reconciliations_resync__statement_id__post: {
+    parameters: {
+      header?: {
+        authorization?: string | null;
+      };
+      path: {
+        statement_id: string;
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /**
    * List Statement Ids
    * @description 获取所有流水批次 ID
    */
@@ -9789,6 +10760,93 @@ export interface operations {
       };
       header?: {
         authorization?: string | null;
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /**
+   * List Category Rules
+   * @description 当前账套的银行流水分类规则。
+   */
+  list_category_rules_api_bank_category_rules_get: {
+    parameters: {
+      query?: {
+        q?: string;
+        direction?: string;
+        enabled?: boolean | null;
+        limit?: number;
+        offset?: number;
+      };
+      header?: {
+        authorization?: string | null;
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /** Remove Category Rule */
+  remove_category_rule_api_bank_category_rules__rule_id__delete: {
+    parameters: {
+      header?: {
+        authorization?: string | null;
+      };
+      path: {
+        rule_id: string;
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /** Patch Category Rule */
+  patch_category_rule_api_bank_category_rules__rule_id__patch: {
+    parameters: {
+      header?: {
+        authorization?: string | null;
+      };
+      path: {
+        rule_id: string;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["CategoryRuleUpdateRequest"];
       };
     };
     responses: {
@@ -11411,6 +12469,66 @@ export interface operations {
     requestBody: {
       content: {
         "application/json": components["schemas"]["TaxPreviewRequest"];
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /**
+   * Preview Tax Batch
+   * @description 批量试算整张工资表员工在指定月份应预扣的个税。
+   */
+  preview_tax_batch_api_salary_tax_preview_batch_post: {
+    parameters: {
+      header?: {
+        authorization?: string | null;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["TaxPreviewBatchRequest"];
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /**
+   * Parse Rates Screenshot
+   * @description 上传或粘贴税务局社保核定表/明细截图 → 多模态视觉大模型提取费率。
+   */
+  parse_rates_screenshot_api_salary_rates_parse_screenshot_post: {
+    parameters: {
+      header?: {
+        authorization?: string | null;
+      };
+    };
+    requestBody: {
+      content: {
+        "multipart/form-data": components["schemas"]["Body_parse_rates_screenshot_api_salary_rates_parse_screenshot_post"];
       };
     };
     responses: {
@@ -14345,6 +15463,91 @@ export interface operations {
     };
   };
   /**
+   * Admin Industry Templates
+   * @description 行业模板目录：管理员可看到隐藏、停用和自定义模板。
+   */
+  admin_industry_templates_api_admin_industry_templates_get: {
+    parameters: {
+      query?: {
+        q?: string;
+      };
+      header?: {
+        authorization?: string | null;
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /** Admin Create Industry Template */
+  admin_create_industry_template_api_admin_industry_templates_post: {
+    parameters: {
+      header?: {
+        authorization?: string | null;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["IndustryTemplateValues"];
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /** Admin Update Industry Template */
+  admin_update_industry_template_api_admin_industry_templates__template_id__put: {
+    parameters: {
+      header?: {
+        authorization?: string | null;
+      };
+      path: {
+        template_id: string;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["IndustryTemplateValues"];
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /**
    * Admin Users
    * @description 用户列表：搜索（ID/手机号/昵称模糊）+ 分页，含公司数与角色。
    */
@@ -14376,9 +15579,9 @@ export interface operations {
   };
   /**
    * Admin Patch User
-   * @description 禁用/启用用户、授予/撤销平台管理员（禁用即时生效：require_auth 每请求查库）。
+   * @description 禁用/启用用户、授予/撤销平台管理员、切换商业套餐/锚点日期/赠送额度。
    *
-   * 禁止管理员修改自己的标记，避免自锁。
+   * 禁止管理员修改自己的禁用/管理员标记，避免自锁。
    */
   admin_patch_user_api_admin_users__user_id__patch: {
     parameters: {
@@ -14692,6 +15895,34 @@ export interface operations {
     };
   };
   /**
+   * My Usage
+   * @description 本人 AI 用量汇总：本月/上月、分场景、近 N 天日序列。
+   */
+  my_usage_api_usage_me_get: {
+    parameters: {
+      query?: {
+        days?: number;
+      };
+      header?: {
+        authorization?: string | null;
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /**
    * Get Readiness
    * @description 账套就绪度：账套能不能开始用。
    *
@@ -14769,6 +16000,32 @@ export interface operations {
       200: {
         content: {
           "application/json": components["schemas"]["DemoBookDeleteResponse"];
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /** Get Industry Templates */
+  get_industry_templates_api_industry_templates_get: {
+    parameters: {
+      query?: {
+        q?: string;
+        includeHidden?: boolean;
+      };
+      header?: {
+        authorization?: string | null;
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
         };
       };
       /** @description Validation Error */
@@ -15015,6 +16272,326 @@ export interface operations {
       422: {
         content: {
           "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /**
+   * Analyze Health Scan
+   * @description 公开免登录：执行 AI 账本体检分析，免存即焚。
+   */
+  analyze_health_scan_api_health_scan_analyze_post: {
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["HealthScanRequest"];
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /**
+   * Get Mailbox
+   * @description 专属收件地址（幂等：首次访问生成；优先用用户手机号作为地址码）。
+   */
+  get_mailbox_api_mailbox_get: {
+    parameters: {
+      header?: {
+        authorization?: string | null;
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /**
+   * Reset Mailbox Address
+   * @description 重置专属地址：旧地址随之失效。
+   */
+  reset_mailbox_address_api_mailbox_address_reset_post: {
+    parameters: {
+      header?: {
+        authorization?: string | null;
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /** List Documents */
+  list_documents_api_mailbox_documents_get: {
+    parameters: {
+      query?: {
+        /** @description pending / consumed / dismissed / unsupported */
+        status?: string | null;
+      };
+      header?: {
+        authorization?: string | null;
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /**
+   * Download Document
+   * @description 附件内容：前端拉取后构造 File 走现有导入向导；浏览器直接打开则为下载。
+   */
+  download_document_api_mailbox_documents__document_id__file_get: {
+    parameters: {
+      header?: {
+        authorization?: string | null;
+      };
+      path: {
+        document_id: string;
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /** Mark Document Consumed */
+  mark_document_consumed_api_mailbox_documents__document_id__consumed_post: {
+    parameters: {
+      header?: {
+        authorization?: string | null;
+      };
+      path: {
+        document_id: string;
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /** Delete Document */
+  delete_document_api_mailbox_documents__document_id__delete: {
+    parameters: {
+      header?: {
+        authorization?: string | null;
+      };
+      path: {
+        document_id: string;
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /**
+   * Billing Pricing
+   * @description 售卖目录：价格为后端唯一真相（core/plans.py），前端禁止自写价格。
+   */
+  billing_pricing_api_billing_pricing_get: {
+    parameters: {
+      header?: {
+        authorization?: string | null;
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /**
+   * Billing List Orders
+   * @description 本人订单列表（我的页面展示 + 回跳轮询兜底）。
+   */
+  billing_list_orders_api_billing_orders_get: {
+    parameters: {
+      query?: {
+        limit?: number;
+      };
+      header?: {
+        authorization?: string | null;
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /**
+   * Billing Create Order
+   * @description 创建待支付订单，返回收银台跳转 URL（前端 location.href 即可）。
+   */
+  billing_create_order_api_billing_orders_post: {
+    parameters: {
+      header?: {
+        authorization?: string | null;
+      };
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["CreateOrderRequest"];
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /**
+   * Billing Get Order
+   * @description 订单详情（按商户订单号，仅本人可见）：收银台同步回跳后的轮询端点。
+   */
+  billing_get_order_api_billing_orders__order_no__get: {
+    parameters: {
+      header?: {
+        authorization?: string | null;
+      };
+      path: {
+        order_no: string;
+      };
+    };
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description Validation Error */
+      422: {
+        content: {
+          "application/json": components["schemas"]["HTTPValidationError"];
+        };
+      };
+    };
+  };
+  /**
+   * Alipay Notify
+   * @description 异步通知：验签 → 幂等处理 → 落档。永远 200 + 纯文本，防支付宝误判网络异常。
+   */
+  alipay_notify_api_billing_alipay_notify_post: {
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
+        };
+      };
+    };
+  };
+  /**
+   * Alipay Return
+   * @description 同步跳转：支付完成后浏览器回到这里，302 到产品页由前端轮询订单状态。
+   *
+   * 同步跳转不可信（任何人可构造），只做展示引导；权益以 notify 为准。
+   */
+  alipay_return_api_billing_alipay_return_get: {
+    responses: {
+      /** @description Successful Response */
+      200: {
+        content: {
+          "application/json": unknown;
         };
       };
     };

@@ -29,6 +29,8 @@ const ACTION_MAP: Record<string, { label: string; tone: 'warning' | 'info' | 'da
   enable_user: { label: '启用用户', tone: 'success' },
   grant_admin: { label: '授予管理员', tone: 'info' },
   revoke_admin: { label: '撤销管理员', tone: 'warning' },
+  change_plan: { label: '变更套餐', tone: 'info' },
+  update_quota_bonus: { label: '调整赠送额度', tone: 'success' },
   cleanup: { label: '数据清理', tone: 'warning' },
 }
 

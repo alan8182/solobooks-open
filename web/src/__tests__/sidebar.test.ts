@@ -123,7 +123,7 @@ describe('sidebar workspace filtering', () => {
     const { wrapper } = await mountSidebar({ mode: 'boss' })
 
     expect(wrapper.text()).toContain('工作台')
-    expect(wrapper.text()).toContain('AI CFO')
+    expect(wrapper.text()).toContain('AI 财务官')
     expect(wrapper.text()).toContain('待办')
     expect(wrapper.text()).toContain('资金流水')
     expect(wrapper.text()).toContain('月度结账')
@@ -136,7 +136,7 @@ describe('sidebar workspace filtering', () => {
     expect(wrapper.text()).toContain('复盘')
     // 项目利润收进「经营报表」页卡片，不再占导航位
     expect(wrapper.text()).not.toContain('项目利润')
-    // 每月 2（月度结账、报税）+ 每天 4（工作台、AI CFO、待办、资金流水）+ 复盘 1
+    // 每月 2（月度结账、报税）+ 每天 4（工作台、AI 财务官、待办、资金流水）+ 复盘 1
     const navItems = wrapper.findAll('button.nav-item')
     expect(navItems).toHaveLength(7)
 

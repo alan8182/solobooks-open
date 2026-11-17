@@ -113,9 +113,9 @@ export interface NavItem {
 // 按用户工作阶段分组：日常协同 → 账务处理 → 周期核算 → 低频工具。
 // 不按系统模块堆功能，避免出现“财务工具”这类混合分类。
 export const NAV_ITEMS: NavItem[] = [
-  // 日常协同（以 AI CFO 为核心）
+  // 日常协同（以 AI 财务官为核心）
   { path: '/', label: '工作台', bossLabel: '工作台', bossGroup: '每天', icon: 'ri-dashboard-3-line', group: '日常' },
-  { path: '/copilot', label: 'AI CFO', bossGroup: '每天', icon: 'ri-chat-3-line', group: '日常' },
+  { path: '/copilot', label: 'AI 财务官', bossGroup: '每天', icon: 'ri-chat-3-line', group: '日常' },
   { path: '/todos', label: '待办', bossGroup: '每天', icon: 'ri-checkbox-circle-line', group: '日常' },
 
   // 账务处理（原始单据 → 流水 → 凭证 → 账簿）
@@ -180,7 +180,7 @@ export const NAV_ITEMS: NavItem[] = [
 // AI 功能场景的中文标签：对应后端 llm_usage 埋点的 scene 字段（services/llm.py）。
 // 个人设置页「AI 用量」与管理后台用量页共用，新增 scene 时两处一起生效。
 export const AI_SCENE_LABELS: Record<string, string> = {
-  agent_chat: 'AI CFO 对话',
+  agent_chat: 'AI 财务官对话',
   copilot: '经营助手',
   invoice_ocr: '单据识别',
   classify: '智能分类',

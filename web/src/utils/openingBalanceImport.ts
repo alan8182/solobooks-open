@@ -9,6 +9,12 @@
  */
 import * as XLSX from 'xlsx'
 import { saveWorkbook } from '@/utils/export'
+import { companyInception } from '@/utils/openingPeriod'
+import type {
+  TrialBalanceColumns,
+  TrialBalanceRow,
+  TrialBalanceRowStatus,
+} from '@/utils/trialBalance'
 
 export interface MatchedOpeningItem {
   account_code: string
@@ -74,6 +80,13 @@ export interface ParseOpeningResult {
   yearStartItems?: YearStartBalanceItem[]
   /** 年初数的来源：explicit=文件年初列，derived=期末减本年累计 */
   yearStartSource?: 'explicit' | 'derived' | null
+  /**
+   * 原表逐行核对快照（只读展示，不参与入账）：含被层级去重/零余额/合计行
+   * 跳过的行，金额一律取原表列值，不做任何合并或冲抵。
+   */
+  previewRows?: TrialBalanceRow[]
+  /** 实际命中的表头列，供界面说明「系统认成了哪几列」 */
+  columns?: TrialBalanceColumns
 }
 
 /**
@@ -145,6 +158,11 @@ const DEBIT_ALIASES = ['期末余额借方', '期末借方', '借方期末', '�
 const CREDIT_ALIASES = ['期末余额贷方', '期末贷方', '贷方期末', '期末贷方余额', '贷方余额', '期初余额贷方', '期初贷方', '贷方期初', '期初贷方余额', '贷方', 'credit', 'credit_balance']
 const YTD_DEBIT_ALIASES = ['本年累计发生额借方', '本年累计借方', '借方累计', '本年借方累计', '累计借方', '借方发生额', '本期借方']
 const YTD_CREDIT_ALIASES = ['本年累计发生额贷方', '本年累计贷方', '贷方累计', '本年贷方累计', '累计贷方', '贷方发生额', '本期贷方']
+// 「本期发生额」在余额表里是报表覆盖期间的累计发生额：起期是 1 月或公司成立月时，
+// 它才等同于本年累计。只有调用方确认了起期，才把这两列并入 YTD 别名——否则
+// 单月表的「本期发生额」会被误当累计，年初数也会被算成上月末。
+const MOVEMENT_DEBIT_ALIASES = ['本期发生额借方']
+const MOVEMENT_CREDIT_ALIASES = ['本期发生额贷方']
 const YEAR_START_DEBIT_ALIASES = ['年初余额借方', '年初借方余额', '年初借方', '借方年初', '年初数借方', '上年结转借方']
 const YEAR_START_CREDIT_ALIASES = ['年初余额贷方', '年初贷方余额', '年初贷方', '贷方年初', '年初数贷方', '上年结转贷方']
 const DIRECTION_ALIASES = ['方向', '借贷方向', '借/贷', 'direction']
@@ -172,10 +190,16 @@ function parseNumber(val: unknown): number {
 /**
  * 解析从 Excel 转换而来的行数据，匹配到系统的科目体系中
  */
+export interface ParseOpeningRowOptions {
+  /** 已确认源表起期是 1 月/公司成立月时，把「本期发生额」当本年累计 */
+  movementAsYtd?: boolean
+}
+
 export function parseOpeningRows(
   rows: Record<string, unknown>[],
   allAccounts: { account_code: string; account_name?: string }[],
   mapping?: Record<string, string>,
+  options: ParseOpeningRowOptions = {},
 ): ParseOpeningResult {
   if (!rows || rows.length === 0) {
     return {
@@ -199,8 +223,14 @@ export function parseOpeningRows(
   const nameKey = findKey(allKeys, NAME_ALIASES)
   const debitKey = findKey(allKeys, DEBIT_ALIASES)
   const creditKey = findKey(allKeys, CREDIT_ALIASES)
-  const ytdDebitKey = findKey(allKeys, YTD_DEBIT_ALIASES)
-  const ytdCreditKey = findKey(allKeys, YTD_CREDIT_ALIASES)
+  const ytdDebitKey = findKey(
+    allKeys,
+    options.movementAsYtd ? [...YTD_DEBIT_ALIASES, ...MOVEMENT_DEBIT_ALIASES] : YTD_DEBIT_ALIASES,
+  )
+  const ytdCreditKey = findKey(
+    allKeys,
+    options.movementAsYtd ? [...YTD_CREDIT_ALIASES, ...MOVEMENT_CREDIT_ALIASES] : YTD_CREDIT_ALIASES,
+  )
   const directionKey = findKey(allKeys, DIRECTION_ALIASES)
   const balanceKey = findKey(allKeys, BALANCE_ALIASES)
   const partnerKey = findKey(allKeys, PARTNER_ALIASES)
@@ -209,6 +239,20 @@ export function parseOpeningRows(
   // 只有「期末借贷列」不是年初列时，才能用「期末 − 本年累计」推算年初；
   // 若表里只有年初列（老模板），它本身就是年初，不能再减一次累计。
   const endingIsYearStartColumn = /年初|上年/.test(debitKey || '') || /年初|上年/.test(creditKey || '')
+
+  const columns: TrialBalanceColumns = {
+    ...(codeKey ? { code: codeKey } : {}),
+    ...(nameKey ? { name: nameKey } : {}),
+    ...(partnerKey ? { partner: partnerKey } : {}),
+    ...(yearStartDebitKey ? { yearStartDebit: yearStartDebitKey } : {}),
+    ...(yearStartCreditKey ? { yearStartCredit: yearStartCreditKey } : {}),
+    ...(ytdDebitKey ? { ytdDebit: ytdDebitKey } : {}),
+    ...(ytdCreditKey ? { ytdCredit: ytdCreditKey } : {}),
+    ...(debitKey ? { endingDebit: debitKey } : {}),
+    ...(creditKey ? { endingCredit: creditKey } : {}),
+    ...(balanceKey ? { balance: balanceKey } : {}),
+    ...(directionKey ? { direction: directionKey } : {}),
+  }
 
   const warnings: string[] = []
   if (!codeKey && !nameKey) {
@@ -312,6 +356,58 @@ export function parseOpeningRows(
     }
     const net = round2(debit - credit)
     return net >= 0 ? { debit: net, credit: 0 } : { debit: 0, credit: -net }
+  }
+
+  /**
+   * 原表快照金额：直接读源列，不做「借贷冲抵」「损益优先累计」等入账口径处理。
+   * 某一组列不存在时给 null，界面显示「—」——不能用 0 冒充「原表没有这列」。
+   */
+  function previewAmounts(row: Record<string, unknown>, code: string) {
+    let endingDebit: number | null = null
+    let endingCredit: number | null = null
+    if (debitKey || creditKey) {
+      endingDebit = debitKey ? parseNumber(row[debitKey]) : 0
+      endingCredit = creditKey ? parseNumber(row[creditKey]) : 0
+    } else if (balanceKey && directionKey) {
+      const dir = String(row[directionKey] ?? '').trim()
+      const bal = parseNumber(row[balanceKey])
+      endingDebit = dir.includes('借') ? bal : 0
+      endingCredit = dir.includes('贷') ? bal : 0
+    }
+    const hasYtd = Boolean(ytdDebitKey || ytdCreditKey)
+    const yearStart = isProfitLossCode(code) ? null : rowYearStart(row, code)
+    return {
+      year_start_debit: yearStart ? yearStart.debit : null,
+      year_start_credit: yearStart ? yearStart.credit : null,
+      ytd_debit: hasYtd ? (ytdDebitKey ? parseNumber(row[ytdDebitKey]) : 0) : null,
+      ytd_credit: hasYtd ? (ytdCreditKey ? parseNumber(row[ytdCreditKey]) : 0) : null,
+      ending_debit: endingDebit,
+      ending_credit: endingCredit,
+    }
+  }
+
+  const previewRows: TrialBalanceRow[] = []
+
+  function addPreviewRow(
+    row: Record<string, unknown>,
+    rawCode: string,
+    rawName: string,
+    rawPartner: string,
+    status: TrialBalanceRowStatus,
+    target?: { account_code: string; account_name?: string },
+    note = '',
+  ) {
+    previewRows.push({
+      row_no: previewRows.length + 1,
+      original_code: rawCode,
+      original_name: rawName,
+      partner_name: rawPartner,
+      ...previewAmounts(row, rawCode),
+      target_code: target?.account_code || '',
+      target_name: target?.account_name || '',
+      status,
+      note,
+    })
   }
 
   const amountByCode = new Map<string, number>()
@@ -468,20 +564,24 @@ export function parseOpeningRows(
 
     // 过滤掉总计行/空行
     if (rawCode.includes('合计') || rawName.includes('合计') || rawName.includes('总计')) {
+      addPreviewRow(row, rawCode, rawName, rawPartner, 'skipped_total', undefined, '原表合计/总计行，不入账')
       continue
     }
     if (!rawCode && !rawName) continue
 
     // 文件内层级去重：见上方「父子科目层级去重」说明
     if (rawCode && parentYieldsToChildren.has(rawCode)) {
+      addPreviewRow(row, rawCode, rawName, rawPartner, 'skipped_rollup', undefined, '上级合计行让位给下级明细')
       continue // 上级合计行已让位给匹配系统科目的下级明细
     }
     if (rawCode && isCoveredByKeptAncestor(rawCode)) {
       skippedRollupRowCount++ // 下级明细金额已含于保留的上级合计行
+      addPreviewRow(row, rawCode, rawName, rawPartner, 'skipped_rollup', undefined, '金额已含在保留的上级合计行')
       continue
     }
     if (rawCode && skipUnmatchableParent.has(rawCode)) {
       skippedRollupRowCount++ // 上级无法匹配系统科目，由其下级明细行进映射列表
+      addPreviewRow(row, rawCode, rawName, rawPartner, 'skipped_rollup', undefined, '上级行无法匹配，改由下级明细行映射')
       continue
     }
 
@@ -504,10 +604,11 @@ export function parseOpeningRows(
     // 期末已清零的科目仍可能有年初余额（年内收清的应收、付清的应付）：这类行
     // 期末金额为 0，但年初数不能跟着丢，否则报表年初列两侧对不平。
     if (debit === 0 && credit === 0 && yearStartEmpty) {
+      addPreviewRow(row, rawCode, rawName, rawPartner, 'skipped_zero', undefined, '期末余额与年初余额均为 0')
       continue
     }
 
-    // 匹配系统科目（映射优先 -> 精准 -> 清洗 -> 前缀 -> 中文名称）
+    // 匹配系统科目（映射优先 -> 精准 -> 清洗 -> 前缀 -> 撞码时同名优先 -> 中文名称）
     const mappedCode = mapping?.[rawCode] || mapping?.[rawName]
     let target = mappedCode ? codeMap.get(mappedCode) : undefined
     if (!target) {
@@ -516,6 +617,20 @@ export function parseOpeningRows(
       target = codeMap.get(rawCode) || codeMap.get(cleanCode)
       if (!target && prefixCode) {
         target = codeMap.get(prefixCode)
+      }
+      // 旧账套的科目码可能与本系统撞码：源表 2221021 是「应交个人所得税」，
+      // 本系统 2221021 却是「待转销项税额」（同名科目在 2221012）。同码但名称
+      // 对不上时，同族的精确同名科目比科目码更可信。限定同族（前 4 位）是为了
+      // 避免把「销售费用-办公费」按重名改到「管理费用-办公费」。
+      if (target && rawName) {
+        const targetName = target.account_name || ''
+        const nameConflicts = targetName && targetName !== rawName
+          && !targetName.includes(rawName) && !rawName.includes(targetName)
+        const sameName = nameMap.get(rawName)
+        if (nameConflicts && sameName && sameName.account_code !== target.account_code
+          && sameName.account_code.slice(0, 4) === target.account_code.slice(0, 4)) {
+          target = sameName
+        }
       }
       // 往来科目子码回退到 4 位父科目：第三方导出的是 1122001（单位名在科目名里），
       // 本系统只有一级 1122。单位身份由客商承载，科目落回 1122——
@@ -577,9 +692,11 @@ export function parseOpeningRows(
         existing.matched = true
       }
       matchedCount++
+      addPreviewRow(row, rawCode, rawName, rawPartner, 'matched', target)
     } else {
       unmatchedCount++
       warnings.push(`未匹配到系统科目：[${rawCode || '-'}] ${rawName || '-'} (借: ${debit}, 贷: ${credit})`)
+      addPreviewRow(row, rawCode, rawName, rawPartner, 'unmatched', undefined, '未匹配到系统科目，需手工映射')
       unmatchedRows.push({
         originalCode: rawCode,
         originalName: rawName,
@@ -616,6 +733,16 @@ export function parseOpeningRows(
       item.credit_balance = 0
       yearStartNet.delete(`${item.account_code}\u0000`)
       item.warning = '上级合计行已由带往来单位的明细行承载，本行不计入'
+      for (const preview of previewRows) {
+        if (
+          preview.target_code === item.account_code
+          && preview.status === 'matched'
+          && !preview.partner_name
+        ) {
+          preview.status = 'skipped_partner_rollup'
+          preview.note = '往来合计行已由带客商明细承载，本行不计入'
+        }
+      }
     } else {
       warnings.push(
         `科目 ${item.account_code} 的合计行金额与往来单位明细行之和不一致，已同时保留，请核对`,
@@ -671,6 +798,8 @@ export function parseOpeningRows(
     yearStartSource: yearStartDerivable
       ? (yearStartDebitKey || yearStartCreditKey ? 'explicit' : 'derived')
       : null,
+    previewRows,
+    columns,
   }
 }
 
@@ -730,6 +859,9 @@ export function suggestMappingTarget(
   if (/印花税/.test(name)) return findByNameToken('印花税')
   if (/房产税/.test(name)) return findByNameToken('应交房产税')
   if (/个人所得税/.test(name)) return findByNameToken('个人所得税')
+  // 「营业外收入-其他」这类杂项收入在标准科目表里没有对应叶子（5301001～5301004
+  // 都是具名项），兜底到一级 5301；不兜底会作为未匹配损益行被静默丢掉。
+  if (/营业外收入/.test(name) && /其他/.test(name)) return findByNameToken('营业外收入')
   if (/福利/.test(name)) return findByNameToken('福利费')
   if (/技术服务/.test(name)) return findByNameToken('信息技术服务费')
   if (/工资|薪酬/.test(name)) return findByNameToken('工资')
@@ -893,15 +1025,17 @@ export interface ExpectedPeriod {
   startMonth: number
   endYear: number
   endMonth: number
-  /** 年中建账要求从 1 月起（损益累计完整性）；年初建账只要求终点是上年 12 月 */
+  /** 年中建账要求从 1 月/公司成立月起（损益累计完整性）；年初建账只要求终点是上年 12 月 */
   requiresFullYear: boolean
+  /** 公司成立月不早于启用月：成立前没有账务，期初恒为 0，无需导入源表 */
+  zeroOpening: boolean
 }
 
 export type OpeningPeriodCheck =
   | { ok: true; period: StatementPeriod }
   | {
       ok: false
-      reason: 'unknown' | 'end_mismatch' | 'start_mismatch'
+      reason: 'unknown' | 'end_mismatch' | 'start_mismatch' | 'zero_opening'
       message: string
       expected: ExpectedPeriod
     }
@@ -972,29 +1106,64 @@ function formatYearMonth(year: number, month: number): string {
   return `${year}-${String(month).padStart(2, '0')}`
 }
 
-/** 建账期间对应的应有报表期间 */
-export function expectedOpeningPeriod(fiscalYear: number, startMonth: string): ExpectedPeriod {
+/**
+ * 建账期间对应的应有报表期间。
+ *
+ * 年中建账要求源表覆盖「本年起（或公司成立起）～ 启用前一月」，保证损益累计
+ * 完整；当年成立的公司，起期是成立月而不是 1 月。启用月不晚于成立月时，
+ * 公司成立前没有账务，期初恒为 0（zeroOpening）。
+ */
+export function expectedOpeningPeriod(
+  fiscalYear: number,
+  startMonth: string,
+  companyStartDate?: string | null,
+  incorporationDate?: string | null,
+): ExpectedPeriod {
   const month = parseInt(startMonth, 10) || 1
+  // 成立日期优先；未填时退回启用日期（旧账套兼容，页面会提示补填）。
+  const inception = companyInception(
+    String(incorporationDate || '').trim() || companyStartDate,
+  )
+
   if (month > 1) {
+    const inceptionMonth = inception && inception.year === fiscalYear ? inception.month : 1
+    const zeroOpening = month <= inceptionMonth
     return {
       startYear: fiscalYear,
-      startMonth: 1,
+      startMonth: zeroOpening ? month : inceptionMonth,
       endYear: fiscalYear,
-      endMonth: month - 1,
+      endMonth: zeroOpening ? month : month - 1,
       requiresFullYear: true,
+      zeroOpening,
     }
   }
+
+  // 年初建账：公司当年才成立时，上年 12 月还没有这家公司，期初恒为 0。
+  if (inception && inception.year === fiscalYear) {
+    return {
+      startYear: fiscalYear,
+      startMonth: month,
+      endYear: fiscalYear,
+      endMonth: month,
+      requiresFullYear: false,
+      zeroOpening: true,
+    }
+  }
+
+  // 上年已成立：截止上年 12 月；起期给成立月，让兜底下拉不出现成立前的月份。
   return {
     startYear: fiscalYear - 1,
-    startMonth: 1,
+    startMonth: inception && inception.year === fiscalYear - 1 ? inception.month : 1,
     endYear: fiscalYear - 1,
     endMonth: 12,
     requiresFullYear: false,
+    zeroOpening: false,
   }
 }
 
 /** 期望期间的可读文案，如「2026-01 ～ 2026-05」或「2025-12 月末」 */
 export function describeExpectedPeriod(expected: ExpectedPeriod): string {
+  if (expected.zeroOpening) return '无需期初余额（启用前无账务）'
   if (expected.requiresFullYear) {
     return `${formatYearMonth(expected.startYear, expected.startMonth)} ～ ${formatYearMonth(expected.endYear, expected.endMonth)}`
   }
@@ -1005,16 +1174,42 @@ export function describeExpectedPeriod(expected: ExpectedPeriod): string {
  * 校验导入表期间是否与建账期间匹配。
  *
  * 年初建账（1 月）只校验终点为上一年 12 月：资产负债要上年末余额，损益不生成
- * YTD，起点不重要。年中建账额外要求起点为当年 1 月，否则损益累计会缺月份。
+ * YTD，起点不重要。年中建账额外要求起点为当年 1 月或公司成立月，否则损益
+ * 累计会缺月份。启用月不晚于成立月时，成立前没有账务，期初恒为 0。
  */
 export function checkOpeningPeriod(
   period: StatementPeriod | null,
   fiscalYear: number,
   startMonth: string,
+  companyStartDate?: string | null,
+  incorporationDate?: string | null,
 ): OpeningPeriodCheck {
-  const expected = expectedOpeningPeriod(fiscalYear, startMonth)
+  const expected = expectedOpeningPeriod(fiscalYear, startMonth, companyStartDate, incorporationDate)
   const wanted = describeExpectedPeriod(expected)
   const month = parseInt(startMonth, 10) || 1
+
+  if (expected.zeroOpening) {
+    const hasInception = Boolean(String(incorporationDate || '').trim())
+    const inception = companyInception(
+      hasInception ? incorporationDate : companyStartDate,
+    )
+    const monthText = inception
+      ? `${inception.year}-${String(inception.month).padStart(2, '0')}`
+      : ''
+    const subject = hasInception
+      ? `公司 ${monthText} 成立`
+      : `账套 ${monthText} 启用`
+    const fillHint = hasInception ? '' : '若公司成立早于启用月，请先在主体管理补填公司成立日期。'
+    let message = `${subject}，${month} 月启用无需期初余额；直接录入业务即可。${fillHint}`
+    if (period) {
+      const gotEnd = formatYearMonth(period.endYear, period.endMonth)
+      const next = period.endMonth === 12
+        ? `${period.endYear + 1}-01`
+        : `${period.endYear}-${String(period.endMonth + 1).padStart(2, '0')}`
+      message = `${subject}，${month} 月启用无需期初余额；这份表截止 ${gotEnd}，如需作为期初，请把启用月改为 ${next}。${fillHint}`
+    }
+    return { ok: false, reason: 'zero_opening', expected, message }
+  }
 
   if (!period) {
     return {
@@ -1057,7 +1252,9 @@ export function checkOpeningPeriod(
       const reason =
         startOrder > 0
           ? `这份表从 ${gotStart} 开始，缺前序月份，损益本年累计会少算。`
-          : `这份表从 ${gotStart} 开始，含了建账年度之前的月份，损益本年累计会多算。`
+          : expected.startMonth > 1
+            ? `这份表从 ${gotStart} 开始，早于公司成立月 ${formatYearMonth(expected.startYear, expected.startMonth)}，请从成立月起导出。`
+            : `这份表从 ${gotStart} 开始，含了建账年度之前的月份，损益本年累计会多算。`
       return {
         ok: false,
         reason: 'start_mismatch',
@@ -1070,6 +1267,14 @@ export function checkOpeningPeriod(
   return { ok: true, period }
 }
 
+export interface ParseOpeningWorkbookOptions {
+  /**
+   * 期望的源表起期。只有表头期间起于这个月时，才把「本期发生额」当本年累计；
+   * 起期未确认（或表头无期间）时保持原来的「本年累计」口径。
+   */
+  expectedStart?: { year: number; month: number } | null
+}
+
 /**
  * 解析完整 Excel 工作簿（支持多 Sheet：资产负债、损益累计、固定资产卡片）
  */
@@ -1077,6 +1282,7 @@ export function parseOpeningWorkbook(
   workbook: XLSX.WorkBook,
   allAccounts: { account_code: string; account_name?: string }[],
   mapping?: Record<string, string>,
+  options: ParseOpeningWorkbookOptions = {},
 ): ParseOpeningResult {
   const sheetNames = workbook.SheetNames
   if (!sheetNames || sheetNames.length === 0) {
@@ -1088,11 +1294,18 @@ export function parseOpeningWorkbook(
   const ytdSheetName = sheetNames.find(n => n.includes('损益') || n.includes('累计发生'))
   const faSheetName = sheetNames.find(n => n.includes('固定资产') || n.includes('资产卡片') || n.includes('卡片'))
 
-  // 解析资产负债 Sheet
+  // 解析资产负债 Sheet。起期必须先确认，才能决定「本期发生额」是不是本年累计。
   const balanceSheet = workbook.Sheets[balanceSheetName]
   const balanceRows = sheetToRows(balanceSheet)
-  const baseResult = parseOpeningRows(balanceRows, allAccounts, mapping)
-  baseResult.period = balanceSheet ? detectStatementPeriod(balanceSheet) : null
+  const period = balanceSheet ? detectStatementPeriod(balanceSheet) : null
+  const movementAsYtd = Boolean(
+    options.expectedStart &&
+    period &&
+    period.startYear === options.expectedStart.year &&
+    period.startMonth === options.expectedStart.month,
+  )
+  const baseResult = parseOpeningRows(balanceRows, allAccounts, mapping, { movementAsYtd })
+  baseResult.period = period
 
   // 如果有独立的损益 Sheet，合并损益科目数据
   if (ytdSheetName && ytdSheetName !== balanceSheetName) {

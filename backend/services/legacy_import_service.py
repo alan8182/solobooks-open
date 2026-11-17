@@ -191,11 +191,37 @@ def _resolve_code(
     只自动应用"用户已确认的映射"和"编码精确命中"；名称匹配仅作**建议**，
     不自动落库——不同软件编码体系差异大，静默按名字改码会把金额记到错误科目，
     这类错误在报表层面极难发现。建议由前端映射表逐条确认后回传 mapping。
+
+    例外：同码撞名。旧账套的 2221021 是「应交个人所得税」，本系统 2221021
+    却是「待转销项税额」，而同名科目在 2221012。此时死守科目码会把金额静默
+    记进错误子科目，因此同族（前 4 位）恰有一个精确同名末级科目时以同名为准。
     """
     code = str(raw_code or "").strip()
     if code in mapping and mapping[code] in by_code:
         return mapping[code], ""
     if code and code in by_code:
+        target = by_code[code]
+        name = str(raw_name or "").strip()
+        target_name = (target.name or "").strip()
+        # 名称互不包含才算撞名；「银行存款」与「银行存款-招商银行」这类从属关系不干预。
+        # 限定同族是为了避开「销售费用-办公费 / 管理费用-办公费」这类跨族重名。
+        if (
+            name
+            and target_name
+            and name != target_name
+            and name not in target_name
+            and target_name not in name
+        ):
+            same_name = [
+                item
+                for item in by_name.get(name, [])
+                if item.code != target.code
+                and item.code[:4] == target.code[:4]
+                and item.is_leaf
+                and item.is_active
+            ]
+            if len(same_name) == 1:
+                return same_name[0].code, ""
         return code, ""
     name = str(raw_name or "").strip()
     if name and name in by_name:

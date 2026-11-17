@@ -2,23 +2,38 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { NCard, NSpin, useMessage, NSelect, NButton, NRadioGroup, NRadioButton } from 'naive-ui'
-import { SoloEmpty } from '@/components/ui'
+import { NCard, NSpin, useMessage, NSelect, NButton, NRadioGroup, NRadioButton, NInputNumber, NTag, NSwitch, NModal, NInput, NDatePicker } from 'naive-ui'
+import { SoloEmpty, SoloDrawer } from '@/components/ui'
 import { useEntryStore } from '@/stores/entry'
 import { useWorkspaceViewStore } from '@/stores/workspaceView'
-import { getMonthlyReport, getReportDiagnosis, getBalanceSheet } from '@/api/report'
+import {
+  getMonthlyReport,
+  getReportDiagnosis,
+  getBalanceSheet,
+  getCashForecast,
+  getCashForecastConfig,
+  updateCashForecastConfig,
+  getBusinessAttribution,
+} from '@/api/report'
 import { exportSmallBusinessMonthQuarterTaxReport } from '@/api/tax-report'
 import { formatMoney, getCurrentMonth } from '@/utils/format'
 import { usePageRefresh } from '@/composables/usePageRefresh'
-import type { MonthlyReportResponse, BalanceSheetResponse } from '@/api/types'
+import type {
+  MonthlyReportResponse,
+  BalanceSheetResponse,
+  CashForecastResponse,
+  CashForecastConfig,
+  ManualCashEvent,
+  BusinessAttributionResponse,
+} from '@/api/types'
 
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
-import { BarChart } from 'echarts/charts'
+import { BarChart, LineChart } from 'echarts/charts'
 import { GridComponent, TooltipComponent } from 'echarts/components'
 import VChart from 'vue-echarts'
 
-use([CanvasRenderer, BarChart, GridComponent, TooltipComponent])
+use([CanvasRenderer, BarChart, LineChart, GridComponent, TooltipComponent])
 
 // ponytail: Boss-centric report hub: direct financial conclusions, cash/receivables visibility, restrained blues
 const router = useRouter()
@@ -500,14 +515,327 @@ async function loadReport() {
   }
 }
 
+// ── 现金流滚动预测与资金跑道 ──
+const forecastHorizon = ref<number>(60)
+const forecastScenario = ref<'neutral' | 'optimistic' | 'pessimistic'>('neutral')
+const forecastLoading = ref(false)
+const forecastData = ref<CashForecastResponse | null>(null)
+const showForecastDrawer = ref(false)
+const showAttributionDrawer = ref(false)
+const showConfigDrawer = ref(false)
+const configSaving = ref(false)
+const forecastConfig = ref<CashForecastConfig>({
+  defaultArDays: 30,
+  defaultApDays: 30,
+  partnerCreditDays: {},
+  safetyCashThreshold: null,
+  manualCashEvents: [],
+})
+
+const showAddEventModal = ref(false)
+const newEventForm = ref<{
+  name: string
+  type: 'inflow' | 'outflow'
+  amount: number
+  date: string
+  repeat: 'none' | 'monthly' | 'quarterly' | 'yearly'
+  repeatDay: number | null
+  confidence: 'high' | 'medium' | 'low'
+}>({
+  name: '',
+  type: 'outflow',
+  amount: 10000,
+  date: '',
+  repeat: 'none',
+  repeatDay: 10,
+  confidence: 'high',
+})
+
+async function loadForecast() {
+  forecastLoading.value = true
+  try {
+    const res = await getCashForecast('', forecastHorizon.value, forecastScenario.value)
+    forecastData.value = res
+  } catch (err) {
+    console.error('加载现金流预测失败:', err)
+  } finally {
+    forecastLoading.value = false
+  }
+}
+
+async function openConfigDrawer() {
+  showConfigDrawer.value = true
+  try {
+    const cfg = await getCashForecastConfig()
+    forecastConfig.value = {
+      defaultArDays: cfg.defaultArDays || 30,
+      defaultApDays: cfg.defaultApDays || 30,
+      partnerCreditDays: cfg.partnerCreditDays || {},
+      safetyCashThreshold: cfg.safetyCashThreshold,
+      manualCashEvents: cfg.manualCashEvents || [],
+    }
+  } catch (err) {
+    console.error('加载现金流配置失败:', err)
+  }
+}
+
+async function saveConfig() {
+  configSaving.value = true
+  try {
+    await updateCashForecastConfig(forecastConfig.value)
+    message.success('现金流预测规则已保存')
+    showConfigDrawer.value = false
+    await loadForecast()
+  } catch (err: any) {
+    message.error(err?.response?.data?.detail || '保存失败')
+  } finally {
+    configSaving.value = false
+  }
+}
+
+function openAddEventModal() {
+  const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10)
+  newEventForm.value = {
+    name: '',
+    type: 'outflow',
+    amount: 10000,
+    date: tomorrow,
+    repeat: 'none',
+    repeatDay: 10,
+    confidence: 'high',
+  }
+  showAddEventModal.value = true
+}
+
+async function confirmAddEvent() {
+  if (!newEventForm.value.name.trim()) {
+    message.warning('请输入事项名称')
+    return
+  }
+  if (!newEventForm.value.amount || newEventForm.value.amount <= 0) {
+    message.warning('请输入有效金额')
+    return
+  }
+
+  if (!forecastConfig.value.manualCashEvents) {
+    const cfg = await getCashForecastConfig()
+    forecastConfig.value = {
+      defaultArDays: cfg.defaultArDays || 30,
+      defaultApDays: cfg.defaultApDays || 30,
+      partnerCreditDays: cfg.partnerCreditDays || {},
+      safetyCashThreshold: cfg.safetyCashThreshold,
+      manualCashEvents: cfg.manualCashEvents || [],
+    }
+  }
+
+  const newEv: ManualCashEvent = {
+    id: `evt_${Date.now()}`,
+    name: newEventForm.value.name.trim(),
+    type: newEventForm.value.type,
+    amount: newEventForm.value.amount,
+    date: newEventForm.value.date,
+    repeat: newEventForm.value.repeat,
+    repeatDay: newEventForm.value.repeat === 'monthly' ? (newEventForm.value.repeatDay || 10) : null,
+    confidence: newEventForm.value.confidence,
+    enabled: true,
+  }
+
+  forecastConfig.value.manualCashEvents = [
+    ...(forecastConfig.value.manualCashEvents || []),
+    newEv,
+  ]
+
+  try {
+    await updateCashForecastConfig(forecastConfig.value)
+    message.success('已登记预期收支，现金流预测已重新计算')
+    showAddEventModal.value = false
+    await loadForecast()
+  } catch (err: any) {
+    message.error(err?.response?.data?.detail || '保存失败')
+  }
+}
+
+async function toggleTimelineEvent(eventId: string) {
+  const baseId = eventId.split('_').slice(0, 2).join('_')
+  if (!forecastConfig.value.manualCashEvents?.length) {
+    const cfg = await getCashForecastConfig()
+    forecastConfig.value.manualCashEvents = cfg.manualCashEvents || []
+  }
+
+  const target = forecastConfig.value.manualCashEvents?.find(
+    e => e.id === eventId || e.id === baseId
+  )
+  if (!target) return
+
+  target.enabled = !target.enabled
+  try {
+    await updateCashForecastConfig(forecastConfig.value)
+    message.info(target.enabled ? `已启用「${target.name}」` : `已在预测中停用「${target.name}」`)
+    await loadForecast()
+  } catch {
+    message.error('更新失败')
+  }
+}
+
+async function removeConfigEvent(id: string) {
+  forecastConfig.value.manualCashEvents = (forecastConfig.value.manualCashEvents || []).filter(
+    e => e.id !== id
+  )
+  try {
+    await updateCashForecastConfig(forecastConfig.value)
+    message.success('已删除收支规则')
+    await loadForecast()
+  } catch {
+    message.error('删除失败')
+  }
+}
+
+// ── 经营波动归因与利现差额桥 ──
+const attributionMode = ref<'mom' | 'yoy'>('mom')
+const attributionLoading = ref(false)
+const attributionData = ref<BusinessAttributionResponse | null>(null)
+
+async function loadAttribution() {
+  attributionLoading.value = true
+  try {
+    const res = await getBusinessAttribution(representativeMonth.value, attributionMode.value)
+    attributionData.value = res
+  } catch (err) {
+    console.error('加载经营归因失败:', err)
+  } finally {
+    attributionLoading.value = false
+  }
+}
+
+const attributionCardSummary = computed(() => {
+  if (!attributionData.value) return '对比净利润与现金变动，穿透应收、应付与开支占用'
+  const raw = attributionData.value.plainSummary || ''
+  // 剥离重复的【利现差额】前缀（数字已在上方大字展示），优先提取真正的归因原因
+  const cleaned = raw.replace(/^【利现差额】[^。]*[。]\s*/, '').trim()
+  if (cleaned) return cleaned
+  if (Math.abs(attributionData.value.profitToCashDiscrepancy || 0) < 0.01) {
+    return '当期账面利润与现金变动基本对齐，无显著往来款或开支占用'
+  }
+  return raw
+})
+
+const attributionStatus = computed(() => {
+  if (!attributionData.value) return null
+  const { netProfit, netCashFlow } = attributionData.value
+  if (netProfit > 0 && netCashFlow < netProfit) {
+    return { text: netCashFlow <= 0 ? '利润承压未变现' : '部分利润未变现', type: 'warning' as const }
+  }
+  if (netCashFlow >= netProfit && netCashFlow > 0) {
+    return { text: '现金转化良好', type: 'success' as const }
+  }
+  return { text: '利现基本对齐', type: 'default' as const }
+})
+
+const forecastChartOption = computed(() => {
+  if (!forecastData.value || !forecastData.value.dailyPoints?.length) return {}
+  const points = forecastData.value.dailyPoints
+  const xData = points.map(p => p.date.slice(5))
+  const yData = points.map(p => p.balance)
+  const safety = Number(forecastData.value.safetyThreshold || 0)
+
+  return {
+    tooltip: {
+      trigger: 'axis',
+      formatter: (params: any) => {
+        const item = params[0]
+        const idx = item.dataIndex
+        const p = points[idx]
+        return `
+          <div style="font-size: 13px; line-height: 1.6;">
+            <strong>${p.date}</strong><br/>
+            预计余额: <b>${formatMoney(p.balance)}</b><br/>
+            预计流入: +${formatMoney(p.inflow)}<br/>
+            预计流出: -${formatMoney(p.outflow)}<br/>
+            当日净额: ${p.net >= 0 ? '+' : ''}${formatMoney(p.net)}
+          </div>
+        `
+      },
+    },
+    grid: { left: 70, right: 30, top: 20, bottom: 25 },
+    xAxis: {
+      type: 'category',
+      data: xData,
+      boundaryGap: false,
+      axisLine: { lineStyle: { color: '#dde3ea' } },
+      axisLabel: { color: '#586474', fontSize: 11 },
+    },
+    yAxis: {
+      type: 'value',
+      splitLine: { lineStyle: { type: 'dashed', color: '#edf0f4' } },
+      axisLabel: {
+        color: '#586474',
+        formatter: (val: number) => `¥${(val / 1000).toFixed(0)}k`,
+      },
+    },
+    series: [
+      {
+        name: '预计可用现金',
+        type: 'line',
+        smooth: true,
+        showSymbol: false,
+        data: yData,
+        lineStyle: { width: 3, color: '#1747b0' },
+        areaStyle: {
+          color: {
+            type: 'linear',
+            x: 0,
+            y: 0,
+            x2: 0,
+            y2: 1,
+            colorStops: [
+              { offset: 0, color: 'rgba(23, 71, 176, 0.25)' },
+              { offset: 1, color: 'rgba(23, 71, 176, 0.01)' },
+            ],
+          },
+        },
+        markLine: safety > 0 ? {
+          silent: true,
+          symbol: 'none',
+          data: [
+            {
+              yAxis: safety,
+              label: {
+                formatter: `安全警戒线 ${formatMoney(safety)}`,
+                position: 'insideEndTop',
+                color: '#bd3d3d',
+                fontSize: 11,
+              },
+              lineStyle: { type: 'dashed', color: '#bd3d3d', width: 1.5 },
+            },
+          ],
+        } : undefined,
+      },
+    ],
+  }
+})
+
 onMounted(() => {
   loadReport()
+  loadForecast()
+  loadAttribution()
 })
 // 切回标签时静默重算：别的标签里刚记的账不该漏在这张报表外
-usePageRefresh(loadReport)
+usePageRefresh(() => {
+  loadReport()
+  loadForecast()
+  loadAttribution()
+})
 
 watch(() => viewStore.mode, () => {
   loadReport()
+})
+
+watch([forecastHorizon, forecastScenario], () => {
+  loadForecast()
+})
+
+watch([attributionMode, representativeMonth], () => {
+  loadAttribution()
 })
 </script>
 
@@ -682,7 +1010,7 @@ watch(() => viewStore.mode, () => {
           </template>
         </div>
 
-        <!-- AI CFO 经营简评（手动触发） -->
+        <!-- AI 财务官 经营简评（手动触发） -->
         <div class="ai-summary-box">
           <div class="ai-summary-header">
             <div class="summary-badge">
@@ -704,7 +1032,7 @@ watch(() => viewStore.mode, () => {
           </div>
           <p v-if="aiSummary" class="summary-text">{{ aiSummary }}</p>
           <p v-else class="summary-hint">
-            基于本期收支、净利润与支出结构，由 AI CFO 分析经营健康度并给出改善建议。
+            基于本期收支、净利润与支出结构，由 AI 财务官分析经营健康度并给出改善建议。
           </p>
         </div>
 
@@ -715,6 +1043,122 @@ watch(() => viewStore.mode, () => {
         </div>
       </NCard>
     </NSpin>
+
+    <!-- AI 决策罗盘：资金跑道与利现差额轻量看板 -->
+    <div v-if="viewStore.isBoss" class="decision-compass-strip">
+      <!-- 资金跑道透视卡 -->
+      <div
+        class="compass-card"
+        role="button"
+        tabindex="0"
+        @click="showForecastDrawer = true"
+        @keydown.enter="showForecastDrawer = true"
+      >
+        <div class="compass-header">
+          <div class="compass-title-wrap">
+            <div class="compass-icon-wrap primary">
+              <i class="ri-funds-box-line" />
+            </div>
+            <div class="compass-title-block">
+              <span class="compass-card-title">资金安全跑道与现金预测</span>
+              <span class="compass-card-subtitle">动态推演未来 30~90 天资金水位 · 预判断流风险</span>
+            </div>
+          </div>
+          <div class="compass-badge">
+            <NTag v-if="forecastData?.isDeficitProjected" type="error" size="small">
+              高危：资金赤字
+            </NTag>
+            <NTag v-else-if="forecastData && forecastData.minBalance < (forecastData.safetyThreshold || 0)" type="warning" size="small">
+              预警：触及安全线
+            </NTag>
+            <NTag v-else-if="forecastData" type="success" size="small">
+              健康：资金充裕
+            </NTag>
+          </div>
+        </div>
+
+        <div class="compass-body">
+          <div class="compass-stat-group">
+            <div class="compass-stat-item">
+              <span class="stat-label">安全跑道 (Runway)</span>
+              <span class="stat-num text-primary">
+                {{ forecastData?.runwayMonths !== null && forecastData?.runwayMonths !== undefined ? `${forecastData.runwayMonths} 个月` : '测算中...' }}
+              </span>
+            </div>
+            <div class="compass-stat-item">
+              <span class="stat-label">预测最低可用资金</span>
+              <span class="stat-num" :class="forecastData && forecastData.minBalance < (forecastData.safetyThreshold || 0) ? 'text-danger' : ''">
+                {{ forecastData ? formatMoney(forecastData.minBalance) : '¥0.00' }}
+              </span>
+            </div>
+          </div>
+          <p class="compass-summary-line">
+            <template v-if="forecastData?.minBalanceDate">
+              预计 {{ forecastData.minBalanceDate }} 最低探底，安全储备线 {{ formatMoney(forecastData.safetyThreshold || 0) }}
+            </template>
+            <template v-else>
+              已综合未结应收按期回款、应付支出与月度刚性开销
+            </template>
+          </p>
+        </div>
+
+        <div class="compass-footer">
+          <span class="footer-link-text">查看走势推演与压力测试</span>
+          <i class="ri-arrow-right-line" />
+        </div>
+      </div>
+
+      <!-- 利现差额透视卡 -->
+      <div
+        class="compass-card"
+        role="button"
+        tabindex="0"
+        @click="showAttributionDrawer = true"
+        @keydown.enter="showAttributionDrawer = true"
+      >
+        <div class="compass-header">
+          <div class="compass-title-wrap">
+            <div class="compass-icon-wrap indigo">
+              <i class="ri-bubble-chart-line" />
+            </div>
+            <div class="compass-title-block">
+              <span class="compass-card-title">利润去向分析与利现对齐</span>
+              <span class="compass-card-subtitle">回答“为什么账面赚钱但手里没现钱”</span>
+            </div>
+          </div>
+          <div class="compass-badge">
+            <NTag v-if="attributionStatus" :type="attributionStatus.type" size="small">
+              {{ attributionStatus.text }}
+            </NTag>
+          </div>
+        </div>
+
+        <div class="compass-body">
+          <div class="compass-stat-group">
+            <div class="compass-stat-item">
+              <span class="stat-label">实际现钱净变动</span>
+              <span class="stat-num" :class="attributionData && attributionData.netCashFlow >= 0 ? 'text-primary' : 'text-danger'">
+                {{ attributionData ? (attributionData.netCashFlow >= 0 ? `+${formatMoney(attributionData.netCashFlow)}` : formatMoney(attributionData.netCashFlow)) : '测算中...' }}
+              </span>
+            </div>
+            <div class="compass-stat-item">
+              <span class="stat-label">账面落袋净利润</span>
+              <span class="stat-num" :class="attributionData && attributionData.netProfit < 0 ? 'text-danger' : 'text-primary'">
+                {{ attributionData ? (attributionData.netProfit >= 0 ? `+${formatMoney(attributionData.netProfit)}` : formatMoney(attributionData.netProfit)) : '¥0.00' }}
+              </span>
+            </div>
+          </div>
+          <p class="compass-summary-line text-truncate" :title="attributionCardSummary">
+            {{ attributionCardSummary }}
+          </p>
+        </div>
+
+        <div class="compass-footer">
+          <span class="footer-link-text">查看调节明细与驱动因素</span>
+          <i class="ri-arrow-right-line" />
+        </div>
+      </div>
+    </div>
 
     <!-- 报表三大板块分层 -->
     <div class="report-sections">
@@ -827,6 +1271,521 @@ watch(() => viewStore.mode, () => {
         </NButton>
       </section>
     </div>
+
+    <!-- 资金安全跑道与现金预测抽屉 -->
+    <SoloDrawer
+      v-model:show="showForecastDrawer"
+      title="资金安全跑道与现金预测"
+      :width="760"
+    >
+      <div class="drawer-section-intro">
+        结合未结清应收（1122）、应付（2202）及月度刚性开销，动态推演未来 30~90 天现金流动走势，评估资金断流风险。
+      </div>
+
+      <div class="drawer-controls-bar">
+        <div class="control-item">
+          <span class="control-label">推演周期：</span>
+          <NRadioGroup v-model:value="forecastHorizon" size="small">
+            <NRadioButton :value="30">30天</NRadioButton>
+            <NRadioButton :value="60">60天</NRadioButton>
+            <NRadioButton :value="90">90天</NRadioButton>
+          </NRadioGroup>
+        </div>
+        <div class="control-item">
+          <span class="control-label">推演情景：</span>
+          <NRadioGroup v-model:value="forecastScenario" size="small">
+            <NRadioButton value="neutral">中性推演</NRadioButton>
+            <NRadioButton value="optimistic">乐观加速</NRadioButton>
+            <NRadioButton value="pessimistic">悲观延期</NRadioButton>
+          </NRadioGroup>
+        </div>
+        <NButton size="small" secondary @click="openConfigDrawer">
+          <template #icon><i class="ri-settings-4-line" /></template>
+          预测规则
+        </NButton>
+      </div>
+
+      <NSpin :show="forecastLoading">
+        <div v-if="forecastData" class="forecast-content">
+          <!-- 核心指标摘要 -->
+          <div class="forecast-metrics-grid">
+            <div class="forecast-metric-item">
+              <div class="metric-label">当前可用资金 (1001/1002)</div>
+              <div class="metric-val text-primary">{{ formatMoney(forecastData.currentCash) }}</div>
+              <div class="metric-sub">实时活期与现金总和</div>
+            </div>
+            <div class="forecast-metric-item">
+              <div class="metric-label">预测期内最低余额</div>
+              <div class="metric-val" :class="forecastData.minBalance < (forecastData.safetyThreshold || 0) ? 'text-danger' : 'text-primary'">
+                {{ formatMoney(forecastData.minBalance) }}
+              </div>
+              <div class="metric-sub">
+                {{ forecastData.minBalanceDate ? `预计出现在 ${forecastData.minBalanceDate}` : '资金平稳' }}
+              </div>
+            </div>
+            <div class="forecast-metric-item">
+              <div class="metric-label">资金安全跑道 (Runway)</div>
+              <div class="metric-val text-indigo">
+                {{ forecastData.runwayMonths !== null ? `${forecastData.runwayMonths} 个月` : '充裕 (>24月)' }}
+              </div>
+              <div class="metric-sub">按月均开支测算支撑时长</div>
+            </div>
+            <div class="forecast-metric-item">
+              <div class="metric-label">资金水位风险评估</div>
+              <div class="metric-status">
+                <NTag v-if="forecastData.isDeficitProjected" type="error" size="small">高危：预计资金赤字</NTag>
+                <NTag v-else-if="forecastData.minBalance < (forecastData.safetyThreshold || 0)" type="warning" size="small">预警：触及安全线</NTag>
+                <NTag v-else type="success" size="small">健康：资金充裕</NTag>
+              </div>
+              <div class="metric-sub">
+                安全储备线: {{ formatMoney(forecastData.safetyThreshold || 0) }}
+              </div>
+            </div>
+          </div>
+
+          <!-- 预警与建议提示条 -->
+          <div v-if="forecastData.scenarioSummary" class="forecast-insights-box">
+            <div
+              class="insight-item"
+              :class="forecastData.isDeficitProjected ? 'insight-danger' : (forecastData.minBalance < (forecastData.safetyThreshold || 0) ? 'insight-warning' : 'insight-info')"
+            >
+              <i :class="forecastData.isDeficitProjected ? 'ri-alarm-warning-line' : (forecastData.minBalance < (forecastData.safetyThreshold || 0) ? 'ri-error-warning-line' : 'ri-information-line')" />
+              <div class="insight-body">
+                <span class="insight-title">{{ forecastData.scenario === 'pessimistic' ? '悲观推演简报' : (forecastData.scenario === 'optimistic' ? '乐观推演简报' : '基准推演简报') }}</span>
+                <span class="insight-desc">{{ forecastData.scenarioSummary }}</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- ECharts 折线图 -->
+          <div class="forecast-chart-wrap">
+            <div class="chart-caption">
+              <span>资金水位推演走势（每日预计可用余额）</span>
+              <span class="caption-tip">已综合未结应收按期回款、应付支出与历史刚性开销</span>
+            </div>
+            <VChart :option="forecastChartOption" autoresize style="height: 240px; width: 100%;" />
+          </div>
+
+          <!-- 待收催收排期 -->
+          <div class="forecast-overdue-box">
+            <div class="schedule-head">
+              <div class="schedule-head-title">
+                <i class="ri-alarm-warning-line text-warning" />
+                <span>待催收客户账款 (逾期优先)</span>
+              </div>
+              <span class="head-count">共 {{ forecastData.overdueReceivables?.length || 0 }} 笔</span>
+            </div>
+            <div v-if="!forecastData.overdueReceivables || forecastData.overdueReceivables.length === 0" class="schedule-empty">
+              暂无待催收账款，客户款项均在正常信用期内
+            </div>
+            <div v-else class="schedule-list">
+              <div
+                v-for="(item, idx) in forecastData.overdueReceivables"
+                :key="idx"
+                class="schedule-row"
+              >
+                <div class="row-partner">
+                  <span class="partner-name">{{ item.partnerName }}</span>
+                  <NTag v-if="item.daysOverdue > 0" size="tiny" type="error">已逾期 {{ item.daysOverdue }} 天</NTag>
+                  <NTag v-else size="tiny" type="default">最久单据 {{ item.oldestDate }}</NTag>
+                </div>
+                <div class="row-amount text-primary">+{{ formatMoney(item.amount) }}</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 未来关键资金日程与预期收支（沙盘推演） -->
+          <div class="forecast-timeline-box">
+            <div class="schedule-head">
+              <div class="schedule-head-title">
+                <i class="ri-calendar-event-line text-primary" />
+                <span>未来资金日程与收支测算 (沙盘推演)</span>
+              </div>
+              <div class="schedule-head-actions">
+                <span class="head-count">共 {{ forecastData.timelineEvents?.length || 0 }} 项节点</span>
+                <NButton size="tiny" type="primary" secondary @click="openAddEventModal">
+                  <template #icon><i class="ri-add-line" /></template>
+                  添加预期收支
+                </NButton>
+              </div>
+            </div>
+
+            <div v-if="!forecastData.timelineEvents || forecastData.timelineEvents.length === 0" class="schedule-empty">
+              暂无未来计划收支节点。可点击右上角添加预期回款或偶发大额支出。
+            </div>
+            <div v-else class="timeline-list">
+              <div
+                v-for="ev in forecastData.timelineEvents"
+                :key="ev.id"
+                class="timeline-row"
+                :class="{ 'is-disabled': ev.enabled === false }"
+              >
+                <div class="timeline-date-badge">
+                  <span class="timeline-day">{{ ev.date.slice(5) }}</span>
+                </div>
+                <div class="timeline-detail">
+                  <div class="timeline-title-bar">
+                    <span class="timeline-title">{{ ev.name }}</span>
+                    <NTag v-if="ev.source === 'system_tax'" size="tiny" type="warning">税费征期</NTag>
+                    <NTag v-else-if="ev.repeat === 'monthly'" size="tiny" type="info">每月固定</NTag>
+                    <NTag v-else-if="ev.repeat === 'quarterly'" size="tiny" type="info">季度固定</NTag>
+                    <NTag v-if="ev.confidence === 'medium'" size="tiny" type="default">口头约定</NTag>
+                    <NTag v-else-if="ev.confidence === 'low'" size="tiny" type="default">初步意向</NTag>
+                  </div>
+                  <div class="timeline-sub">
+                    <span>{{ ev.date }}</span>
+                    <span v-if="ev.repeat && ev.repeat !== 'none'"> · 周期性</span>
+                  </div>
+                </div>
+                <div class="timeline-amount-col">
+                  <span
+                    v-if="Number(ev.amount) > 0"
+                    class="timeline-amount"
+                    :class="ev.type === 'inflow' ? 'text-primary' : 'text-danger'"
+                  >
+                    {{ ev.type === 'inflow' ? '+' : '-' }}{{ formatMoney(Number(ev.amount)) }}
+                  </span>
+                  <span v-else class="timeline-amount text-muted">预警提醒</span>
+                  <div v-if="ev.source === 'manual'" class="timeline-switch">
+                    <NSwitch
+                      :value="ev.enabled"
+                      size="small"
+                      @update:value="() => toggleTimelineEvent(ev.id)"
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </NSpin>
+    </SoloDrawer>
+
+    <!-- 利润去向分析与利现对齐抽屉 -->
+    <SoloDrawer
+      v-model:show="showAttributionDrawer"
+      title="利润去向分析与利现对齐"
+      :width="760"
+    >
+      <div class="drawer-section-intro">
+        对比基准期剖析收入/费用驱动因素，精准对齐账面净利润与现金净增减，穿透钱压在哪里。
+      </div>
+
+      <div class="drawer-controls-bar">
+        <div class="control-item">
+          <span class="control-label">对比口径：</span>
+          <NRadioGroup v-model:value="attributionMode" size="small">
+            <NRadioButton value="mom">环比（上月）</NRadioButton>
+            <NRadioButton value="yoy">同比（去年同月）</NRadioButton>
+          </NRadioGroup>
+        </div>
+      </div>
+
+      <NSpin :show="attributionLoading">
+        <div v-if="attributionData" class="attribution-content">
+          <!-- 左右双栏：左侧利现差额桥，右侧驱动因子分解 -->
+          <div class="attribution-grid">
+            <!-- 左侧：利现差额桥 Profit-to-Cash Bridge -->
+            <div class="bridge-panel">
+              <div class="panel-title">
+                <i class="ri-git-commit-line" />
+                <span>利润与现金调节桥 (Profit-to-Cash Bridge)</span>
+              </div>
+              <p class="bridge-desc">{{ attributionData.plainSummary }}</p>
+
+              <div class="bridge-steps-list">
+                <div
+                  v-for="(step, idx) in attributionData.bridgeSteps"
+                  :key="idx"
+                  class="bridge-step-row"
+                  :class="{
+                    'bridge-base': step.type === 'profit',
+                    'bridge-total': step.type === 'cash',
+                  }"
+                >
+                  <div class="step-label">
+                    <span
+                      v-if="step.type === 'add'"
+                      class="step-op plus"
+                    >+</span>
+                    <span
+                      v-else-if="step.type === 'sub'"
+                      class="step-op minus"
+                    >-</span>
+                    <span>{{ step.name }}</span>
+                    <span v-if="step.note" class="caption-tip">({{ step.note }})</span>
+                  </div>
+                  <div
+                    class="step-val"
+                    :class="step.amount >= 0 ? (step.type === 'cash' ? 'text-primary font-bold' : 'text-primary') : 'text-danger'"
+                  >
+                    {{ step.type === 'add' && step.amount > 0 ? '+' : '' }}{{ formatMoney(step.amount) }}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 右侧：收入与成本驱动因素 -->
+            <div class="drivers-panel">
+              <!-- 收入因子 -->
+              <div class="driver-section">
+                <div class="driver-header">
+                  <div class="driver-title">
+                    <i class="ri-arrow-up-circle-line text-primary" />
+                    <span>主要收入驱动分析</span>
+                  </div>
+                  <span class="driver-stat">
+                    利润波动: {{ attributionData.profitDelta >= 0 ? '+' : '' }}{{ formatMoney(attributionData.profitDelta) }}
+                  </span>
+                </div>
+
+                <!-- 客户贡献标签清单 -->
+                <div v-if="attributionData.topIncomeDrivers?.length" class="driver-items-list">
+                  <div
+                    v-for="(cust, idx) in attributionData.topIncomeDrivers.slice(0, 5)"
+                    :key="idx"
+                    class="driver-item"
+                  >
+                    <div class="driver-name-tag">
+                      <span class="driver-name">{{ cust.name }}</span>
+                      <NTag v-if="cust.tag === '新客户' || cust.tag === 'new'" type="success" size="tiny">新客户</NTag>
+                      <NTag v-else-if="cust.tag === '流失' || cust.tag === 'churned'" type="error" size="tiny">流失</NTag>
+                      <NTag v-else-if="cust.tag === '增量' || cust.tag === 'expansion'" type="info" size="tiny">增量</NTag>
+                      <NTag v-else size="tiny">{{ cust.tag || '波动' }}</NTag>
+                    </div>
+                    <div class="driver-val" :class="cust.deltaAmount >= 0 ? 'text-primary' : 'text-danger'">
+                      {{ cust.deltaAmount >= 0 ? '+' : '' }}{{ formatMoney(cust.deltaAmount) }}
+                    </div>
+                  </div>
+                </div>
+                <div v-else class="anomalies-empty">
+                  <span>暂无收入主要波动因子</span>
+                </div>
+              </div>
+
+              <!-- 费用异常与激增项 -->
+              <div class="driver-section">
+                <div class="driver-header">
+                  <div class="driver-title">
+                    <i class="ri-alert-line text-warning" />
+                    <span>支出异常激增检测</span>
+                  </div>
+                </div>
+
+                <!-- 异常检测提醒 -->
+                <div v-if="attributionData.anomalies?.length" class="anomalies-list">
+                  <div
+                    v-for="(anomaly, idx) in attributionData.anomalies"
+                    :key="idx"
+                    class="anomaly-card"
+                  >
+                    <div class="anomaly-top">
+                      <span class="anomaly-name">{{ anomaly.title || anomaly.category }}</span>
+                      <NTag v-if="anomaly.growthRate !== null" type="error" size="tiny">激增 +{{ (anomaly.growthRate * 100).toFixed(0) }}%</NTag>
+                    </div>
+                    <div class="anomaly-desc">{{ anomaly.reason }}</div>
+                  </div>
+                </div>
+                <div v-else class="anomalies-empty">
+                  <i class="ri-shield-check-line" />
+                  <span>未发现支出异常突增项目，开支结构平稳</span>
+                </div>
+
+                <!-- 费用主要变动项 -->
+                <div v-if="attributionData.topExpenseDrivers?.length" class="driver-items-list" style="margin-top: 8px;">
+                  <div
+                    v-for="(exp, idx) in attributionData.topExpenseDrivers.slice(0, 3)"
+                    :key="idx"
+                    class="driver-item"
+                  >
+                    <div class="driver-name-tag">
+                      <span class="driver-name">{{ exp.name }}</span>
+                      <span class="caption-tip">较上期变动</span>
+                    </div>
+                    <div class="driver-val" :class="exp.deltaAmount > 0 ? 'text-danger' : 'text-primary'">
+                      {{ exp.deltaAmount > 0 ? '+' : '' }}{{ formatMoney(exp.deltaAmount) }}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </NSpin>
+    </SoloDrawer>
+
+    <!-- 现金流预测规则配置抽屉 -->
+    <SoloDrawer
+      v-model:show="showConfigDrawer"
+      title="现金流预测规则配置"
+      :width="600"
+    >
+      <div class="config-drawer-content">
+        <p class="config-intro">
+          设置企业默认账期与周期性固定收支项。AI 财务官将根据本配置在滚动推演中自动计算未到期资金流动。
+        </p>
+
+        <!-- 基础账期与水位线 -->
+        <div class="config-group">
+          <div class="config-group-title">基础账期与警戒线</div>
+          <div class="config-fields-grid">
+            <div class="config-field">
+              <label>默认客户收款账期 (天)</label>
+              <NInputNumber
+                v-model:value="forecastConfig.defaultArDays"
+                :min="1"
+                :max="365"
+                placeholder="如 30"
+              />
+              <span class="field-hint">未设置特定约定时按此天数推算客户应收回款日</span>
+            </div>
+            <div class="config-field">
+              <label>默认供应商付款账期 (天)</label>
+              <NInputNumber
+                v-model:value="forecastConfig.defaultApDays"
+                :min="1"
+                :max="365"
+                placeholder="如 30"
+              />
+              <span class="field-hint">未设置特定约定时按此天数推算供应商应付款到期日</span>
+            </div>
+            <div class="config-field full-width">
+              <label>安全现金储备警戒线 (元)</label>
+              <NInputNumber
+                v-model:value="forecastConfig.safetyCashThreshold"
+                :min="0"
+                :step="10000"
+                placeholder="如 50000 (留空为 0)"
+              />
+              <span class="field-hint">账面可用现钱低于此水位时系统将高亮预警并提示催收</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 预期与周期性收支日程列表 -->
+        <div class="config-group">
+          <div class="config-group-head">
+            <div class="config-group-title">预期与周期性收支规则 (已配置 {{ forecastConfig.manualCashEvents?.length || 0 }} 条)</div>
+            <NButton size="tiny" secondary type="primary" @click="openAddEventModal">
+              <template #icon><i class="ri-add-line" /></template>
+              新增规则
+            </NButton>
+          </div>
+          <div v-if="!forecastConfig.manualCashEvents || forecastConfig.manualCashEvents.length === 0" class="config-events-empty">
+            暂无自定义收支规则。添加如固定发薪日、办公室租金、大额设备采购等可更准确测算资金水位。
+          </div>
+          <div v-else class="config-events-list">
+            <div
+              v-for="item in forecastConfig.manualCashEvents"
+              :key="item.id"
+              class="config-event-item"
+            >
+              <div class="event-item-info">
+                <div class="event-item-name">
+                  <span class="event-title">{{ item.name }}</span>
+                  <NTag :type="item.type === 'inflow' ? 'success' : 'error'" size="tiny">
+                    {{ item.type === 'inflow' ? '流入' : '支出' }}
+                  </NTag>
+                  <NTag v-if="item.repeat === 'monthly'" size="tiny" type="info">每月 {{ item.repeatDay }} 号</NTag>
+                  <NTag v-else-if="item.repeat === 'quarterly'" size="tiny" type="info">季度循环</NTag>
+                  <NTag v-else size="tiny">{{ item.date || '单次' }}</NTag>
+                  <NTag v-if="item.confidence === 'medium'" size="tiny">口头承诺</NTag>
+                  <NTag v-else-if="item.confidence === 'low'" size="tiny">初步意向</NTag>
+                </div>
+                <div class="event-item-amount" :class="item.type === 'inflow' ? 'text-primary' : 'text-danger'">
+                  {{ item.type === 'inflow' ? '+' : '-' }}{{ formatMoney(Number(item.amount)) }}
+                </div>
+              </div>
+              <div class="event-item-ops">
+                <NSwitch v-model:value="item.enabled" size="small" />
+                <NButton text size="tiny" type="error" @click="removeConfigEvent(item.id)">
+                  <template #icon><i class="ri-delete-bin-line" /></template>
+                </NButton>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <template #footer>
+        <div class="drawer-actions">
+          <NButton secondary @click="showConfigDrawer = false">取消</NButton>
+          <NButton type="primary" :loading="configSaving" @click="saveConfig">保存规则</NButton>
+        </div>
+      </template>
+    </SoloDrawer>
+
+    <!-- 添加预期收支模态框 -->
+    <NModal
+      v-model:show="showAddEventModal"
+      preset="card"
+      title="添加预期收支（纳入现金流测算）"
+      style="width: min(520px, 94vw);"
+    >
+      <div class="add-event-form">
+        <div class="form-row">
+          <label class="form-label">事项名称 *</label>
+          <NInput v-model:value="newEventForm.name" placeholder="如：办公室季度租金 / 客户尾款" />
+        </div>
+        <div class="form-row-grid">
+          <div class="form-row">
+            <label class="form-label">资金流向 *</label>
+            <NRadioGroup v-model:value="newEventForm.type" size="small">
+              <NRadioButton value="outflow">流出 (支出)</NRadioButton>
+              <NRadioButton value="inflow">流入 (回款)</NRadioButton>
+            </NRadioGroup>
+          </div>
+          <div class="form-row">
+            <label class="form-label">金额 (元) *</label>
+            <NInputNumber v-model:value="newEventForm.amount" :min="1" :step="1000" placeholder="如 15000" />
+          </div>
+        </div>
+        <div class="form-row-grid">
+          <div class="form-row">
+            <label class="form-label">周期规则</label>
+            <NSelect
+              v-model:value="newEventForm.repeat"
+              :options="[
+                { label: '单次支出/收款', value: 'none' },
+                { label: '每月固定', value: 'monthly' },
+                { label: '每季度固定', value: 'quarterly' },
+                { label: '每年固定', value: 'yearly' },
+              ]"
+              size="small"
+            />
+          </div>
+          <div v-if="newEventForm.repeat === 'none'" class="form-row">
+            <label class="form-label">预计发生日期 *</label>
+            <NDatePicker
+              v-model:formatted-value="newEventForm.date"
+              value-format="yyyy-MM-dd"
+              type="date"
+              size="small"
+              placeholder="选择发生日期"
+            />
+          </div>
+          <div v-else class="form-row">
+            <label class="form-label">每月几号</label>
+            <NInputNumber v-model:value="newEventForm.repeatDay" :min="1" :max="31" placeholder="如 10" size="small" />
+          </div>
+        </div>
+        <div class="form-row">
+          <label class="form-label">置信度</label>
+          <NRadioGroup v-model:value="newEventForm.confidence" size="small">
+            <NRadioButton value="high">高 (已定约定)</NRadioButton>
+            <NRadioButton value="medium">中 (口头承诺)</NRadioButton>
+            <NRadioButton value="low">低 (初步意向)</NRadioButton>
+          </NRadioGroup>
+          <span class="field-hint">悲观压力测试将自动剔除低/中置信度的回款流入</span>
+        </div>
+      </div>
+      <template #footer>
+        <div class="drawer-actions">
+          <NButton secondary @click="showAddEventModal = false">取消</NButton>
+          <NButton type="primary" @click="confirmAddEvent">确定添加</NButton>
+        </div>
+      </template>
+    </NModal>
   </div>
 </template>
 
@@ -1417,5 +2376,843 @@ watch(() => viewStore.mode, () => {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+/* ── 决策罗盘看板卡条（轻量渐进式设计） ── */
+.decision-compass-strip {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin-top: 16px;
+}
+
+@media (max-width: 960px) {
+  .decision-compass-strip {
+    grid-template-columns: 1fr;
+  }
+}
+
+.compass-card {
+  background: var(--solo-surface, #ffffff);
+  border: 1px solid var(--solo-border-color, #dde3ea);
+  border-radius: 12px;
+  padding: 18px 20px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 14px;
+  cursor: pointer;
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02);
+}
+
+.compass-card:hover {
+  border-color: var(--solo-primary, #1747b0);
+  box-shadow: 0 6px 18px rgba(23, 71, 176, 0.08);
+  transform: translateY(-1px);
+}
+
+.compass-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.compass-title-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.compass-icon-wrap {
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  flex-shrink: 0;
+}
+
+.compass-icon-wrap.primary {
+  background: var(--solo-primary-soft, #edf3ff);
+  color: var(--solo-primary, #1747b0);
+}
+
+.compass-icon-wrap.indigo {
+  background: var(--solo-capital-soft, #f1eefe);
+  color: var(--solo-capital, #4c3fa8);
+}
+
+.compass-title-block {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.compass-card-title {
+  font-size: 15px;
+  font-weight: 650;
+  color: var(--solo-text-primary, #182230);
+  line-height: 1.3;
+}
+
+.compass-card-subtitle {
+  font-size: 12px;
+  color: var(--solo-text-muted, #636e7c);
+}
+
+.compass-micro-tag {
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: var(--solo-surface-soft, #f1f4f8);
+  color: var(--solo-text-secondary, #586474);
+  font-weight: 500;
+}
+
+.compass-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.compass-stat-group {
+  display: flex;
+  align-items: baseline;
+  gap: 28px;
+}
+
+.compass-stat-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.stat-label {
+  font-size: 12px;
+  color: var(--solo-text-secondary, #586474);
+}
+
+.stat-num {
+  font-size: 22px;
+  font-weight: 700;
+  font-family: var(--font-numeric, var(--solo-font-numeric));
+  color: var(--solo-text-primary, #182230);
+  line-height: 1.2;
+}
+
+.compass-summary-line {
+  margin: 0;
+  font-size: 12px;
+  color: var(--solo-text-muted, #636e7c);
+  line-height: 1.4;
+}
+
+.compass-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--solo-primary, #1747b0);
+  padding-top: 10px;
+  border-top: 1px dashed var(--solo-border-light, #edf0f4);
+}
+
+.compass-card:hover .compass-footer {
+  color: var(--solo-primary-hover, #2b66e2);
+}
+
+/* 抽屉内控制条与说明 */
+.drawer-section-intro {
+  font-size: 13px;
+  color: var(--solo-text-secondary, #586474);
+  line-height: 1.5;
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--solo-border-light, #edf0f4);
+}
+
+.drawer-controls-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  background: var(--solo-surface-soft, #f1f4f8);
+  border-radius: 8px;
+}
+
+.control-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.control-label {
+  font-size: 12px;
+  color: var(--solo-text-secondary, #586474);
+  font-weight: 500;
+}
+
+/* 预测卡片内容 */
+.forecast-content {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.forecast-metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+}
+
+@media (max-width: 900px) {
+  .forecast-metrics-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+.forecast-metric-item {
+  background: var(--solo-bg-soft);
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.metric-label {
+  font-size: 12px;
+  color: var(--solo-text-secondary);
+}
+
+.metric-val {
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.3px;
+}
+
+.metric-sub {
+  font-size: 11px;
+  color: var(--solo-text-muted);
+}
+
+.forecast-insights-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.insight-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: var(--solo-radius-sm);
+  font-size: 13px;
+}
+
+.insight-danger {
+  background: var(--solo-expense-bg);
+  border: 1px solid var(--solo-border);
+  color: var(--solo-expense);
+}
+
+.insight-warning {
+  background: var(--solo-warning-bg);
+  border: 1px solid var(--solo-border);
+  color: var(--solo-warning);
+}
+
+.insight-info {
+  background: var(--solo-income-bg);
+  border: 1px solid var(--solo-border);
+  color: var(--solo-income);
+}
+
+.insight-body {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.insight-title {
+  font-weight: 600;
+}
+
+.insight-desc {
+  color: inherit;
+}
+
+.insight-action {
+  font-weight: 600;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.forecast-chart-wrap {
+  background: var(--solo-bg-card);
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius);
+  padding: 14px 16px 8px;
+}
+
+.chart-caption {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  color: var(--solo-text-secondary);
+  font-weight: 500;
+  margin-bottom: 8px;
+}
+
+.caption-tip {
+  font-size: 11px;
+  color: var(--solo-text-muted);
+}
+
+.forecast-schedules-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+
+@media (max-width: 768px) {
+  .forecast-schedules-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.schedule-column {
+  background: var(--solo-bg-soft);
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius);
+  padding: 12px 14px;
+}
+
+.schedule-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--solo-text-primary);
+  margin-bottom: 10px;
+}
+
+.head-count {
+  font-size: 11px;
+  color: var(--solo-text-muted);
+  font-weight: normal;
+}
+
+.schedule-empty {
+  font-size: 12px;
+  color: var(--solo-text-muted);
+  text-align: center;
+  padding: 16px 0;
+}
+
+.schedule-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.schedule-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 8px;
+  background: var(--solo-bg-card);
+  border: 1px solid var(--solo-border-light);
+  border-radius: var(--solo-radius-sm);
+  font-size: 12px;
+}
+
+.row-partner {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.partner-name {
+  max-width: 150px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.row-amount {
+  font-weight: 600;
+}
+
+/* 归因与利现桥卡片样式 */
+.attribution-content {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.attribution-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+@media (max-width: 860px) {
+  .attribution-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.bridge-panel,
+.drivers-panel {
+  background: var(--solo-bg-soft);
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.panel-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--solo-text-primary);
+}
+
+.bridge-desc {
+  margin: 0;
+  font-size: 12px;
+  color: var(--solo-text-secondary);
+  line-height: 1.5;
+}
+
+.bridge-steps-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.bridge-step-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 10px;
+  background: var(--solo-bg-card);
+  border: 1px solid var(--solo-border-light);
+  border-radius: var(--solo-radius-sm);
+  font-size: 13px;
+}
+
+.bridge-base {
+  background: var(--solo-bg-blue-soft);
+  border-color: var(--solo-border);
+  font-weight: 600;
+}
+
+.bridge-total {
+  background: var(--solo-bg-soft);
+  border-color: var(--solo-border);
+  border-top: 2px solid var(--solo-border);
+  margin-top: 4px;
+}
+
+.step-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--solo-text-primary);
+}
+
+.step-op {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.step-op.plus {
+  background: var(--solo-income-bg);
+  color: var(--solo-income);
+}
+
+.step-op.minus {
+  background: var(--solo-expense-bg);
+  color: var(--solo-expense);
+}
+
+.step-val {
+  font-weight: 600;
+}
+
+.drivers-panel {
+  gap: 14px;
+}
+
+.driver-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.driver-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 13px;
+}
+
+.driver-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  color: var(--solo-text-primary);
+}
+
+.driver-stat {
+  font-size: 11px;
+  color: var(--solo-text-muted);
+}
+
+.driver-summary {
+  margin: 0;
+  font-size: 12px;
+  color: var(--solo-text-secondary);
+  line-height: 1.5;
+}
+
+.driver-items-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.driver-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 10px;
+  background: var(--solo-bg-card);
+  border: 1px solid var(--solo-border-light);
+  border-radius: var(--solo-radius-sm);
+  font-size: 12px;
+}
+
+.driver-name-tag {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.anomalies-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.anomaly-card {
+  padding: 8px 10px;
+  background: var(--solo-expense-bg);
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius-sm);
+  font-size: 12px;
+}
+
+.anomaly-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-weight: 600;
+  color: var(--solo-expense);
+  margin-bottom: 2px;
+}
+
+.anomaly-desc {
+  color: var(--solo-text-secondary);
+  font-size: 11px;
+}
+
+.anomalies-empty {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px;
+  background: var(--solo-income-bg);
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius-sm);
+  font-size: 12px;
+  color: var(--solo-income);
+}
+
+/* 抽屉样式 */
+.config-drawer-content {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.config-intro {
+  margin: 0;
+  font-size: 13px;
+  color: var(--solo-text-secondary);
+  line-height: 1.5;
+}
+
+.config-group {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.config-group-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+}
+
+.config-group-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--solo-text-primary);
+}
+
+.group-sub {
+  margin: 2px 0 0;
+  font-size: 12px;
+  color: var(--solo-text-muted);
+}
+
+.config-fields-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.config-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.config-field.full-width {
+  grid-column: span 2;
+}
+
+.config-field label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--solo-text-secondary);
+}
+
+.field-hint {
+  font-size: 11px;
+  color: var(--solo-text-muted);
+}
+
+.drawer-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+/* 时间轴与沙盘推演收支日程 */
+.forecast-timeline-box {
+  background: var(--solo-bg-soft);
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.schedule-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.timeline-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.timeline-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px;
+  background: var(--solo-bg-card);
+  border: 1px solid var(--solo-border-light);
+  border-radius: var(--solo-radius-sm);
+  transition: opacity 0.2s ease;
+}
+
+.timeline-row.is-disabled {
+  opacity: 0.45;
+  background: var(--solo-bg-soft);
+}
+
+.timeline-date-badge {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  padding: 4px 6px;
+  background: var(--solo-bg-blue-soft);
+  border-radius: var(--solo-radius-sm);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--solo-primary);
+  font-family: var(--font-numeric, var(--solo-font-numeric));
+}
+
+.timeline-detail {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.timeline-title-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.timeline-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--solo-text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.timeline-sub {
+  font-size: 11px;
+  color: var(--solo-text-muted);
+}
+
+.timeline-amount-col {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.timeline-amount {
+  font-size: 13px;
+  font-weight: 600;
+  font-family: var(--font-numeric, var(--solo-font-numeric));
+}
+
+.config-group-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.config-events-empty {
+  font-size: 12px;
+  color: var(--solo-text-muted);
+  background: var(--solo-bg-soft);
+  padding: 12px;
+  border-radius: var(--solo-radius-sm);
+  text-align: center;
+}
+
+.config-events-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.config-event-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  background: var(--solo-bg-card);
+  border: 1px solid var(--solo-border-light);
+  border-radius: var(--solo-radius-sm);
+}
+
+.event-item-info {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.event-item-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.event-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--solo-text-primary);
+}
+
+.event-item-amount {
+  font-size: 13px;
+  font-weight: 600;
+  font-family: var(--font-numeric, var(--solo-font-numeric));
+}
+
+.event-item-ops {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.add-event-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.form-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.form-row-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.form-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--solo-text-secondary);
 }
 </style>

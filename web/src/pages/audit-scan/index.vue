@@ -3,142 +3,148 @@
 import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { NButton, useMessage } from 'naive-ui'
-import { parseBalanceFileWithPreview, submitHealthScan } from '@/api/healthScan'
+import {
+  detectBalanceFollowups,
+  parseBalanceFileWithPreview,
+  submitHealthScan,
+  type BalanceFilePreview,
+  type HealthScanReport,
+} from '@/api/healthScan'
 import { saveWorkpaperImage } from '@/utils/workpaperImage'
 
 const router = useRouter()
 const message = useMessage()
+
 const currentMode = ref<'quiz' | 'balance'>('quiz')
+const companyType = ref<string>('UNKNOWN')
+const useAi = ref(true)
 const loading = ref(false)
-const report = ref<ScanReport | null>(null)
+const report = ref<HealthScanReport | null>(null)
+const reportError = ref('')
 const workpaperEl = ref<HTMLElement | null>(null)
 const savingImage = ref(false)
 const reportSerial = ref('')
 
-interface Check {
-  code: string
-  name: string
-  status: string
-  observed?: unknown
-  missing?: unknown
-  fix?: unknown
-  source?: unknown
-  dimension?: string
-  deduction?: number | null
-}
-interface ScanReport {
-  totalScore: number | null
-  levelLabel?: string
-  healthLevel?: string
-  dimensions?: Array<{ key: string; name: string; score: number | null; detail?: string; statusLabel?: string }>
-  checks?: Check[]
-  flags?: Array<{ code: string; name: string; desc?: string; fix?: string; legalBasis?: string }>
-  coverage?: { completed: number; applicable: number; percent: number | null }
-  scoreBreakdown?: unknown
-  views?: unknown
-  meta?: Record<string, unknown>
-}
-interface BalancePreview {
-  periodLabel: string | null
-  balanceType: string | null
-  unit: string | null
-  debitTotal: number | string | null
-  creditTotal: number | string | null
-  warnings: string[]
-  hasAmbiguity: boolean
-  selectedColumns: unknown
+const companyTypes = [
+  { val: 'OPC', label: '一人有限责任公司' },
+  { val: 'LTD', label: '多股东公司' },
+  { val: 'INDIVIDUAL', label: '个体工商户' },
+  { val: 'UNKNOWN', label: '暂不确定' },
+]
+
+interface QuizQuestion {
+  key: string
+  topic: string
+  title: string
+  why: string
+  options: { val: string; label: string; hint?: string }[]
 }
 
-type Option = { val: string; text: string }
-type Question = { key: string; title: string; options: Option[]; when?: { key: string; value: string } }
-const unknownOptions: Option[] = [{ val: 'UNKNOWN', text: '不清楚' }, { val: 'NA', text: '不适用' }]
-const yesNo: Option[] = [{ val: 'YES', text: '是' }, { val: 'NO', text: '否' }, ...unknownOptions]
-const questions: Question[] = [
-  { key: 'q1', title: '个人替主体垫付支出后，通常如何处理？', options: [
-    { val: 'A', text: '没有个人垫付' }, { val: 'B', text: '有垫付，按单据报销' }, { val: 'C', text: '有垫付，尚未规范处理' }, ...unknownOptions,
-  ] },
-  { key: 'q2', title: '无票支出通常如何处理？', options: [
-    { val: 'A', text: '取得真实业务凭据并依法处理' }, { val: 'B', text: '用与业务无关的票据列支' }, { val: 'C', text: '挂往来账，尚未处理' }, ...unknownOptions,
-  ] },
-  { key: 'q3', title: '主体向个人转款通常如何记录？', options: [
-    { val: 'A', text: '按工资、分红等实际业务记录' }, { val: 'B', text: '记为借款或往来款，跨年尚未归还' }, { val: 'C', text: '没有此类转款' }, ...unknownOptions,
-  ] },
-  { key: 'q4', title: '研发支出是否建立辅助账？', options: [
-    { val: 'A', text: '有研发支出，未建立辅助账' }, { val: 'B', text: '有研发支出，已建立辅助账' }, { val: 'C', text: '无研发支出' }, ...unknownOptions,
-  ] },
-  { key: 'q5', title: '对财务报表中的利润情况了解多少？', options: [
-    { val: 'A', text: '了解报表中的利润情况' }, { val: 'B', text: '利润长期接近零或微亏' }, { val: 'C', text: '从未查看报表' }, ...unknownOptions,
-  ] },
-  { key: 'q6', title: '能否取得主体的账簿和财务报表？', options: [
-    { val: 'A', text: '可以取得' }, { val: 'B', text: '无法取得完整账表' }, { val: 'C', text: '不清楚需要哪些账表' }, ...unknownOptions,
-  ] },
-  { key: 'loanOccurrence', title: '本期间是否发生主体向个人的借款？', options: yesNo },
-  { key: 'loanCounterparty', title: '借款对象是谁？', when: { key: 'loanOccurrence', value: 'YES' }, options: [
-    { val: 'SHAREHOLDER', text: '股东' }, { val: 'EMPLOYEE', text: '员工' }, { val: 'OTHER', text: '其他个人' }, ...unknownOptions,
-  ] },
-  { key: 'loanRepayment', title: '该借款是否已归还？', when: { key: 'loanOccurrence', value: 'YES' }, options: [
-    { val: 'YES', text: '全部归还' }, { val: 'NO', text: '尚未归还' }, { val: 'PARTIAL', text: '部分归还' }, ...unknownOptions,
-  ] },
-  { key: 'loanPurpose', title: '借款用途是什么？', when: { key: 'loanOccurrence', value: 'YES' }, options: [
-    { val: 'BUSINESS', text: '经营用途' }, { val: 'PERSONAL', text: '个人用途' }, { val: 'OTHER', text: '其他用途' }, ...unknownOptions,
-  ] },
-  { key: 'rdActivities', title: '本期间是否开展研发活动？', options: yesNo },
-  { key: 'rdAuxiliaryLedger', title: '研发支出是否建立辅助账？', when: { key: 'rdActivities', value: 'YES' }, options: yesNo },
-  { key: 'assetExists', title: '是否存在需要核查的固定资产？', options: yesNo },
-  { key: 'assetPutIntoUse', title: '该资产是否已投入使用？', when: { key: 'assetExists', value: 'YES' }, options: yesNo },
-  { key: 'advanceReceived', title: '是否存在需要核查的预收款？', options: yesNo },
-  { key: 'advancePerformance', title: '预收款对应的义务是否已履行？', when: { key: 'advanceReceived', value: 'YES' }, options: [
-    { val: 'YES', text: '已全部履行' }, { val: 'NO', text: '尚未履行' }, { val: 'PARTIAL', text: '部分履行' }, ...unknownOptions,
-  ] },
+const quizQuestions: QuizQuestion[] = [
+  {
+    key: 'q1',
+    topic: '公私资金隔离',
+    title: '公司公户往老板或个人卡转钱，平时通常怎么走账？',
+    why: '公转私长期挂“借款”跨年未还，税局可按 20% 税率视同分红追缴个税。',
+    options: [
+      { val: 'A', label: '依法代扣个税走工资/分红，或极少公转私' },
+      { val: 'B', label: '先备注“借款/备用金”转出，年底前会平掉账' },
+      { val: 'C', label: '常备注“借款/往来款”转个人卡，跨年也没归还' },
+    ],
+  },
+  {
+    key: 'q2',
+    topic: '个人垫资报销',
+    title: '用自己微信/支付宝垫付公司花销后，账上怎么处理？',
+    why: '私卡垫付不留痕，不仅利润虚高多交税，以后公户有钱也难合规转回个人。',
+    options: [
+      { val: 'A', label: '全公对公付款，或垫付后按单据及时报销入账' },
+      { val: 'B', label: '平时直接付，年底再集中找票/凑数冲一笔' },
+      { val: 'C', label: '经常私卡垫付，账上根本没记或长期挂在往来里' },
+    ],
+  },
+  {
+    key: 'q3',
+    topic: '无票与成本票',
+    title: '遇到没有发票的支出或个人外包，一般怎么入账？',
+    why: '找加油/餐饮等无关票顶账是金税四期高危红线，直接漏记又会多交企业所得税。',
+    options: [
+      { val: 'A', label: '合规代开或按小额零星/代扣代缴规范处理' },
+      { val: 'B', label: '挂在往来账里一直不平，或者干脆不算成本' },
+      { val: 'C', label: '找其他加油票、餐饮票等无关发票顶替冲成本' },
+    ],
+  },
+  {
+    key: 'q4',
+    topic: '账表与利润透明度',
+    title: '现在能随时看清自己公司的账本和真实利润吗？',
+    why: '长期做成“零利润/微亏”不仅触发税务预警，银行经营贷初筛也会直接拒贷。',
+    options: [
+      { val: 'A', label: '随时能看到真实盈亏，也能导出标准财务三表' },
+      { val: 'B', label: '只收到过报税截图，从没见过自己的账本和利润表' },
+      { val: 'C', label: '报表长期做成零利润或微亏，或者拿不出完整三表' },
+    ],
+  },
+  {
+    key: 'q5',
+    topic: '开票与往来对账',
+    title: '开出去的发票、客户回款和银行流水，平时对得上吗？',
+    why: '银票不对账，容易出现没收到钱先交税、漏开发票滞纳金或坏账忘催。',
+    options: [
+      { val: 'A', label: '开票、收款与银行流水月月对平，往来清楚' },
+      { val: 'B', label: '平时只看银行卡余额，开票回款全靠脑子记' },
+      { val: 'C', label: '账面应收应付乱成一团，陈年往来一直对不上' },
+    ],
+  },
+  {
+    key: 'q6',
+    topic: '研发与减税红利',
+    title: '公司有软件开发、技术外包或算力等研发投入吗？',
+    why: '有研发投入却没单独建辅助账，会白白错失 100% 研发费用加计扣除节税。',
+    options: [
+      { val: 'A', label: '有研发投入，已按规范建立研发辅助账享受优惠' },
+      { val: 'B', label: '有技术/研发支出，但全混在管理费用里没建辅助账' },
+      { val: 'C', label: '目前没有研发投入，暂不涉及此项' },
+    ],
+  },
 ]
+
 const answers = ref<Record<string, string>>({})
-const visibleQuestions = computed(() => questions.filter(q => {
-  const quizQuestion = /^q[1-6]$/.test(q.key)
-  return (currentMode.value === 'quiz' ? quizQuestion : !quizQuestion) && (!q.when || answers.value[q.when.key] === q.when.value)
-}))
-const profile = ref({ companyType: '', period: '', accountingStandard: '', vatType: '' })
+const currentStep = ref(0)
+const activeQuestion = computed(() => quizQuestions[currentStep.value]!)
+const answeredCount = computed(() => quizQuestions.filter(q => answers.value[q.key]).length)
+
+function selectQuizOption(key: string, val: string) {
+  answers.value = { ...answers.value, [key]: val }
+  if (currentStep.value < quizQuestions.length - 1) {
+    currentStep.value += 1
+  }
+}
+
+// ── 余额表模式状态 ──
 const uploadedFileName = ref('')
 const parsedRows = ref<Record<string, unknown>[]>([])
-const preview = ref<BalancePreview | null>(null)
-const balanceMeta = ref({ period: '', balanceType: '', currencyUnit: '', confirmed: false, complete: false })
-const disclaimer = '本报告仅依据所提供资料和回答进行有限规则检查，不构成审计、税务或法律意见；未覆盖事项不能视为无风险，请结合原始凭证并咨询专业人士。'
-const reportError = ref('')
-function normalizedPeriod(label: string | null): string {
-  const match = label?.trim().match(/^(\d{4})[年\-/](\d{1,2})月?$/)
-  if (!match || Number(match[2]) < 1 || Number(match[2]) > 12) return ''
-  return `${match[1]}-${match[2].padStart(2, '0')}`
-}
-const sourceLabel = computed(() => {
-  const source = report.value?.meta?.source
-  if (source === 'backend') return '服务端分析'
-  if (source === 'local-quiz') return '本地问卷规则（服务端不可用）'
-  if (source === 'local-template') return '本地占位结果（未完成余额表分析）'
-  return source ? String(source) : '来源未提供'
+const preview = ref<BalanceFilePreview | null>(null)
+const selectedBalanceType = ref<'ending' | 'opening'>('ending')
+const balanceAnswers = ref<Record<string, string>>({})
+
+const followupHints = computed(() => detectBalanceFollowups(parsedRows.value))
+const isBalanced = computed(() => {
+  if (!preview.value) return true
+  return Math.abs(Number(preview.value.debitTotal) - Number(preview.value.creditTotal)) < 0.01
 })
-const reportScope = computed(() => currentMode.value === 'balance' ? '科目余额表及补充回答' : '问卷回答')
-const coverageLabel = computed(() => {
-  const coverage = report.value?.coverage
-  if (!coverage) return '未提供'
-  if (!coverage.applicable || coverage.percent == null) return '不适用'
-  return `${coverage.percent}%`
+const balanceDiffText = computed(() => {
+  if (!preview.value) return '0.00'
+  const diff = Math.abs(Number(preview.value.debitTotal) - Number(preview.value.creditTotal))
+  return diff.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 })
-function errorMessage(err: unknown, fallback: string): string {
-  if (err && typeof err === 'object' && 'response' in err) {
-    const response = (err as { response?: { data?: { detail?: unknown } } }).response
-    if (typeof response?.data?.detail === 'string') return response.data.detail
-  }
-  return err instanceof Error ? err.message : fallback
+
+const disclaimer = '本报告基于您提供的数据或回答按现行公开财税规则初筛，仅供经营自查与风险梳理参考，不构成法定审计、税务鉴证或贷款授信结论。'
+
+function fmtYuan(val: number): string {
+  return `¥${val.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 }
-function display(value: unknown): string {
-  if (value === null || value === undefined || value === '') return '未提供'
-  if (Array.isArray(value)) return value.length ? value.map(display).join('；') : '无'
-  if (typeof value === 'object') return Object.entries(value as Record<string, unknown>).map(([key, val]) => `${key}: ${display(val)}`).join('；') || '未提供'
-  return String(value)
-}
-function statusLabel(status: string): string {
-  const labels: Record<string, string> = { PASS: '已检查', RISK: '需关注', ERROR: '检查失败（未评分）', FAIL: '需关注', WARNING: '需关注', UNKNOWN: '未评分', NA: '不适用', NOT_APPLICABLE: '不适用', INSUFFICIENT_DATA: '未评分', NOT_SCORED: '未评分' }
-  return labels[status?.toUpperCase()] || status || '未提供'
-}
+
 async function handleFileUpload(e: Event) {
   const target = e.target as HTMLInputElement
   const file = target.files?.[0]
@@ -146,153 +152,499 @@ async function handleFileUpload(e: Event) {
   uploadedFileName.value = ''
   parsedRows.value = []
   preview.value = null
-  balanceMeta.value = { period: '', balanceType: '', currencyUnit: '', confirmed: false, complete: false }
+  balanceAnswers.value = {}
   loading.value = true
   try {
     const result = await parseBalanceFileWithPreview(file)
     parsedRows.value = result.rows
-    preview.value = result.preview as BalancePreview
+    preview.value = result.preview
     uploadedFileName.value = file.name
-    balanceMeta.value.period = normalizedPeriod(result.preview.periodLabel)
-    balanceMeta.value.balanceType = result.preview.balanceType || 'unknown'
-    balanceMeta.value.currencyUnit = result.preview.unit || 'unknown'
-    message.success(`已解析 ${result.rows.length} 行，请核对预览`)
+    selectedBalanceType.value = result.preview.balanceType === 'opening' ? 'opening' : 'ending'
+    message.success(`已解析 ${result.rows.length} 条科目明细，可立即开始体检`)
   } catch (err: unknown) {
-    message.error(err instanceof Error ? err.message : '文件解析失败，请检查文件格式')
+    message.error(err instanceof Error ? err.message : '文件解析失败，请检查是否为标准科目余额表')
   } finally {
     loading.value = false
     target.value = ''
   }
 }
+
+function canSubmit(): boolean {
+  if (currentMode.value === 'quiz') {
+    const meaningful = quizQuestions.filter(q => answers.value[q.key] && answers.value[q.key] !== 'UNKNOWN').length
+    return meaningful >= 3
+  }
+  return parsedRows.value.length > 0
+}
+
 async function startScan() {
-  if (!profile.value.companyType || !profile.value.period || !profile.value.accountingStandard || !profile.value.vatType) {
-    message.warning('请填写主体、期间、会计准则和纳税人类型')
+  if (currentMode.value === 'quiz' && !canSubmit()) {
+    message.warning('请至少完成 3 道题目，以便为您生成准确的健康评分')
     return
   }
-  if (currentMode.value === 'balance' && (!parsedRows.value.length || !balanceMeta.value.confirmed || !balanceMeta.value.period || !balanceMeta.value.balanceType || !balanceMeta.value.currencyUnit)) {
-    message.warning('请上传余额表并核对确认期间、余额类型及单位')
+  if (currentMode.value === 'balance' && !parsedRows.value.length) {
+    message.warning('请先上传科目余额表（支持 .xlsx / .xls / .csv）')
     return
   }
-  const selectedAnswers = Object.fromEntries(visibleQuestions.value.filter(q => answers.value[q.key]).map(q => [q.key, answers.value[q.key]]))
-  if (currentMode.value === 'quiz' && !Object.keys(selectedAnswers).length) {
-    message.warning('请至少回答一个问题；不清楚可选择“不清楚”')
-    return
-  }
+
   loading.value = true
   reportError.value = ''
   try {
-    const payload = {
-      mode: currentMode.value,
-      answers: selectedAnswers,
-      rows: currentMode.value === 'balance' ? parsedRows.value : undefined,
-      profile: { ...profile.value },
-      balanceMeta: currentMode.value === 'balance' ? { ...balanceMeta.value, balanceType: preview.value?.balanceType === 'unknown' ? balanceMeta.value.balanceType : preview.value?.balanceType || 'unknown' } : undefined,
-    }
-    report.value = await submitHealthScan(payload) as unknown as ScanReport
-    reportSerial.value = `SCAN-${Date.now()}`
-    message.success('体检结果已生成')
+    const payload = currentMode.value === 'quiz'
+      ? {
+          mode: 'quiz' as const,
+          answers: answers.value,
+          profile: { companyType: companyType.value },
+          useAi: useAi.value,
+        }
+      : {
+          mode: 'balance' as const,
+          rows: parsedRows.value,
+          answers: balanceAnswers.value,
+          profile: { companyType: companyType.value },
+          balanceMeta: {
+            balanceType: preview.value?.balanceType === 'opening' ? 'opening' : selectedBalanceType.value,
+            currencyUnit: preview.value?.unit || 'yuan',
+            confirmed: true,
+            complete: true,
+          },
+          useAi: useAi.value,
+        }
+    report.value = await submitHealthScan(payload)
+    reportSerial.value = `SCAN-${Date.now().toString().slice(-6)}`
+    message.success('体检报告已生成')
   } catch (err: unknown) {
-    reportError.value = errorMessage(err, '体检分析失败，请稍后重试')
+    const msg = (err && typeof err === 'object' && 'response' in err)
+      ? String((err as { response?: { data?: { detail?: unknown } } }).response?.data?.detail || '')
+      : ''
+    reportError.value = msg || (err instanceof Error ? err.message : '体检分析失败，请稍后重试')
     message.error(reportError.value)
   } finally {
     loading.value = false
   }
 }
+
+function severityLabel(sev: string): string {
+  return ({ CRITICAL: '高危红线', HIGH: '重点隐患', MEDIUM: '需关注', LOW: '轻度提醒' } as Record<string, string>)[sev] || '提醒'
+}
+
+function checkStatusLabel(status: string): string {
+  return ({ PASS: '已检查', RISK: '有隐患', UNKNOWN: '待补充', NA: '不涉及', ERROR: '异常' } as Record<string, string>)[status] || status
+}
+
+const analysisSourceLabel = computed(() => {
+  const src = report.value?.meta?.analysisSource
+  if (src === 'llm') return '规则引擎 + AI 财务官润色'
+  if (src === 'deterministic-fallback') return '确定性规则引擎（AI 降级）'
+  return '确定性规则引擎'
+})
+
 function reportSummary(): string {
   if (!report.value) return ''
-  const coverage = report.value.coverage
-  const lines = (report.value.checks || []).map(c => `${c.code} ${c.name}：${statusLabel(c.status)}；观察：${display(c.observed)}；缺失：${display(c.missing)}；依据：${display(c.source)}；建议：${display(c.fix)}`)
-  return ['梭罗记账 · 财税健康体检', `范围：${reportScope.value}`, `来源：${sourceLabel.value}`, `主体：${profile.value.companyType}；期间：${profile.value.period}；准则：${profile.value.accountingStandard}；纳税人类型：${profile.value.vatType}`, `评分：${report.value.totalScore == null ? '未评分' : `${report.value.totalScore} / 100`} ${report.value.levelLabel || ''}`, `覆盖率：${coverage ? `${coverage.completed}/${coverage.applicable}（${coverageLabel.value}）` : '未提供'}`, ...lines, disclaimer].join('\n')
+  const scoreText = report.value.totalScore == null ? '暂未评分' : `${report.value.totalScore} 分（${report.value.levelLabel}）`
+  const flagLines = (report.value.flags || []).map((f, i) => `${i + 1}. [${severityLabel(f.severity)}] ${f.painTitle || f.name}：${f.desc} 建议：${f.fix}`)
+  return [
+    `梭罗记账 · 3分钟财税健康体检（${reportSerial.value}）`,
+    `综合评分：${scoreText}`,
+    `总诊断：${report.value.oneSentenceVerdict}`,
+    `税局视角：${report.value.taxBureauView?.details || ''}`,
+    `银行视角：${report.value.bankFunderView?.details || ''}`,
+    ...(flagLines.length ? ['重点隐患清单：', ...flagLines] : ['未检出高频红线隐患']),
+    `来源：${analysisSourceLabel.value}`,
+    disclaimer,
+  ].join('\n')
 }
+
 async function copyReportSummary() {
   try {
     if (!navigator.clipboard?.writeText) throw new Error('clipboard unavailable')
     await navigator.clipboard.writeText(reportSummary())
-    message.success('报告摘要已复制')
+    message.success('体检摘要已复制')
   } catch {
     message.error('复制失败，请手动复制报告内容')
   }
 }
+
 async function saveReportImage() {
   if (!workpaperEl.value || savingImage.value) return
   savingImage.value = true
   try {
-    await saveWorkpaperImage(workpaperEl.value, reportSerial.value)
-    message.success('报告图片已保存')
+    await saveWorkpaperImage(workpaperEl.value, reportSerial.value || 'solobooks-scan')
+    message.success('体检长图已保存')
   } catch {
     message.error('图片生成失败，请重试')
   } finally {
     savingImage.value = false
   }
 }
+
+function switchToBalanceCheck() {
+  report.value = null
+  currentMode.value = 'balance'
+}
+
+function restartScan() {
+  report.value = null
+  reportError.value = ''
+}
+
+function goAction(route?: string) {
+  router.push(route || '/login')
+}
 </script>
 
 <template>
   <div class="audit-scan-page">
-    <header class="scan-header"><div class="header-inner">
-      <button class="brand-wrap" @click="router.push('/landing-v2')"><img src="/solo-logo.png" alt="SoloBooks" class="brand-logo" /><span>梭罗记账 · 财税健康体检</span></button>
-      <NButton quaternary size="small" @click="router.push('/landing-v2')">返回官网</NButton>
-    </div></header>
+    <header class="scan-header">
+      <div class="header-inner">
+        <button class="brand-wrap" @click="router.push('/')">
+          <img src="/solo-logo.png" alt="SoloBooks" class="brand-logo" />
+          <span>梭罗记账 · 3分钟财务健康体检</span>
+        </button>
+        <div class="header-actions">
+          <NButton quaternary size="small" @click="router.push('/')">返回官网</NButton>
+          <NButton type="primary" size="small" @click="router.push('/login')">免费建账</NButton>
+        </div>
+      </div>
+    </header>
+
     <main class="scan-main">
+      <!-- 顶部 Hero -->
       <section class="scan-hero">
-        <p class="eyebrow">财税健康体检</p>
-        <h1>从已知信息出发，梳理需要关注的事项</h1>
-        <p>选择问卷或上传科目余额表，结果取决于提供的资料及可执行的检查，不替代专业判断。</p>
+        <p class="eyebrow">免登录 · 免存即焚 · 3 分钟自查</p>
+        <h1 v-if="!report">别等税局预警、银行拒贷，才发现账本早就埋了雷</h1>
+        <h1 v-else>你的企业财税健康体检简报</h1>
+        <p v-if="!report">不需要懂会计术语。做 6 道经营常识题（90 秒），或传一张科目余额表（2 分钟），立刻揪出公私混同、20% 借款个税、找票顶账等隐形雷区。</p>
+
         <div v-if="!report" class="mode-tabs">
-          <button class="mode-tab-btn" :class="{ active: currentMode === 'quiz' }" @click="currentMode = 'quiz'">问卷体检</button>
-          <button class="mode-tab-btn" :class="{ active: currentMode === 'balance' }" @click="currentMode = 'balance'">余额表体检</button>
+          <button
+            class="mode-tab-btn"
+            :class="{ active: currentMode === 'quiz' }"
+            @click="currentMode = 'quiz'"
+          >
+            <i class="ri-flashlight-line" />
+            90秒经营快检（无账本也能测）
+          </button>
+          <button
+            class="mode-tab-btn"
+            :class="{ active: currentMode === 'balance' }"
+            @click="currentMode = 'balance'"
+          >
+            <i class="ri-file-excel-2-line" />
+            2分钟传表深扫（上传科目余额表）
+          </button>
         </div>
       </section>
-      <section v-if="!report" class="scan-card-section">
-        <h2>主体与期间</h2>
-        <div class="profile-grid">
-          <label>主体类型<select v-model="profile.companyType"><option value="" disabled>请选择</option><option value="OPC">一人有限责任公司</option><option value="LTD">多股东有限责任公司</option><option value="INDIVIDUAL">个体工商户</option><option value="SOLE_PROPRIETOR">个人独资企业</option><option value="UNKNOWN">不清楚</option></select></label>
-          <label>体检期间<input v-model="profile.period" type="month" /></label>
-          <label>会计准则<select v-model="profile.accountingStandard"><option value="" disabled>请选择</option><option value="SMALL_ENTERPRISE">小企业会计准则</option><option value="ENTERPRISE">企业会计准则</option><option value="OTHER">其他</option><option value="UNKNOWN">不清楚</option></select></label>
-          <label>纳税人类型<select v-model="profile.vatType"><option value="" disabled>请选择</option><option value="GENERAL">一般纳税人</option><option value="SMALL_SCALE">小规模纳税人</option><option value="UNKNOWN">不清楚</option></select></label>
-        </div>
-        <div v-if="currentMode === 'balance'" class="upload-container">
-          <h2>上传科目余额表</h2><p>支持 .xlsx、.xls、.csv；解析后的结构化数据将提交用于体检，请核对后再提交。</p>
-          <label class="btn-file-pick">选择文件<input type="file" accept=".xlsx,.xls,.csv" @change="handleFileUpload" /></label>
-          <div v-if="preview" class="preview-box">
-            <h3>解析预览 · {{ uploadedFileName }}（{{ parsedRows.length }} 行）</h3>
-            <p>识别期间：{{ display(preview.periodLabel) }}；余额类型：{{ preview.balanceType === 'ending' ? '期末余额' : preview.balanceType === 'opening' ? '期初余额' : '不清楚' }}；单位：{{ preview.unit === 'yuan' ? '元' : '不清楚' }}</p>
-            <p>识别列（从 0 开始，-1 表示未识别）：{{ display(preview.selectedColumns) }}</p>
-            <p>借方合计：{{ display(preview.debitTotal) }}；贷方合计：{{ display(preview.creditTotal) }}</p>
-            <p v-if="preview.hasAmbiguity" class="warning">存在识别歧义，请仔细核对原表。</p>
-            <ul v-if="preview.warnings?.length" class="warning"><li v-for="warning in preview.warnings" :key="warning">{{ warning }}</li></ul>
-            <div class="profile-grid">
-              <label>余额表期间<input v-model="balanceMeta.period" type="month" @input="balanceMeta.confirmed = false" /></label>
-              <label v-if="preview.balanceType === 'unknown'">确认余额类型<select v-model="balanceMeta.balanceType" @change="balanceMeta.confirmed = false"><option value="unknown">不清楚（暂不评分）</option><option value="ending">期末余额</option><option value="opening">期初余额（不作为期末余额评分）</option></select></label>
-              <label v-else>识别余额类型<input :value="preview.balanceType === 'ending' ? '期末余额' : '期初余额（不作为期末余额评分）'" readonly /></label>
-              <label>金额单位<select v-model="balanceMeta.currencyUnit" @change="balanceMeta.confirmed = false"><option value="unknown">不清楚</option><option value="yuan">元</option></select></label>
-            </div>
-            <label class="check-label"><input v-model="balanceMeta.complete" type="checkbox" /> 我确认余额表涵盖本次体检所需的完整科目范围</label>
-            <label class="check-label"><input v-model="balanceMeta.confirmed" type="checkbox" /> 我已核对识别列、期间、余额类型、单位和合计</label>
+
+      <!-- 输入区 -->
+      <section v-if="!report" class="scan-card">
+        <!-- 1. 极简主体选择（1次点击，不强制） -->
+        <div class="company-strip">
+          <span class="strip-label">企业形态（选填）：</span>
+          <div class="pill-group">
+            <button
+              v-for="item in companyTypes"
+              :key="item.val"
+              class="pill-btn"
+              :class="{ active: companyType === item.val }"
+              @click="companyType = item.val"
+            >
+              {{ item.label }}
+            </button>
           </div>
         </div>
-        <div class="quiz-container">
-          <h2>{{ currentMode === 'quiz' ? '经营情况问卷' : '补充经营情况' }}</h2>
-          <p>所有问题均不预选；可以跳过，也可以选择“不清楚”或“不适用”。</p>
-          <fieldset v-for="q in visibleQuestions" :key="q.key" class="quiz-item">
-            <legend>{{ q.title }}</legend>
-            <div class="quiz-options"><label v-for="opt in q.options" :key="opt.val" class="quiz-option-label" :class="{ selected: answers[q.key] === opt.val }"><input v-model="answers[q.key]" type="radio" :name="q.key" :value="opt.val" />{{ opt.text }}</label></div>
-          </fieldset>
+
+        <!-- 2A. 90秒经营快检（分步单卡） -->
+        <div v-if="currentMode === 'quiz'" class="quiz-wizard">
+          <div class="wizard-progress">
+            <div class="progress-text">
+              <span>第 {{ currentStep + 1 }} / {{ quizQuestions.length }} 题 · {{ activeQuestion.topic }}</span>
+              <span>已完成 {{ answeredCount }} / {{ quizQuestions.length }}</span>
+            </div>
+            <div class="progress-track">
+              <div
+                class="progress-fill"
+                :style="{ width: `${((currentStep + 1) / quizQuestions.length) * 100}%` }"
+              />
+            </div>
+            <div class="step-dots">
+              <button
+                v-for="(q, idx) in quizQuestions"
+                :key="q.key"
+                class="step-dot"
+                :class="{ current: idx === currentStep, done: !!answers[q.key] }"
+                :aria-label="`第 ${idx + 1} 题`"
+                @click="currentStep = idx"
+              >
+                {{ idx + 1 }}
+              </button>
+            </div>
+          </div>
+
+          <div class="question-stage">
+            <h2>{{ activeQuestion.title }}</h2>
+            <p class="question-why"><i class="ri-information-line" /> {{ activeQuestion.why }}</p>
+
+            <div class="option-cards">
+              <button
+                v-for="opt in activeQuestion.options"
+                :key="opt.val"
+                class="option-card"
+                :class="{ selected: answers[activeQuestion.key] === opt.val }"
+                @click="selectQuizOption(activeQuestion.key, opt.val)"
+              >
+                <span class="opt-badge">{{ opt.val }}</span>
+                <span class="opt-text">{{ opt.label }}</span>
+                <i v-if="answers[activeQuestion.key] === opt.val" class="ri-checkbox-circle-fill opt-check" />
+              </button>
+            </div>
+
+            <div class="wizard-nav">
+              <button
+                class="nav-link"
+                :disabled="currentStep === 0"
+                @click="currentStep = Math.max(0, currentStep - 1)"
+              >
+                ← 上一题
+              </button>
+              <button
+                class="nav-skip"
+                @click="selectQuizOption(activeQuestion.key, 'UNKNOWN')"
+              >
+                不清楚，跳过这题
+              </button>
+              <button
+                v-if="currentStep < quizQuestions.length - 1"
+                class="nav-link"
+                @click="currentStep += 1"
+              >
+                下一题 →
+              </button>
+            </div>
+          </div>
         </div>
-        <p class="disclaimer">{{ disclaimer }} 提交后，问卷与解析出的余额数据会发送至体检服务；请勿在表中包含不必要的敏感信息。</p>
-        <p v-if="reportError" class="warning" role="alert">{{ reportError }}</p>
-        <button class="scan-cta-btn" :disabled="loading" @click="startScan">{{ loading ? '处理中…' : '生成体检结果' }}</button>
+
+        <!-- 2B. 2分钟传表深扫 -->
+        <div v-else class="balance-wizard">
+          <label class="upload-dropzone">
+            <input type="file" accept=".xlsx,.xls,.csv" @change="handleFileUpload" />
+            <i class="ri-upload-cloud-2-line upload-icon" />
+            <strong>{{ uploadedFileName || '点击选择科目余额表（.xlsx / .xls / .csv）' }}</strong>
+            <span>浏览器本地解析并自动脱敏客户与人名，不上传原始文件，不落库留存</span>
+          </label>
+
+          <div v-if="preview" class="balance-summary-card">
+            <div class="summary-stats">
+              <div class="stat-item">
+                <span>已识别科目</span>
+                <strong>{{ parsedRows.length }} 项</strong>
+              </div>
+              <div class="stat-item">
+                <span>试算平衡</span>
+                <strong :class="isBalanced ? 'text-income' : 'text-expense'">
+                  {{ isBalanced ? '借贷平衡' : `差额 ¥${balanceDiffText}` }}
+                </strong>
+              </div>
+              <div class="stat-item">
+                <span>表内异常线索</span>
+                <strong :class="(followupHints.hasLoanClue || followupHints.hasAdvanceClue) ? 'text-warning' : 'text-income'">
+                  {{ followupHints.hasLoanClue ? `其他应收 ${fmtYuan(followupHints.loanAmount)}` : followupHints.hasAdvanceClue ? `预收款 ${fmtYuan(followupHints.advanceAmount)}` : '初筛未见大额挂账' }}
+                </strong>
+              </div>
+            </div>
+
+            <div v-if="preview.balanceType === 'unknown'" class="inline-balance-type">
+              <span>未自动识别期别，这张表是：</span>
+              <button
+                class="pill-btn"
+                :class="{ active: selectedBalanceType === 'ending' }"
+                @click="selectedBalanceType = 'ending'"
+              >
+                期末余额（推荐）
+              </button>
+              <button
+                class="pill-btn"
+                :class="{ active: selectedBalanceType === 'opening' }"
+                @click="selectedBalanceType = 'opening'"
+              >
+                期初余额
+              </button>
+            </div>
+            <p v-else-if="preview.balanceType === 'opening'" class="opening-tip">
+              <i class="ri-error-warning-line" /> 检测到当前为期初余额表，报告将基于期初数据进行线索提示。
+            </p>
+
+            <!-- 仅按表内真实线索弹出 0~2 个追问 -->
+            <div v-if="followupHints.hasLoanClue" class="smart-followup">
+              <p class="followup-title">补充确认 1：表内「其他应收款 / 备用金」有 {{ fmtYuan(followupHints.loanAmount) }}，主要是？</p>
+              <div class="pill-group">
+                <button
+                  v-for="opt in [
+                    { val: 'SHAREHOLDER', label: '股东/老板个人借用' },
+                    { val: 'EMPLOYEE', label: '员工业务备用金' },
+                    { val: 'UNKNOWN', label: '不清楚' },
+                  ]"
+                  :key="opt.val"
+                  class="pill-btn"
+                  :class="{ active: balanceAnswers.loanCounterparty === opt.val }"
+                  @click="balanceAnswers = { ...balanceAnswers, loanCounterparty: opt.val }"
+                >
+                  {{ opt.label }}
+                </button>
+              </div>
+            </div>
+
+            <div v-if="followupHints.hasAdvanceClue" class="smart-followup">
+              <p class="followup-title">补充确认：表内「预收账款 / 合同负债」有 {{ fmtYuan(followupHints.advanceAmount) }}，对应服务或货物交付了吗？</p>
+              <div class="pill-group">
+                <button
+                  v-for="opt in [
+                    { val: 'YES', label: '已交付或部分交付' },
+                    { val: 'NO', label: '尚未交付' },
+                    { val: 'UNKNOWN', label: '不清楚' },
+                  ]"
+                  :key="opt.val"
+                  class="pill-btn"
+                  :class="{ active: balanceAnswers.advancePerformance === opt.val }"
+                  @click="balanceAnswers = { ...balanceAnswers, advancePerformance: opt.val }"
+                >
+                  {{ opt.label }}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 底部提交区 -->
+        <div class="submit-footer">
+          <label class="ai-toggle">
+            <input v-model="useAi" type="checkbox" />
+            <span>开启 AI 财务官大白话解读（仅向模型发送脱敏后的风险规则代号）</span>
+          </label>
+          <p v-if="reportError" class="error-banner" role="alert">{{ reportError }}</p>
+          <button
+            class="scan-cta-btn"
+            :disabled="loading || !canSubmit()"
+            @click="startScan"
+          >
+            {{ loading ? '正在扫描分析中…' : '立即生成我的体检报告' }}
+          </button>
+        </div>
       </section>
+
+      <!-- 报告区 -->
       <section v-else class="report-section">
-        <div class="report-actions"><button @click="copyReportSummary">复制报告摘要</button><button :disabled="savingImage" @click="saveReportImage">{{ savingImage ? '正在生成图片…' : '保存为图片' }}</button><button @click="report = null">重新体检</button></div>
+        <div class="report-actions">
+          <button @click="copyReportSummary"><i class="ri-file-copy-line" /> 复制报告摘要</button>
+          <button :disabled="savingImage" @click="saveReportImage">
+            <i class="ri-image-line" /> {{ savingImage ? '正在生成长图…' : '保存体检长图' }}
+          </button>
+          <button v-if="currentMode === 'quiz'" @click="switchToBalanceCheck">
+            <i class="ri-file-excel-2-line" /> 再传余额表复核
+          </button>
+          <button @click="restartScan"><i class="ri-refresh-line" /> 重新体检</button>
+        </div>
+
         <article ref="workpaperEl" class="audit-workpaper">
-          <header class="report-heading"><div><p class="eyebrow">{{ reportSerial }}</p><h2>财税健康体检结果</h2></div><span>范围：{{ reportScope }}</span></header>
-          <div class="report-meta"><span>来源：{{ sourceLabel }}</span><span>主体：{{ profile.companyType }}</span><span>期间：{{ profile.period }}</span><span>准则：{{ profile.accountingStandard }}</span><span>纳税人类型：{{ profile.vatType }}</span></div>
-          <p v-if="report.meta?.source === 'local-template'" class="warning">本结果为占位结果，未完成余额表分析，不应作为决策依据。</p>
-          <div class="score-grid"><div><span>综合评分</span><strong>{{ report.totalScore == null ? '未评分' : `${report.totalScore} / 100` }}</strong><span>{{ report.levelLabel }}</span></div><div><span>检查覆盖率</span><strong>{{ coverageLabel }}</strong><span v-if="report.coverage">已完成 {{ report.coverage.completed }} / 适用 {{ report.coverage.applicable }}</span></div></div>
-          <div v-if="report.dimensions?.length" class="report-block"><h3>维度结果</h3><ul><li v-for="dim in report.dimensions" :key="dim.key">{{ dim.name }}：{{ dim.score == null ? '未评分' : dim.score }} {{ dim.statusLabel }} {{ dim.detail }}</li></ul></div>
-          <div class="report-block"><h3>检查明细</h3><p v-if="!report.checks?.length">未提供检查明细，不能据此认定无风险。</p><div v-for="check in report.checks" :key="check.code" class="check-card"><h4>{{ check.name }} <small>{{ check.code }} · {{ statusLabel(check.status) }}</small></h4><p>观察：{{ display(check.observed) }}</p><p>缺失：{{ display(check.missing) }}</p><p>依据 / 来源：{{ display(check.source) }}</p><p>建议：{{ display(check.fix) }}</p><p>维度：{{ display(check.dimension) }}；扣分：{{ check.deduction == null ? '未评分' : check.deduction }}</p></div></div>
-          <div v-if="report.scoreBreakdown" class="report-block"><h3>评分明细</h3><p>{{ display(report.scoreBreakdown) }}</p></div>
+          <!-- 顶部评分 + 一句话诊断 -->
+          <div class="verdict-hero" :class="`level-${report.healthLevel}`">
+            <div class="score-ring">
+              <span class="score-num">{{ report.totalScore ?? '—' }}</span>
+              <span class="score-unit">{{ report.totalScore != null ? '分 / 100' : '信息不足' }}</span>
+            </div>
+            <div class="verdict-content">
+              <div class="verdict-top">
+                <span class="level-pill">{{ report.levelLabel }}</span>
+                <span class="serial-tag">{{ reportSerial }} · {{ analysisSourceLabel }}</span>
+              </div>
+              <p class="verdict-headline">{{ report.oneSentenceVerdict }}</p>
+              <div class="urgent-strip">
+                <strong>优先动作：</strong>{{ report.urgentAction }}
+              </div>
+              <div class="hero-cta-row">
+                <button class="primary-convert-btn" @click="goAction(report.flags?.[0]?.ctaRoute || '/login')">
+                  {{ report.flags?.[0]?.ctaLabel || '免费开启干净账本' }} →
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 双视角仪表盘 -->
+          <div class="perspectives-grid">
+            <div class="perspective-card tax-card">
+              <div class="p-head">
+                <span class="p-title"><i class="ri-alarm-warning-fill" /> 税局稽查视角</span>
+                <span class="p-badge" :class="`risk-${report.taxBureauView?.riskLevel || 'unknown'}`">
+                  {{ report.taxBureauView?.riskLevel === 'high' ? '重点预警' : report.taxBureauView?.riskLevel === 'medium' ? '需核查' : report.taxBureauView?.riskLevel === 'low' ? '风险较低' : '待评估' }}
+                </span>
+              </div>
+              <p>{{ report.taxBureauView?.details }}</p>
+            </div>
+            <div class="perspective-card bank-card">
+              <div class="p-head">
+                <span class="p-title"><i class="ri-bank-fill" /> 银行 / 资方授信视角</span>
+                <span class="p-badge" :class="`credit-${report.bankFunderView?.creditLevel || 'unknown'}`">
+                  {{ report.bankFunderView?.creditLevel === 'high' ? '信用良好' : report.bankFunderView?.creditLevel === 'medium' ? '存在扣分' : report.bankFunderView?.creditLevel === 'low' ? '易被拒贷' : '待评估' }}
+                </span>
+              </div>
+              <p>{{ report.bankFunderView?.details }}</p>
+            </div>
+          </div>
+
+          <!-- 四维健康矩阵 -->
+          <div v-if="report.dimensions?.length" class="dimensions-strip">
+            <div v-for="dim in report.dimensions" :key="dim.key" class="dim-tile">
+              <div class="dim-tile-head">
+                <span>{{ dim.name }}</span>
+                <strong :class="`dim-${dim.status}`">{{ dim.score != null ? `${dim.score}分` : dim.statusLabel }}</strong>
+              </div>
+              <p>{{ dim.detail }}</p>
+            </div>
+          </div>
+
+          <!-- 最痛的雷区清单 -->
+          <div class="flags-section">
+            <h3>{{ report.flags?.length ? `最先要拆掉的 ${report.flags.length} 颗雷` : '风险排雷结论' }}</h3>
+            <div v-if="report.flags?.length" class="flags-list">
+              <div v-for="flag in report.flags" :key="flag.code" class="flag-card" :class="`sev-${flag.severity}`">
+                <div class="flag-head">
+                  <span class="sev-badge">{{ severityLabel(flag.severity) }}</span>
+                  <h4>{{ flag.painTitle || flag.name }}</h4>
+                  <span v-if="flag.amount" class="flag-amount">涉及金额 {{ flag.amount }}</span>
+                </div>
+                <p v-if="flag.estimatedExposure" class="exposure-callout">
+                  <i class="ri-money-cny-circle-line" /> {{ flag.estimatedExposure }}
+                </p>
+                <p class="flag-desc">{{ flag.desc }}</p>
+                <p class="flag-fix"><strong>化解建议：</strong>{{ flag.fix }}</p>
+                <div class="flag-foot">
+                  <span v-if="flag.legalBasis" class="legal-basis">依据：{{ flag.legalBasis }}</span>
+                  <button class="flag-cta" @click="goAction(flag.ctaRoute)">{{ flag.ctaLabel || '去处理' }} →</button>
+                </div>
+              </div>
+            </div>
+            <div v-else class="clean-pass-card">
+              <i class="ri-shield-check-fill" />
+              <div>
+                <strong>未触发高频财税红线</strong>
+                <p>当前作答或表内科目未见明显公私混同、找票顶账或试算失衡隐患。建议接入梭罗记账保持自动对账留痕。</p>
+              </div>
+            </div>
+          </div>
+
+          <!-- 可折叠的专业核查明细 -->
+          <details class="tech-details">
+            <summary>查看专业规则核查明细（覆盖率 {{ report.coverage?.percent ?? 0 }}%）</summary>
+            <div class="checks-list">
+              <div v-for="check in report.checks" :key="check.code" class="check-row">
+                <span class="check-code">{{ check.code }}</span>
+                <span class="check-name">{{ check.name }}</span>
+                <span class="check-status" :class="`st-${check.status}`">{{ checkStatusLabel(check.status) }}</span>
+                <span class="check-obs">{{ check.observed }}</span>
+              </div>
+            </div>
+          </details>
+
           <p class="disclaimer">{{ disclaimer }}</p>
         </article>
       </section>
@@ -301,31 +653,174 @@ async function saveReportImage() {
 </template>
 
 <style scoped>
-.audit-scan-page { min-height: 100vh; background: #f4f6f5; color: #22322d; font-family: system-ui, sans-serif; }
-.scan-header { background: #fff; border-bottom: 1px solid #e1e8e4; }
-.header-inner { max-width: 1080px; margin: auto; padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; }
-.brand-wrap { display: flex; align-items: center; gap: 10px; font-weight: 700; border: 0; background: transparent; color: inherit; cursor: pointer; }
-.brand-logo { width: 30px; height: 30px; object-fit: contain; }
-.scan-main { max-width: 1080px; margin: auto; padding: 40px 24px 80px; }
-.scan-hero { margin-bottom: 24px; } .scan-hero h1 { font-size: clamp(28px, 4vw, 40px); margin: 8px 0 12px; } .scan-hero p { color: #63756b; line-height: 1.7; }
-.eyebrow { color: #38866a !important; font-size: 13px; font-weight: 700; letter-spacing: .08em; }
-.mode-tabs, .report-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 22px; }
-.mode-tab-btn, .report-actions button { background: #fff; border: 1px solid #d8e2dc; border-radius: 8px; padding: 10px 16px; cursor: pointer; color: #31483b; }
-.mode-tab-btn.active { background: #e7f4ed; border-color: #368364; color: var(--solo-income); font-weight: 700; }
-.scan-card-section, .audit-workpaper { background: #fff; border: 1px solid #e0e8e3; border-radius: 14px; padding: 32px; }
-h2 { font-size: 21px; margin: 0 0 20px; } h3 { font-size: 17px; } p { line-height: 1.65; }
-.profile-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
-.profile-grid label { display: grid; gap: 8px; font-size: 14px; font-weight: 600; }
-.profile-grid input, .profile-grid select { box-sizing: border-box; width: 100%; min-height: 40px; border: 1px solid #cfdad3; border-radius: 6px; padding: 8px; background: white; color: #22322d; }
-.upload-container, .quiz-container { margin-top: 36px; } .upload-container > p, .quiz-container > p { color: #63756b; }
-.btn-file-pick { display: inline-block; background: #edf6f1; padding: 10px 16px; border-radius: 6px; cursor: pointer; color: var(--solo-income); } .btn-file-pick input { display: block; margin-top: 8px; }
-.preview-box { margin-top: 16px; background: #f7faf8; border: 1px solid #dce8df; padding: 18px; border-radius: 8px; overflow-wrap: anywhere; }
-.warning { color: var(--solo-warning); } .check-label { display: block; margin-top: 15px; }
-.quiz-item { border: 0; border-top: 1px solid #edf0ee; padding: 20px 0; margin: 0; min-width: 0; }.quiz-item legend { font-weight: 650; padding: 0 0 8px; }
-.quiz-options { display: flex; flex-wrap: wrap; gap: 8px; }.quiz-option-label { border: 1px solid #dce5df; border-radius: 7px; padding: 9px 12px; cursor: pointer; font-size: 14px; }.quiz-option-label.selected { border-color: #368364; background: #eef8f2; }.quiz-option-label input { margin-right: 7px; }
-.disclaimer { color: #65746c; background: #f5f7f6; border-radius: 7px; padding: 15px; font-size: 13px; }.scan-cta-btn { border: 0; background: var(--solo-income); color: white; padding: 13px 26px; border-radius: 7px; cursor: pointer; font-weight: 700; }.scan-cta-btn:disabled { opacity: .6; cursor: wait; }
-.report-actions { justify-content: flex-end; margin: 0 0 12px; }.report-heading { display: flex; justify-content: space-between; gap: 16px; align-items: center; }.report-heading h2 { margin-bottom: 0; }.report-meta { display: flex; flex-wrap: wrap; gap: 12px 22px; color: #607268; border-block: 1px solid #e5ece7; margin: 22px 0; padding: 14px 0; font-size: 13px; }
-.score-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }.score-grid > div { background: #f2f8f4; padding: 20px; border-radius: 8px; display: grid; gap: 8px; }.score-grid strong { font-size: 30px; color: var(--solo-income); }.score-grid span { font-size: 14px; color: #52675a; }
-.report-block { margin-top: 30px; }.check-card { border-top: 1px solid #e4ebe6; padding: 12px 0; }.check-card h4 { margin: 0 0 8px; }.check-card small { color: #66796c; font-weight: 400; }.check-card p { margin: 4px 0; font-size: 14px; overflow-wrap: anywhere; }
-@media (max-width: 700px) { .scan-main { padding: 24px 14px 50px; }.scan-card-section, .audit-workpaper { padding: 20px; }.profile-grid { grid-template-columns: 1fr 1fr; }.report-heading { align-items: flex-start; flex-direction: column; } }
+.audit-scan-page { min-height: 100vh; background: #f8fafc; color: #0f172a; font-family: system-ui, -apple-system, sans-serif; }
+.scan-header { background: #fff; border-bottom: 1px solid #e2e8f0; }
+.header-inner { max-width: 960px; margin: auto; padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.brand-wrap { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 15px; border: 0; background: transparent; color: inherit; cursor: pointer; }
+.brand-logo { width: 28px; height: 28px; object-fit: contain; }
+.header-actions { display: flex; align-items: center; gap: 8px; }
+.scan-main { max-width: 960px; margin: auto; padding: 32px 24px 72px; }
+
+.scan-hero { margin-bottom: 24px; }
+.eyebrow { color: var(--solo-income); font-size: 13px; font-weight: 700; letter-spacing: .04em; margin: 0 0 8px; }
+.scan-hero h1 { font-size: clamp(24px, 3.6vw, 34px); line-height: 1.25; margin: 0 0 10px; color: #0f172a; }
+.scan-hero p { color: #475569; line-height: 1.65; margin: 0; }
+
+.mode-tabs { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 20px; }
+.mode-tab-btn { display: inline-flex; align-items: center; gap: 6px; background: #fff; border: 1px solid #cbd5e1; border-radius: 10px; padding: 10px 16px; cursor: pointer; color: #334155; font-size: 14px; font-weight: 600; transition: all .15s; }
+.mode-tab-btn.active { background: var(--solo-income-bg); border-color: var(--solo-income); color: var(--solo-income); }
+
+.scan-card, .audit-workpaper { background: #fff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 28px; box-shadow: 0 4px 20px rgba(15, 23, 42, 0.04); }
+
+.company-strip { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding-bottom: 20px; border-bottom: 1px solid #f1f5f9; margin-bottom: 24px; }
+.strip-label { font-size: 13px; color: #64748b; font-weight: 600; }
+.pill-group { display: flex; flex-wrap: wrap; gap: 8px; }
+.pill-btn { border: 1px solid #cbd5e1; background: #fff; color: #334155; border-radius: 999px; padding: 6px 14px; font-size: 13px; cursor: pointer; transition: all .15s; }
+.pill-btn.active { background: #0f172a; border-color: #0f172a; color: #fff; font-weight: 600; }
+
+/* 问卷分步向导 */
+.wizard-progress { margin-bottom: 20px; }
+.progress-text { display: flex; justify-content: space-between; font-size: 13px; color: #475569; font-weight: 600; margin-bottom: 8px; }
+.progress-track { height: 6px; background: #e2e8f0; border-radius: 999px; overflow: hidden; }
+.progress-fill { height: 100%; background: var(--solo-income); transition: width .2s ease; }
+.step-dots { display: flex; gap: 8px; margin-top: 12px; }
+.step-dot { width: 28px; height: 28px; border-radius: 999px; border: 1px solid #cbd5e1; background: #fff; color: #64748b; font-size: 12px; font-weight: 600; cursor: pointer; }
+.step-dot.done { background: var(--solo-income-bg); border-color: var(--solo-income); color: var(--solo-income); }
+.step-dot.current { background: #0f172a; border-color: #0f172a; color: #fff; }
+
+.question-stage h2 { font-size: 20px; margin: 0 0 8px; color: #0f172a; line-height: 1.4; }
+.question-why { display: flex; align-items: flex-start; gap: 6px; font-size: 13px; color: #64748b; background: #f8fafc; padding: 10px 12px; border-radius: 8px; margin: 0 0 18px; }
+.option-cards { display: grid; gap: 10px; }
+.option-card { display: flex; align-items: center; gap: 12px; text-align: left; padding: 14px 16px; border: 1px solid #cbd5e1; border-radius: 10px; background: #fff; cursor: pointer; transition: all .15s; color: #0f172a; }
+.option-card:hover { border-color: var(--solo-income); background: #f8fafc; }
+.option-card.selected { border-color: var(--solo-income); background: var(--solo-income-bg); }
+.opt-badge { width: 26px; height: 26px; border-radius: 6px; background: #f1f5f9; color: #334155; display: inline-flex; align-items: center; justify-content: center; font-weight: 700; font-size: 13px; flex-shrink: 0; }
+.option-card.selected .opt-badge { background: var(--solo-income); color: #fff; }
+.opt-text { flex: 1; font-size: 15px; line-height: 1.45; font-weight: 500; }
+.opt-check { color: var(--solo-income); font-size: 18px; }
+
+.wizard-nav { display: flex; justify-content: space-between; align-items: center; margin-top: 18px; padding-top: 12px; border-top: 1px solid #f1f5f9; }
+.nav-link, .nav-skip { background: transparent; border: 0; color: #475569; font-size: 13px; cursor: pointer; padding: 6px 4px; }
+.nav-link:disabled { opacity: .4; cursor: not-allowed; }
+.nav-skip { color: #64748b; text-decoration: underline; }
+
+/* 余额表上传区 */
+.upload-dropzone { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; border: 2px dashed #cbd5e1; border-radius: 12px; padding: 32px 20px; background: #f8fafc; cursor: pointer; text-align: center; transition: border-color .15s; }
+.upload-dropzone:hover { border-color: var(--solo-income); }
+.upload-dropzone input { display: none; }
+.upload-icon { font-size: 32px; color: var(--solo-income); }
+.upload-dropzone strong { font-size: 15px; color: #0f172a; }
+.upload-dropzone span { font-size: 13px; color: #64748b; }
+
+.balance-summary-card { margin-top: 18px; padding: 18px; border-radius: 12px; background: #f8fafc; border: 1px solid #e2e8f0; }
+.summary-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.stat-item { background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; display: grid; gap: 4px; }
+.stat-item span { font-size: 12px; color: #64748b; }
+.stat-item strong { font-size: 16px; color: #0f172a; }
+.text-income { color: var(--solo-income) !important; }
+.text-expense { color: var(--solo-expense) !important; }
+.text-warning { color: var(--solo-warning) !important; }
+
+.inline-balance-type { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 14px; font-size: 13px; color: #475569; }
+.opening-tip { margin: 12px 0 0; font-size: 13px; color: var(--solo-warning); display: flex; align-items: center; gap: 6px; }
+.smart-followup { margin-top: 16px; padding-top: 14px; border-top: 1px solid #e2e8f0; }
+.followup-title { font-size: 14px; font-weight: 600; color: #0f172a; margin: 0 0 10px; }
+
+.submit-footer { margin-top: 24px; padding-top: 20px; border-top: 1px solid #f1f5f9; display: flex; flex-direction: column; gap: 14px; }
+.ai-toggle { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #475569; cursor: pointer; }
+.error-banner { color: var(--solo-expense); background: var(--solo-expense-bg); padding: 10px 12px; border-radius: 8px; font-size: 13px; margin: 0; }
+.scan-cta-btn { border: 0; background: var(--solo-income); color: #fff; padding: 14px 24px; border-radius: 10px; font-size: 15px; font-weight: 700; cursor: pointer; }
+.scan-cta-btn:disabled { opacity: .5; cursor: not-allowed; }
+
+/* 报告视图 */
+.report-actions { display: flex; justify-content: flex-end; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+.report-actions button { display: inline-flex; align-items: center; gap: 6px; background: #fff; border: 1px solid #cbd5e1; border-radius: 8px; padding: 8px 14px; font-size: 13px; color: #334155; cursor: pointer; }
+
+.verdict-hero { display: flex; gap: 24px; align-items: center; padding: 22px; border-radius: 12px; background: #f8fafc; border: 1px solid #e2e8f0; }
+.verdict-hero.level-HIGH_RISK { background: var(--solo-expense-bg); border-color: var(--solo-expense); }
+.verdict-hero.level-MEDIUM_RISK { background: var(--solo-warning-bg); border-color: var(--solo-warning); }
+.verdict-hero.level-HEALTHY { background: var(--solo-income-bg); border-color: var(--solo-income); }
+
+.score-ring { width: 104px; height: 104px; border-radius: 999px; background: #fff; border: 4px solid currentColor; display: flex; flex-direction: column; align-items: center; justify-content: center; flex-shrink: 0; }
+.level-HIGH_RISK .score-ring { color: var(--solo-expense); }
+.level-MEDIUM_RISK .score-ring { color: var(--solo-warning); }
+.level-HEALTHY .score-ring { color: var(--solo-income); }
+.level-UNKNOWN .score-ring { color: #64748b; }
+.score-num { font-size: 32px; font-weight: 800; line-height: 1; }
+.score-unit { font-size: 11px; color: #64748b; margin-top: 4px; }
+
+.verdict-content { flex: 1; min-width: 0; }
+.verdict-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.level-pill { font-size: 12px; font-weight: 700; padding: 3px 10px; border-radius: 999px; background: #0f172a; color: #fff; }
+.serial-tag { font-size: 12px; color: #64748b; }
+.verdict-headline { font-size: 18px; font-weight: 700; color: #0f172a; margin: 0 0 10px; line-height: 1.4; }
+.urgent-strip { font-size: 13px; color: #334155; background: rgba(255, 255, 255, 0.78); padding: 8px 12px; border-radius: 8px; margin-bottom: 12px; }
+.primary-convert-btn { border: 0; background: #0f172a; color: #fff; padding: 10px 18px; border-radius: 8px; font-size: 13px; font-weight: 700; cursor: pointer; }
+
+.perspectives-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 20px; }
+.perspective-card { border: 1px solid #e2e8f0; border-radius: 12px; padding: 16px; background: #fff; }
+.p-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.p-title { font-weight: 700; font-size: 14px; display: inline-flex; align-items: center; gap: 6px; }
+.tax-card .p-title i { color: var(--solo-expense); }
+.bank-card .p-title i { color: var(--solo-primary); }
+.p-badge { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px; background: #f1f5f9; color: #475569; }
+.p-badge.risk-high, .p-badge.credit-low { background: var(--solo-expense-bg); color: var(--solo-expense); }
+.p-badge.risk-medium, .p-badge.credit-medium { background: var(--solo-warning-bg); color: var(--solo-warning); }
+.p-badge.risk-low, .p-badge.credit-high { background: var(--solo-income-bg); color: var(--solo-income); }
+.perspective-card p { margin: 0; font-size: 13px; line-height: 1.6; color: #334155; }
+
+.dimensions-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 16px; }
+.dim-tile { border: 1px solid #e2e8f0; border-radius: 10px; padding: 12px; background: #f8fafc; }
+.dim-tile-head { display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: #475569; margin-bottom: 6px; }
+.dim-tile-head strong { font-size: 14px; }
+.dim-CRITICAL { color: var(--solo-expense); }
+.dim-WARNING { color: var(--solo-warning); }
+.dim-HEALTHY { color: var(--solo-income); }
+.dim-NA, .dim-UNKNOWN { color: #64748b; }
+.dim-tile p { margin: 0; font-size: 12px; color: #64748b; line-height: 1.45; }
+
+.flags-section { margin-top: 24px; }
+.flags-section h3 { font-size: 17px; margin: 0 0 12px; color: #0f172a; }
+.flags-list { display: grid; gap: 12px; }
+.flag-card { border: 1px solid #e2e8f0; border-left: 4px solid var(--solo-warning); border-radius: 10px; padding: 16px; background: #fff; }
+.flag-card.sev-CRITICAL { border-left-color: var(--solo-expense); }
+.flag-card.sev-HIGH { border-left-color: var(--solo-warning); }
+.flag-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.sev-badge { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 6px; background: var(--solo-warning-bg); color: var(--solo-warning); }
+.sev-CRITICAL .sev-badge { background: var(--solo-expense-bg); color: var(--solo-expense); }
+.flag-head h4 { margin: 0; font-size: 15px; color: #0f172a; flex: 1; }
+.flag-amount { font-size: 13px; font-weight: 700; color: #0f172a; }
+.exposure-callout { margin: 0 0 8px; font-size: 13px; font-weight: 600; color: var(--solo-expense); background: var(--solo-expense-bg); padding: 6px 10px; border-radius: 6px; display: flex; align-items: center; gap: 6px; }
+.flag-desc { margin: 0 0 8px; font-size: 13px; color: #334155; line-height: 1.6; }
+.flag-fix { margin: 0 0 10px; font-size: 13px; color: #0f172a; line-height: 1.55; }
+.flag-foot { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; padding-top: 8px; border-top: 1px solid #f1f5f9; }
+.legal-basis { font-size: 12px; color: #64748b; }
+.flag-cta { border: 0; background: transparent; color: var(--solo-primary); font-size: 13px; font-weight: 700; cursor: pointer; padding: 0; }
+
+.clean-pass-card { display: flex; align-items: center; gap: 14px; padding: 18px; border-radius: 12px; background: var(--solo-income-bg); color: var(--solo-income); }
+.clean-pass-card i { font-size: 28px; }
+.clean-pass-card p { margin: 4px 0 0; font-size: 13px; color: #334155; }
+
+.tech-details { margin-top: 22px; border: 1px solid #e2e8f0; border-radius: 10px; padding: 12px 16px; background: #f8fafc; }
+.tech-details summary { font-size: 13px; font-weight: 600; color: #475569; cursor: pointer; }
+.checks-list { margin-top: 12px; display: grid; gap: 8px; }
+.check-row { display: grid; grid-template-columns: 56px 150px 72px 1fr; gap: 8px; font-size: 12px; padding: 6px 0; border-top: 1px solid #e2e8f0; align-items: baseline; }
+.check-code { font-weight: 700; color: #475569; }
+.check-name { font-weight: 600; color: #0f172a; }
+.check-status { font-weight: 700; }
+.st-PASS { color: var(--solo-income); }
+.st-RISK { color: var(--solo-expense); }
+.st-NA, .st-UNKNOWN { color: #64748b; }
+.check-obs { color: #475569; }
+
+.disclaimer { margin: 20px 0 0; padding: 12px 14px; background: #f8fafc; border-radius: 8px; font-size: 12px; color: #64748b; line-height: 1.6; }
+
+@media (max-width: 720px) {
+  .scan-main { padding: 20px 14px 56px; }
+  .scan-card, .audit-workpaper { padding: 18px; }
+  .summary-stats, .perspectives-grid, .dimensions-strip { grid-template-columns: 1fr; }
+  .verdict-hero { flex-direction: column; align-items: flex-start; }
+  .check-row { grid-template-columns: 52px 1fr 64px; }
+  .check-obs { grid-column: 1 / -1; }
+}
 </style>

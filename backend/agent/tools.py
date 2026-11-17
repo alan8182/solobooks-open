@@ -416,6 +416,119 @@ async def _get_aging(ctx: ToolContext, kind: str = "ar", group_by: str = "none")
     return await query_ar_aging(ctx.company_id, group_by=resolved)
 
 
+async def _get_cash_forecast(
+    ctx: ToolContext,
+    horizon_days: int = 60,
+    scenario: str = "neutral",
+) -> Any:
+    """滚动现金流预测（回答'钱还能撑多久/什么时候跌破安全线/客户拖欠会怎样'）。"""
+    from services.cash_forecast_service import calculate_cash_forecast
+
+    safe_days = max(7, min(int(horizon_days or 60), 180))
+    res = await calculate_cash_forecast(
+        ctx.company_id,
+        horizon_days=safe_days,
+        scenario=str(scenario or "neutral"),
+    )
+    return {
+        "asOf": res.get("asOf"),
+        "horizonDays": res.get("horizonDays"),
+        "scenario": res.get("scenario"),
+        "currentCash": str(res.get("currentCash")),
+        "endingCash": str(res.get("endingCash")),
+        "minBalance": str(res.get("minBalance")),
+        "minBalanceDate": res.get("minBalanceDate"),
+        "safetyThreshold": str(res.get("safetyThreshold")),
+        "runwayMonths": str(res.get("runwayMonths")) if res.get("runwayMonths") is not None else None,
+        "isDeficitProjected": res.get("isDeficitProjected"),
+        "deficitDate": res.get("deficitDate"),
+        "overdueReceivables": res.get("overdueReceivables", [])[:5],
+        "scenarioSummary": res.get("scenarioSummary"),
+    }
+
+
+async def _record_cash_forecast_event(
+    ctx: ToolContext,
+    name: str,
+    amount: float,
+    type: str = "outflow",
+    date: Optional[str] = None,
+    repeat: str = "none",
+    repeat_day: Optional[int] = None,
+    confidence: str = "high",
+    memo: Optional[str] = None,
+) -> Any:
+    """登记一笔未来的现金收支预期事件（如未签合同的口头回款、一次性设备采购、临时分红或大额预算支出），用于滚动现金流推演与资金跑道测算。"""
+    from services.cash_forecast_service import (
+        get_cash_forecast_config,
+        save_cash_forecast_config,
+        calculate_cash_forecast,
+    )
+    import uuid
+
+    cfg = await get_cash_forecast_config(ctx.company_id)
+    events = list(cfg.get("manualCashEvents") or [])
+
+    new_event = {
+        "id": f"evt_{uuid.uuid4().hex[:8]}",
+        "name": str(name).strip(),
+        "type": "inflow" if str(type).lower() == "inflow" else "outflow",
+        "amount": str(round(float(amount), 2)),
+        "date": str(date or "")[:10],
+        "repeat": repeat if repeat in ("monthly", "quarterly", "yearly") else "none",
+        "repeatDay": int(repeat_day) if repeat_day else None,
+        "confidence": confidence if confidence in ("high", "medium", "low") else "high",
+        "enabled": True,
+    }
+    events.append(new_event)
+    cfg["manualCashEvents"] = events
+    await save_cash_forecast_config(ctx.company_id, cfg)
+
+    fc = await calculate_cash_forecast(ctx.company_id, horizon_days=60, scenario="neutral")
+
+    direction_text = "预期流入" if new_event["type"] == "inflow" else "预期支出"
+    return {
+        "status": "success",
+        "event": new_event,
+        "message": f"已成功登记【{new_event['name']}】{direction_text} ¥{new_event['amount']}，已纳入滚动现金流预测日程。",
+        "currentCash": str(fc.get("currentCash")),
+        "endingCash": str(fc.get("endingCash")),
+        "minBalance": str(fc.get("minBalance")),
+        "runwayMonths": str(fc.get("runwayMonths") or "充裕"),
+        "isDeficitProjected": fc.get("isDeficitProjected"),
+        "deficitDate": fc.get("deficitDate"),
+    }
+
+
+async def _get_business_attribution(
+    ctx: ToolContext,
+    month: Optional[str] = None,
+    compare_mode: str = "mom",
+) -> Any:
+    """利润去向分析与利现对齐（回答'为什么利润降了/钱去哪了/为什么账面有利润却没现钱'）。"""
+    from datetime import datetime, timezone
+    from services.variance_attribution_service import get_business_attribution
+
+    target_month = month or datetime.now(timezone.utc).strftime("%Y-%m")
+    res = await get_business_attribution(
+        ctx.company_id,
+        base_month=target_month,
+        compare_mode=str(compare_mode or "mom"),
+    )
+    return {
+        "baseMonth": res.get("baseMonth"),
+        "compareMonth": res.get("compareMonth"),
+        "baseProfit": str(res.get("baseProfit")),
+        "compareProfit": str(res.get("compareProfit")),
+        "profitDelta": str(res.get("profitDelta")),
+        "topIncomeDrivers": res.get("topIncomeDrivers", [])[:5],
+        "topExpenseDrivers": res.get("topExpenseDrivers", [])[:5],
+        "anomalies": res.get("anomalies", []),
+        "netCashFlow": str(res.get("netCashFlow")),
+        "bridgeSummary": res.get("plainSummary"),
+    }
+
+
 async def _list_todos(
     ctx: ToolContext,
     type: Optional[str] = None,
@@ -1671,6 +1784,7 @@ async def _propose_company_setup(
     company_type: str = "有限责任公司",
     taxpayer_type: str = "小规模纳税人",
     start_date: Optional[str] = None,
+    incorporation_date: Optional[str] = None,
     industry: Optional[str] = None,
     vat_filing_cycle: str = "quarter",
     note: Optional[str] = None,
@@ -1696,6 +1810,7 @@ async def _propose_company_setup(
         "type": company_type or "有限责任公司",
         "taxpayerType": taxpayer_type or "小规模纳税人",
         "startDate": resolved_start,
+        "incorporationDate": str(incorporation_date or "").strip(),
         "industry": str(industry or current.get("industry") or "").strip(),
         "vatFilingCycle": vat_filing_cycle or "quarter",
         "isFromDemo": is_from_demo,
@@ -1775,6 +1890,9 @@ async def _generate_filing_package(ctx: ToolContext, period: str) -> Any:
                     "autoAdjustmentTotal",
                     "taxableIncome",
                     "preferentialTax",
+                    "priorYearLoss",
+                    "prepaidCitTax",
+                    "taxPayable",
                     "fields",
                     "note",
                     "deadline",
@@ -1907,6 +2025,76 @@ TOOLS: List[Tool] = [
             ["kind"],
         ),
         handler=_get_aging,
+    ),
+    Tool(
+        name="get_cash_forecast",
+        description="查询未来 30/60/90 天滚动现金流预测与资金跑道（回答'账上的钱能撑多久/什么时候跌破安全线/客户拖欠会怎样'）。",
+        parameters=_obj(
+            {
+                "horizon_days": {
+                    "type": "integer",
+                    "description": "预测天数，通常为 30、60 或 90，默认 60",
+                },
+                "scenario": {
+                    "type": "string",
+                    "enum": ["neutral", "optimistic", "pessimistic"],
+                    "description": "预测情景：neutral=基准，optimistic=乐观回款，pessimistic=悲观压力测试（客户推迟30天且逾期不回）",
+                },
+            }
+        ),
+        handler=_get_cash_forecast,
+    ),
+    Tool(
+        name="record_cash_forecast_event",
+        description=(
+            "登记一笔未来的现金收支预期事件（如未签合同的口头承诺回款、一次性采购/分红/大额支出、周期性租金/发薪日等），"
+            "立即更新未来 30/60/90 天滚动现金流推演与资金跑道（Runway）。"
+        ),
+        parameters=_obj(
+            {
+                "name": {"type": "string", "description": "事项名称，如'客户尾款预期回款'、'采购电脑设备'、'四季度办公室租金'"},
+                "amount": {"type": "number", "description": "金额（元），正数", "exclusiveMinimum": 0},
+                "type": {
+                    "type": "string",
+                    "enum": ["inflow", "outflow"],
+                    "description": "资金流向：inflow=预期流入/收款，outflow=预期支出/付款（默认）",
+                },
+                "date": {"type": "string", "description": "预计发生日期 YYYY-MM-DD，可选", "pattern": DATE_PATTERN},
+                "repeat": {
+                    "type": "string",
+                    "enum": ["none", "monthly", "quarterly", "yearly"],
+                    "description": "重复周期：none=一次性（默认），monthly=每月固定，quarterly=每季度，yearly=每年",
+                },
+                "repeat_day": {"type": "integer", "description": "每月/每季固定几号（1-31），如 10 代表每月10号", "minimum": 1, "maximum": 31},
+                "confidence": {
+                    "type": "string",
+                    "enum": ["high", "medium", "low"],
+                    "description": "置信度：high=高/已确认（默认），medium=中/口头约定，low=低/意向沟通。悲观情景压力测试将自动过滤非高置信流入。",
+                },
+                "memo": {"type": "string", "description": "补充说明，可选"},
+            },
+            ["name", "amount"],
+        ),
+        handler=_record_cash_forecast_event,
+    ),
+    Tool(
+        name="get_business_attribution",
+        description="查询利润去向分析与利现对齐（回答'为什么利润降了/钱花哪了/为什么账面有利润却没现钱'）。",
+        parameters=_obj(
+            {
+                "month": {
+                    "type": "string",
+                    "description": "分析月份 YYYY-MM，默认当前月",
+                    "pattern": MONTH_PATTERN,
+                },
+                "compare_mode": {
+                    "type": "string",
+                    "enum": ["mom", "yoy"],
+                    "description": "对比口径：mom=环比（上月），yoy=同比（去年同期），默认 mom",
+                },
+            }
+        ),
+        handler=_get_business_attribution,
     ),
     Tool(
         name="get_advance_balances",
@@ -2317,7 +2505,8 @@ TOOLS: List[Tool] = [
             "发起新公司从零建账或从其他代账/软件转入的主体建账确认卡（老板在卡片上核对/补填并确认后生效；"
             "若当前为演示账套会自动新建正式账套并切换）。"
             "onboarding_type=new（新成立公司从零记账）或 migration（从其他代账或财务软件转入）；"
-            "start_date 为启用日期 YYYY-MM-DD（新公司取成立日或当月1日，代账转入取交接起账月1日，如 2026-10-01）。"
+            "start_date 为账套启用日期 YYYY-MM-DD（代账转入取交接起账月1日，如 2026-10-01）；"
+            "incorporation_date 为营业执照成立日期，成立早于启用时务必填写，否则期初损益累计会少算月份。"
         ),
         parameters=_obj(
             {
@@ -2341,6 +2530,11 @@ TOOLS: List[Tool] = [
                 "start_date": {
                     "type": "string",
                     "description": "启用日期 YYYY-MM-DD，可选（默认当月1日）",
+                    "pattern": DATE_PATTERN,
+                },
+                "incorporation_date": {
+                    "type": "string",
+                    "description": "营业执照成立日期 YYYY-MM-DD，可选；成立早于启用时用于期初损益累计起点",
                     "pattern": DATE_PATTERN,
                 },
                 "industry": {"type": "string", "description": "所属行业，可选"},

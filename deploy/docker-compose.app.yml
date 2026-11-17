@@ -30,7 +30,8 @@ services:
       ALIYUN_SMS_SIGN_NAME: ${ALIYUN_SMS_SIGN_NAME}
       ALIYUN_SMS_TEMPLATE_CODE: ${ALIYUN_SMS_TEMPLATE_CODE}
       ACCOUNTING_TIMEZONE: Asia/Shanghai
-    command: sh -c "cd /app && DATABASE_URL=$$MIGRATION_DATABASE_URL alembic upgrade head && exec uvicorn main:app --host 0.0.0.0 --port 80"
+    # 同 docker-compose.yml：信任 nginx 转发头，避免所有用户共用 Docker 网关 IP。
+    command: sh -c "cd /app && DATABASE_URL=$$MIGRATION_DATABASE_URL alembic upgrade head && exec uvicorn main:app --host 0.0.0.0 --port 80 --proxy-headers --forwarded-allow-ips=127.0.0.1,172.16.0.0/12"
     networks:
       - default
       - db

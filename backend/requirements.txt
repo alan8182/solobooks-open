@@ -22,3 +22,5 @@ fastmcp==4.1.0
 # fastmcp-slim 4.x 的 client/server extra 要求 starlette>=1.0.1、uvicorn>=0.35、pydantic>=2.12，
 # 三者须与 fastapi 钉版联动（0.143.0 起放开 starlette<2.0），显式钉住防漂移
 starlette==1.7.0
+# 支付宝 RSA2 加签/验签（services/alipay_client.py）：只收款，公钥模式，无官方 SDK 依赖
+cryptography==50.0.2

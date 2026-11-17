@@ -6,7 +6,7 @@
 import apiClient from './client'
 
 export interface AdminOverviewData {
-  operator: { userId: string }
+  operator: { userId: string; nickname?: string; phone?: string }
   database: { ok: boolean; engine: string }
   counts: { users: number; companies: number }
   agent: { actionsToday: number; conversationsToday: number }
@@ -92,12 +92,18 @@ export async function fetchUsageRecent(params: {
 
 // ── M2：用户与公司管理 + 操作留痕 ─────────────────────────────────
 
+export type PlanCode = 'trial' | 'standard' | 'pro' | 'plus'
+
 export interface AdminUserItem {
   userId: string
   nickname: string
   phone: string
   isPlatformAdmin: boolean
   isDisabled: boolean
+  planCode: PlanCode
+  planName: string
+  planAnchorAt: string
+  quotaBonusTokens: number
   companyCount: number
   roles: string[]
   createdAt: string
@@ -121,7 +127,13 @@ export async function fetchAdminUsers(params: {
 
 export async function patchAdminUser(
   userId: string,
-  payload: { isDisabled?: boolean; isPlatformAdmin?: boolean },
+  payload: {
+    isDisabled?: boolean
+    isPlatformAdmin?: boolean
+    planCode?: PlanCode
+    planAnchorAt?: string | null
+    quotaBonusTokens?: number
+  },
 ): Promise<{ user: AdminUserItem; changed: string[] }> {
   return (await apiClient.patch(`/api/admin/users/${userId}`, payload)) as {
     user: AdminUserItem

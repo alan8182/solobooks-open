@@ -8,7 +8,8 @@ import {
 } from 'naive-ui'
 import * as XLSX from 'xlsx'
 import apiClient from '@/api/client'
-import { requestStepUp, sendPhoneCode } from '@/api/auth'
+import { requestStepUp } from '@/api/auth'
+import { sendVerificationCode } from '@/utils/verificationCode'
 import {
   confirmLegacyBalance, confirmLegacyVouchers, parseLegacyBalance, parseLegacyVouchers,
 } from '@/api/legacy'
@@ -24,7 +25,8 @@ import {
   sheetToRows,
   type StatementPeriod,
 } from '@/utils/openingBalanceImport'
-import { openingCutoffOptions } from '@/utils/openingPeriod'
+import { companyInception, openingCutoffOptions } from '@/utils/openingPeriod'
+import { useAuthStore } from '@/stores/auth'
 
 type Mode = 'balance' | 'voucher'
 
@@ -33,6 +35,23 @@ const emit = defineEmits<{ imported: [] }>()
 
 const router = useRouter()
 const message = useMessage()
+const authStore = useAuthStore()
+
+/** 公司信息里的启用日期（账套从这天开始记账），用来确定源表最早可接受起期 */
+function companyStartDate(): string {
+  const company = authStore.companies.find(
+    (item) => item.company_id === authStore.currentCompanyId,
+  )
+  return String(company?.startDate || '')
+}
+
+/** 营业执照成立日期；未填时为空，调用方回退到启用日期 */
+function companyIncorporationDate(): string {
+  const company = authStore.companies.find(
+    (item) => item.company_id === authStore.currentCompanyId,
+  )
+  return String(company?.incorporationDate || '')
+}
 
 const mode = ref<Mode>('balance')
 const fileName = ref('')
@@ -74,9 +93,28 @@ const effectiveStart = computed(() => {
   return { year: fiscalYear.value, month: '01' }
 })
 
-const expectedPeriodLabel = computed(() =>
-  describeExpectedPeriod(expectedOpeningPeriod(effectiveStart.value.year, effectiveStart.value.month)),
+const expectedPeriod = computed(() =>
+  expectedOpeningPeriod(
+    effectiveStart.value.year,
+    effectiveStart.value.month,
+    companyStartDate(),
+    companyIncorporationDate(),
+  ),
 )
+const expectedPeriodLabel = computed(() => describeExpectedPeriod(expectedPeriod.value))
+const zeroOpening = computed(() => expectedPeriod.value.zeroOpening)
+const hasIncorporationDate = computed(() => Boolean(companyIncorporationDate()))
+const inceptionLabel = computed(() => {
+  const inception = companyInception(companyIncorporationDate() || companyStartDate())
+  return inception ? `${inception.year}-${String(inception.month).padStart(2, '0')}` : ''
+})
+const zeroOpeningHint = computed(() => {
+  const book = `${effectiveStart.value.year}-${effectiveStart.value.month}`
+  if (hasIncorporationDate.value) {
+    return `公司 ${inceptionLabel.value} 成立，${book} 启用无需期初余额；直接录入业务，或把启用月改到有历史账的月份。`
+  }
+  return `账套 ${book} 启用，无需期初余额；直接录入业务。若公司成立早于启用月，请先到「主体管理」补填公司成立日期。`
+})
 
 const periodCheck = computed(() => {
   if (mode.value !== 'balance' || !periodChecked.value) return null
@@ -85,19 +123,31 @@ const periodCheck = computed(() => {
     statementPeriod.value ?? manualPeriod.value,
     effectiveStart.value.year,
     effectiveStart.value.month,
+    companyStartDate(),
+    companyIncorporationDate(),
   )
 })
 
 const periodBlocked = computed(() => Boolean(periodCheck.value && !periodCheck.value.ok))
 
+/** 起期与应有起期一致时，「本期发生额」才可以当本年累计传给后端解析 */
+const movementAsYtd = computed(() => {
+  const period = statementPeriod.value ?? manualPeriod.value
+  return Boolean(
+    period &&
+    !zeroOpening.value &&
+    period.startYear === expectedPeriod.value.startYear &&
+    period.startMonth === expectedPeriod.value.startMonth,
+  )
+})
+
 const cutoffOptions = computed(() =>
-  openingCutoffOptions(effectiveStart.value.year, effectiveStart.value.month)
-    .map(value => ({ label: value, value })),
+  openingCutoffOptions(expectedPeriod.value).map(value => ({ label: value, value })),
 )
 
 function defaultCutoff(): string {
-  const expected = expectedOpeningPeriod(effectiveStart.value.year, effectiveStart.value.month)
-  return `${expected.endYear}-${String(expected.endMonth).padStart(2, '0')}`
+  if (expectedPeriod.value.zeroOpening) return ''
+  return `${expectedPeriod.value.endYear}-${String(expectedPeriod.value.endMonth).padStart(2, '0')}`
 }
 
 function applyCutoff() {
@@ -107,14 +157,18 @@ function applyCutoff() {
     manualPeriod.value = null
     return
   }
+  const expected = expectedPeriod.value
+  if (expected.zeroOpening) return
   const [year, month] = cutoffMonth.value.split('-').map(Number)
   manualPeriod.value = {
-    startYear: year,
-    startMonth: 1,
+    startYear: expected.startYear,
+    startMonth: expected.startMonth,
     endYear: year,
     endMonth: month,
     label: `手动选择截止 ${cutoffMonth.value}`,
   }
+  // 手选截止月后可能才开始认得「本期发生额=本年累计」，重新解析一次
+  void runParse()
 }
 
 function downloadTemplate() {
@@ -156,13 +210,26 @@ async function onFilePicked(event: Event) {
   }
 }
 
+/** 旧账后端解析器只认「本年累计」；起期确认后把「本期发生额」映射成累计列 */
+function balanceRowsForBackend(): Record<string, unknown>[] {
+  if (mode.value !== 'balance' || !movementAsYtd.value) return rawRows.value
+  return rawRows.value.map(row => {
+    const out = { ...row }
+    for (const [key, value] of Object.entries(row)) {
+      if (key.includes('本期发生额借方')) out['本年累计借方'] = value
+      if (key.includes('本期发生额贷方')) out['本年累计贷方'] = value
+    }
+    return out
+  })
+}
+
 async function runParse() {
   if (rawRows.value.length === 0) return
   parsing.value = true
   try {
     const mapping = Object.keys(mappingOverrides.value).length > 0 ? mappingOverrides.value : undefined
     if (mode.value === 'balance') {
-      balanceResult.value = await parseLegacyBalance(rawRows.value, mapping)
+      balanceResult.value = await parseLegacyBalance(balanceRowsForBackend(), mapping)
       voucherResult.value = null
     } else {
       voucherResult.value = await parseLegacyVouchers(rawRows.value, mapping)
@@ -252,17 +319,10 @@ async function confirmVouchers() {
 }
 
 async function sendCode() {
-  if (!phone.value) {
-    message.warning('请输入账号绑定的手机号')
-    return
-  }
   sendingCode.value = true
   try {
-    const result = await sendPhoneCode({ phone: phone.value })
-    bizId.value = result.biz_id || ''
-    message.success('验证码已发送')
-  } catch {
-    message.error('验证码发送失败')
+    const outcome = await sendVerificationCode(message, phone.value, '请输入账号绑定的手机号')
+    if (outcome.ok) bizId.value = outcome.bizId
   } finally {
     sendingCode.value = false
   }
@@ -525,13 +585,13 @@ onMounted(loadAccounts)
           </div>
 
           <div v-if="mode === 'balance' && periodCheck" class="period-status">
-            <NAlert :type="periodCheck.ok ? 'success' : 'error'" :bordered="false">
+            <NAlert :type="periodCheck.ok ? 'success' : zeroOpening ? 'info' : 'error'" :bordered="false">
               <template v-if="periodCheck.ok">
                 表格期间已确认（{{ (manualPeriod ?? statementPeriod)?.label || '按账套建账期间' }}）：资产负债取期末余额，损益取本年累计发生额。
               </template>
               <template v-else>
                 <div>{{ periodCheck.message }}</div>
-                <div v-if="!statementPeriod" class="period-cutoff-row">
+                <div v-if="!statementPeriod && cutoffOptions.length > 0" class="period-cutoff-row">
                   <span>这份表截止到：</span>
                   <NSelect
                     v-model:value="cutoffMonth"
@@ -541,7 +601,10 @@ onMounted(loadAccounts)
                     @update:value="applyCutoff"
                   />
                 </div>
-                <div class="period-help">
+                <div v-if="zeroOpening" class="period-help">
+                  {{ zeroOpeningHint }}
+                </div>
+                <div v-else class="period-help">
                   建账期间 {{ effectiveStart.year }}-{{ effectiveStart.month }} 需要 {{ expectedPeriodLabel }} 的科目余额表。
                 </div>
               </template>

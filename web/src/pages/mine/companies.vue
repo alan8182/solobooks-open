@@ -2,9 +2,10 @@
 <script setup lang="ts">
 import { computed, ref, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NCard, NButton, NModal, NForm, NFormItem, NInput, NSelect, NTag, NPopover, NTooltip, NDatePicker, useMessage, NSpace, NGrid, NGi } from 'naive-ui'
+import { NAlert, NCard, NButton, NModal, NForm, NFormItem, NInput, NSelect, NTag, NPopover, NTooltip, NDatePicker, useMessage, NSpace, NGrid, NGi } from 'naive-ui'
 import { useAuthStore } from '@/stores/auth'
 import { useCompanyStore } from '@/stores/company'
+import { useUsageStore } from '@/stores/usage'
 import { updateCompany as apiUpdateCompany, deleteCompany as apiDeleteCompany } from '@/api/auth'
 import { listTaxRegistrations, type TaxRegistrationRow } from '@/api/tax-registration'
 import { reportErrorToast } from '@/utils/errorPresenter'
@@ -26,8 +27,13 @@ const route = useRoute()
 const router = useRouter()
 const authStore = useAuthStore()
 const companyStore = useCompanyStore()
+const usageStore = useUsageStore()
 
 const companies = ref<CompanyInfo[]>([])
+const maxCompanies = computed(() => usageStore.summary?.quota?.maxCompanies ?? null)
+const companyLimitReached = computed(
+  () => maxCompanies.value !== null && companies.value.length >= maxCompanies.value,
+)
 // Create dialog
 function defaultCreateForm() {
   return {
@@ -35,6 +41,7 @@ function defaultCreateForm() {
     name: '', type: '有限责任公司', taxpayerType: '小规模纳税人',
     // formatted-value 的「无值」哨兵是 null，空字符串会被当作待解析日期导致弹窗崩溃
     startDate: null as string | null,
+    incorporationDate: null as string | null,
     taxId: '',
     restrictedIndustry: 'no', industry: '', industryCode: '',
     industryTouched: false, legacyIndustryName: '',
@@ -72,6 +79,7 @@ const editForm = ref({
   onboardingType: 'new' as 'new' | 'migration',
   name: '', type: '有限责任公司', taxpayerType: '小规模纳税人',
   startDate: null as string | null,
+  incorporationDate: null as string | null,
   taxId: '',
   restrictedIndustry: 'no', industry: '', industryCode: '', vatFilingCycle: '' as string,
   businessIncomeIitFilingCycle: '' as string,
@@ -208,6 +216,7 @@ const iitCycleSynced = ref(false)
 
 onMounted(async () => {
   loadCompanies()
+  void usageStore.ensureLoaded().catch(() => {})
   await Promise.all([
     loadIndustryTemplates(),
     (async () => {
@@ -293,6 +302,10 @@ async function handleCreate() {
     message.warning('请填写启用日期（账套从此日开始记账）')
     return
   }
+  if (createForm.value.incorporationDate && createForm.value.incorporationDate > createForm.value.startDate) {
+    message.warning('公司成立日期不能晚于账套启用日期')
+    return
+  }
   const rawTaxId = createForm.value.taxId.trim().toUpperCase()
   if (!/^[0-9A-Z]{15}$|^[0-9A-Z]{17}$|^[0-9A-Z]{18}$|^[0-9A-Z]{20}$/.test(rawTaxId)) {
     message.warning('纳税人识别号格式不正确（15/17/18/20 位字母数字）')
@@ -318,6 +331,7 @@ async function submitCreate(rawTaxId: string) {
       taxId: rawTaxId,
       restrictedIndustry: createForm.value.restrictedIndustry === 'yes',
       startDate: createForm.value.startDate || undefined,
+      incorporationDate: createForm.value.incorporationDate || undefined,
       industryCode: createForm.value.industryCode || undefined,
     })
     let switched = false
@@ -331,6 +345,7 @@ async function submitCreate(rawTaxId: string) {
       }
     }
     if (!needSwitch || switched) loadCompanies()
+    void usageStore.ensureLoaded(true).catch(() => {})
     message.success(wasDemo && switched ? '已创建正式账套并切换生效' : '创建成功')
     if (fromOnboarding && (!needSwitch || switched)) {
       showCreate.value = false
@@ -376,6 +391,7 @@ function openEdit(co: CompanyInfo) {
     type: co.type || '有限责任公司',
     taxpayerType: co.taxpayerType || '小规模纳税人',
     startDate: co.startDate || null,
+    incorporationDate: co.incorporationDate || null,
     taxId: co.taxId || '',
     restrictedIndustry: co.restrictedIndustry === undefined || co.restrictedIndustry === null
       ? restrictedIndustryFor(co.industry)
@@ -404,6 +420,10 @@ async function handleSaveEdit() {
     message.warning('请填写启用日期（账套从此日开始记账）')
     return
   }
+  if (editForm.value.incorporationDate && editForm.value.incorporationDate > editForm.value.startDate) {
+    message.warning('公司成立日期不能晚于账套启用日期')
+    return
+  }
   const rawTaxId = editForm.value.taxId.trim().toUpperCase()
   if (rawTaxId && !/^[0-9A-Z]{15}$|^[0-9A-Z]{17}$|^[0-9A-Z]{18}$|^[0-9A-Z]{20}$/.test(rawTaxId)) {
     message.warning('纳税人识别号格式不正确（15/17/18/20 位字母数字）')
@@ -421,6 +441,8 @@ async function handleSaveEdit() {
       taxId: rawTaxId,
       restrictedIndustry: editForm.value.restrictedIndustry === 'yes',
       startDate: editForm.value.startDate || undefined,
+      // 可选字段要能清空：undefined 会被 JSON 丢掉，后端就收不到删除意图
+      incorporationDate: editForm.value.incorporationDate || '',
       vatFilingCycle: editForm.value.vatFilingCycle || undefined,
       businessIncomeIitFilingCycle: editForm.value.businessIncomeIitFilingCycle || undefined,
       ...industryChange,
@@ -428,6 +450,7 @@ async function handleSaveEdit() {
     // Refresh profile to get updated company list
     await authStore.fetchProfile()
     loadCompanies()
+    void usageStore.ensureLoaded(true).catch(() => {})
     showEdit.value = false
     message.success('已保存')
   } catch (err) {
@@ -472,6 +495,7 @@ async function confirmDelete() {
     // 拷来的旧数组，不重取就还指着已删除的卡片，要整页刷新才消失。
     await authStore.fetchProfile()
     loadCompanies()
+    void usageStore.ensureLoaded(true).catch(() => {})
     if (authStore.companies.length === 0) {
       message.info('当前已无主体，请新建一个主体后继续使用')
     }
@@ -488,12 +512,23 @@ async function confirmDelete() {
     <div class="page-header">
       <div>
         <h2>主体管理</h2>
-        <p class="text-muted">管理您的所有公司及纳税人身份</p>
+        <p class="text-muted">
+          管理您的所有公司及纳税人身份
+          <template v-if="maxCompanies !== null">
+            · 当前 {{ companies.length }} / {{ maxCompanies }} 个账套
+          </template>
+        </p>
       </div>
       <NSpace>
-        <NButton type="primary" @click="showCreate = true">新增主体</NButton>
+        <NButton type="primary" :disabled="companyLimitReached" @click="showCreate = true">
+          新增主体
+        </NButton>
       </NSpace>
     </div>
+
+    <NAlert v-if="companyLimitReached" type="info" :bordered="false" style="margin-bottom: 16px">
+      当前套餐最多支持 {{ maxCompanies }} 个账套；未来将面向代账机构开放更多账套方案。如需新建，请先清理闲置账套。
+    </NAlert>
 
     <NSpace vertical :size="16">
       <NCard
@@ -566,6 +601,7 @@ async function confirmDelete() {
           </div>
           <div class="card-footer">
             <span class="date">启用日期：{{ co.startDate || '—' }}</span>
+            <span v-if="co.incorporationDate" class="date">成立日期：{{ co.incorporationDate }}</span>
             <span v-if="co.isDemo" class="date">演示账套仅供体验，不可修改主体信息</span>
           </div>
         </div>
@@ -790,6 +826,28 @@ async function confirmDelete() {
             </NFormItem>
           </NGi>
           <NGi>
+            <NFormItem>
+              <template #label>
+                公司成立日期（选填）
+                <NPopover trigger="click" :style="{ maxWidth: '320px' }">
+                  <template #trigger>
+                    <i class="ri-question-line form-help-icon" />
+                  </template>
+                  营业执照上的成立日期。成立早于账套启用的（如 3 月成立、6 月才建账），填了才能把成立至启用前一月的损益累计带入期初；不填则按启用日期处理。
+                </NPopover>
+              </template>
+              <NDatePicker
+                v-model:formatted-value="createForm.incorporationDate"
+                value-format="yyyy-MM-dd"
+                type="date"
+                clearable
+                style="width: 100%"
+                placeholder="选择公司成立日期（选填）"
+                :is-date-disabled="(ts: number) => ts > Date.now()"
+              />
+            </NFormItem>
+          </NGi>
+          <NGi>
             <NFormItem required>
               <template #label>
                 启用日期
@@ -797,7 +855,7 @@ async function confirmDelete() {
                   <template #trigger>
                     <i class="ri-question-line form-help-icon" />
                   </template>
-                  账套从此日开始记账。新开业公司填成立（开业）日期；从代账或手工账转来的，填接账后账套启用的起始日即可，更早的业务请在「我的 → 期初设置」中以期初余额带入
+                  账套从此日开始记账。从代账或手工账转来的，填接账后账套启用的起始日即可；更早的业务请在「我的 → 期初设置」中以期初余额带入。
                 </NPopover>
               </template>
               <NDatePicker
@@ -983,6 +1041,28 @@ async function confirmDelete() {
             </NFormItem>
           </NGi>
           <NGi>
+            <NFormItem>
+              <template #label>
+                公司成立日期（选填）
+                <NPopover trigger="click" :style="{ maxWidth: '320px' }">
+                  <template #trigger>
+                    <i class="ri-question-line form-help-icon" />
+                  </template>
+                  营业执照上的成立日期。成立早于账套启用的（如 3 月成立、6 月才建账），填了才能把成立至启用前一月的损益累计带入期初；不填则按启用日期处理。
+                </NPopover>
+              </template>
+              <NDatePicker
+                v-model:formatted-value="editForm.incorporationDate"
+                value-format="yyyy-MM-dd"
+                type="date"
+                clearable
+                style="width: 100%"
+                placeholder="选择公司成立日期（选填）"
+                :is-date-disabled="(ts: number) => ts > Date.now()"
+              />
+            </NFormItem>
+          </NGi>
+          <NGi>
             <NFormItem required>
               <template #label>
                 启用日期
@@ -990,7 +1070,7 @@ async function confirmDelete() {
                   <template #trigger>
                     <i class="ri-question-line form-help-icon" />
                   </template>
-                  账套从此日开始记账。新开业公司填成立（开业）日期；从代账或手工账转来的，填接账后账套启用的起始日即可，更早的业务请在「我的 → 期初设置」中以期初余额带入
+                  账套从此日开始记账。从代账或手工账转来的，填接账后账套启用的起始日即可；更早的业务请在「我的 → 期初设置」中以期初余额带入。
                 </NPopover>
               </template>
               <NDatePicker

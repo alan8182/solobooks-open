@@ -8,10 +8,11 @@
  * 从 closing-wizard/index.vue 拆出：流式对话/思考态/快捷提问/结论提取全部自包含；
  * 上下文（流水事实、候选科目）由父页算好传入，accept 事件由父页落地入账。
  */
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { NButton, NInput, NModal, useMessage } from 'naive-ui'
 import { chatAgentStream, type AgentStreamEvent } from '@/api/agent'
 import { renderMarkdown } from '@/utils/markdown'
+import { createMarkdownMemo, createStreamRenderThrottle } from '@/utils/streamRender'
 import { formatMoney } from '@/utils/format'
 
 const props = defineProps<{
@@ -32,13 +33,43 @@ const show = defineModel<boolean>('show', { default: false })
 
 const message = useMessage()
 
+interface AskAiMessage {
+  role: 'user' | 'assistant'
+  content: string
+  /** 正在流式承接 token 的占位消息（结束后翻 false，渲染切回完整直渲） */
+  streaming?: boolean
+}
+
 // 首条为随问题发给 AI 的上下文（模板渲染成卡片，不显示为气泡）
-const messages = ref<{ role: 'user' | 'assistant'; content: string }[]>([])
+const messages = ref<AskAiMessage[]>([])
 const streaming = ref(false)
 const toolHint = ref('')
 const input = ref('')
 const threadRef = ref<HTMLElement | null>(null)
 let controller: AbortController | null = null
+/** 本轮流式 token 的承接目标；error 事件会另推消息，不能按「最后一条」猜 */
+const streamMsg = ref<AskAiMessage | null>(null)
+
+// ── 流式渲染节流：与 copilot 同一策略——msg.content 是权威文本，markdown 解析
+// 按上次渲染耗时自适应节流；流式结束切回完整直渲，尾巴不会丢 ──
+const streamHtml = ref('')
+const streamThrottle = createStreamRenderThrottle(renderMarkdown, (html) => {
+  streamHtml.value = html
+})
+const renderMemo = createMarkdownMemo(renderMarkdown)
+
+function renderMessageMarkdown(msg: AskAiMessage): string {
+  return msg.streaming ? streamHtml.value : renderMemo(msg, msg.content)
+}
+
+/** 回车发送；中文输入法选词的回车（isComposing）不发送，Shift+回车保留换行 */
+function onComposerKeydown(event: KeyboardEvent) {
+  if (event.isComposing || event.shiftKey) return
+  event.preventDefault()
+  send()
+}
+
+onBeforeUnmount(() => streamThrottle.dispose())
 
 const QUICK_QUESTIONS = [
   '这笔是溢价增资吗？该怎么判断？',
@@ -72,9 +103,9 @@ function scrollBottom() {
 function onEvent(ev: AgentStreamEvent) {
   switch (ev.type) {
     case 'token': {
-      const last = messages.value[messages.value.length - 1]
-      if (last && last.role === 'assistant') {
-        last.content += ev.content || ''
+      if (streamMsg.value) {
+        streamMsg.value.content += ev.content || ''
+        streamThrottle.push(streamMsg.value.content)
         scrollBottom()
       }
       break
@@ -88,9 +119,8 @@ function onEvent(ev: AgentStreamEvent) {
     case 'final':
       toolHint.value = ''
       // 个别响应只发 final 不发 token，占位气泡需要兜底填充
-      if (ev.content) {
-        const last = messages.value[messages.value.length - 1]
-        if (last && last.role === 'assistant' && !last.content) last.content = ev.content
+      if (ev.content && streamMsg.value && !streamMsg.value.content) {
+        streamMsg.value.content = ev.content
       }
       break
     case 'error':
@@ -108,7 +138,9 @@ async function runStream() {
   scrollBottom()
   // 后端要求最后一条是 user；占位的空 assistant 消息只在本地承接流式 token
   const history = messages.value.map((m) => ({ role: m.role, content: m.content }))
-  messages.value.push({ role: 'assistant', content: '' })
+  const placeholder: AskAiMessage = { role: 'assistant', content: '', streaming: true }
+  streamMsg.value = placeholder
+  messages.value.push(placeholder)
   try {
     await chatAgentStream(history, onEvent, controller.signal, undefined, false, 'accounting')
   } catch (err) {
@@ -120,6 +152,10 @@ async function runStream() {
     }
   } finally {
     streaming.value = false
+    placeholder.streaming = false
+    // 快速关开面板时旧流 finally 不能误清新一轮的承接目标
+    if (streamMsg.value === placeholder) streamMsg.value = null
+    streamThrottle.reset()
     controller = null
     scrollBottom()
   }
@@ -214,7 +250,7 @@ function accept() {
           <div
             v-else-if="msg.role === 'assistant' && msg.content"
             class="ask-ai-bubble ask-ai-md"
-            v-html="renderMarkdown(msg.content)"
+            v-html="renderMessageMarkdown(msg)"
           ></div>
         </div>
 
@@ -244,7 +280,7 @@ function accept() {
             type="textarea"
             :rows="2"
             placeholder="补充事实或追问，Enter 发送，Shift+Enter 换行"
-            @keydown.enter.exact.prevent="send()"
+            @keydown.enter.exact="onComposerKeydown($event as KeyboardEvent)"
           />
           <NButton v-if="!streaming" type="primary" :disabled="!input.trim()" @click="send()">
             <template #icon><i class="ri-send-plane-fill" /></template>

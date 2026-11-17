@@ -20,6 +20,7 @@ import { useWorkspaceViewStore } from '@/stores/workspaceView'
 import { clearCopilotChat, loadCopilotChat, saveCopilotChat } from '@/utils/copilotChat'
 import AgentActionCard from '@/components/business/AgentActionCard.vue'
 import { renderMarkdown } from '@/utils/markdown'
+import { createMarkdownMemo, createStreamRenderThrottle } from '@/utils/streamRender'
 import { linkifyClosingWizardRoutes, localClosingWizardPath } from '@/utils/assistantLinks'
 import { copyToClipboard } from '@/utils/clipboard'
 import type { CompanyOnboardingType } from '@/utils/companyOnboarding'
@@ -232,6 +233,7 @@ async function toggleRecording() {
 
 onBeforeUnmount(() => {
   if (recording.value) mediaRecorder?.stop()
+  streamThrottle.dispose()
   boundScrollEl?.removeEventListener('scroll', onChatScroll)
   boundScrollEl = null
 })
@@ -317,6 +319,7 @@ function handleEvent(ev: AgentStreamEvent, target: ChatMessage) {
         target.reasoningCollapsed = true
       }
       target.content += ev.content || ''
+      streamThrottle.push(target.content)
       scrollBottom()
       break
     case 'tool_call': {
@@ -366,6 +369,26 @@ function renderCopilotMarkdown(raw: string): string {
   return renderMarkdown(linkifyClosingWizardRoutes(raw))
 }
 
+// ── 流式渲染节流：token 直接累加进 msg.content（权威文本），markdown 解析
+// 按上次渲染耗时自适应节流；流式结束切回完整直渲，节流尾巴不会丢字 ──
+const streamHtml = ref('')
+const streamThrottle = createStreamRenderThrottle(renderCopilotMarkdown, (html) => {
+  streamHtml.value = html
+})
+// 历史消息内容不变，整表随 token 重渲染时不重复解析
+const renderMemo = createMarkdownMemo(renderCopilotMarkdown)
+
+function renderMessageMarkdown(msg: ChatMessage): string {
+  return msg.streaming ? streamHtml.value : renderMemo(msg, msg.content)
+}
+
+/** 回车发送；中文输入法选词的回车（isComposing）不发送，Shift+回车保留换行 */
+function onComposerKeydown(event: KeyboardEvent) {
+  if (event.isComposing || event.shiftKey) return
+  event.preventDefault()
+  send()
+}
+
 function openClosingLink(link?: ClosingLink) {
   const path = localClosingWizardPath(link?.url || '')
   if (!path) {
@@ -391,6 +414,7 @@ async function send(imageUrl?: string) {
   messages.value.push({ role: 'user', content: text, imageUrl })
   input.value = ''
   streaming.value = true
+  streamThrottle.reset()
 
   const assistant = reactive<ChatMessage>({ role: 'assistant', content: '', steps: [], streaming: true })
   messages.value.push(assistant)
@@ -415,6 +439,7 @@ async function send(imageUrl?: string) {
         (assistant.content ? '\n\n' : '') + '⚠ 连接中断，请稍后重试。'
     }
   } finally {
+    streamThrottle.reset()
     assistant.streaming = false
     streaming.value = false
     abortController = null
@@ -623,7 +648,7 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
   <div class="copilot-page">
     <div class="page-header">
       <div class="header-titles">
-        <h2>AI CFO · 交互工作台</h2>
+        <h2>AI 财务官 · 交互工作台</h2>
         <NTooltip trigger="hover" placement="bottom-start" :style="{ maxWidth: '340px' }">
           <template #trigger>
             <span class="header-badge-tag">
@@ -659,7 +684,7 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
         <NCard :bordered="false" class="chat-card" ref="chatCardRef">
           <div class="chat-messages" v-if="messages.length > 0">
             <div v-for="(msg, i) in messages" :key="i" class="message" :class="[msg.role, { streaming: msg.streaming }]">
-              <div class="msg-avatar" :class="{ 'is-streaming': msg.streaming }" :title="msg.role === 'user' ? '我' : '梭罗 · AI CFO'">
+              <div class="msg-avatar" :class="{ 'is-streaming': msg.streaming }" :title="msg.role === 'user' ? '我' : '梭罗 · AI 财务官'">
                 <i v-if="msg.role === 'user'" class="ri-user-3-fill" />
                 <img v-else src="/solo-logo.png" alt="梭罗" class="avatar-logo" />
               </div>
@@ -713,7 +738,7 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
                       <div
                         v-if="msg.content"
                         class="md-body"
-                        v-html="renderCopilotMarkdown(msg.content)"
+                        v-html="renderMessageMarkdown(msg)"
                         @click="handleMarkdownClick"
                       ></div>
                       <span class="cursor-caret" v-if="msg.streaming && msg.content" />
@@ -774,7 +799,7 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
 
           <div v-else class="chat-empty">
             <div class="empty-icon"><i class="ri-chat-3-line"></i></div>
-            <p>你好，我是梭罗，你的 AI CFO。刚开始用？可以先选你的建账情况：</p>
+            <p>你好，我是梭罗，你的 AI 财务官。刚开始用？可以先选你的建账情况：</p>
             <div class="onboarding-entry-cards">
               <button
                 type="button"
@@ -879,7 +904,7 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
             :autosize="{ minRows: 1, maxRows: 6 }"
             placeholder="例如：这个月赚了多少？这笔收入要交哪些税？"
             :disabled="streaming"
-            @keydown.enter.prevent="(!($event as KeyboardEvent).shiftKey && send())"
+            @keydown.enter="onComposerKeydown($event as KeyboardEvent)"
           />
           <NButton v-if="streaming" type="warning" secondary @click="stopStream">停止</NButton>
           <NButton v-else type="primary" :disabled="!canSend" @click="() => send()">发送</NButton>

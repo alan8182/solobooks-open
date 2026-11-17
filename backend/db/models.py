@@ -66,6 +66,9 @@ class AuthUser(Base):
     plan_code: Mapped[str] = mapped_column(String(32), nullable=False, default="trial", server_default="trial")
     plan_anchor_at: Mapped[str | None] = mapped_column(Text, nullable=True)
     quota_bonus_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    # 付费套餐到期日（ISO 日期串，同 plan_anchor_at 惯例）；None = 不适用（trial/管理员调整）
+    # 过期后 quota_service._effective_plan 惰性按 trial 口径生效，无需 cron
+    plan_expires_at: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[str] = mapped_column(Text, nullable=False)
     last_login_at: Mapped[str] = mapped_column(Text, nullable=False)
     updated_at: Mapped[str] = mapped_column(Text, nullable=False, default="")
@@ -1922,4 +1925,77 @@ class InboxDocument(Base):
         ),
         UniqueConstraint("company_id", "content_sha256", name="uq_inbox_company_sha256"),
         Index("ix_inbox_documents_company_created", "company_id", "created_at"),
+    )
+
+
+class BillingOrder(Base):
+    """平台自营收款订单（支付宝电脑网站支付，售卖 SoloBooks 套餐）。
+
+    与用户账套的账务层（journal_entries 等）完全隔离：这是平台自己的收入流水，
+    不参与任何账套的借贷记账。状态机 created → paid → activated（旁路 closed/failed），
+    迁移只允许 CAS（UPDATE ... WHERE status=旧值），并发重复通知天然幂等。
+    """
+
+    __tablename__ = "billing_orders"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True, default=new_id)
+    # 商户订单号（支付宝 out_trade_no，6-32 位字母数字；out_trade_no 幂等的唯一键）
+    out_trade_no: Mapped[str] = mapped_column(String(32), nullable=False, unique=True)
+    user_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("auth_users.user_id"), nullable=False
+    )
+    plan_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    # 计费周期：第一版仅 annual（年付），列保留以便后续开月付
+    period: Mapped[str] = mapped_column(String(16), nullable=False, default="annual")
+    # 应付金额（元）：下单时取自 core/plans.py 唯一目录，支付回调时严格比对
+    amount: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="created")
+    subject: Mapped[str] = mapped_column(String(128), nullable=False)
+    # 支付宝侧信息（TRADE_SUCCESS 通知回填）
+    trade_no: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    buyer_logon_id: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    # 最后一次通知的原始参数快照（审计取证用；全量通知流水见 billing_notify_logs）
+    notify_payload: Mapped[dict | None] = mapped_column(JSON_VALUE, nullable=True)
+    # 订单支付有效期（ISO 时刻）；过期 created 订单被惰性关单
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('created','paid','activated','closed','failed')",
+            name="ck_billing_order_status",
+        ),
+        CheckConstraint("period IN ('annual')", name="ck_billing_order_period"),
+        CheckConstraint("amount > 0", name="ck_billing_order_amount_positive"),
+        Index("ix_billing_orders_user_created", "user_id", "created_at"),
+        Index("ix_billing_orders_trade_no", "trade_no"),
+    )
+
+
+class BillingNotifyLog(Base):
+    """支付宝异步通知流水：只增不改（对齐 A2「审计只增」），每次推送原样落一行。
+
+    验签失败/金额不符/订单不存在的通知也必须留档——这是排查「钱到了但没开通」
+    或「伪造通知」的唯一证据链。人工干预永不更新此表，纠错在 billing_orders 上 CAS。
+    """
+
+    __tablename__ = "billing_notify_logs"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True, default=new_id)
+    out_trade_no: Mapped[str] = mapped_column(String(32), nullable=False, default="", index=True)
+    trade_no: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    trade_status: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+    sign_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # 处理结论（processed / duplicate / rejected_* / order_not_found / ignored_*），便于对账筛查
+    result: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+    payload: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )

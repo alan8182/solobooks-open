@@ -41,6 +41,15 @@ def _f(value: Any) -> float:
         return 0.0
 
 
+def _cit_payable(cit: Optional[Dict[str, Any]]) -> Any:
+    """第 32 行口径：已预缴覆盖时 taxPayable 合法为 0，不能回退成正税额。"""
+    if not cit:
+        return 0
+    if cit.get("taxPayable") is not None:
+        return cit["taxPayable"]
+    return cit.get("preferentialTax", 0)
+
+
 def _quarter_of_period(period: str) -> Optional[str]:
     """2026-08 -> 2026-Q3；2026-Q3 -> 原样。"""
     text = (period or "").strip()
@@ -142,11 +151,30 @@ async def _cit_estimate(
     )
     auto_increase = _d2(adjustments.get("totalIncrease") or 0)
 
-    taxable_base = max(Decimal("0"), total_profit + auto_increase)
+    profit_before_loss = _d2(total_profit + auto_increase)
+    from services.cit_tax_opening import apply_tax_opening, get_tax_opening_memo
+
+    # 期初税务备忘（仅在其所属纳税年度内生效）：第 24 行弥补亏损、第 30 行已预缴
+    opening = apply_tax_opening(
+        profit_before_loss,
+        await get_tax_opening_memo(company_id),
+        statement.period.fiscal_year_start.year,
+    )
+    taxable_base = max(Decimal("0"), profit_before_loss - opening["lossDeducted"])
     standard_tax = (taxable_base * Decimal("0.25")).quantize(D2, rounding="ROUND_HALF_UP")
     preferential_tax = (taxable_base * Decimal("0.05")).quantize(D2, rounding="ROUND_HALF_UP")
+    prepaid = opening["prepaidCitTax"]
+    tax_payable = max(Decimal("0"), preferential_tax - prepaid)
 
     note = "按实际利润额×5% 估算（小型微利优惠）。如有以前年度亏损或已预缴，以税局申报表为准。"
+    if opening["applies"] and (opening["priorYearLoss"] > 0 or prepaid > 0):
+        note = (
+            f"已按期初税务备忘处理：以前年度亏损可弥补 {opening['priorYearLoss']} 元、"
+            f"本期抵扣 {opening['lossDeducted']} 元，本年累计已预缴 {prepaid} 元；"
+            "请与税局申报表核对。"
+        )
+        if prepaid > preferential_tax:
+            note += "已预缴税额覆盖本期应纳，本期无需补缴。"
     if auto_increase > 0:
         note = (
             f"已按规则自动纳税调增 {auto_increase}（招待费/广宣费限额、罚款滞纳金、无票支出），"
@@ -165,16 +193,22 @@ async def _cit_estimate(
         "preferentialTax": _f(preferential_tax),
         # A200000 第 28 栏减免所得税额（老板小抄直接抄表用）
         "preferentialRelief": _f(standard_tax - preferential_tax),
+        "priorYearLoss": _f(opening["lossDeducted"]),
+        "prepaidCitTax": _f(prepaid),
+        "taxPayable": _f(tax_payable),
+        "taxOpeningApplied": bool(opening["applies"]),
         "note": note,
         "fields": [
             {"line": "1", "label": "营业收入（本年累计）", "amount": _f(revenue)},
             {"line": "2", "label": "营业成本（本年累计）", "amount": _f(cost)},
             {"line": "18", "label": "利润总额（本年累计）", "amount": _f(total_profit)},
             {"line": "18A", "label": "纳税调增（系统测算）", "amount": _f(auto_increase)},
+            {"line": "24", "label": "减：弥补以前年度亏损", "amount": _f(opening["lossDeducted"])},
             {"line": "25", "label": "实际利润额", "amount": _f(taxable_base)},
             {"line": "27", "label": "应纳所得税额（25%）", "amount": _f(standard_tax)},
             {"line": "28", "label": "减免所得税额（小型微利）", "amount": _f(standard_tax - preferential_tax)},
-            {"line": "32", "label": "本期应补（退）所得税额", "amount": _f(preferential_tax)},
+            {"line": "30", "label": "减：本年累计已预缴所得税额", "amount": _f(prepaid)},
+            {"line": "32", "label": "本期应补（退）所得税额", "amount": _f(tax_payable)},
         ],
     }
 
@@ -350,7 +384,7 @@ def _preferences(vat: Dict[str, Any], cit: Optional[Dict[str, Any]], cit_applica
                 "detail": (
                     f"本年累计实际利润额 {cit.get('totalProfit')} 元；按小型微利企业政策"
                     "（应纳税所得额≤300 万部分实际税负 5%，政策至 2027 年）估算本期预缴 "
-                    f"{cit.get('preferentialTax')} 元。"
+                    f"{cit.get('taxPayable', cit.get('preferentialTax'))} 元。"
                 ),
                 "action": "预缴申报表第 28 行'减免所得税额'自动体现；从业人数自动取自员工名册、资产总额取自报表，补充所属行业即可",
             }
@@ -712,7 +746,7 @@ async def build_filing_package(
             "blockingIssues": vat.get("blockingIssues", []),
             "warnings": vat.get("warnings", []),
             "vatPayable": float(_d2(vat.get("totalVatPayable"))),
-            "citPayable": cit.get("preferentialTax") if cit else 0,
+            "citPayable": _cit_payable(cit),
             "iitPayable": float(iit.get("suggestedPayable")) if iit_applicable else 0,
             "overdue": [d["taxName"] for d in quarter_deadlines if d["status"] == "pending" and d["daysLeft"] < 0],
         },

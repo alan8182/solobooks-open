@@ -1505,13 +1505,13 @@ usePageRefresh(load)
 
                 <div class="handcard-item">
                   <div class="handcard-item-top">
-                    <span class="item-label">应纳所得税额 (5%微利)</span>
-                    <NButton size="tiny" quaternary type="primary" @click="copyAmount(pkg.summary.citPayable || pkg.cit.preferentialTax, '应纳税额')">
+                    <span class="item-label">本期应补缴（5%微利）</span>
+                    <NButton size="tiny" quaternary type="primary" @click="copyAmount(pkg.summary.citPayable ?? pkg.cit.preferentialTax, '本期应补缴税额')">
                       复制
                     </NButton>
                   </div>
-                  <div class="item-amount-val" :class="{ 'is-zero-val': !(pkg.summary.citPayable || pkg.cit.preferentialTax) }">
-                    ¥ {{ money(pkg.summary.citPayable || pkg.cit.preferentialTax) }}
+                  <div class="item-amount-val" :class="{ 'is-zero-val': !(pkg.summary.citPayable ?? pkg.cit.preferentialTax) }">
+                    ¥ {{ money(pkg.summary.citPayable ?? pkg.cit.preferentialTax) }}
                   </div>
                 </div>
               </div>

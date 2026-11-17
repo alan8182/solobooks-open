@@ -3,8 +3,9 @@
  * Licensed under the SoloBooks License v2.0.
  */
 
+import { h } from 'vue'
 import axios, { type AxiosRequestConfig } from 'axios'
-import { createDiscreteApi } from 'naive-ui'
+import { NButton, createDiscreteApi } from 'naive-ui'
 
 // 金额字段以字符串形式传输（Decimal 序列化），响应拦截器按此正则把命中字段的数值字符串转为 Number。
 // 不变量：凡是前端要做数值运算（求和/比较）的响应字段，命名必须命中此正则；绕过 apiClient 的裸 fetch 不做转换。
@@ -95,17 +96,34 @@ export function shouldClearSession(status: number | undefined, body: unknown): b
  * 这里用 naive-ui 离散 API 全局弹一次提示——调用方各自的错误处理仍会照常执行，
  * 对没有接 reportErrorToast 的调用点（如工具型页面）这是唯一可见出口。
  */
-let quotaMessageApi: ReturnType<typeof createDiscreteApi>['message'] | null = null
+let quotaNotifyApi: ReturnType<typeof createDiscreteApi>['notification'] | null = null
 let quotaToastAt = 0
 
 function notifyQuotaExceeded(): void {
   const now = Date.now()
   if (now - quotaToastAt < 3000) return // 批量调用（如导入逐行分类）只弹一次
   quotaToastAt = now
-  if (!quotaMessageApi) {
-    quotaMessageApi = createDiscreteApi(['message']).message
+  if (!quotaNotifyApi) {
+    quotaNotifyApi = createDiscreteApi(['notification']).notification
   }
-  quotaMessageApi.error('AI 额度已用完，请升级套餐或等待下期恢复', { duration: 5000 })
+  const handle = quotaNotifyApi.error({
+    title: '本月体验额度已用完',
+    content: '免费体验版每月 10 万 Token 已耗尽，升级云端标准版即可畅用并获注册会计师 1 对 1 旧账导入。',
+    duration: 8000,
+    action: () =>
+      h(
+        NButton,
+        {
+          type: 'primary',
+          size: 'small',
+          onClick: () => {
+            handle.destroy()
+            window.location.assign('/mine/plan?plan=standard')
+          },
+        },
+        { default: () => '去升级套餐' },
+      ),
+  })
 }
 
 apiClient.interceptors.response.use(

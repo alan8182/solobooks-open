@@ -67,6 +67,26 @@ describe('opening balance Excel import and matching', () => {
     expect(cashAcc?.debit_balance).toBe(5000)
   })
 
+  // 回归：旧账套 2221021 是「应交个人所得税」，本系统 2221021 是「待转销项税额」。
+  // 科目码撞名但同族存在精确同名科目时，不能被科目码带偏。
+  it('prefers an exact same-name account over a colliding code in the same family', () => {
+    const accounts = [
+      { account_code: '2221012', account_name: '应交个人所得税' },
+      { account_code: '2221021', account_name: '待转销项税额' },
+      { account_code: '5602001', account_name: '办公费' },
+      { account_code: '6602001', account_name: '销售费用-其他' },
+    ]
+    const rows = [
+      { '科目代码': '2221021', '科目名称': '应交个人所得税', '期初贷方': '457.40' },
+      { '科目代码': '6602001', '科目名称': '办公费', '期初借方': '100.00' },
+    ]
+    const result = parseOpeningRows(rows, accounts)
+    expect(result.items.find(i => i.credit_balance === 457.4)?.account_code).toBe('2221012')
+    // 同名但不同族时不改道，仍按科目码落 6602001
+    expect(result.items.some(i => i.account_code === '6602001')).toBe(true)
+    expect(result.items.some(i => i.account_code === '5602001')).toBe(false)
+  })
+
   it('handles direction + single amount column pattern', () => {
     const rows = [
       { '代码': '1002', '名称': '银行存款', '方向': '借', '余额': '20000' },
@@ -227,6 +247,72 @@ describe('opening balance Excel import and matching', () => {
     expect(child?.credit_balance).toBe(3000)
     expect(result.totalCredit).toBe(3000)
     expect(result.isBalanced).toBe(true)
+  })
+
+  // 根因回归：导入弹窗只给汇总数时，财务无法回答「系统到底读了我表里的哪几列、
+  // 哪一行被跳过」。原表快照必须逐行保留源金额与处理结果，且不能把被去重的
+  // 层级行悄悄藏掉。
+  it('exposes the original table rows and detected columns for preview', () => {
+    const rows = [
+      {
+        '科目编码': '1002', '科目名称': '银行存款',
+        '期末余额借方': '12,265.09', '期末余额贷方': '0.00',
+        '本年累计发生额借方': '158,900.42', '本年累计发生额贷方': '164,963.04',
+      },
+      {
+        '科目编码': '1002004', '科目名称': '银行存款-招商银行5719',
+        '期末余额借方': '12,265.09', '期末余额贷方': '0.00',
+        '本年累计发生额借方': '158,900.42', '本年累计发生额贷方': '164,963.04',
+      },
+      {
+        '科目编码': '3001', '科目名称': '实收资本',
+        '期末余额借方': '0.00', '期末余额贷方': '12,265.09',
+        '本年累计发生额借方': '0.00', '本年累计发生额贷方': '0.00',
+      },
+      {
+        '科目编码': '合计', '科目名称': '',
+        '期末余额借方': '12,265.09', '期末余额贷方': '12,265.09',
+        '本年累计发生额借方': '158,900.42', '本年累计发生额贷方': '164,963.04',
+      },
+    ]
+
+    const result = parseOpeningRows(rows, mockExistingAccounts)
+    expect(result.columns).toMatchObject({
+      code: '科目编码',
+      name: '科目名称',
+      endingDebit: '期末余额借方',
+      endingCredit: '期末余额贷方',
+      ytdDebit: '本年累计发生额借方',
+      ytdCredit: '本年累计发生额贷方',
+    })
+
+    const byCode = Object.fromEntries((result.previewRows || []).map(r => [r.original_code, r]))
+    expect(byCode['1002']).toMatchObject({
+      status: 'matched',
+      target_code: '1002',
+      ending_debit: 12265.09,
+      ending_credit: 0,
+      ytd_debit: 158900.42,
+      ytd_credit: 164963.04,
+    })
+    // 期末 12,265.09 − 本年净发生 −6,062.62 = 年初 18,327.71
+    expect(byCode['1002'].year_start_debit).toBeCloseTo(18327.71, 2)
+    expect(byCode['1002004'].status).toBe('skipped_rollup')
+    expect(byCode['合计'].status).toBe('skipped_total')
+    // 原表快照保留源金额，不做借贷冲抵；合计行也在，方便逐行对回原表
+    expect(result.previewRows?.length).toBe(4)
+  })
+
+  it('keeps missing amount groups as null in the preview instead of pretending they are zero', () => {
+    const rows = [
+      { '科目代码': '9999', '科目名称': '历史往来户', '期初余额借方': '500' },
+    ]
+    const result = parseOpeningRows(rows, mockExistingAccounts)
+    const row = result.previewRows?.[0]
+    expect(row?.status).toBe('unmatched')
+    expect(row?.ending_debit).toBe(500)
+    expect(row?.ytd_debit).toBeNull()
+    expect(row?.year_start_debit).toBeNull()
   })
 
   // 根因回归（规则三）：上级匹配不上系统科目（如容器科目 2211 应付职工薪酬，
@@ -417,6 +503,62 @@ describe('opening balance Excel import and matching', () => {
     expect(result.warnings.some(w => w.includes('已跳过 1 行冗余层级科目行'))).toBe(true)
   })
 
+  // 3 月成立的公司，余额表只有「本期发生额」（3-5 月）。起期确认后才能把它当
+  // 本年累计；否则损益累计会丢，利润表 1-5 月又是 0。
+  it('uses 本期发生额 as YTD only when the statement starts at the expected month', () => {
+    const accounts = [
+      ...mockExistingAccounts,
+      { account_code: '5601', account_name: '销售费用' },
+    ]
+    const wb = XLSX.utils.book_new()
+    const ws = XLSX.utils.aoa_to_sheet([
+      ['科目余额表', '', '', '', '', '', '', ''],
+      ['', '', '期间：2026年03月-2026年05月', '', '', '', '', ''],
+      ['科目编码', '科目名称', '期初余额', '', '本期发生额', '', '期末余额', ''],
+      ['', '', '借方', '贷方', '借方', '贷方', '借方', '贷方'],
+      ['1002', '银行存款', '', '', '5,000.00', '1,404.50', '3,595.50', ''],
+      ['3001', '实收资本', '', '', '', '5,000.00', '', '5,000.00'],
+      ['5601', '销售费用', '', '', '21,841.62', '21,841.62', '', ''],
+    ])
+    XLSX.utils.book_append_sheet(wb, ws, '科目余额表')
+
+    const gated = parseOpeningWorkbook(wb, accounts, undefined, {
+      expectedStart: { year: 2026, month: 3 },
+    })
+    expect(gated.columns?.ytdDebit).toBe('本期发生额借方')
+    expect(gated.ytdItems.find(i => i.account_code === '5601')?.debit_balance).toBe(21841.62)
+    expect(gated.yearStartSource).toBe('derived')
+
+    const ungated = parseOpeningWorkbook(wb, accounts)
+    expect(ungated.columns?.ytdDebit).toBeUndefined()
+    expect(
+      ungated.ytdItems.some(i => (i.debit_balance || 0) > 0 || (i.credit_balance || 0) > 0),
+    ).toBe(false)
+    expect(ungated.yearStartSource).toBeNull()
+  })
+
+  it('keeps 本期发生额 out of YTD unless the caller confirms the start period', () => {
+    const rows = [
+      {
+        '科目编码': '5601',
+        '科目名称': '销售费用',
+        '本期发生额借方': '100.00',
+        '本期发生额贷方': '0.00',
+        '期末余额借方': '0.00',
+        '期末余额贷方': '0.00',
+      },
+    ]
+    const accounts = [{ account_code: '5601', account_name: '销售费用' }]
+    expect(
+      parseOpeningRows(rows, accounts, undefined, { movementAsYtd: true })
+        .ytdItems.find(i => i.account_code === '5601')?.debit_balance,
+    ).toBe(100)
+    expect(
+      parseOpeningRows(rows, accounts).ytdItems
+        .some(i => (i.debit_balance || 0) > 0 || (i.credit_balance || 0) > 0),
+    ).toBe(false)
+  })
+
   // 回归：2241 下既有往来单位明细，又有不挂单位的公积金明细。上级合计行
   // 已被层级去重跳过，剩下的公积金明细却被拿去和客商行「对账」，弹窗误报
   // 「科目 2241 的合计行金额与往来单位明细行之和不一致」。
@@ -467,6 +609,7 @@ describe('mapping suggestions from legacy account names', () => {
     { account_code: '222100105', account_name: '销项税额' },
     { account_code: '2221006', account_name: '应交所得税' },
     { account_code: '2221008', account_name: '应交城市维护建设税' },
+    { account_code: '5301', account_name: '营业外收入' },
     { account_code: '5602014', account_name: '管理费用-职工福利费' },
     { account_code: '5602015', account_name: '管理费用-信息技术服务费' },
     { account_code: '5602016', account_name: '管理费用-单位社保' },
@@ -498,6 +641,19 @@ describe('mapping suggestions from legacy account names', () => {
   it('maps welfare and tech-service expense leaves to the standard chart', () => {
     expect(suggestMappingTarget('5602038', '管理费用-员工福利费', chartLeaves)).toBe('5602014')
     expect(suggestMappingTarget('5602028', '管理费用-技术服务费', chartLeaves)).toBe('5602015')
+  })
+
+  // 回归：标准科目表只有营业外收入的具名明细（5301001～5301004），
+  // 旧账套的「营业外收入-其他」匹配不上时会被当成未匹配损益行静默丢弃，
+  // 必须兜底到一级 5301。父级与具名子级同时存在时仍要选中 5301 本身。
+  it('falls back bare 营业外收入-其他 to the 5301 parent', () => {
+    const withNamedChildren = [
+      ...chartLeaves,
+      { account_code: '5301002', account_name: '营业外收入-政府补助' },
+      { account_code: '5301004', account_name: '营业外收入-盘盈收益' },
+    ]
+    expect(suggestMappingTarget('5301012', '营业外收入-其他', withNamedChildren)).toBe('5301')
+    expect(suggestMappingTarget('5301012', '营业外收入-其他收入', withNamedChildren)).toBe('5301')
   })
 
   it('maps income tax by name even when the legacy code differs', () => {
@@ -677,6 +833,71 @@ describe('opening statement period detection and validation', () => {
       expect(describeExpectedPeriod(check.expected)).toBe('2026-01 ～ 2026-05')
     }
     expect(describeExpectedPeriod(expectedOpeningPeriod(2026, '01'))).toBe('2025-12 月末')
+  })
+
+  // 回归：3 月成立的公司被「必须从 1 月起」的规则挡住，财务无法导入 3-5 月余额表
+  it('accepts a statement starting at the company inception month', () => {
+    const period = { startYear: 2026, startMonth: 3, endYear: 2026, endMonth: 5, label: '' }
+    expect(checkOpeningPeriod(period, 2026, '06', '2026-03-01').ok).toBe(true)
+    expect(describeExpectedPeriod(expectedOpeningPeriod(2026, '06', '2026-03-01')))
+      .toBe('2026-03 ～ 2026-05')
+  })
+
+  // 回归：主体档案只填了启用日期 6 月，不能把 6 月当成立月；成立日期 3 月单独填
+  it('prefers the incorporation date over the book start date', () => {
+    const period = { startYear: 2026, startMonth: 3, endYear: 2026, endMonth: 5, label: '' }
+    expect(expectedOpeningPeriod(2026, '06', '2026-06-01', '2026-03-15')).toMatchObject({
+      startYear: 2026,
+      startMonth: 3,
+      endYear: 2026,
+      endMonth: 5,
+      zeroOpening: false,
+    })
+    expect(checkOpeningPeriod(period, 2026, '06', '2026-06-01', '2026-03-15').ok).toBe(true)
+  })
+
+  it('falls back to the book start date and asks for the incorporation date when missing', () => {
+    expect(expectedOpeningPeriod(2026, '06', '2026-06-01').zeroOpening).toBe(true)
+    const check = checkOpeningPeriod(null, 2026, '06', '2026-06-01')
+    expect(check.ok).toBe(false)
+    if (!check.ok) {
+      expect(check.reason).toBe('zero_opening')
+      expect(check.message).toContain('账套 2026-06 启用')
+      expect(check.message).toContain('补填公司成立日期')
+    }
+  })
+
+  it('rejects a statement starting later than the company inception month', () => {
+    const period = { startYear: 2026, startMonth: 4, endYear: 2026, endMonth: 5, label: '' }
+    const check = checkOpeningPeriod(period, 2026, '06', '2026-03-01')
+    expect(check.ok).toBe(false)
+    if (!check.ok) expect(check.reason).toBe('start_mismatch')
+  })
+
+  it('treats an opening at or before inception as zero and suggests the next cutover', () => {
+    expect(expectedOpeningPeriod(2026, '03', '2026-03-15').zeroOpening).toBe(true)
+    expect(describeExpectedPeriod(expectedOpeningPeriod(2026, '03', '2026-03-15')))
+      .toContain('无需期初余额')
+
+    const period = { startYear: 2026, startMonth: 3, endYear: 2026, endMonth: 5, label: '' }
+    const check = checkOpeningPeriod(period, 2026, '03', '2026-03-15')
+    expect(check.ok).toBe(false)
+    if (!check.ok) {
+      expect(check.reason).toBe('zero_opening')
+      expect(check.message).toContain('2026-06')
+    }
+  })
+
+  it('keeps the prior-December cutoff for January starts and starts options at inception', () => {
+    const expected = expectedOpeningPeriod(2026, '01', '2025-03-01')
+    expect(expected).toMatchObject({
+      startYear: 2025,
+      startMonth: 3,
+      endYear: 2025,
+      endMonth: 12,
+      zeroOpening: false,
+    })
+    expect(describeExpectedPeriod(expected)).toBe('2025-12 月末')
   })
 
   it('exports ending-balance column names in the opening template', () => {

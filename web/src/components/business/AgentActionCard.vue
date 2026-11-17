@@ -87,6 +87,7 @@ const companyForm = reactive({
   type: String(payload.value.type || '有限责任公司'),
   taxpayerType: String(payload.value.taxpayerType || '小规模纳税人'),
   startDate: String(payload.value.startDate || ''),
+  incorporationDate: String(payload.value.incorporationDate || ''),
   industry: String(payload.value.industry || ''),
   vatFilingCycle: String(payload.value.vatFilingCycle || 'quarter'),
 })
@@ -305,6 +306,11 @@ async function approveSingle() {
       message.warning('统一社会信用代码格式不正确（15/17/18/20 位字母数字）')
       return
     }
+    if (companyForm.incorporationDate.trim() && companyForm.startDate.trim()
+      && companyForm.incorporationDate.trim() > companyForm.startDate.trim()) {
+      message.warning('公司成立日期不能晚于账套启用日期')
+      return
+    }
     return doApprove({
       edits: {
         '0': {
@@ -314,6 +320,7 @@ async function approveSingle() {
           type: companyForm.type,
           taxpayerType: companyForm.taxpayerType,
           startDate: companyForm.startDate.trim(),
+          incorporationDate: companyForm.incorporationDate.trim(),
           industry: companyForm.industry.trim(),
           vatFilingCycle: companyForm.vatFilingCycle,
         },
@@ -540,6 +547,16 @@ const approveText = computed(() => {
             placeholder="YYYY-MM-DD"
           />
           <span v-else class="field-value">{{ companyForm.startDate || '—' }}</span>
+        </div>
+        <div class="field">
+          <span class="field-label">公司成立日期（选填）</span>
+          <NInput
+            v-if="local.status === 'pending'"
+            v-model:value="companyForm.incorporationDate"
+            size="tiny"
+            placeholder="营业执照日期 YYYY-MM-DD"
+          />
+          <span v-else class="field-value">{{ companyForm.incorporationDate || '—' }}</span>
         </div>
         <div class="field field-span-2">
           <span class="field-label">公司全称（必填）</span>

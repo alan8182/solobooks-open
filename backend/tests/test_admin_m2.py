@@ -252,3 +252,98 @@ def test_companies_list(client):
         assert [c["companyId"] for c in body["items"]] == ["c-m2"]
     finally:
         _cleanup()
+
+
+def test_admin_patch_user_plan_and_clears_quota_cache(client, monkeypatch):
+    """管理员手工开单切套餐：校验入参、立即失效配额缓存并写入审计日志。"""
+    import config
+    from services import quota_service
+
+    monkeypatch.setattr(config, "QUOTA_ENFORCEMENT_ENABLED", True)
+    _seed_users()
+    _seed_companies()  # 使 u-normal 在 company c-m2 中为 active 成员，便于 /api/usage/me 查询
+    quota_service.clear_state_cache()
+    try:
+        # 1. 用户列表包含默认套餐字段
+        list_resp = client.get("/api/admin/users", params={"query": "u-normal"}, headers=_headers("u-admin"))
+        assert list_resp.status_code == 200
+        normal = next(u for u in list_resp.json()["items"] if u["userId"] == "u-normal")
+        assert normal["planCode"] == "trial"
+        assert normal["planName"] == "免费体验版"
+        assert normal["quotaBonusTokens"] == 0
+
+        # 2. 先触发一次配额查询填充 30s 缓存
+        u_headers = create_access_token({"sub": "u-normal", "company_id": "c-m2"})
+        me_before = client.get("/api/usage/me", headers={"Authorization": f"Bearer {u_headers}"})
+        assert me_before.status_code == 200
+        assert me_before.json()["quota"]["planCode"] == "trial"
+        assert me_before.json()["quota"]["limitTokens"] == 100_000
+        # 调一次 ensure_within_quota 填充 _STATE_CACHE
+        quota_service.ensure_within_quota("u-normal")
+
+        # 3. 管理员手动开单升级到云端标准版 + 锚点日 + 赠送额度
+        patch_resp = client.patch(
+            "/api/admin/users/u-normal",
+            json={"planCode": "standard", "planAnchorAt": "2026-11-13", "quotaBonusTokens": 50000},
+            headers=_headers("u-admin"),
+        )
+        assert patch_resp.status_code == 200
+        body = patch_resp.json()
+        assert body["changed"] == ["change_plan", "update_quota_bonus"]
+        assert body["user"]["planCode"] == "standard"
+        assert body["user"]["planName"] == "云端标准版"
+        assert body["user"]["planAnchorAt"] == "2026-11-13"
+        assert body["user"]["quotaBonusTokens"] == 50000
+
+        # 4. 缓存已立即清空，用户端立刻拿到新套餐与年付 500 万额度
+        me_after = client.get("/api/usage/me", headers={"Authorization": f"Bearer {u_headers}"})
+        assert me_after.status_code == 200
+        assert me_after.json()["quota"]["planCode"] == "standard"
+        assert me_after.json()["quota"]["periodType"] == "annual"
+        assert me_after.json()["quota"]["limitTokens"] == 5_000_000
+        assert me_after.json()["quota"]["maxCompanies"] == 3
+        assert me_after.json()["quota"]["bonusTokens"] == 50000
+
+        # 5. 支持清空锚点日期
+        clear_resp = client.patch(
+            "/api/admin/users/u-normal",
+            json={"planAnchorAt": ""},
+            headers=_headers("u-admin"),
+        )
+        assert clear_resp.status_code == 200
+        assert clear_resp.json()["user"]["planAnchorAt"] == ""
+
+        # 6. 非法输入 422 拦截
+        assert (
+            client.patch(
+                "/api/admin/users/u-normal",
+                json={"planCode": "nonexistent"},
+                headers=_headers("u-admin"),
+            ).status_code
+            == 422
+        )
+        assert (
+            client.patch(
+                "/api/admin/users/u-normal",
+                json={"planAnchorAt": "not-a-date"},
+                headers=_headers("u-admin"),
+            ).status_code
+            == 422
+        )
+        assert (
+            client.patch(
+                "/api/admin/users/u-normal",
+                json={"quotaBonusTokens": -100},
+                headers=_headers("u-admin"),
+            ).status_code
+            == 422
+        )
+
+        # 7. 审计日志留痕
+        logs = client.get("/api/admin/audit-logs", headers=_headers("u-admin")).json()["items"]
+        plan_log = next(log for log in logs if log["action"] == "change_plan" and log["targetId"] == "u-normal")
+        assert plan_log["detail"]["after"]["planCode"] in ("standard", "")
+        assert any(log["action"] == "update_quota_bonus" and log["targetId"] == "u-normal" for log in logs)
+    finally:
+        quota_service.clear_state_cache()
+        _cleanup()

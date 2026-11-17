@@ -1,6 +1,7 @@
 {
   "mcpServers": {
     "solobooks": {
+      "type": "http",
       "url": "https://solobooks.cn/mcp",
       "headers": {
         "Authorization": "Bearer ${SOLOBOOKS_ACCOUNTING_TOKEN}"

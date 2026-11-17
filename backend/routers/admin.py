@@ -20,9 +20,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select, text
 
 from config import LLM_PRICE_TABLE
+from core.plans import PLAN_CATALOG, get_plan
 from db.models import AgentAction, AuthUser, Company, CompanyMember, IndustryTemplate, JournalEntry, LlmUsage
 from db.session import session_scope
 from deps.auth import AuthContext, require_admin
+from services import quota_service
 from services.industry_template_service import (
     IndustryTemplateValues,
     create_template,
@@ -68,6 +70,11 @@ async def admin_overview(admin: AuthContext = Depends(require_admin)):
 
     async with session_scope() as session:
         db_ok = (await session.execute(text("SELECT 1"))).scalar() == 1
+        operator_row = (
+            await session.execute(
+                select(AuthUser.nickname, AuthUser.phone).where(AuthUser.user_id == admin.user_id)
+            )
+        ).first()
         user_total = (
             await session.execute(select(func.count()).select_from(AuthUser))
         ).scalar() or 0
@@ -132,7 +139,11 @@ async def admin_overview(admin: AuthContext = Depends(require_admin)):
         )
 
     return {
-        "operator": {"userId": admin.user_id},
+        "operator": {
+            "userId": admin.user_id,
+            "nickname": (operator_row[0] if operator_row else "") or "",
+            "phone": (operator_row[1] if operator_row else "") or "",
+        },
         "database": {
             "ok": db_ok,
             "engine": "sqlite" if os.getenv("ACCOUNTING_TEST_MODE") == "1" else "postgresql",
@@ -304,6 +315,10 @@ class AdminUserPatchRequest(BaseModel):
 
     is_disabled: Optional[bool] = Field(None, alias="isDisabled")
     is_platform_admin: Optional[bool] = Field(None, alias="isPlatformAdmin")
+    plan_code: Optional[str] = Field(None, alias="planCode")
+    plan_anchor_at: Optional[str] = Field(None, alias="planAnchorAt")
+    plan_expires_at: Optional[str] = Field(None, alias="planExpiresAt")
+    quota_bonus_tokens: Optional[int] = Field(None, alias="quotaBonusTokens")
 
 
 async def _write_audit_log(
@@ -408,12 +423,17 @@ async def admin_update_industry_template(
 
 
 def _user_summary(user: AuthUser, company_count: int = 0, roles: Optional[list] = None) -> dict:
+    plan = get_plan(getattr(user, "plan_code", None))
     return {
         "userId": user.user_id,
         "nickname": user.nickname or "",
         "phone": user.phone or "",
         "isPlatformAdmin": bool(user.is_platform_admin),
         "isDisabled": bool(user.is_disabled),
+        "planCode": plan.code,
+        "planName": plan.name,
+        "planAnchorAt": user.plan_anchor_at or "",
+        "quotaBonusTokens": int(getattr(user, "quota_bonus_tokens", 0) or 0),
         "companyCount": company_count,
         "roles": roles or [],
         "createdAt": user.created_at,
@@ -479,20 +499,57 @@ async def admin_patch_user(
     req: AdminUserPatchRequest,
     admin: AuthContext = Depends(require_admin),
 ):
-    """禁用/启用用户、授予/撤销平台管理员（禁用即时生效：require_auth 每请求查库）。
+    """禁用/启用用户、授予/撤销平台管理员、切换商业套餐/锚点日期/赠送额度。
 
-    禁止管理员修改自己的标记，避免自锁。
+    禁止管理员修改自己的禁用/管理员标记，避免自锁。
     """
     if user_id == admin.user_id and (req.is_disabled is not None or req.is_platform_admin is not None):
         raise HTTPException(status_code=422, detail="不能修改自己的管理状态，请由其他管理员操作")
+
+    anchor_provided = "plan_anchor_at" in req.model_fields_set
+    anchor_to_set: Optional[str] = None
+    if anchor_provided:
+        raw_anchor = (req.plan_anchor_at or "").strip()
+        if raw_anchor:
+            parsed_anchor = quota_service.parse_iso_date(raw_anchor)
+            if parsed_anchor is None:
+                raise HTTPException(status_code=422, detail="planAnchorAt 日期格式无效，应为 YYYY-MM-DD")
+            anchor_to_set = parsed_anchor.isoformat()
+        else:
+            anchor_to_set = None
+
+    expires_provided = "plan_expires_at" in req.model_fields_set
+    expires_to_set: Optional[str] = None
+    if expires_provided:
+        raw_expires = (req.plan_expires_at or "").strip()
+        if raw_expires:
+            parsed_expires = quota_service.parse_iso_date(raw_expires)
+            if parsed_expires is None:
+                raise HTTPException(status_code=422, detail="planExpiresAt 日期格式无效，应为 YYYY-MM-DD")
+            expires_to_set = parsed_expires.isoformat()
+        else:
+            expires_to_set = None
+
+    if req.plan_code is not None and req.plan_code not in PLAN_CATALOG:
+        raise HTTPException(status_code=422, detail=f"无效套餐编码: {req.plan_code}")
+    if req.quota_bonus_tokens is not None and req.quota_bonus_tokens < 0:
+        raise HTTPException(status_code=422, detail="赠送额度不能为负数")
 
     actions = []
     if req.is_disabled is not None:
         actions.append("disable_user" if req.is_disabled else "enable_user")
     if req.is_platform_admin is not None:
         actions.append("grant_admin" if req.is_platform_admin else "revoke_admin")
+    if req.plan_code is not None or anchor_provided or expires_provided:
+        actions.append("change_plan")
+    if req.quota_bonus_tokens is not None:
+        actions.append("update_quota_bonus")
     if not actions:
         raise HTTPException(status_code=422, detail="未提供任何要修改的字段")
+
+    plan_touched = (
+        req.plan_code is not None or anchor_provided or expires_provided or req.quota_bonus_tokens is not None
+    )
 
     async with session_scope() as session:
         user = (
@@ -500,12 +557,38 @@ async def admin_patch_user(
         ).scalar_one_or_none()
         if user is None:
             raise HTTPException(status_code=404, detail="用户不存在")
-        before = {"isDisabled": bool(user.is_disabled), "isPlatformAdmin": bool(user.is_platform_admin)}
+        before = {
+            "isDisabled": bool(user.is_disabled),
+            "isPlatformAdmin": bool(user.is_platform_admin),
+            "planCode": getattr(user, "plan_code", None) or "trial",
+            "planAnchorAt": user.plan_anchor_at or "",
+            "planExpiresAt": user.plan_expires_at or "",
+            "quotaBonusTokens": int(getattr(user, "quota_bonus_tokens", 0) or 0),
+        }
         if req.is_disabled is not None:
             user.is_disabled = req.is_disabled
         if req.is_platform_admin is not None:
             user.is_platform_admin = req.is_platform_admin
-        after = {"isDisabled": bool(user.is_disabled), "isPlatformAdmin": bool(user.is_platform_admin)}
+        if req.plan_code is not None:
+            user.plan_code = req.plan_code
+        if anchor_provided:
+            user.plan_anchor_at = anchor_to_set
+        if expires_provided:
+            user.plan_expires_at = expires_to_set
+        if req.quota_bonus_tokens is not None:
+            user.quota_bonus_tokens = req.quota_bonus_tokens
+        after = {
+            "isDisabled": bool(user.is_disabled),
+            "isPlatformAdmin": bool(user.is_platform_admin),
+            "planCode": getattr(user, "plan_code", None) or "trial",
+            "planAnchorAt": user.plan_anchor_at or "",
+            "planExpiresAt": user.plan_expires_at or "",
+            "quotaBonusTokens": int(getattr(user, "quota_bonus_tokens", 0) or 0),
+        }
+
+    if plan_touched:
+        # 套餐/锚点/加量变更需立即失效 30s 配额缓存，保证用户端与卡口即时生效
+        quota_service.clear_state_cache()
 
     for action in actions:
         await _write_audit_log(

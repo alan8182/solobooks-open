@@ -11,17 +11,29 @@ import { lazyShell } from '@/pages/layout/lazyShell'
 
 export const routes: RouteRecordRaw[] = [
   {
+    // 官网首页（「点一点、问一问」驻场 AI 财务官叙事），匿名根路径同屏渲染。
     path: '/landing',
     name: 'Landing',
     component: () => import('@/pages/landing/index.vue'),
     meta: { requiresAuth: false },
   },
   {
-    // 升维版官网首页（科技小微 × 驻场 AI 财务官「点一点、问一问」叙事），
-    // 与 /landing 原版并存做对比验收；原版首页保持不动。
+    // 旧版官网首页保留可访问，不再作为对外主入口；内容与首页重复，SEO noindex。
+    path: '/landing-old',
+    name: 'LandingOld',
+    component: () => import('@/pages/landing/legacy.vue'),
+    meta: { requiresAuth: false },
+  },
+  {
+    // 旧对比验收地址：v2 已转正为官网首页，外链与书签统一 301 到根路径。
     path: '/landing-v2',
-    name: 'LandingV2',
-    component: () => import('@/pages/landing/v2.vue'),
+    redirect: '/',
+  },
+  {
+    // 免费财务软件专题页：承接「免费财务软件 / 自托管 / 一人公司」搜索意图（SEO/GEO P0）
+    path: '/free',
+    name: 'FreeSoftware',
+    component: () => import('@/pages/free/index.vue'),
     meta: { requiresAuth: false },
   },
   {
@@ -397,6 +409,11 @@ export const routes: RouteRecordRaw[] = [
         path: 'mine',
         name: 'Mine',
         component: () => import('@/pages/mine/index.vue'),
+      },
+      {
+        path: 'mine/plan',
+        name: 'PlanSubscription',
+        component: () => import('@/pages/mine/plan.vue'),
       },
       {
         path: 'mine/companies',

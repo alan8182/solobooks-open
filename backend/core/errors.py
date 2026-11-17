@@ -44,6 +44,15 @@ class QuotaExceededError(AccountingError):
     status_code: int = 402
 
 
+@dataclass
+class CompanyLimitExceededError(AccountingError):
+    """名下账套数量超出当前套餐上限（403 Forbidden）。"""
+
+    code: str = "COMPANY_LIMIT_EXCEEDED"
+    message: str = "当前套餐最多支持 3 个账套；未来将面向代账机构开放更多账套方案"
+    status_code: int = 403
+
+
 PERIOD_CLOSED = "PERIOD_CLOSED"
 CLOSING_SNAPSHOT_STALE = "CLOSING_SNAPSHOT_STALE"
 PERIOD_BEFORE_BOOK_START = "PERIOD_BEFORE_BOOK_START"

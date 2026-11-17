@@ -15,6 +15,9 @@ import type {
   IncomeStatementViewMode,
   IncomeStatementBasis,
   ComparisonResponse,
+  CashForecastResponse,
+  CashForecastConfig,
+  BusinessAttributionResponse,
 } from './types'
 
 export function getMonthlyReport(
@@ -115,4 +118,27 @@ export function getComparison(
 
 export function getAIDiagnosis(month: string): Promise<any> {
   return apiClient.post('/api/report/ai-diagnosis', { month })
+}
+
+export function getCashForecast(
+  as_of = '',
+  horizon_days = 60,
+  scenario: 'neutral' | 'optimistic' | 'pessimistic' = 'neutral',
+): Promise<CashForecastResponse> {
+  return apiClient.post('/api/report/cash-forecast', { as_of, horizon_days, scenario })
+}
+
+export function getCashForecastConfig(): Promise<CashForecastConfig> {
+  return apiClient.get('/api/report/cash-forecast-config')
+}
+
+export function updateCashForecastConfig(config: Partial<CashForecastConfig>): Promise<CashForecastConfig> {
+  return apiClient.put('/api/report/cash-forecast-config', config)
+}
+
+export function getBusinessAttribution(
+  base_month: string,
+  compare_mode: 'mom' | 'yoy' = 'mom',
+): Promise<BusinessAttributionResponse> {
+  return apiClient.post('/api/report/attribution', { base_month, compare_mode })
 }

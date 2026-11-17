@@ -110,6 +110,8 @@ from routers.audit_share import owner_router as audit_share_owner_router
 from routers.audit_share import public_router as audit_share_public_router
 from routers.health_scan import router as health_scan_router
 from routers.mailbox import router as mailbox_router
+from routers.billing import owner_router as billing_owner_router
+from routers.billing import public_router as billing_public_router
 
 app.include_router(record_router)
 app.include_router(copilot_router)
@@ -151,6 +153,9 @@ app.include_router(audit_share_owner_router)
 app.include_router(audit_share_public_router)
 app.include_router(health_scan_router)
 app.include_router(mailbox_router)
+# 平台自营收款：公开回调路由（/api/billing/alipay/*）也必须注册在 MCP 兜底 mount 之前
+app.include_router(billing_owner_router)
+app.include_router(billing_public_router)
 
 
 @app.middleware("http")

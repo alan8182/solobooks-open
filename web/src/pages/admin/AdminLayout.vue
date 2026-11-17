@@ -14,10 +14,12 @@ import {
   type MenuOption,
 } from 'naive-ui'
 import { useAdminStore } from '@/stores/admin'
+import { useAuthStore } from '@/stores/auth'
 
 const route = useRoute()
 const router = useRouter()
 const adminStore = useAdminStore()
+const authStore = useAuthStore()
 
 const collapsed = ref(false)
 const refreshing = ref(false)
@@ -74,6 +76,13 @@ const pageTitles: Record<string, string> = {
 
 const pageTitle = computed(() => pageTitles[route.path] ?? '平台控制台')
 
+const operatorLabel = computed(() => {
+  const op = adminStore.operator
+  if (!op) return ''
+  if (op.nickname && op.phone) return `${op.nickname} · ${op.phone}`
+  return op.nickname || op.phone || op.userId
+})
+
 function onMenuSelect(key: string | number) {
   void router.push(String(key))
 }
@@ -90,6 +99,15 @@ async function handleRefresh() {
 
 function backToApp() {
   void router.push('/')
+}
+
+function switchAdminAccount() {
+  authStore.logout()
+  adminStore.reset()
+  void router.replace({
+    path: '/login',
+    query: { redirect: route.fullPath || '/console' },
+  })
 }
 
 onMounted(() => {
@@ -118,7 +136,7 @@ onBeforeUnmount(() => {
     >
       <div class="admin-brand" :class="{ collapsed }" @click="backToApp">
         <div class="admin-brand-icon">
-          <i class="ri-shield-star-line" />
+          <img src="/solo-logo.png" alt="梭罗记账" />
         </div>
         <div class="admin-brand-text">
           <strong>梭罗记账管理台</strong>
@@ -212,10 +230,15 @@ onBeforeUnmount(() => {
           </NButton>
 
           <!-- 操作者身份 -->
-          <div v-if="adminStore.operator" class="admin-operator-badge">
-            <i class="ri-admin-line" />
-            <span>{{ adminStore.operator.userId }}</span>
-          </div>
+          <NTooltip v-if="adminStore.operator" trigger="hover">
+            <template #trigger>
+              <div class="admin-operator-badge">
+                <i class="ri-admin-line" />
+                <span>{{ operatorLabel }}</span>
+              </div>
+            </template>
+            用户 ID：{{ adminStore.operator.userId }}
+          </NTooltip>
 
           <!-- 快速返回工作台 -->
           <NButton size="small" tertiary class="admin-exit-btn" @click="backToApp">
@@ -239,10 +262,13 @@ onBeforeUnmount(() => {
           <NResult
             status="403"
             title="无管理控制台访问权限"
-            description="当前账号未开启平台管理员权限（is_platform_admin = false）。如需访问，请联系运维团队授权。"
+            description="当前账号未开启平台管理员权限（is_platform_admin = false）。如需访问，请切换管理员账号或联系运维团队授权。"
           >
             <template #footer>
-              <NButton type="primary" @click="backToApp">返回业务工作台</NButton>
+              <div class="admin-result-actions">
+                <NButton type="primary" @click="switchAdminAccount">切换管理员账号</NButton>
+                <NButton @click="backToApp">返回业务工作台</NButton>
+              </div>
             </template>
           </NResult>
         </div>
@@ -293,16 +319,19 @@ onBeforeUnmount(() => {
 }
 
 .admin-brand-icon {
-  width: 36px;
-  height: 36px;
+  width: 34px;
+  height: 34px;
   flex-shrink: 0;
-  border-radius: var(--solo-radius, 8px);
-  background: var(--solo-primary);
-  color: #ffffff;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 19px;
+}
+
+.admin-brand-icon img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
 }
 
 .admin-brand-text {
@@ -524,5 +553,11 @@ onBeforeUnmount(() => {
   margin-top: 14px;
   font-size: 13.5px;
   color: var(--solo-text-muted);
+}
+
+.admin-result-actions {
+  display: flex;
+  justify-content: center;
+  gap: 12px;
 }
 </style>

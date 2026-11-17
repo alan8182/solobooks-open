@@ -129,6 +129,30 @@ RD_DEPARTMENTS = tuple(
     part.strip() for part in os.getenv("RD_DEPARTMENTS", "研发部").split(",") if part.strip()
 )
 
+# ── 支付宝电脑网站支付（收款，docs/alipay-payment-integration.md）────────────
+# 企业自研接入：公钥模式 RSA2（只收款不支出，无需证书加签三件套）。
+# 三项配齐 alipay_enabled() 才为真，未配置时支付路由运行时 503（对齐 ZHIPU_API_KEY 惯例）。
+ALIPAY_APP_ID = os.getenv("ALIPAY_APP_ID", "").strip()
+# 应用私钥：PKCS8 单行 base64 或完整 PEM（\n 转义）均可，alipay_client 会归一化
+ALIPAY_PRIVATE_KEY = os.getenv("ALIPAY_PRIVATE_KEY", "").strip()
+# 支付宝公钥（平台「接口加签方式」配置后由支付宝生成，不是应用公钥）
+ALIPAY_PUBLIC_KEY = os.getenv("ALIPAY_PUBLIC_KEY", "").strip()
+# 生产网关；沙箱联调在 .env 覆盖为 https://openapi-sandbox.dl.alipaydev.com/gateway.do
+ALIPAY_GATEWAY = (
+    os.getenv("ALIPAY_GATEWAY", "").strip() or "https://openapi.alipay.com/gateway.do"
+)
+# 异步通知/同步跳转地址：挂在公网 HTTPS 入口下（宿主 nginx → 容器后端）
+ALIPAY_NOTIFY_URL = f"{APP_PUBLIC_URL}/api/billing/alipay/notify"
+ALIPAY_RETURN_URL = f"{APP_PUBLIC_URL}/api/billing/alipay/return"
+# 订单支付有效期（支付宝 timeout_express 与本地惰性关单共用）
+ALIPAY_ORDER_TIMEOUT = os.getenv("ALIPAY_ORDER_TIMEOUT", "2h")
+
+
+def alipay_enabled() -> bool:
+    """APP_ID/应用私钥/支付宝公钥齐全时支付链路可用。"""
+    return bool(ALIPAY_APP_ID and ALIPAY_PRIVATE_KEY and ALIPAY_PUBLIC_KEY)
+
+
 # ── 邮件单据通道（专属收件地址，catch-all 邮箱 IMAP 拉取）────────────────
 # 邮箱侧是中转站：拉取入库后即删信，长期存储在本地 data/inbox/。
 # 换邮箱服务商只需改这里的 IMAP 配置与 DNS MX 指向，地址码与前端零改动。
@@ -153,3 +177,15 @@ def mail_inbound_enabled() -> bool:
         and MAIL_INBOUND_IMAP_PASSWORD
         and MAIL_INBOUND_DOMAIN
     )
+
+
+# 商业化套餐 Token 额度卡口开关：
+# 开源自部署默认关闭（0），使用用户自有 Key 不受月 10 万体验额度限制；
+# 官方云端 SaaS 在部署环境变量中设 QUOTA_ENFORCEMENT_ENABLED=1 开启体验版月额度控制。
+QUOTA_ENFORCEMENT_ENABLED = os.getenv("QUOTA_ENFORCEMENT_ENABLED", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+

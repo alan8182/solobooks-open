@@ -656,7 +656,7 @@ async def update_company(user_id: str, company_id: str, updates: dict) -> Dict:
 
         previous = dict(company)
         for key in [
-            "name", "type", "taxpayerType", "startDate", "taxId",
+            "name", "type", "taxpayerType", "startDate", "incorporationDate", "taxId",
             "restrictedIndustry", "industry", "industryCode",
             "industryTemplateVersion", "industryTemplateAppliedAt",
             "vatRate", "vatFilingCycle", "businessIncomeIitFilingCycle",

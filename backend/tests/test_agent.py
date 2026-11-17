@@ -536,7 +536,7 @@ async def test_workspace_view_is_injected_into_agent_prompt(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_propose_company_setup_tool():
-    """验证 AI CFO 对话内的主体建账工具。
+    """验证 AI 财务官对话内的主体建账工具。
 
     期初余额曾也在这里：`propose_opening_balance` 让老板口述科目余额、
     对话侧生成期初卡。该路径已整体移除——期初是整张表的事，口述既容易听错
@@ -621,6 +621,7 @@ async def test_company_setup_from_demo_creates_company_and_token():
             "name": "杭州对话建账测试有限公司",
             "taxId": "91330100MA2TEST001",
             "startDate": "2026-11-01",
+            "incorporationDate": "2026-03-15",
         },
         evidence={"created_via": "pytest"},
     )
@@ -634,6 +635,16 @@ async def test_company_setup_from_demo_creates_company_and_token():
     assert result["companyId"] != demo["company_id"]
     token_payload = decode_access_token(result["accessToken"])
     assert token_payload["company_id"] == result["companyId"]
+
+    # 成立日期必须真正落进主体档案，后续期初 YTD 起月才能读到
+    from services.account_service import get_company, update_company
+
+    created = await get_company(result["companyId"])
+    assert created["incorporationDate"] == "2026-03-15"
+    updated = await update_company(
+        user["user_id"], result["companyId"], {"incorporationDate": "2026-04-01"}
+    )
+    assert updated["incorporationDate"] == "2026-04-01"
 
 
 # ---------------------------------------------------------------------------

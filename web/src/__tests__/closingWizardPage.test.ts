@@ -281,7 +281,7 @@ describe('closing wizard unified view', () => {
     const wrapper = mount(ClosingWizard)
     await flushPromises()
 
-    const aiEntry = wrapper.findAll('button').find(button => button.text().includes('AI CFO'))
+    const aiEntry = wrapper.findAll('button').find(button => button.text().includes('AI 财务官'))
     expect(aiEntry).toBeTruthy()
     await aiEntry!.trigger('click')
 

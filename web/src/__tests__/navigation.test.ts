@@ -146,7 +146,16 @@ describe('landing page routing', () => {
       .filter((route) => route.meta?.requiresAuth === false)
       .map((route) => route.path)
     expect(publicPaths).toContain('/landing')
-    expect(publicPaths).toEqual(expect.arrayContaining(['/landing', '/login', '/agreement', '/privacy']))
+    expect(publicPaths).toContain('/free')
+    expect(publicPaths).toEqual(expect.arrayContaining(['/landing', '/free', '/login', '/agreement', '/privacy']))
+  })
+
+  it('keeps the old landing at /landing-old and 301s the retired /landing-v2 to root', () => {
+    const old = routes.find((route) => route.path === '/landing-old')
+    expect(old?.name).toBe('LandingOld')
+    expect(old?.meta?.requiresAuth).toBe(false)
+    expect(routes.some((route) => route.name === 'LandingV2')).toBe(false)
+    expect(routes.find((route) => route.path === '/landing-v2')?.redirect).toBe('/')
   })
 
   it('keeps the workbench root protected while / itself is the public landing', () => {
@@ -179,14 +188,26 @@ describe('auth redirect guard rules', () => {
     expect(resolveAuthRedirect({ path: '/', meta: {} }, null)).toBeNull()
   })
 
-  it('directs unauthenticated protected visits to login', () => {
+  it('directs unauthenticated protected visits to login and preserves deep link redirect', () => {
     expect(resolveAuthRedirect(protectedRoute, null)).toBe('/login')
     expect(resolveAuthRedirect(protectedRoute, '')).toBe('/login')
+    expect(
+      resolveAuthRedirect(
+        { path: '/console/users', fullPath: '/console/users?tab=1', meta: { requiresAuth: true } },
+        null,
+      ),
+    ).toBe('/login?redirect=%2Fconsole%2Fusers%3Ftab%3D1')
   })
 
-  it('lets authenticated users past protected routes but bounces them away from login', () => {
+  it('lets authenticated users past protected routes and honors safe redirect on /login', () => {
     expect(resolveAuthRedirect(protectedRoute, 'token')).toBeNull()
     expect(resolveAuthRedirect({ path: '/login', meta: {} }, 'token')).toBe('/')
+    expect(
+      resolveAuthRedirect({ path: '/login', query: { redirect: '/console/users' }, meta: {} }, 'token'),
+    ).toBe('/console/users')
+    expect(
+      resolveAuthRedirect({ path: '/login', query: { redirect: '//evil.com' }, meta: {} }, 'token'),
+    ).toBe('/')
   })
 
   it('leaves public routes alone in both states', () => {

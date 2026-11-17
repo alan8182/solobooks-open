@@ -20,13 +20,19 @@ import calendar
 import logging
 import threading
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
-from core.errors import QuotaExceededError
-from core.plans import PlanDef, any_limit_configured, get_plan
+import config
+from core.errors import CompanyLimitExceededError, QuotaExceededError
+from core.plans import DEFAULT_PLAN_CODE, PLAN_CATALOG, PlanDef, any_limit_configured, get_plan
 
 logger = logging.getLogger(__name__)
+
+
+def is_quota_enforced() -> bool:
+    """仅当开启商业化额度开关且套餐目录存在限额配置时，才执行卡口拦截。"""
+    return bool(config.QUOTA_ENFORCEMENT_ENABLED and any_limit_configured())
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +84,21 @@ def _anchor_date(user_row: Any, today: date) -> date:
     return anchor
 
 
+def _effective_plan(user_row: Any) -> PlanDef:
+    """当前生效套餐：付费套餐 plan_expires_at 已过期时惰性回落 trial。
+
+    无 cron 的到期收口：读取侧（卡口/用量展示/计数）统一走本函数，
+    到期次日起按 DEFAULT_PLAN_CODE 口径计费与展示。trial/历史编码无到期概念。
+    """
+    plan = get_plan(getattr(user_row, "plan_code", None))
+    if plan.code == DEFAULT_PLAN_CODE:
+        return plan
+    expires = parse_iso_date(getattr(user_row, "plan_expires_at", None))
+    if expires is not None and datetime.now(timezone.utc).date() > expires:
+        return PLAN_CATALOG[DEFAULT_PLAN_CODE]
+    return plan
+
+
 # ---------------------------------------------------------------------------
 # 周期计数（随 llm_usage 埋点同事务 upsert；dialect 感知 ON CONFLICT）
 # ---------------------------------------------------------------------------
@@ -107,7 +128,7 @@ def _counter_upsert_stmt(dialect_name: str, user_id: str, period_type: str, peri
 
 
 def _plan_and_anchor_for(user_row: Any) -> tuple[PlanDef, date]:
-    plan = get_plan(getattr(user_row, "plan_code", None))
+    plan = _effective_plan(user_row)
     return plan, _anchor_date(user_row, datetime.now(timezone.utc).date())
 
 
@@ -199,11 +220,20 @@ async def _period_usage_fallback_async(session: Any, user_id: str, start: date, 
     return int(total.scalar() or 0)
 
 
-def _assemble_state(plan: PlanDef, user_row: Any, start: date, end: date, used: int) -> dict[str, Any]:
-    limit = plan.token_quota
+def _assemble_state(
+    plan: PlanDef,
+    user_row: Any,
+    start: date,
+    end: date,
+    used: int,
+    company_count: int | None = None,
+) -> dict[str, Any]:
+    # 开源自部署关闭额度卡口时，对外统一返回不限量，避免前端误展示「已用完」
+    limit = plan.token_quota if config.QUOTA_ENFORCEMENT_ENABLED else None
+    max_companies = plan.max_companies if config.QUOTA_ENFORCEMENT_ENABLED else None
     bonus = int(getattr(user_row, "quota_bonus_tokens", 0) or 0)
     effective = None if limit is None else limit + bonus
-    return {
+    state: dict[str, Any] = {
         "planCode": plan.code,
         "planName": plan.name,
         "periodType": plan.period_type,
@@ -212,16 +242,23 @@ def _assemble_state(plan: PlanDef, user_row: Any, start: date, end: date, used: 
         "limitTokens": limit,
         "bonusTokens": bonus,
         "usedTokens": used,
+        # 付费套餐到期日（ISO 日期串；None = 不适用）。到期后 _effective_plan 已按 trial 口径生效
+        "planExpiresAt": getattr(user_row, "plan_expires_at", None),
         # remaining 基于计数行；limit 为 None（未设限）时恒为 None
         "remainingTokens": max(0, effective - used) if effective is not None else None,
+        # 账套上限（None = 不限；未来面向代账机构开放更多账套）
+        "maxCompanies": max_companies,
     }
+    if company_count is not None:
+        state["companyCount"] = company_count
+    return state
 
 
 async def quota_state(user_id: str) -> dict[str, Any] | None:
     """用户当前配额状态（给 /api/usage/me；用户行缺失返回 None）。"""
-    from sqlalchemy import select
+    from sqlalchemy import func, select
 
-    from db.models import AuthUser, UserQuotaCounter
+    from db.models import AuthUser, Company, UserQuotaCounter
     from db.session import session_scope
 
     async with session_scope() as session:
@@ -230,7 +267,7 @@ async def quota_state(user_id: str) -> dict[str, Any] | None:
         ).scalars().first()
         if user is None:
             return None
-        plan = get_plan(user.plan_code)
+        plan = _effective_plan(user)
         anchor = _anchor_date(user, datetime.now(timezone.utc).date())
         start, end = current_period(plan, anchor, datetime.now(timezone.utc).date())
         counter = (
@@ -243,7 +280,51 @@ async def quota_state(user_id: str) -> dict[str, Any] | None:
             )
         ).scalars().first()
         used = int(counter.used_tokens) if counter else await _period_usage_fallback_async(session, user_id, start, end)
-        return _assemble_state(plan, user, start, end, used)
+        company_count = int(
+            (
+                await session.execute(
+                    select(func.count()).select_from(Company).where(Company.owner_user_id == user_id)
+                )
+            ).scalar_one()
+            or 0
+        )
+        return _assemble_state(plan, user, start, end, used, company_count=company_count)
+
+
+async def ensure_within_company_limit(user_id: str | None) -> None:
+    """新建账套卡口：开启商业化限额且当前套餐设了 max_companies 时校验证照数量。"""
+    if not user_id or not config.QUOTA_ENFORCEMENT_ENABLED:
+        return
+    from sqlalchemy import func, select
+
+    from db.models import AuthUser, Company
+    from db.session import session_scope
+
+    async with session_scope() as session:
+        user = (
+            await session.execute(select(AuthUser).where(AuthUser.user_id == user_id))
+        ).scalars().first()
+        plan = _effective_plan(user) if user is not None else PLAN_CATALOG[DEFAULT_PLAN_CODE]
+        limit = plan.max_companies
+        if limit is None:
+            return
+        company_count = int(
+            (
+                await session.execute(
+                    select(func.count()).select_from(Company).where(Company.owner_user_id == user_id)
+                )
+            ).scalar_one()
+            or 0
+        )
+        if company_count >= limit:
+            raise CompanyLimitExceededError(
+                message=f"当前{plan.name}最多支持 {limit} 个账套；未来将面向代账机构开放更多账套方案",
+                context={
+                    "planCode": plan.code,
+                    "maxCompanies": limit,
+                    "companyCount": company_count,
+                },
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -264,25 +345,29 @@ def _load_state_sync(user_id: str) -> dict[str, Any] | None:
     from db.session import get_sync_engine
 
     today = datetime.now(timezone.utc).date()
-    with Session(get_sync_engine()) as session:
-        user = session.execute(
-            select(AuthUser).where(AuthUser.user_id == user_id)
-        ).scalars().first()
-        if user is None:
-            return None
-        plan = get_plan(user.plan_code)
-        anchor = _anchor_date(user, today)
-        start, end = current_period(plan, anchor, today)
-        counter = session.execute(
-            select(UserQuotaCounter).where(
-                UserQuotaCounter.user_id == user_id,
-                UserQuotaCounter.period_type == plan.period_type,
-                UserQuotaCounter.period_start == start.isoformat(),
-            )
-        ).scalars().first()
-        # 卡口读计数行（PK 单行查询，快）；行缺失时回退聚合一次（含历史回填）
-        used = int(counter.used_tokens) if counter else _period_usage_fallback(session, user_id, start, end)
-        return _assemble_state(plan, user, start, end, used)
+    try:
+        with Session(get_sync_engine()) as session:
+            user = session.execute(
+                select(AuthUser).where(AuthUser.user_id == user_id)
+            ).scalars().first()
+            if user is None:
+                return None
+            plan = _effective_plan(user)
+            anchor = _anchor_date(user, today)
+            start, end = current_period(plan, anchor, today)
+            counter = session.execute(
+                select(UserQuotaCounter).where(
+                    UserQuotaCounter.user_id == user_id,
+                    UserQuotaCounter.period_type == plan.period_type,
+                    UserQuotaCounter.period_start == start.isoformat(),
+                )
+            ).scalars().first()
+            # 卡口读计数行（PK 单行查询，快）；行缺失时回退聚合一次（含历史回填）
+            used = int(counter.used_tokens) if counter else _period_usage_fallback(session, user_id, start, end)
+            return _assemble_state(plan, user, start, end, used)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("quota state 读取失败，按 fail-open 放行: %s", exc)
+        return None
 
 
 def _cached_state(user_id: str) -> dict[str, Any] | None:
@@ -298,11 +383,11 @@ def _cached_state(user_id: str) -> dict[str, Any] | None:
 
 
 def ensure_within_quota(user_id: str | None) -> None:
-    """同步卡口：套餐未设限（当前默认状态）时只扫内存目录即直通。
+    """同步卡口：未开启商业化限额开关或套餐未设限时直通。
 
     用户行缺失（含开发兜底身份）按无套餐处理，放行——与鉴权层的 fail-open 口径一致。
     """
-    if not user_id or not any_limit_configured():
+    if not user_id or not is_quota_enforced():
         return
     state = _cached_state(user_id)
     if state is None or state["limitTokens"] is None:
@@ -321,8 +406,8 @@ def ensure_within_quota(user_id: str | None) -> None:
 
 
 async def ensure_within_quota_async(user_id: str | None) -> None:
-    """异步入口的卡口：未设限时零开销直通；设限后经线程池读库（带 TTL 缓存）。"""
-    if not user_id or not any_limit_configured():
+    """异步入口的卡口：未启用限额时零开销直通；启用后经线程池读库（带 TTL 缓存）。"""
+    if not user_id or not is_quota_enforced():
         return
     await asyncio.to_thread(ensure_within_quota, user_id)
 

@@ -7,11 +7,13 @@ import {
   NAlert, NInputNumber, NSwitch,
 } from 'naive-ui'
 import LegacyImportTab from './legacy-import.vue'
+import TrialBalanceTable from '@/components/business/TrialBalanceTable.vue'
 import * as XLSX from 'xlsx'
 import apiClient from '@/api/client'
-import { getAuthMe, requestStepUp, sendPhoneCode } from '@/api/auth'
+import { getAuthMe, requestStepUp } from '@/api/auth'
 import { useAuthStore } from '@/stores/auth'
 import { reportErrorToast } from '@/utils/errorPresenter'
+import { sendVerificationCode } from '@/utils/verificationCode'
 import { SoloFieldHelp } from '@/components/ui'
 import {
   exportOpeningTemplate,
@@ -28,8 +30,15 @@ import {
   type UnmatchedOpeningRow,
 } from '@/utils/openingBalanceImport'
 import { loadOpeningMapping, saveOpeningMapping, pickConfirmedMappings } from '@/utils/openingMapping'
-import { openingCutoffOptions, resolveOpeningPeriod } from '@/utils/openingPeriod'
+import { readWorkbookFromFile } from '@/utils/workbookFile'
+import { companyInception, openingCutoffOptions, resolveOpeningPeriod } from '@/utils/openingPeriod'
 import { mergeOpeningRows, mergeYtdRows } from '@/utils/openingMerge'
+import { buildOpeningReconciliation } from '@/utils/openingReconciliation'
+import {
+  normalizeTrialBalanceRows,
+  type TrialBalanceColumns,
+  type TrialBalanceRow,
+} from '@/utils/trialBalance'
 import {
   loadTaxOpeningMemory,
   saveTaxOpeningMemory,
@@ -53,7 +62,7 @@ interface BalanceItem {
 
 type CategoryFilter = 'all' | 'asset' | 'liability' | 'equity'
 type YtdCategoryFilter = 'all' | 'revenue' | 'expense'
-type ActiveSheetTab = 'balance' | 'ytd'
+type ActiveSheetTab = 'balance' | 'ytd' | 'reconcile' | 'trial'
 type StepUpMode = 'save' | 'reset'
 
 const message = useMessage()
@@ -65,6 +74,8 @@ const items = ref<BalanceItem[]>([])
 const ytdItems = ref<BalanceItem[]>([])
 // 年初（1 月 1 日）余额快照：只随导入更新、随保存落库，供报表「年初余额」列使用
 const yearStartItems = ref<{ account_code: string; account_name?: string; partner_name?: string; debit_balance: number; credit_balance: number }[]>([])
+// 全 0 的年初快照是「已知的 0」（当年成立），不能因为数组为空就当成未知
+const yearStartSnapshotKnown = ref(false)
 const fixedAssets = ref<FixedAssetImportItem[]>([])
 const fiscalYear = ref(new Date().getFullYear())
 const startMonth = ref('01')
@@ -128,7 +139,7 @@ function saveLocalTaxMemory(year: number) {
 }
 
 watch(startMonth, (m) => {
-  if (m === '01' && activeTab.value === 'ytd') {
+  if (m === '01' && activeTab.value !== 'balance') {
     activeTab.value = 'balance'
   }
 })
@@ -252,6 +263,27 @@ const ytdNetProfit = computed(() =>
   Math.round((ytdTotalCredit.value - ytdTotalDebit.value) * 100) / 100
 )
 
+// 期初对账（只读）：年初快照 ↔ 期初余额。资产负债类的本年累计不落库，
+// 净变动按期初 − 年初推算；年初快照缺失时不能把 0 当成真实年初。
+const yearStartKnown = computed(() =>
+  !isMidYear.value || yearStartSnapshotKnown.value || yearStartItems.value.length > 0,
+)
+const reconciliation = computed(() =>
+  buildOpeningReconciliation(items.value, yearStartItems.value, {
+    yearStartKnown: yearStartKnown.value,
+  })
+)
+const filteredReconciliationRows = computed(() => {
+  const q = searchQuery.value.trim().toLowerCase()
+  if (!q) return reconciliation.value.rows
+  return reconciliation.value.rows.filter(row =>
+    row.account_code.toLowerCase().includes(q) ||
+    row.account_name.toLowerCase().includes(q))
+})
+function amountOrDash(val: number): string {
+  return Math.abs(Number(val) || 0) < 0.005 ? '—' : formatCurrency(Number(val))
+}
+
 const hasTaxMemoryConfigured = computed(() =>
   (taxMemory.value.priorYearLoss || 0) > 0 ||
   (taxMemory.value.prepaidCitTax || 0) > 0 ||
@@ -337,18 +369,47 @@ const cutoffMonth = ref('')
 // 否则会拿「截至 5 月」的表按 7 月建账保存，6 月损益静默漏记。
 const appliedPeriod = ref<{ fiscalYear: number; startMonth: string } | null>(null)
 
-const expectedPeriodLabel = computed(() =>
-  describeExpectedPeriod(expectedOpeningPeriod(fiscalYear.value, startMonth.value)),
+const expectedPeriod = computed(() =>
+  expectedOpeningPeriod(
+    fiscalYear.value,
+    startMonth.value,
+    companyStartDate(),
+    companyIncorporationDate(),
+  ),
+)
+const expectedPeriodLabel = computed(() => describeExpectedPeriod(expectedPeriod.value))
+const zeroOpening = computed(() => expectedPeriod.value.zeroOpening)
+const hasIncorporationDate = computed(() => Boolean(companyIncorporationDate()))
+// 成立日期优先；没填时退回启用日期，文案必须说成「启用」，不能冒充「成立」。
+const inceptionDate = computed(() => companyIncorporationDate() || companyStartDate())
+const inception = computed(() => companyInception(inceptionDate.value))
+const inceptionLabel = computed(() =>
+  inception.value
+    ? `${inception.value.year}-${String(inception.value.month).padStart(2, '0')}`
+    : '',
+)
+const zeroOpeningHint = computed(() => {
+  if (hasIncorporationDate.value) {
+    return `公司 ${inceptionLabel.value} 成立，${startMonthNum.value} 月启用无需期初余额；直接录入业务即可。若要迁入成立至上一月的历史账，请把启用月改到这些月份之后。`
+  }
+  const book = inceptionLabel.value ? `账套 ${inceptionLabel.value} 启用` : '账套未填启用日期'
+  return `${book}，${startMonthNum.value} 月启用无需期初余额；直接录入业务即可。若公司成立早于启用月，请先到「主体管理」补填公司成立日期。`
+})
+// 年中建账 YTD 的起点：公司成立月与启用前一月取较早者
+const ytdStartMonth = computed(() =>
+  isMidYear.value
+    ? Math.max(1, Math.min(expectedPeriod.value.startMonth, startMonthNum.value - 1))
+    : 1,
 )
 
 function defaultCutoffMonth(): string {
-  const expected = expectedOpeningPeriod(fiscalYear.value, startMonth.value)
-  return `${expected.endYear}-${String(expected.endMonth).padStart(2, '0')}`
+  if (expectedPeriod.value.zeroOpening) return ''
+  return `${expectedPeriod.value.endYear}-${String(expectedPeriod.value.endMonth).padStart(2, '0')}`
 }
 
-/** 兜底下拉的选项：建账年 1 月 ~ 启动月（年初建账则为上年全年） */
+/** 兜底下拉的选项：只列能通过期间校验的月份 */
 const cutoffOptions = computed(() =>
-  openingCutoffOptions(fiscalYear.value, startMonth.value).map(value => ({ label: value, value })),
+  openingCutoffOptions(expectedPeriod.value).map(value => ({ label: value, value })),
 )
 
 // 未匹配的资产负债科目让「文件本身是平的」变成「页面不平」。
@@ -385,6 +446,12 @@ const importSummary = ref<{
   fixedAssetCount: number
 } | null>(null)
 
+// 导入原表快照：预览弹窗立即展示；保存时写入期初凭证 metadata，工作台页签读回。
+const importPreviewRows = ref<TrialBalanceRow[]>([])
+const importColumns = ref<TrialBalanceColumns | null>(null)
+const savedTrialBalanceRows = ref<TrialBalanceRow[]>([])
+const savedTrialBalanceColumns = ref<TrialBalanceColumns | null>(null)
+
 function triggerUpload() {
   if (isLocked.value) {
     message.warning('期初凭证已过账锁定；如需重新导入，请先点击「冲销并重设期初」')
@@ -417,8 +484,12 @@ function applyImportResult(parseResult: any) {
   // 4. 年初余额快照：解析不出来就清空。宁可报表年初列留空（导出会被拦下），
   // 也不能沿用上一次导入的年初数——那份数对应的是另一张表。
   yearStartItems.value = Array.isArray(parseResult.yearStartItems) ? parseResult.yearStartItems : []
+  // derived/explicit 都说明「年初数可以确定」；全 0 时数组为空，但 0 是有效结论
+  yearStartSnapshotKnown.value = Boolean(parseResult.yearStartSource)
 
   unmatchedRows.value = parseResult.unmatchedRows || []
+  importPreviewRows.value = parseResult.previewRows || []
+  importColumns.value = parseResult.columns || null
 
   importSummary.value = {
     matchedCount: parseResult.matchedCount,
@@ -432,12 +503,27 @@ function applyImportResult(parseResult: any) {
   }
 }
 
+/** 解析器只在这个起期下把「本期发生额」当本年累计，重解析必须带同一口径 */
+function parsePeriodOptions() {
+  const expected = expectedPeriod.value
+  return {
+    expectedStart: expected.zeroOpening
+      ? null
+      : { year: expected.startYear, month: expected.startMonth },
+  }
+}
+
 function reapplyMapping() {
   if (!lastWorkbook.value) return
   loading.value = true
   try {
     const allAccounts = [...balanceItems.value, ...ytdItems.value]
-    const parseResult = parseOpeningWorkbook(lastWorkbook.value, allAccounts, mappingOverrides.value)
+    const parseResult = parseOpeningWorkbook(
+      lastWorkbook.value,
+      allAccounts,
+      mappingOverrides.value,
+      parsePeriodOptions(),
+    )
     applyImportResult(parseResult)
     // 用户确认过的映射按账套持久化，下次导入同格式文件自动套用
     saveOpeningMapping(authStore.currentCompanyId, { ...mappingOverrides.value })
@@ -480,7 +566,8 @@ function buildPrefilledMappings(
 /** 解析结果已通过期间校验后，预填映射并写入表格 */
 function applyWorkbook(workbook: XLSX.WorkBook, parsed?: ParseOpeningResult) {
   const allAccounts = [...balanceItems.value, ...ytdItems.value]
-  const parseResult = parsed ?? parseOpeningWorkbook(workbook, allAccounts)
+  const options = parsePeriodOptions()
+  const parseResult = parsed ?? parseOpeningWorkbook(workbook, allAccounts, undefined, options)
   mappingOverrides.value = buildPrefilledMappings(parseResult, allAccounts)
   // 上次已确认的映射直接套用；按名称猜的建议值不自动生效，仍留在映射面板等用户确认
   const confirmed = pickConfirmedMappings(
@@ -489,7 +576,7 @@ function applyWorkbook(workbook: XLSX.WorkBook, parsed?: ParseOpeningResult) {
   )
   const effective =
     Object.keys(confirmed).length > 0
-      ? parseOpeningWorkbook(workbook, allAccounts, confirmed)
+      ? parseOpeningWorkbook(workbook, allAccounts, confirmed, options)
       : parseResult
   applyImportResult(effective)
   appliedPeriod.value = { fiscalYear: fiscalYear.value, startMonth: startMonth.value }
@@ -508,23 +595,33 @@ async function onFileSelected(e: Event) {
   target.value = ''
   if (!file) return
 
+  importSummary.value = null
+  importPreviewRows.value = []
+  importColumns.value = null
   loading.value = true
   try {
-    const data = await file.arrayBuffer()
-    const workbook = XLSX.read(data, { type: 'array' })
+    const workbook = await readWorkbookFromFile(file)
     lastWorkbook.value = workbook
     const allAccounts = [...balanceItems.value, ...ytdItems.value]
-    const parseResult = parseOpeningWorkbook(workbook, allAccounts)
+    const parseResult = parseOpeningWorkbook(workbook, allAccounts, undefined, parsePeriodOptions())
     const period = parseResult.period ?? null
     statementPeriod.value = period
     cutoffMonth.value = defaultCutoffMonth()
-    const check = checkOpeningPeriod(period, fiscalYear.value, startMonth.value)
+    const check = checkOpeningPeriod(
+      period,
+      fiscalYear.value,
+      startMonth.value,
+      companyStartDate(),
+      companyIncorporationDate(),
+    )
     periodCheck.value = check
 
     if (!check.ok) {
       // 期间不符不写表格：写进去的是一屏「看起来已经导好」的错数。
       importSummary.value = null
       unmatchedRows.value = []
+      importPreviewRows.value = []
+      importColumns.value = null
       importModalVisible.value = true
       message.warning('这份科目余额表的期间与账套建账期间不一致，请先确认期间')
       return
@@ -542,15 +639,23 @@ async function onFileSelected(e: Event) {
 function applyCutoffSelection() {
   // 表头已识别出期间就不允许手选覆盖：1-9 月的表选成 7 月会让错月份的数据通过
   if (!lastWorkbook.value || !cutoffMonth.value || statementPeriod.value) return
+  const expected = expectedPeriod.value
+  if (expected.zeroOpening) return
   const [year, month] = cutoffMonth.value.split('-').map(Number)
   const assumed: StatementPeriod = {
-    startYear: year,
-    startMonth: 1,
+    startYear: expected.startYear,
+    startMonth: expected.startMonth,
     endYear: year,
     endMonth: month,
     label: `手动选择截止 ${cutoffMonth.value}`,
   }
-  const check = checkOpeningPeriod(assumed, fiscalYear.value, startMonth.value)
+  const check = checkOpeningPeriod(
+    assumed,
+    fiscalYear.value,
+    startMonth.value,
+    companyStartDate(),
+    companyIncorporationDate(),
+  )
   periodCheck.value = check
   if (!check.ok) return
   statementPeriod.value = assumed
@@ -623,6 +728,17 @@ async function load() {
     items.value = normalizeRowNumbers(data.items || [])
     ytdItems.value = normalizeRowNumbers(data.ytd_items || [])
     yearStartItems.value = normalizeRowNumbers(data.year_start_items || [])
+    yearStartSnapshotKnown.value = Boolean(data.year_start_known)
+
+    // 已保存的原表快照：工作台页签展示；同时覆盖内存中的上次导入预览，
+    // 防止冲销重设后未重新导入就保存时，把上一份旧快照再写进新凭证。
+    savedTrialBalanceRows.value = normalizeTrialBalanceRows(data.trial_balance_items)
+    savedTrialBalanceColumns.value =
+      data.trial_balance_columns && typeof data.trial_balance_columns === 'object'
+        ? (data.trial_balance_columns as TrialBalanceColumns)
+        : null
+    importPreviewRows.value = savedTrialBalanceRows.value
+    importColumns.value = savedTrialBalanceColumns.value
     serverLocked.value = Boolean(data.is_locked)
     voucherNo.value = data.voucher_no || items.value.find(i => i.voucherRef)?.voucherRef || null
 
@@ -699,17 +815,14 @@ function openResetModal() {
 }
 
 async function sendCode() {
-  if (!phone.value) {
-    message.warning('请输入当前账号已绑定的手机号')
-    return
-  }
   sendingCode.value = true
   try {
-    const result = await sendPhoneCode({ phone: phone.value })
-    bizId.value = result.biz_id || ''
-    message.success('验证码已发送')
-  } catch {
-    message.error('验证码发送失败')
+    const outcome = await sendVerificationCode(
+      message,
+      phone.value,
+      '请输入当前账号已绑定的手机号',
+    )
+    if (outcome.ok) bizId.value = outcome.bizId
   } finally {
     sendingCode.value = false
   }
@@ -780,6 +893,13 @@ async function confirmStepUpAction() {
               credit_balance: Number(yi.credit_balance) || 0,
             }))
           : undefined,
+        // 全 0 的年初快照也要告诉后端「这是已知的 0」，否则报表会把当年成立当成无从得知
+        year_start_known: yearStartSnapshotKnown.value || undefined,
+        // 原表快照只用于事后核对，不参与分录；没有导入原表时不必写空数组
+        trial_balance_items: importPreviewRows.value.length
+          ? importPreviewRows.value
+          : undefined,
+        trial_balance_columns: importColumns.value || undefined,
         tax_memory: {
           prior_year_loss: Number(taxMemory.value.priorYearLoss) || 0,
           prepaid_cit_tax: Number(taxMemory.value.prepaidCitTax) || 0,
@@ -830,6 +950,14 @@ function companyStartDate(): string {
   return String(company?.startDate || '')
 }
 
+/** 营业执照成立日期；未填时为空，调用方回退到启用日期 */
+function companyIncorporationDate(): string {
+  const company = authStore.companies.find(
+    (item) => item.company_id === authStore.currentCompanyId,
+  )
+  return String(company?.incorporationDate || '')
+}
+
 // 账套相关初始化：首次 mount 与切换账套后都要走一遍
 async function bootstrapOpeningPage() {
   fiscalYear.value = new Date().getFullYear()
@@ -848,8 +976,11 @@ async function bootstrapOpeningPage() {
 onMounted(async () => {
   await bootstrapOpeningPage()
   try {
-    const profile: any = await getAuthMe()
-    phone.value = profile?.user?.phone || ''
+    // /api/auth/me 返回扁平结构（phone 在顶层），此前误写成 profile.user.phone，
+    // 取到的永远是 undefined，导致短信二次验证弹窗的手机号始终为空、用户
+    // 直接点发送时一条短信都不会发出。保持 UserProfile 类型，防止回归。
+    const profile = await getAuthMe()
+    phone.value = profile.phone || ''
   } catch {
     // 绑定手机号会在提交时由后端再次校验
   }
@@ -902,8 +1033,14 @@ watch(
           <p class="subtitle">
             将原账套或手工账的科目余额迁入系统，借贷试算平衡后生成不可篡改的系统期初凭证（《小企业会计准则》）。
           </p>
-          <p class="subtitle period-hint">
+          <p v-if="zeroOpening" class="subtitle period-hint">
+            {{ zeroOpeningHint }}
+          </p>
+          <p v-else class="subtitle period-hint">
             导入的余额表期间应为 {{ expectedPeriodLabel }}：资产负债取期末余额，损益取本年累计发生额。
+            <NButton text size="tiny" type="primary" @click="handleDownloadTemplate">
+              没有现成的表？下载模板
+            </NButton>
           </p>
         </div>
       </div>
@@ -929,10 +1066,6 @@ watch(
         <div class="header-divider" />
 
         <div class="action-buttons">
-          <NButton size="medium" secondary @click="handleDownloadTemplate">
-            <template #icon><i class="ri-download-2-line" /></template>
-            下载模板
-          </NButton>
           <NButton size="medium" secondary :disabled="isLocked" @click="triggerUpload">
             <template #icon><i class="ri-upload-2-line" /></template>
             导入余额表
@@ -1002,7 +1135,7 @@ watch(
         <template v-if="isMidYear">
           <div class="metric-divider" />
           <div class="metric-item">
-            <span class="metric-label">1-{{ startMonthNum - 1 }}月累计净损益（自动转入 3103）</span>
+            <span class="metric-label">{{ ytdStartMonth }}-{{ Math.max(1, startMonthNum - 1) }}月累计净损益（自动转入 3103）</span>
             <span
               class="metric-value"
               :class="ytdNetProfit >= 0 ? 'text-income' : 'text-expense'"
@@ -1181,13 +1314,38 @@ watch(
               @click="activeTab = 'ytd'"
             >
               <i class="ri-line-chart-line" />
-              <span>损益本年累计发生额（1-{{ Math.max(1, startMonthNum - 1) }}月）</span>
+              <span>损益本年累计发生额（{{ ytdStartMonth }}-{{ Math.max(1, startMonthNum - 1) }}月）</span>
               <span class="tab-count">{{ filledYtdCount }} / {{ ytdItems.length }}</span>
+            </button>
+
+            <button
+              v-if="savedTrialBalanceRows.length > 0"
+              type="button"
+              class="sheet-tab-btn"
+              :class="{ active: activeTab === 'trial' }"
+              @click="activeTab = 'trial'"
+            >
+              <i class="ri-table-line" />
+              <span>科目余额表（原表）</span>
+              <span class="tab-count">{{ savedTrialBalanceRows.length }} 行</span>
+            </button>
+
+            <button
+              v-if="isMidYear || yearStartItems.length > 0"
+              type="button"
+              class="sheet-tab-btn"
+              :class="{ active: activeTab === 'reconcile' }"
+              @click="activeTab = 'reconcile'"
+            >
+              <i class="ri-search-eye-line" />
+              <span>期初对账</span>
+              <span class="tab-count">{{ reconciliation.movementCount }} / {{ reconciliation.rows.length }}</span>
             </button>
           </div>
 
           <div class="toolbar-right">
             <NInput
+              v-if="activeTab === 'balance' || activeTab === 'ytd'"
               v-model:value="searchQuery"
               placeholder="搜索科目代码、名称或客商..."
               clearable
@@ -1197,7 +1355,7 @@ watch(
               <template #prefix><i class="ri-search-line" /></template>
             </NInput>
 
-            <label class="only-filled-toggle">
+            <label v-if="activeTab === 'balance' || activeTab === 'ytd'" class="only-filled-toggle">
               <NSwitch v-model:value="onlyFilled" size="small" />
               <span>仅看已填项</span>
             </label>
@@ -1247,7 +1405,7 @@ watch(
             </span>
           </template>
 
-          <template v-else>
+          <template v-else-if="activeTab === 'ytd'">
             <div class="category-pills">
               <button
                 type="button"
@@ -1276,7 +1434,21 @@ watch(
             </div>
             <span class="rule-hint">
               <i class="ri-information-line" />
-              年中建账保存时，系统自动将 1-{{ Math.max(1, startMonthNum - 1) }} 月累计损益差额配平至「3103 本年利润」
+              年中建账保存时，系统自动将 {{ ytdStartMonth }}-{{ Math.max(1, startMonthNum - 1) }} 月累计损益差额配平至「3103 本年利润」
+            </span>
+          </template>
+
+          <template v-else-if="activeTab === 'trial'">
+            <span class="rule-hint">
+              <i class="ri-information-line" />
+              导入时保存的原表快照，只读核对；不随手工调整变化，也不参与凭证与报表取数。
+            </span>
+          </template>
+
+          <template v-else>
+            <span class="rule-hint">
+              <i class="ri-information-line" />
+              年初余额取自导入快照；本年净变动 = 期初 − 年初，只反映净额，不还原年内借贷毛额。年初、期初两列可直接与原科目余额表逐行对照。
             </span>
           </template>
         </div>
@@ -1376,7 +1548,7 @@ watch(
         </div>
 
         <!-- 表格 2：损益本年累计发生额（年中建账） -->
-        <div v-else class="table-container">
+        <div v-else-if="activeTab === 'ytd'" class="table-container">
           <table class="balance-table">
             <thead>
               <tr>
@@ -1456,6 +1628,148 @@ watch(
             </tfoot>
           </table>
         </div>
+
+        <!-- 表格 3：科目余额表原表快照（只读，不参与凭证/报表取数） -->
+        <div v-else-if="activeTab === 'trial'" class="table-container">
+          <TrialBalanceTable
+            :rows="savedTrialBalanceRows"
+            :columns="savedTrialBalanceColumns"
+            max-height="62vh"
+          />
+        </div>
+
+        <!-- 表格 4：期初对账（只读，不参与报表取数） -->
+        <div v-else class="table-container">
+          <div v-if="!reconciliation.yearStartKnown" class="recon-warning">
+            <i class="ri-error-warning-line" />
+            <span>
+              年初余额未导入：年中建账且账套里没有年初快照，无法核对「年初 → 期初」的变动。
+              请重新导入含「年初余额」或「本年累计发生额」列的科目余额表。
+            </span>
+          </div>
+
+          <div class="recon-summary">
+            <div class="recon-card">
+              <span class="recon-label">年初余额合计</span>
+              <span class="recon-value">
+                {{ reconciliation.yearStartKnown
+                  ? `借 ¥ ${formatCurrency(reconciliation.totals.yearStartDebit)} / 贷 ¥ ${formatCurrency(reconciliation.totals.yearStartCredit)}`
+                  : '—' }}
+              </span>
+              <span
+                v-if="reconciliation.yearStartKnown"
+                class="recon-state"
+                :class="Math.abs(reconciliation.totals.yearStartDiff) <= 0.01 ? 'ok' : 'diff'"
+              >
+                {{ Math.abs(reconciliation.totals.yearStartDiff) <= 0.01
+                  ? '借贷平衡'
+                  : `差额 ¥ ${formatCurrency(Math.abs(reconciliation.totals.yearStartDiff))}` }}
+              </span>
+            </div>
+
+            <div class="recon-card">
+              <span class="recon-label">本年净变动合计（推算）</span>
+              <span class="recon-value">
+                {{ reconciliation.yearStartKnown
+                  ? `借 ¥ ${formatCurrency(reconciliation.totals.movementDebit)} / 贷 ¥ ${formatCurrency(reconciliation.totals.movementCredit)}`
+                  : '—' }}
+              </span>
+              <span
+                v-if="reconciliation.yearStartKnown"
+                class="recon-state"
+                :class="Math.abs(reconciliation.totals.movementDebit - reconciliation.totals.movementCredit) <= 0.01 ? 'ok' : 'diff'"
+              >
+                {{ Math.abs(reconciliation.totals.movementDebit - reconciliation.totals.movementCredit) <= 0.01
+                  ? '借贷净额相抵'
+                  : `差额 ¥ ${formatCurrency(Math.abs(reconciliation.totals.movementDebit - reconciliation.totals.movementCredit))}` }}
+              </span>
+            </div>
+
+            <div class="recon-card">
+              <span class="recon-label">期初余额合计</span>
+              <span class="recon-value">
+                借 ¥ {{ formatCurrency(reconciliation.totals.openingDebit) }} / 贷 ¥ {{ formatCurrency(reconciliation.totals.openingCredit) }}
+              </span>
+              <span
+                class="recon-state"
+                :class="Math.abs(reconciliation.totals.openingDiff) <= 0.01 ? 'ok' : 'diff'"
+              >
+                {{ Math.abs(reconciliation.totals.openingDiff) <= 0.01
+                  ? '借贷平衡'
+                  : `差额 ¥ ${formatCurrency(Math.abs(reconciliation.totals.openingDiff))}` }}
+              </span>
+            </div>
+          </div>
+
+          <table class="balance-table recon-table">
+            <thead>
+              <tr>
+                <th class="col-code">科目代码</th>
+                <th class="col-name">科目名称</th>
+                <th class="col-amount">年初借方</th>
+                <th class="col-amount">年初贷方</th>
+                <th class="col-amount">本年净变动借方</th>
+                <th class="col-amount">本年净变动贷方</th>
+                <th class="col-amount">期初借方</th>
+                <th class="col-amount">期初贷方</th>
+              </tr>
+            </thead>
+            <tbody v-if="filteredReconciliationRows.length > 0">
+              <tr
+                v-for="row in filteredReconciliationRows"
+                :key="row.account_code"
+                :class="{ 'row-filled': row.hasMovement }"
+              >
+                <td class="col-code">{{ row.account_code }}</td>
+                <td class="col-name">
+                  <span class="acct-name-text">{{ row.account_name }}</span>
+                  <span class="acct-cat-tag">{{ getAccountCategoryLabel(row.account_code) }}</span>
+                </td>
+                <td class="col-amount recon-amount">
+                  {{ reconciliation.yearStartKnown ? amountOrDash(row.yearStartDebit) : '—' }}
+                </td>
+                <td class="col-amount recon-amount">
+                  {{ reconciliation.yearStartKnown ? amountOrDash(row.yearStartCredit) : '—' }}
+                </td>
+                <td class="col-amount recon-amount">
+                  {{ reconciliation.yearStartKnown ? amountOrDash(row.movementDebit) : '—' }}
+                </td>
+                <td class="col-amount recon-amount">
+                  {{ reconciliation.yearStartKnown ? amountOrDash(row.movementCredit) : '—' }}
+                </td>
+                <td class="col-amount recon-amount">{{ amountOrDash(row.openingDebit) }}</td>
+                <td class="col-amount recon-amount">{{ amountOrDash(row.openingCredit) }}</td>
+              </tr>
+            </tbody>
+            <tbody v-else>
+              <tr>
+                <td colspan="8" class="empty-table-cell">
+                  <i class="ri-inbox-line" />
+                  <span>当前筛选条件下暂无可核对科目</span>
+                </td>
+              </tr>
+            </tbody>
+            <tfoot>
+              <tr>
+                <td colspan="2" class="col-total">合计（{{ reconciliation.rows.length }} 个有余额科目）</td>
+                <td class="col-amount total">
+                  {{ reconciliation.yearStartKnown ? amountOrDash(reconciliation.totals.yearStartDebit) : '—' }}
+                </td>
+                <td class="col-amount total">
+                  {{ reconciliation.yearStartKnown ? amountOrDash(reconciliation.totals.yearStartCredit) : '—' }}
+                </td>
+                <td class="col-amount total">
+                  {{ reconciliation.yearStartKnown ? amountOrDash(reconciliation.totals.movementDebit) : '—' }}
+                </td>
+                <td class="col-amount total">
+                  {{ reconciliation.yearStartKnown ? amountOrDash(reconciliation.totals.movementCredit) : '—' }}
+                </td>
+                <td class="col-amount total">{{ amountOrDash(reconciliation.totals.openingDebit) }}</td>
+                <td class="col-amount total">{{ amountOrDash(reconciliation.totals.openingCredit) }}</td>
+              </tr>
+            </tfoot>
+          </table>
+        </div>
       </div>
     </NSpin>
 
@@ -1463,28 +1777,36 @@ watch(
     <NModal
       v-model:show="importModalVisible"
       preset="card"
+      :auto-focus="false"
       :title="periodCheck && !periodCheck.ok ? '导入期间需要确认' : 'Excel 科目余额表导入结果'"
-      style="max-width: 520px"
+      style="max-width: min(1120px, 94vw)"
     >
       <!-- 期间不符：先确认期间，金额不写入表格 -->
       <div v-if="periodCheck && !periodCheck.ok" class="import-period-gate">
-        <NAlert type="error" :bordered="false">
+        <NAlert :type="zeroOpening ? 'info' : 'error'" :bordered="false">
           {{ periodCheck.message }}
         </NAlert>
         <div class="period-meta">
           <span v-if="statementPeriod">已识别表格期间：<strong>{{ statementPeriod.label }}</strong></span>
-          <span v-else>未能从表头识别期间。</span>
+          <span v-else>
+            未能从表头识别期间，
+            <NButton text size="tiny" type="primary" @click="handleDownloadTemplate">下载模板</NButton>
+            整理后重导。
+          </span>
         </div>
         <!-- 表头已识别出期间时不给下拉：否则 1-9 月的表能手选 7 月绕过校验 -->
-        <div v-if="!statementPeriod" class="period-cutoff-row">
+        <div v-if="!statementPeriod && cutoffOptions.length > 0" class="period-cutoff-row">
           <span>这份表截止到：</span>
           <NSelect v-model:value="cutoffMonth" :options="cutoffOptions" size="small" style="width: 130px;" />
           <NButton size="small" type="primary" secondary @click="applyCutoffSelection">
             按所选月份重新校验
           </NButton>
         </div>
-        <p v-else class="period-help">请重新导出期间相符的科目余额表，或换一份表。</p>
-        <p class="period-help">
+        <p v-else-if="!zeroOpening" class="period-help">请重新导出期间相符的科目余额表，或换一份表。</p>
+        <p v-if="zeroOpening" class="period-help">
+          {{ zeroOpeningHint }}
+        </p>
+        <p v-else class="period-help">
           建账期间 {{ startPeriod }} 需要 {{ expectedPeriodLabel }} 的科目余额表：资产负债取期末余额，损益取本年累计发生额。
         </p>
       </div>
@@ -1526,6 +1848,20 @@ watch(
               {{ diffExplainedByUnmatched ? '（差额全部由此产生）' : '' }}
             </strong>
           </div>
+        </div>
+
+        <div v-if="importPreviewRows.length > 0" class="import-preview-section">
+          <div class="import-preview-header">
+            <span class="warning-title">原表逐行核对</span>
+            <span class="mapping-tip">
+              金额直接取自原表；被层级去重、零余额跳过的行也保留，可逐行对照
+            </span>
+          </div>
+          <TrialBalanceTable
+            :rows="importPreviewRows"
+            :columns="importColumns"
+            max-height="42vh"
+          />
         </div>
 
         <div v-if="importSummary.warnings.length" class="warnings-box">
@@ -2208,6 +2544,68 @@ watch(
   margin-right: 6px;
 }
 
+/* 期初对账（只读） */
+.recon-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 14px 20px 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid #f5d9a8;
+  background: #fff8e8;
+  color: #8a5a12;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.recon-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 14px 20px;
+}
+.recon-card {
+  flex: 1 1 210px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 14px;
+  border: 1px solid #dde3ea;
+  border-radius: 10px;
+  background: #f8fafc;
+}
+.recon-label {
+  font-size: 12px;
+  color: #636e7c;
+}
+.recon-value {
+  font-size: 14px;
+  font-weight: 600;
+  color: #182230;
+  font-variant-numeric: tabular-nums;
+}
+.recon-state {
+  font-size: 12px;
+  font-weight: 500;
+}
+.recon-state.ok {
+  color: #1a7f4b;
+}
+.recon-state.diff {
+  color: #b42318;
+}
+.recon-amount {
+  font-variant-numeric: tabular-nums;
+  color: #182230;
+}
+/* 八列并排时压缩金额列宽，避免横向滚动把「期初贷方」挤出卡片 */
+.recon-table .col-amount {
+  width: 118px;
+}
+.recon-table .col-name {
+  min-width: 170px;
+}
+
 .step-up-note {
   color: #586474;
   font-size: 12px;
@@ -2261,6 +2659,16 @@ watch(
 .stat-line {
   display: flex;
   justify-content: space-between;
+}
+.import-preview-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.import-preview-header {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 .warnings-box {
   font-size: 12px;

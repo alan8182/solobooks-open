@@ -56,6 +56,39 @@
   - 卡片主标题：`15px` / `16px`，字重 `600`，颜色 `var(--solo-text-primary)`（`#182230`）；
   - 辅助说明/时间：`12px` / `13px`，字重 `400`，颜色 `var(--solo-text-muted)`（`#636E7C`）。
 
+### 4. 嵌套圆角与连续曲率（Nested Radius & Continuous Corners）
+
+> 来源：RedSkill 技能 `kubai-continuous-corners`（@kubai087《999 个小技巧，让你 Vibe 的产品更有质感》第 004 期），2026-11 起作为圆角的硬规则纳入本规范。
+
+**规则一：嵌套圆角一致 —— 内圆角 = 外圆角 − 间距（r = R − p）**
+
+- 由外向内逐层推导：页面级卡片 → 面板 / 输入框 / 按钮 → chip / 标签。内层盒子四边距外层 p 时，内圆角取 R − p，使内外圆角共用同一圆心，视觉上「同一条曲线包住同一条曲线」。
+- 同一层级的盒子共用同一个半径；胶囊与整圆保持全圆（`$solo-radius-pill`），不参与推导。
+- 结果不允许小于 4px（即 `$solo-radius-sm` 8rpx）；padding、gap、圆角全部落在 4px（8rpx）网格。
+- **token 优先**：不在页面里硬编码半径。为已有容器推导时，结果就近向下落到四档；**新增容器**优先选 R/p 组合让 R − p 恰好命中 token 档。SoloBooks 常见映射：
+
+| 外层（R） | 内边距（p） | 推导 r = R − p | 落档 |
+|---|---|---|---|
+| 弹层/抽屉 `$solo-radius-lg` 24rpx（12px） | 16rpx（8px） | 8px | `$solo-radius` 16rpx（精确命中） |
+| 卡片 `$solo-radius-lg` 24rpx（12px） | 紧凑 24rpx（12px） | 0px | `$solo-radius-sm` 8rpx（钳到下限） |
+| 卡片 `$solo-radius-lg` 24rpx（12px） | 标准 32rpx（16px） | −4px | `$solo-radius-sm` 8rpx（钳到下限） |
+
+**规则二：连续曲率圆角（squircle）—— 渐进增强，不改基线**
+
+- 保留 `border-radius` 不动，叠加 `corner-shape` 超椭圆：支持的浏览器获得连续曲率（接近 iOS 圆角质感），不支持的走 `@supports` 零成本回退普通圆角。
+
+  ```css
+  /* App.vue 全局样式（H5 生效；各小程序 WebView 不支持，自动跳过回退） */
+  @supports (corner-shape: superellipse(1.25)) {
+    .solo-card,
+    .solo-badge,
+    .solo-btn { corner-shape: superellipse(1.25); }
+  }
+  ```
+
+- 基线指数 1.25；胶囊与整圆显式声明 `corner-shape: round`，不参与超椭圆。
+- 兼容面：Chrome / Edge 139+ 渲染连续曲率；Safari / Firefox / 小程序端回退普通圆角，视觉不劣化。
+
 ---
 
 ## 三、四大核心卡片类型标准
@@ -203,5 +236,6 @@
 - [ ] **是否套娃**：卡片内部是否存在第二层带边框阴影的独立小卡片？（若是，改用淡灰背景块或分割线）
 - [ ] **信息密度**：375px 屏宽下一屏能否有效浏览 3~4 个关键业务对象？
 - [ ] **热区合规**：所有可点按元素的有效触控范围是否 ≥ 44px × 44px？
+- [ ] **嵌套圆角**：内层圆角是否按 r = R − p 推导并落在 token 四档（不低于 8rpx）？同层级是否同半径？
 - [ ] **色彩克制**：除状态 Badge、收支红绿和主按钮外，卡片主体是否保持纯净的墨石黑白灰？
 - [ ] **等宽数字**：金额是否均应用了 `tabular-nums`，且未出现小数位错位？

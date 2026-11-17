@@ -13,6 +13,7 @@ from datetime import date
 
 import pytest
 
+import config
 from core.errors import QuotaExceededError
 from core.plans import PLAN_CATALOG, PlanDef
 from services import quota_service
@@ -61,13 +62,18 @@ def _seed_member(user_id: str) -> None:
         conn.close()
 
 
-def _seed_counter(user_id: str, used_tokens: int, period_start: str = "2026-01-01") -> None:
+def _seed_counter(
+    user_id: str,
+    used_tokens: int,
+    period_start: str = "2026-01-01",
+    period_type: str = "annual",
+) -> None:
     conn = sqlite3.connect(TEST_CORE_DB)
     try:
         conn.execute(
             "INSERT OR REPLACE INTO user_quota_counters (user_id, period_type, period_start, used_tokens, updated_at)"
-            " VALUES (?, 'annual', ?, ?, '2026-01-01')",
-            (user_id, period_start, used_tokens),
+            " VALUES (?, ?, ?, ?, '2026-01-01')",
+            (user_id, period_type, period_start, used_tokens),
         )
         conn.commit()
     finally:
@@ -98,6 +104,12 @@ def _cleanup(user_ids: list[str]) -> None:
             conn.execute("DELETE FROM user_quota_counters WHERE user_id = ?", (uid,))
             conn.execute("DELETE FROM llm_usage WHERE user_id = ?", (uid,))
             conn.execute("DELETE FROM company_members WHERE user_id = ?", (uid,))
+            conn.execute(
+                "DELETE FROM company_members WHERE company_id IN "
+                "(SELECT company_id FROM auth_companies WHERE owner_user_id = ?)",
+                (uid,),
+            )
+            conn.execute("DELETE FROM auth_companies WHERE owner_user_id = ?", (uid,))
             conn.execute("DELETE FROM auth_users WHERE user_id = ?", (uid,))
         conn.commit()
     finally:
@@ -134,13 +146,65 @@ def test_current_period_annual():
 # 卡口
 # ---------------------------------------------------------------------------
 
-def test_gate_passes_when_no_limit_configured():
-    """当前默认状态（目录内全 None）必须零开销直通，连用户行都不查。"""
+def test_gate_passes_when_no_limit_configured(monkeypatch):
+    """目录内全 None 时必须零开销直通，连用户行都不查。"""
+    monkeypatch.setattr(config, "QUOTA_ENFORCEMENT_ENABLED", True)
+    for code, plan in list(PLAN_CATALOG.items()):
+        monkeypatch.setitem(
+            PLAN_CATALOG,
+            code,
+            PlanDef(code=plan.code, name=plan.name, period_type=plan.period_type, token_quota=None),
+        )
     quota_service.ensure_within_quota("u-quota-nobody")  # 不应抛出
     quota_service.ensure_within_quota(None)
 
 
+def test_default_trial_plan_has_monthly_100k_quota():
+    """商业化方案：免费体验版默认月度 10 万 token，全线套餐当前最多 3 个账套。"""
+    trial = PLAN_CATALOG["trial"]
+    assert trial.period_type == "monthly"
+    assert trial.token_quota == 100_000
+    assert trial.max_companies == 3
+
+
+def test_paid_plans_have_annual_5m_token_quota():
+    """云端标准版与人机双签版年享 500 万 token 额度，最多支持 3 个账套。"""
+    for code in ("standard", "pro", "plus"):
+        plan = PLAN_CATALOG[code]
+        assert plan.period_type == "annual"
+        assert plan.token_quota == 5_000_000
+        assert plan.max_companies == 3
+
+
+def test_self_hosted_mode_bypasses_quota_gate(client, monkeypatch):
+    """开源自部署模式（QUOTA_ENFORCEMENT_ENABLED=False）不拦截超出 10 万额度的请求且展示不限量。"""
+    monkeypatch.setattr(config, "QUOTA_ENFORCEMENT_ENABLED", False)
+    _ensure_user("u-quota-oss")
+    _seed_member("u-quota-oss")
+    _seed_counter(
+        "u-quota-oss",
+        500_000,
+        period_start=_current_month_start_iso(),
+        period_type="monthly",
+    )
+    quota_service.clear_state_cache()
+    try:
+        quota_service.ensure_within_quota("u-quota-oss")  # 超过 100k 仍必须放行
+        resp = client.get("/api/usage/me", headers=_headers("u-quota-oss"))
+        assert resp.status_code == 200
+        quota = resp.json()["quota"]
+        assert quota["planCode"] == "trial"
+        assert quota["limitTokens"] is None
+        assert quota["maxCompanies"] is None
+        assert quota["remainingTokens"] is None
+        assert quota["usedTokens"] >= 500_000
+    finally:
+        quota_service.clear_state_cache()
+        _cleanup(["u-quota-oss"])
+
+
 def test_gate_passes_when_under_limit(client, monkeypatch):
+    monkeypatch.setattr(config, "QUOTA_ENFORCEMENT_ENABLED", True)
     _ensure_user("u-quota-under")
     _seed_counter("u-quota-under", 50)
     monkeypatch.setitem(PLAN_CATALOG, "trial", _LIMITED_TRIAL)
@@ -153,6 +217,7 @@ def test_gate_passes_when_under_limit(client, monkeypatch):
 
 
 def test_gate_raises_when_over_limit(client, monkeypatch):
+    monkeypatch.setattr(config, "QUOTA_ENFORCEMENT_ENABLED", True)
     _ensure_user("u-quota-over")
     _seed_counter("u-quota-over", 500)
     monkeypatch.setitem(PLAN_CATALOG, "trial", _LIMITED_TRIAL)
@@ -169,6 +234,7 @@ def test_gate_raises_when_over_limit(client, monkeypatch):
 
 def test_gate_counts_bonus_tokens(client, monkeypatch):
     """管理员一次性加量并入当期额度：100 + 200 = 300，用 250 放行、301 超限。"""
+    monkeypatch.setattr(config, "QUOTA_ENFORCEMENT_ENABLED", True)
     _ensure_user("u-quota-bonus", bonus=200)
     _seed_counter("u-quota-bonus", 250)
     monkeypatch.setitem(PLAN_CATALOG, "trial", _LIMITED_TRIAL)
@@ -187,6 +253,12 @@ def test_gate_counts_bonus_tokens(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # 周期计数与状态
 # ---------------------------------------------------------------------------
+
+def _current_month_start_iso() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).date().replace(day=1).isoformat()
+
 
 @pytest.mark.asyncio
 async def test_record_consumption_upserts_counter(client):
@@ -209,13 +281,14 @@ async def test_record_consumption_upserts_counter(client):
             ).fetchone()
         finally:
             conn.close()
-        assert row == (80, "annual", "2026-01-01")
+        assert row == (80, "monthly", _current_month_start_iso())
     finally:
         _cleanup(["u-quota-acc"])
 
 
-def test_usage_me_quota_state_fallback_to_llm_usage(client):
-    """计数行缺失时 /api/usage/me 的 quota.usedTokens 回退聚合 llm_usage。"""
+def test_usage_me_quota_state_fallback_to_llm_usage(client, monkeypatch):
+    """计数行缺失时 /api/usage/me 的 quota.usedTokens 回退聚合 llm_usage，且默认 trial 为月度 10 万 token。"""
+    monkeypatch.setattr(config, "QUOTA_ENFORCEMENT_ENABLED", True)
     _ensure_user("u-quota-me")
     _seed_member("u-quota-me")  # 播种了用户行后鉴权会查成员归属，须补齐
     _seed_llm_usage("u-quota-me", 120)
@@ -225,9 +298,10 @@ def test_usage_me_quota_state_fallback_to_llm_usage(client):
         quota = resp.json()["quota"]
         assert quota is not None
         assert quota["planCode"] == "trial"
-        assert quota["limitTokens"] is None  # 额度未定 = 未设限
-        assert quota["remainingTokens"] is None
-        assert quota["periodStart"] == "2026-01-01"
+        assert quota["periodType"] == "monthly"
+        assert quota["limitTokens"] == 100_000
+        assert quota["remainingTokens"] == 100_000 - 120
+        assert quota["periodStart"] == _current_month_start_iso()
         assert quota["usedTokens"] >= 120
     finally:
         _cleanup(["u-quota-me"])
@@ -239,6 +313,7 @@ def test_usage_me_quota_state_fallback_to_llm_usage(client):
 
 def test_quota_exceeded_returns_402_end_to_end(client, monkeypatch):
     """启用限额 + 超限计数 → /api/invoice/parse-columns 返回 402（卡口在 LLM 调用前）。"""
+    monkeypatch.setattr(config, "QUOTA_ENFORCEMENT_ENABLED", True)
     _ensure_user("u-quota-e2e")
     _seed_member("u-quota-e2e")
     _seed_counter("u-quota-e2e", 500)
@@ -279,3 +354,46 @@ def test_safe_chat_text_json_reraises_accounting_error(client, monkeypatch):
 
     monkeypatch.setattr(llm, "chat_text_json", _raise_value_error)
     assert llm.safe_chat_text_json("sys", "user", fallback={"x": 1}) == {"x": 1}
+
+
+def test_company_creation_enforces_plan_max_companies(client, monkeypatch):
+    """商业化开关开启时所有套餐最多创建 3 个账套；开源自部署模式不拦截。"""
+    monkeypatch.setattr(config, "QUOTA_ENFORCEMENT_ENABLED", True)
+    uid = "u-company-limit"
+    _ensure_user(uid, plan_code="standard")
+    _seed_member(uid)
+    quota_service.clear_state_cache()
+    try:
+        for idx in range(1, 4):
+            resp = client.post(
+                "/api/auth/companies",
+                json={"name": f"账套 {idx}"},
+                headers=_headers(uid),
+            )
+            assert resp.status_code == 200, resp.text
+
+        blocked = client.post(
+            "/api/auth/companies",
+            json={"name": "第 4 个账套"},
+            headers=_headers(uid),
+        )
+        assert blocked.status_code == 403
+        assert blocked.json()["detail"]["code"] == "COMPANY_LIMIT_EXCEEDED"
+
+        # /api/usage/me 返回账套计数与上限
+        me = client.get("/api/usage/me", headers=_headers(uid))
+        assert me.status_code == 200
+        assert me.json()["quota"]["maxCompanies"] == 3
+        assert me.json()["quota"]["companyCount"] == 3
+
+        # 开源自部署（QUOTA_ENFORCEMENT_ENABLED=False）放行第 4 个账套
+        monkeypatch.setattr(config, "QUOTA_ENFORCEMENT_ENABLED", False)
+        allowed = client.post(
+            "/api/auth/companies",
+            json={"name": "自部署第 4 个账套"},
+            headers=_headers(uid),
+        )
+        assert allowed.status_code == 200, allowed.text
+    finally:
+        quota_service.clear_state_cache()
+        _cleanup([uid])

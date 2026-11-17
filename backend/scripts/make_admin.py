@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import select  # noqa: E402
 
+import config  # noqa: F401, E402  (加载 backend/.env 中的 DATABASE_URL)
 from db.models import AuthUser  # noqa: E402
 from db.session import session_scope  # noqa: E402
 
@@ -32,7 +33,7 @@ async def _list_admins() -> None:
         rows = (
             (
                 await session.execute(
-                    select(AuthUser.user_id, AuthUser.nickname, AuthUser.is_disabled)
+                    select(AuthUser.user_id, AuthUser.phone, AuthUser.nickname, AuthUser.is_disabled)
                     .where(AuthUser.is_platform_admin.is_(True))
                     .order_by(AuthUser.user_id)
                 )
@@ -40,26 +41,38 @@ async def _list_admins() -> None:
             .all()
         )
     if not rows:
-        print("当前没有平台管理员。用 `python scripts/make_admin.py <user_id>` 置位首个管理员。")
+        print("当前没有平台管理员。用 `python scripts/make_admin.py <user_id|phone>` 置位首个管理员。")
         return
-    for user_id, nickname, disabled in rows:
+    for user_id, phone, nickname, disabled in rows:
         state = "已禁用" if disabled else "正常"
-        print(f"{user_id}  {nickname or '-'}  [{state}]")
+        print(f"{user_id}  {phone or '-'}  {nickname or '-'}  [{state}]")
 
 
-async def _set_admin(user_id: str, grant: bool) -> None:
+async def _set_admin(target: str, grant: bool) -> None:
     verb = "设为平台管理员" if grant else "撤销平台管理员"
     async with session_scope() as session:
-        user = (
-            await session.execute(select(AuthUser).where(AuthUser.user_id == user_id))
-        ).scalar_one_or_none()
-        if user is None:
-            print(f"错误：用户 {user_id} 不存在。可用 user_id 参考 auth_users 表。", file=sys.stderr)
+        matches = (
+            (
+                await session.execute(
+                    select(AuthUser).where((AuthUser.user_id == target) | (AuthUser.phone == target))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not matches:
+            print(f"错误：用户 {target} 不存在。可用 user_id 或 phone 参考 auth_users 表。", file=sys.stderr)
             raise SystemExit(1)
+        if len(matches) > 1:
+            ids = ", ".join(u.user_id for u in matches)
+            print(f"错误：匹配到多个用户（{ids}），请改传精确 user_id。", file=sys.stderr)
+            raise SystemExit(1)
+        user = matches[0]
         if user.is_disabled and grant:
-            print("警告：该账号处于禁用状态，设为管理员后仍无法调用接口；如需启用请在 M2 用户管理中处理。")
+            print("警告：该账号处于禁用状态，设为管理员后仍无法调用接口；如需启用请在用户管理中处理。")
         user.is_platform_admin = grant
-    print(f"完成：{user_id} 已{verb}。重新登录无需操作，下一次请求即生效（权限每次请求查库校验）。")
+        uid = user.user_id
+    print(f"完成：{uid} 已{verb}。重新登录无需操作，下一次请求即生效（权限每次请求查库校验）。")
 
 
 def main() -> None:

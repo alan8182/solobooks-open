@@ -226,35 +226,36 @@ const columns: DataTableColumns<AdminCompanyItem> = [
   color: var(--solo-text-muted);
 }
 
-.company-cell {
+:deep(.company-cell) {
   display: flex;
   flex-direction: column;
   line-height: 1.4;
   cursor: pointer;
 }
 
-.company-name {
+:deep(.company-name) {
   font-weight: 600;
   color: var(--solo-text-primary);
 }
 
-.company-id-sub {
+.company-id-sub,
+:deep(.company-id-sub) {
   font-size: 12px;
   color: var(--solo-text-muted);
   font-family: monospace;
 }
 
-.owner-cell {
+:deep(.owner-cell) {
   display: flex;
   flex-direction: column;
   line-height: 1.4;
 }
 
-.owner-name {
+:deep(.owner-name) {
   color: var(--solo-text-primary);
 }
 
-.owner-phone {
+:deep(.owner-phone) {
   font-size: 12px;
   color: var(--solo-text-muted);
 }

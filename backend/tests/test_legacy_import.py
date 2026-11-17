@@ -69,6 +69,27 @@ async def test_parse_balance_rows_reports_unknown_accounts():
 
 
 @pytest.mark.asyncio
+async def test_parse_balance_rows_prefers_same_name_over_colliding_code():
+    """旧账套与本系统撞码时不能被科目码带偏。
+
+    回归：源表 2221021 是「应交个人所得税」，本系统 2221021 是「待转销项税额」，
+    同名科目在 2221012。按码落库会把 457.40 静默记进错误子科目，试算仍平。
+    """
+    company_id = "c-legacy-code-collision"
+    await _setup_company(company_id)
+
+    rows = [
+        {"科目编码": "2221021", "科目名称": "应交个人所得税", "期末余额贷方": "457.40"},
+    ]
+    result = await parse_balance_rows(company_id, rows)
+
+    assert len(result["valid"]) == 1
+    assert result["valid"][0]["accountCode"] == "2221012"
+    assert result["valid"][0]["accountName"] == "应交个人所得税"
+    assert float(result["valid"][0]["creditBalance"]) == pytest.approx(457.4)
+
+
+@pytest.mark.asyncio
 async def test_parse_balance_rows_accepts_two_tier_headers():
     """第三方导出把「期初余额」拆成借/贷两层表头，前端拼成复合列名。
 

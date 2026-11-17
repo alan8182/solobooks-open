@@ -7,7 +7,7 @@
  * 期初「把一批带客商的行并进科目表」的合并规则——只有这一份。
  *
  * 两个来源都要用它：期初工作台的 Excel 解析结果（parseOpeningWorkbook）与
- * AI CFO 对话卡片交接的草稿（sessionStorage `solobooks:ai_opening_draft`）。
+ * AI 财务官对话卡片交接的草稿（sessionStorage `solobooks:ai_opening_draft`）。
  * 它们此前各写了一份，且规则不同：工作台按「科目+客商」拆行，草稿那份按
  * `Map(account_code)` 合并 —— 同一科目下多个往来单位只留最后一条，其余静默
  * 丢弃。实测一张 23 行的期初卡经草稿通道只剩 12 行，丢的 11 行全是往来单位

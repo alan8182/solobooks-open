@@ -5,7 +5,9 @@ import {
   NButton,
   NCard,
   NInput,
+  NInputNumber,
   NPopconfirm,
+  NSelect,
   NTag,
   useMessage,
   type DataTableColumns,
@@ -14,6 +16,7 @@ import {
   fetchAdminUsers,
   patchAdminUser,
   type AdminUserItem,
+  type PlanCode,
 } from '@/api/admin'
 import { useAdminTable, formatAdminDateTime } from '@/composables/useAdminTable'
 import { SoloTable, SoloDrawer, SoloStatusBadge, SoloButton } from '@/components/ui'
@@ -40,6 +43,29 @@ const {
 
 const activeUser = ref<AdminUserItem | null>(null)
 const drawerVisible = ref(false)
+const savingPlan = ref(false)
+const planForm = ref<{
+  planCode: PlanCode
+  planAnchorAt: string
+  quotaBonusTokens: number
+}>({
+  planCode: 'trial',
+  planAnchorAt: '',
+  quotaBonusTokens: 0,
+})
+
+const PLAN_OPTIONS: { label: string; value: PlanCode }[] = [
+  { label: '免费体验版（¥0 · 月 10 万 Token）', value: 'trial' },
+  { label: '云端标准版（¥598/年）', value: 'standard' },
+  { label: '人机双签版（¥2,980/年）', value: 'pro' },
+  { label: '历史订阅版（plus）', value: 'plus' },
+]
+
+function planTone(code: PlanCode): 'neutral' | 'info' | 'brand' {
+  if (code === 'pro' || code === 'plus') return 'brand'
+  if (code === 'standard') return 'info'
+  return 'neutral'
+}
 
 const ROLE_LABELS: Record<string, string> = {
   owner: '所有者',
@@ -53,8 +79,50 @@ function roleLabel(role: string): string {
 }
 
 function openUserDrawer(user: AdminUserItem) {
-  activeUser.value = user
+  activeUser.value = { ...user }
+  planForm.value = {
+    planCode: user.planCode || 'trial',
+    planAnchorAt: user.planAnchorAt || '',
+    quotaBonusTokens: user.quotaBonusTokens ?? 0,
+  }
   drawerVisible.value = true
+}
+
+function onPlanCodeChange(code: PlanCode) {
+  planForm.value.planCode = code
+  if ((code === 'standard' || code === 'pro') && !planForm.value.planAnchorAt) {
+    planForm.value.planAnchorAt = new Date().toISOString().slice(0, 10)
+  }
+}
+
+async function savePlanConfig() {
+  if (!activeUser.value) return
+  const anchor = planForm.value.planAnchorAt.trim()
+  if (anchor && !/^\d{4}-\d{2}-\d{2}$/.test(anchor)) {
+    message.warning('计费锚点日期格式应为 YYYY-MM-DD（或留空）')
+    return
+  }
+  savingPlan.value = true
+  try {
+    const res = await patchAdminUser(activeUser.value.userId, {
+      planCode: planForm.value.planCode,
+      planAnchorAt: anchor,
+      quotaBonusTokens: Math.max(0, Math.floor(Number(planForm.value.quotaBonusTokens || 0))),
+    })
+    activeUser.value = {
+      ...activeUser.value,
+      planCode: res.user.planCode,
+      planName: res.user.planName,
+      planAnchorAt: res.user.planAnchorAt,
+      quotaBonusTokens: res.user.quotaBonusTokens,
+    }
+    message.success('套餐与额度已更新并实时生效')
+    await load()
+  } catch (err: any) {
+    message.error(err?.response?.data?.detail || '更新失败')
+  } finally {
+    savingPlan.value = false
+  }
 }
 
 async function applyPatch(user: AdminUserItem, payload: { isDisabled?: boolean; isPlatformAdmin?: boolean }) {
@@ -99,6 +167,17 @@ const columns: DataTableColumns<AdminUserItem> = [
       row.isDisabled
         ? h(SoloStatusBadge, { tone: 'danger', size: 'small' }, { default: () => '已禁用' })
         : h(SoloStatusBadge, { tone: 'success', size: 'small' }, { default: () => '正常' }),
+  },
+  {
+    title: '套餐档位',
+    key: 'planCode',
+    width: 120,
+    render: (row) =>
+      h(
+        SoloStatusBadge,
+        { tone: planTone(row.planCode), plain: row.planCode === 'trial', size: 'small' },
+        { default: () => row.planName || row.planCode },
+      ),
   },
   {
     title: '公司与角色',
@@ -279,6 +358,50 @@ const columns: DataTableColumns<AdminUserItem> = [
           </div>
         </div>
 
+        <div class="detail-section">
+          <h4 class="section-title">商业套餐与额度开通（手动开单）</h4>
+          <p class="section-desc">
+            线下收款后在此切换用户套餐或赠送体验 Token，保存后立即清除配额缓存并写入审计日志。
+          </p>
+          <div class="plan-card">
+            <div class="plan-field">
+              <label class="info-label">当前套餐档位</label>
+              <NSelect
+                :value="planForm.planCode"
+                :options="PLAN_OPTIONS"
+                size="small"
+                @update:value="onPlanCodeChange"
+              />
+            </div>
+            <div class="plan-row-2">
+              <div class="plan-field">
+                <label class="info-label">计费/生效锚点日（YYYY-MM-DD，可留空）</label>
+                <NInput
+                  v-model:value="planForm.planAnchorAt"
+                  size="small"
+                  clearable
+                  placeholder="例如 2026-11-13"
+                />
+              </div>
+              <div class="plan-field">
+                <label class="info-label">额外赠送 Token 额度</label>
+                <NInputNumber
+                  v-model:value="planForm.quotaBonusTokens"
+                  size="small"
+                  :min="0"
+                  :step="50000"
+                  style="width: 100%"
+                />
+              </div>
+            </div>
+            <div class="plan-actions">
+              <SoloButton size="small" variant="primary" :loading="savingPlan" @click="savePlanConfig">
+                保存套餐设置
+              </SoloButton>
+            </div>
+          </div>
+        </div>
+
         <div class="detail-section danger-section">
           <h4 class="section-title">运维操作与权限变更</h4>
           <p class="section-desc">修改操作将实时写入操作审计日志，即时在全平台生效。</p>
@@ -345,36 +468,36 @@ const columns: DataTableColumns<AdminUserItem> = [
   color: var(--solo-text-muted);
 }
 
-.user-cell {
+:deep(.user-cell) {
   display: flex;
   flex-direction: column;
   line-height: 1.4;
   cursor: pointer;
 }
 
-.user-name {
+:deep(.user-name) {
   font-weight: 600;
   color: var(--solo-text-primary);
 }
 
-.user-sub {
+:deep(.user-sub) {
   font-size: 12px;
   color: var(--solo-text-muted);
 }
 
-.roles-cell {
+:deep(.roles-cell) {
   display: flex;
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
 }
 
-.company-count {
+:deep(.company-count) {
   font-size: 12.5px;
   color: var(--solo-text-secondary);
 }
 
-.action-btns {
+:deep(.action-btns) {
   display: flex;
   align-items: center;
   gap: 4px;
@@ -499,5 +622,32 @@ const columns: DataTableColumns<AdminUserItem> = [
   align-items: center;
   gap: 12px;
   margin-top: 6px;
+}
+
+.plan-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 16px;
+  background: var(--solo-bg-card);
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius, 8px);
+}
+
+.plan-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.plan-row-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.plan-actions {
+  display: flex;
+  justify-content: flex-end;
 }
 </style>

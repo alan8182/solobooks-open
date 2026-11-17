@@ -3,6 +3,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { NButton } from 'naive-ui'
+import { HOME_FAQ } from '@/content/faq'
 
 // ICP 备案号，页脚自动呈现并链接工信部网站
 const ICP_LICENSE = '浙ICP备2025195764号-7'
@@ -27,8 +28,6 @@ function navigateToAnchor(hash: string) {
 
 function onLandingScroll() {
   showStickyCta.value = window.scrollY > 480
-  // 吸底操作栏展示期间通知全局内测浮钮上移避让（样式仅在 ≤768px 生效）
-  document.documentElement.classList.toggle('landing-cta-bar-shown', showStickyCta.value)
 }
 
 // ── PPT 式整页翻页：桌面滚轮由 JS 接管 ──
@@ -47,11 +46,10 @@ function slideEls(): HTMLElement[] {
   )
 }
 
-// 所有页都装得进一屏才启用滚轮翻页；存在超高页（小窗口）时回落自由滚动。
-// 余量放宽到 8px：个别屏（如 showcase）内容只超预算 1~2px 时，不应静默禁用整个翻页特性
+// 所有页都装得进一屏才启用滚轮翻页；存在超高页（小窗口）时回落自由滚动
 function canPageFlip(): boolean {
   const budget = window.innerHeight - NAV_HEIGHT
-  return slideEls().every((el) => el.offsetHeight <= budget + 8)
+  return slideEls().every((el) => el.offsetHeight <= budget + 1)
 }
 
 // 滚轮落点在内部可滚动容器上时不劫持
@@ -100,12 +98,10 @@ onMounted(() => {
   document.documentElement.classList.add('landing-scroll-snap')
   window.addEventListener('wheel', onLandingWheel, { passive: false })
   window.addEventListener('scroll', onLandingScroll, { passive: true })
-  onLandingScroll() // 同步首屏初始状态（刷新时恢复滚动位置的场景）
 })
 
 onUnmounted(() => {
   document.documentElement.classList.remove('landing-scroll-snap')
-  document.documentElement.classList.remove('landing-cta-bar-shown')
   window.removeEventListener('wheel', onLandingWheel)
   window.removeEventListener('scroll', onLandingScroll)
   clearTimeout(flipLockTimer)
@@ -115,163 +111,279 @@ const isLoggedIn = computed(() => Boolean(localStorage.getItem('auth_token')))
 
 // ponytail: 遵循极简主义与 YAGNI 原则，页面轻盈无外部重量库负担
 
-// ── 四大核心支柱 (Four Pillars) ──
+// ── 四大核心支柱 ──
 const fourPillars = [
   {
     num: '01',
-    title: '伴随式建立老板财务直觉',
-    desc: '自然语言理解业务动作，老板白话视图与会计分录同源对照，不背借贷术语也能摸清利润与现金流底牌。',
-    chips: ['老板/会计双视图同源', '10 秒确认看懂门道', '凭证附原始票据'],
-    icon: 'ri-file-edit-line',
+    title: '一键确认入账',
+    desc: '流水与发票智能勾稽，AI 预制入账分录，老板确认即可入账，零会计门槛。',
+    chips: ['免记借贷分录', '人机双签确认', '企银/微信自动对平'],
+    icon: 'ri-cursor-line',
   },
   {
     num: '02',
-    title: '微信与企银 100% 勾稽',
-    desc: '告别传统代账“只抄发票不对流水”的糊弄账，网银与微信商户流水 10 秒交叉配平，账实相符。',
-    chips: ['银行流水 100% 勾稽', '微信商业收款核销', '杜绝漏记与死账'],
-    icon: 'ri-git-merge-line',
+    title: '随时财税咨询',
+    desc: '合同节税、个人垫资转回等疑难，大白话发问，结合账本给出具体合规方案。',
+    chips: ['联动真实账目', '合同节税建议', '金税四期避坑'],
+    icon: 'ri-chat-smile-3-line',
   },
   {
     num: '03',
-    title: '4 步向导式月末封账',
-    desc: '往来核销、设备折旧、小微税负测算一步步指引，看清税负临界点，直出电子税务局申报底稿。',
-    chips: ['往来款一键冲平', '固定资产自动折旧', '税局申报字段对齐'],
-    icon: 'ri-calendar-check-line',
+    title: '公私垫资隔离',
+    desc: '建立合规垫资冲销通道，避免大额借款挂账，彻底排除 20% 股东借款个税风险。',
+    chips: ['垫资免税冲销', '股东借款预警', '0违规挂账'],
+    icon: 'ri-shield-star-line',
   },
   {
     num: '04',
-    title: '公私隔离与融资尽调就绪',
-    desc: '严格遵循小企业会计准则，老板私卡垫资合规冲销，不留“其他应收款”烂账，随时经得起授信与融资尽调。',
-    chips: ['公私垫资合规隔离', 'Day-1 融资尽调就绪', '人机双签入账确认'],
-    icon: 'ri-shield-check-line',
+    title: '标准财务报表',
+    desc: '严格遵循小企业会计准则，资产负债表与利润表实时联动，支持只读协审分享。',
+    chips: ['小企业准则科目', '一键协审链接', '账套全量导出'],
+    icon: 'ri-medal-line',
   },
 ]
 
-// ── 账本迁移：历史账套导入与全量导出 (Migration) ──
+// ── 账本迁移 ──
 const migrateIn = {
-  title: '账本导入',
-  icon: 'ri-download-cloud-2-line',
+  title: '前任代账账套 · 一键体检洗净',
+  icon: 'ri-radar-line',
   items: [
-    { b: '凭证批量导入', t: 'Excel / CSV 三列对齐，自动匹配科目' },
-    { b: '期初余额带入', t: '科目余额表开新账，借贷平衡校验' },
-    { b: '流水与发票', t: '银行、平台账单、税局发票免模板解析' },
+    { b: '历史糊涂账排雷', t: '导入科目余额表，AI 自动扫描大额往来挂账与公私混同隐患' },
+    { b: '费用科目重梳理', t: '纠正粗暴计入管理费用的支出，还原企业真实净利润' },
+    { b: '流水发票免模板', t: '企银流水、商户账单、税局发票直接拖入，无缝开新账' },
   ],
-  tags: ['Excel / CSV', '列名智能识别', '失败行逐条提示'],
+  tags: ['Excel / CSV 直导', '历史风险扫描', '无缝平滑切换'],
 }
 
 const migrateOut = {
-  title: '账本导出',
-  icon: 'ri-upload-cloud-2-line',
+  title: '标准规范账套 · 随时交付',
+  icon: 'ri-links-line',
   items: [
-    { b: '凭证与账表', t: '凭证、明细账、科目余额表导出 Excel' },
-    { b: '三大报表', t: '资产负债表、利润表、现金流量表' },
-    { b: '完整账套备份', t: '科目、期初、凭证与票据整包带走' },
+    { b: 'Solo Audit Share', t: '一键签发只读协审链接，银行与投资人免注册在线验账' },
+    { b: '三大报表与明细', t: '科目余额表、明细账、资产负债表与利润表一键导出' },
+    { b: '数据绝不锁定', t: '完整账套与原始凭证票据整包带走，所有权 100% 归你' },
   ],
-  tags: ['Excel / CSV', '全量备份'],
+  tags: ['一键协审链接', '准则报表直出', '数据完全归你'],
 }
 
 const migratePromises = [
-  { icon: 'ri-refresh-line', title: '迁入只需一次导入' },
-  { icon: 'ri-lock-unlock-line', title: '数据所有权归你' },
-  { icon: 'ri-shield-check-line', title: '不做数据锁定' },
+  { icon: 'ri-stethoscope-line', title: '迁入即享账本风险体检' },
+  { icon: 'ri-share-forward-box-line', title: '一键签发银行/投资人只读链接' },
+  { icon: 'ri-shield-check-line', title: '数据所有权 100% 归你' },
 ]
 
-// ── 对标企微：深度功能交互展台 (Tab Showcase) ──
-type ShowcaseKey = 'batch' | 'reconcile' | 'memory' | 'closing' | 'dashboard' | 'mcp'
+// ── 展台导航 ──
+type ShowcaseKey = 'batch' | 'reconcile' | 'closing' | 'dashboard' | 'mcp'
 const activeShowcase = ref<ShowcaseKey>('batch')
 
 const showcaseTabs = [
-  { key: 'batch' as ShowcaseKey, num: '01', title: '凭据归集', icon: 'ri-folder-upload-line' },
-  { key: 'reconcile' as ShowcaseKey, num: '02', title: '流水对平', icon: 'ri-git-merge-line' },
-  { key: 'memory' as ShowcaseKey, num: '03', title: '越用越准', icon: 'ri-brain-line' },
-  { key: 'closing' as ShowcaseKey, num: '04', title: '月末结账', icon: 'ri-calendar-check-line' },
-  { key: 'dashboard' as ShowcaseKey, num: '05', title: '经营报表', icon: 'ri-pie-chart-line' },
-  { key: 'mcp' as ShowcaseKey, num: '06', title: 'AI 连接 (MCP & Skills)', icon: 'ri-plug-line' },
+  { key: 'batch' as ShowcaseKey, num: '01', title: '智能做账', icon: 'ri-cursor-line' },
+  { key: 'reconcile' as ShowcaseKey, num: '02', title: '财税咨询', icon: 'ri-chat-voice-line' },
+  { key: 'closing' as ShowcaseKey, num: '03', title: '月末结账', icon: 'ri-calendar-check-line' },
+  { key: 'dashboard' as ShowcaseKey, num: '04', title: '经营看板 & 协审', icon: 'ri-medal-line' },
+  { key: 'mcp' as ShowcaseKey, num: '05', title: 'AI 连接 (MCP & Skills)', icon: 'ri-plug-line' },
 ]
 
 function switchShowcaseTab(key: ShowcaseKey) {
   activeShowcase.value = key
 }
 
-// ── 视觉化指标对比数据 ──
+// ── 方案对比 ──
 const comparisons = [
   {
-    dim: '老板财务认知',
-    hired: '专业术语多，老板难看懂账表',
-    agency: '黑盒托管，老板沦为甩手掌柜',
-    solo: '老板白话视图与会计账表同源，边确认边建立财务直觉',
-    highlight: '掌舵人视角',
+    dim: '账本质量',
+    hired: '账目规范，但年薪成本 8~15 万',
+    agency: '科目混乱乱挂往来，报表失真',
+    solo: '严格遵循《小企业会计准则》，科目规范不乱挂',
+    highlight: '准则合规',
   },
   {
-    dim: '融资与尽调就绪',
-    hired: '账目规范，但人力成本高昂',
-    agency: '只抄发票不对流水，授信/尽调需推倒重做',
-    solo: '票、流、账、税 100% 勾稽，随时经得起审计与投资人尽调',
-    highlight: 'Day-1 合规',
+    dim: '财税答疑',
+    hired: '依赖个别会计经验',
+    agency: '1 人管 200 家，回复迟缓，只管抄税',
+    solo: '7×24h 随时问，结合公司真实账目给具体合规方案',
+    highlight: '随时在线',
   },
   {
-    dim: '公私隔离与对账',
-    hired: '依赖月底人工耗费数天核对',
-    agency: '公私混同全塞“其他应收款”留隐患',
-    solo: '企银与微信流水 10 秒配平，个人垫资合规隔离',
-    highlight: '10 秒闭环',
+    dim: '经营掌控',
+    hired: '报表晦涩难懂，沟通成本高',
+    agency: '账本是黑盒，真实赚多少、欠多少看不懂',
+    solo: 'AI 预制方案，老板点一点确认，看清净利与现金',
+    highlight: '一目了然',
   },
   {
-    dim: '综合成本与门槛',
-    hired: '每年 6 到 10 万元专职成本',
-    agency: '年付数千元，仅做机械报税',
-    solo: '极低成本、0 会计门槛，平时免随手记，月末一键搞定',
-    highlight: '降本 90%+',
+    dim: '数据自主权',
+    hired: '人员交接易断层，历史账目难追溯',
+    agency: '账套数据被中介扣留，更换代账扯皮繁琐',
+    solo: '数据 100% 归企业，账套凭证随时完整导出，绝不锁定',
+    highlight: '自主可控',
   },
 ]
 
-// ── 典型角色与效能指标 ──
+// ── 适用场景 ──
 const personaChips = [
   {
-    role: '独立开发者',
-    icon: 'ri-code-s-slash-line',
-    metrics: [{ val: '3 个', label: '外包项目收款' }, { val: '100%', label: '订阅对账闭环' }],
-    tags: ['外包尾款对账', '服务器订阅费用归集', '软件退税测算'],
-  },
-  {
-    role: '自媒体创作者',
-    icon: 'ri-video-line',
-    metrics: [{ val: '10 秒', label: '平台账单导入' }, { val: '自动', label: '摄影器材折旧' }],
-    tags: ['商单回款核销', '器材折旧计提', '多渠道收支汇总'],
+    role: '出海贸易与跨境电商',
+    icon: 'ri-global-line',
+    metrics: [{ val: '10 秒', label: '账单自动导入' }, { val: '100%', label: '流水对平闭环' }],
+    tags: ['多平台账单对平', '分期回款自动核销', '汇兑流水清晰留痕'],
   },
   {
     role: '设计与咨询工作室',
     icon: 'ri-palette-line',
-    metrics: [{ val: '合规', label: '公私垫资通道' }, { val: '清晰', label: '分期回款跟踪' }],
-    tags: ['项目采买垫资隔离', '阶段付款跟进', '经营报表即时生成'],
+    metrics: [{ val: '0 风险', label: '个人垫资免税冲销' }, { val: '透明', label: '合伙人分红对账' }],
+    tags: ['项目采买垫资隔离', '阶段收款核对', '合伙人透明分红'],
   },
   {
-    role: '知识创作者',
-    icon: 'ri-book-open-line',
-    metrics: [{ val: '0 基础', label: '无需会计背景' }, { val: '即时', label: '增值税额测算' }],
-    tags: ['课程分账自动归集', '分录推导透明可查', '一键导出报税底稿'],
+    role: '技术团队与一人公司',
+    icon: 'ri-code-s-slash-line',
+    metrics: [{ val: '0 门槛', label: '一键确认入账' }, { val: 'MCP', label: 'Claude / Agent 直连' }],
+    tags: ['云服务器与算力归集', '无形资产合规摊销', 'MCP 自动化做账'],
+  },
+  {
+    role: '新零售与现代主理人',
+    icon: 'ri-store-2-line',
+    metrics: [{ val: '98 分', label: '账本健康度' }, { val: '0 挂账', label: '借款红线清零' }],
+    tags: ['垫资免税转回', '避开 20% 视同分红税', '银行经营贷标准账表'],
   },
 ]
 
-// ── 合规与安全保障 ──
+// ── 合规与数据安全 ──
 const complianceEvidence = [
   {
-    icon: 'ri-scales-3-line',
-    title: '100% 遵循小企业准则',
-    desc: '严格执行《小企业会计准则》，借贷实时平衡校验。自动生成标准资产负债表与利润表，税局与会计师事务所直接认可。',
-    points: ['准则标准科目体系', '税局申报底稿直出'],
+    icon: 'ri-shield-keyhole-line',
+    title: '仅本人可访问 · 多层防护',
+    desc: '仅本人账号授权方可访问账本。手机动态核验、微信防冒用与多层账号防护，底层行级强隔离防穿透。',
+    points: ['仅本人账号授权访问', '多层防护与防穿透隔离'],
   },
   {
-    icon: 'ri-shield-user-line',
-    title: '人机双签，老板最终把关',
-    desc: 'AI 负责智能解析流水与起草分录，入账与封账权限 100% 由老板掌管，彻底消除 AI 乱做账与失控隐患。',
-    points: ['AI 仅起草凭证草稿', '入账封账由老板确认'],
+    icon: 'ri-robot-2-line',
+    title: 'AI 不用企业数据训练',
+    desc: '对接 DeepSeek 等商用专线 API，财务流水绝不进入公网大模型训练集；AI 仅出草稿，人机双签。',
+    points: ['商用 API 绝不入训练集', 'AI 仅出草稿不越权'],
   },
   {
-    icon: 'ri-file-shield-2-line',
-    title: '流水与凭据双向留痕',
-    desc: '银行回单、发票与凭证双向永久挂接，带数字时间戳审计流，查账、对账与审计随时调取原始票据举证。',
-    points: ['原始票据双向挂接', '时间戳防篡改审计'],
+    icon: 'ri-lock-2-line',
+    title: '全链路双向加密与留痕',
+    desc: '全站强制 TLS 1.3 双向传输加密与核心密钥密文存储；每笔操作时间戳留痕，对外查验支持只读脱敏。',
+    points: ['全链路双向传输加密', '审计留痕与只读脱敏'],
+  },
+  {
+    icon: 'ri-database-2-line',
+    title: '数据自主，绝不锁客',
+    desc: '账套资产 100% 归企业所有。随时一键导出带数据指纹的 Excel 账套与凭证，自由迁移无后顾之忧。',
+    points: ['带指纹标准账套导出', '不锁客随时自由迁移'],
+  },
+]
+
+// ── 开源社区与商业定价方案 ──
+const copiedDocker = ref(false)
+const dockerCmd = 'docker run -d -p 8000:8000 --name solobooks jiezixingchen/solobooks:latest'
+
+function copyDockerCmd() {
+  navigator.clipboard?.writeText(dockerCmd)
+  copiedDocker.value = true
+  setTimeout(() => {
+    copiedDocker.value = false
+  }, 2500)
+}
+
+function handlePricingAction(action: string) {
+  if (action === 'github') {
+    window.open('https://github.com/jiezixingchen/solobooks-open', '_blank')
+  } else if (action === 'pro' || action === 'standard') {
+    if (localStorage.getItem('auth_token')) {
+      router.push(`/mine/plan?plan=${action}`)
+    } else {
+      router.push(`/login?plan=${action}`)
+    }
+  } else {
+    router.push(localStorage.getItem('auth_token') ? '/' : '/login?plan=trial')
+  }
+}
+
+interface PricingFeature {
+  text: string
+  included: boolean
+  note?: string
+}
+
+interface PricingTier {
+  key: string
+  badge: string
+  badgeType: 'neutral' | 'primary' | 'premium'
+  name: string
+  target: string
+  price: string
+  unit: string
+  popular?: boolean
+  desc: string
+  features: PricingFeature[]
+  btnText: string
+  btnAction: string
+}
+
+const pricingTiers: PricingTier[] = [
+  {
+    key: 'trial',
+    badge: '零门槛体验 · 月赠 10 万 Token',
+    badgeType: 'neutral',
+    name: '云端免费试用版',
+    target: '适合刚起步的独立开发者 · 尝鲜体验',
+    price: '0',
+    unit: '基础免费',
+    desc: '免部署开箱即用，功能与标准版完全一致，每月享 10 万 Token 体验额度（最多 3 个企业账套）。',
+    features: [
+      { text: '全功能无阉割：智能记账、三张报表与申报小抄（最多 3 个账套）', included: true },
+      { text: '每月 10 万 Token 体验额度（含多模态票据识别与问答）', included: true },
+      { text: '免买云服务器，Web 与移动端实时云同步', included: true },
+      { text: '银行流水、微信/支付宝账单与发票自动解析导入', included: true },
+      { text: '1对1 历史旧账导入服务', included: false, note: '需自助导入' },
+      { text: '专属问题服务群与会计师审账', included: false, note: '社区文档自助' },
+    ],
+    btnText: '免费开启云端体验',
+    btnAction: 'trial',
+  },
+  {
+    key: 'standard',
+    badge: '主力推荐 · 每日仅 ¥1.6',
+    badgeType: 'primary',
+    name: '云端标准版',
+    target: '一人公司 · 独立主理人 · 初创小微',
+    price: '598',
+    unit: '元 / 年',
+    popular: true,
+    desc: '花小钱买省心。专业财务会计师 1 对 1 帮你把旧账导进来，年享 500 万 Token 额度与专属服务群答疑。',
+    features: [
+      { text: '每年 500 万 AI Token 额度（含多模态票据识别与智能问答）', included: true },
+      { text: '最多支持 3 个企业账套（更多账套将面向代账机构版本开放）', included: true },
+      { text: '1对1 历史旧账导入与期初建账（由注册财务会计师负责）', included: true },
+      { text: '专属问题服务群（系统实操指导 + 日常财税问题响应）', included: true },
+      { text: '老板私卡垫资与免税提现冲销台账（规避 20% 个税风险）', included: true },
+      { text: '研发费用辅助账自动归集与电子税局申报小抄模式', included: true },
+    ],
+    btnText: '开启云端标准版',
+    btnAction: 'standard',
+  },
+  {
+    key: 'pro',
+    badge: 'AI 记账 + 会计师季度审账',
+    badgeType: 'premium',
+    name: '人机双签版',
+    target: '流水稳定 · 重视合规与经营分析',
+    price: '2,980',
+    unit: '元 / 年',
+    popular: false,
+    desc: 'AI 搞定日常流水，中级注册财务会计师每季度审账并出具财务分析报告，提供视频与日常经营问答。',
+    features: [
+      { text: '包含 598 标准版全部功能、每年 500 万 Token（3 个账套）与 1对1 旧账导入', included: true },
+      { text: '中级注册财务会计师每季度审账复核（人机双签把关）', included: true },
+      { text: '每季度出具专属《季度财务分析报告》（净利/税负/现金流穿透）', included: true },
+      { text: '每季度 30 分钟视频在线问答（1对1 深度解读与筹划建议）', included: true },
+      { text: '日常经营财务问答（合同节税、公转私合规、政策适用随时问）', included: true },
+    ],
+    btnText: '开启人机双签版',
+    btnAction: 'pro',
   },
 ]
 </script>
@@ -293,13 +405,19 @@ const complianceEvidence = [
         <nav class="nav-links">
           <a href="#pillars">核心优势</a>
           <a href="#showcase">功能展台</a>
-          <a href="/ai-connect" @click.prevent="router.push('/ai-connect')">AI 连接 (MCP & Skills)</a>
+          <a href="#showcase" @click.prevent="router.push('/ai-connect')">AI 连接 (MCP & Skills)</a>
+          <a href="/audit-scan" @click.prevent="router.push('/audit-scan')">AI 账本体检</a>
           <a href="#compare">方案对比</a>
+          <a href="#story">初衷手记</a>
           <a href="#migrate">账本迁移</a>
           <a href="#personas">适用场景</a>
-          <a href="#trust">合规保障</a>
+          <a href="#trust">合规与安全</a>
+          <a href="#pricing">开源与定价</a>
         </nav>
         <div class="nav-actions">
+          <NButton quaternary size="small" class="desktop-action-btn" @click="router.push('/landing-old')">
+            旧版官网
+          </NButton>
           <template v-if="isLoggedIn">
             <NButton type="primary" size="small" class="btn-primary desktop-action-btn" @click="router.push('/')">
               进入工作台
@@ -340,9 +458,22 @@ const complianceEvidence = [
                 <span>AI 连接 (MCP & Skills)</span>
                 <span class="drawer-badge">新</span>
               </a>
+              <a href="/audit-scan" @click.prevent="mobileMenuOpen = false; router.push('/audit-scan')">
+                <i class="ri-shield-flash-line" />
+                <span>AI 账本体检</span>
+                <span class="drawer-badge highlight">免费</span>
+              </a>
+              <a href="/free" @click.prevent="mobileMenuOpen = false; router.push('/free')">
+                <i class="ri-money-cny-circle-line" />
+                <span>免费说明</span>
+              </a>
               <a href="#compare" @click.prevent="navigateToAnchor('#compare')">
                 <i class="ri-scales-3-line" />
                 <span>方案对比</span>
+              </a>
+              <a href="#story" @click.prevent="navigateToAnchor('#story')">
+                <i class="ri-quill-pen-line" />
+                <span>初衷手记</span>
               </a>
               <a href="#migrate" @click.prevent="navigateToAnchor('#migrate')">
                 <i class="ri-exchange-box-line" />
@@ -354,7 +485,11 @@ const complianceEvidence = [
               </a>
               <a href="#trust" @click.prevent="navigateToAnchor('#trust')">
                 <i class="ri-shield-check-line" />
-                <span>合规保障</span>
+                <span>合规与安全</span>
+              </a>
+              <a href="#pricing" @click.prevent="navigateToAnchor('#pricing')">
+                <i class="ri-price-tag-3-line" />
+                <span>开源与定价</span>
               </a>
             </div>
             <div class="mobile-drawer-bottom">
@@ -371,52 +506,71 @@ const complianceEvidence = [
       </Transition>
     </header>
 
-    <!-- 2. Hero 区域：开阔舒展、大厂气度、深度视觉锚定 (对标企微) -->
+    <!-- 2. Hero 区域：清爽精简版 -->
     <section class="hero">
       <div class="hero-glow" />
       <div class="hero-inner">
+        <!-- 身份胶囊 -->
+        <div class="hero-kicker-pill">
+          <span>驻场 AI 财务官 · 专为小微与一人公司设计</span>
+        </div>
+
         <!-- 主标题 -->
         <h1 class="hero-title">
-          把账记简单，<br class="hero-br-mobile" />
-          <span class="title-highlight">把经营看清楚。</span>
+          点一点把账做清爽，<br class="hero-br-mobile" />
+          <span class="title-highlight">问一问把公司养值钱。</span>
         </h1>
 
-        <!-- 价值副标 -->
+        <!-- 价值副标：干净短促，绝不拖泥带水 -->
         <p class="hero-sub">
-          专为不甘做“甩手掌柜”的一人公司与小微企业主理人打造。<br class="desktop-only" />
-          月末一键导入流水与发票，在 10 秒确认中建立老板财务直觉，从第一天起养出经得起授信与融资尽调的体面账。
+          日常账务一键确认，财税疑难随时提问。<br class="desktop-only" />
+          告别外包糊涂账与公私混同风险，做一本科目规范、借贷平衡的干净账。
         </p>
 
         <!-- 行动按钮 -->
         <div class="hero-action-block">
           <div class="hero-cta">
             <button class="island-cta-btn" @click="router.push('/login')">
-              <span>免费注册，即得演示账套</span>
+              <span>免费开启干净账本</span>
               <span class="btn-arrow-icon"><i class="ri-arrow-right-line" /></span>
+            </button>
+            <button class="hero-scan-btn" @click="router.push('/audit-scan')">
+              <i class="ri-shield-flash-line" />
+              <span>30秒 AI 账本体检</span>
             </button>
           </div>
         </div>
 
-        <!-- 底部宽幅 Bento 价值指标看板 (横向舒展 1120px) -->
+        <!-- 底部 4 张 Bento 卡片：干练清晰 -->
         <div class="hero-proof-bento">
           <div class="proof-card">
             <div class="proof-card-top">
-              <div class="proof-icon-wrap"><i class="ri-time-line" /></div>
-              <span class="proof-badge blue">高效省时</span>
+              <div class="proof-icon-wrap"><i class="ri-cursor-line" /></div>
+              <span class="proof-badge blue">零门槛</span>
             </div>
-            <div class="proof-val">10 min</div>
-            <div class="proof-title">月末批量全流程搞定</div>
-            <p class="proof-desc">企银流水、发票包与平台交易账单一拖即入，平时零琐碎记账负担。</p>
+            <div class="proof-val">点一点 · 问一问</div>
+            <div class="proof-title">不懂会计也能管好账</div>
+            <p class="proof-desc">AI 预制入账方案，老板只需确认；疑难问题随时大白话提问。</p>
           </div>
 
           <div class="proof-card">
             <div class="proof-card-top">
-              <div class="proof-icon-wrap"><i class="ri-shield-check-line" /></div>
-              <span class="proof-badge emerald">准则合规</span>
+              <div class="proof-icon-wrap"><i class="ri-shield-keyhole-line" /></div>
+              <span class="proof-badge emerald">公私防雷</span>
             </div>
-            <div class="proof-val">100%</div>
-            <div class="proof-title">严格遵循会计准则</div>
-            <p class="proof-desc">财政部《小企业会计准则》科目映射，借贷实时平衡，报税数据一键生成。</p>
+            <div class="proof-val">公私合规隔离</div>
+            <div class="proof-title">杜绝 20% 股东借款个税</div>
+            <p class="proof-desc">个人垫资合规冲销，避免公私混同被税局误判为股东分红。</p>
+          </div>
+
+          <div class="proof-card">
+            <div class="proof-card-top">
+              <div class="proof-icon-wrap"><i class="ri-medal-line" /></div>
+              <span class="proof-badge amber">信用资产</span>
+            </div>
+            <div class="proof-val">小企业准则</div>
+            <div class="proof-title">标准科目 · 双向留痕</div>
+            <p class="proof-desc">遵循小企业会计准则，资产负债表与利润表规范联动，凭证回单双向穿透。</p>
           </div>
 
           <div class="proof-card hover-glow" @click="router.push('/ai-connect')">
@@ -426,17 +580,7 @@ const complianceEvidence = [
             </div>
             <div class="proof-val text-gradient">MCP & Skills</div>
             <div class="proof-title">Claude / Cursor / Agent 直连</div>
-            <p class="proof-desc">27 项原生 MCP 账务工具 + 报税/结账等专属 Skills 技能包，开箱即用，人机双签安全闭环。</p>
-          </div>
-
-          <div class="proof-card">
-            <div class="proof-card-top">
-              <div class="proof-icon-wrap"><i class="ri-play-circle-line" /></div>
-              <span class="proof-badge amber">零门槛</span>
-            </div>
-            <div class="proof-val">¥0</div>
-            <div class="proof-title">注册即得演示账套</div>
-            <p class="proof-desc">内置脱敏演练数据账套，注册后自动生成，直接体验全套做账。</p>
+            <p class="proof-desc">27 项原生账务工具与报税 Skills，人机双签，只出草稿不越权。</p>
           </div>
         </div>
       </div>
@@ -447,9 +591,9 @@ const complianceEvidence = [
       <div class="section-inner">
         <div class="section-top text-center">
           <p class="section-tag">核心优势</p>
-          <h2 class="section-headline">四大支柱，重塑小微企业记账体验</h2>
+          <h2 class="section-headline">四个底气，告别外包糊涂账</h2>
           <p class="section-subtitle">
-            告别繁琐会计术语，直击真实做账与对账闭环。
+            告别外包糊涂账，做一本规范透明、经得起查验的干净账本。
           </p>
         </div>
 
@@ -479,9 +623,9 @@ const complianceEvidence = [
       <div class="section-inner">
         <div class="section-top text-center">
           <p class="section-tag">核心功能</p>
-          <h2 class="section-headline">全流程财务自动化，一目了然</h2>
+          <h2 class="section-headline">极简流程，财务一目了然</h2>
           <p class="section-subtitle">
-            告别繁复跨表操作。从凭据导入、流水对平，到月末报税与 AI 助手直连。
+            从日常流水对平、财税咨询，到期末报税与银行协审。
           </p>
         </div>
 
@@ -504,17 +648,17 @@ const complianceEvidence = [
         <!-- 展台主体容器 -->
         <div class="showcase-stage">
           <Transition name="fade-slide" mode="out-in">
-            <!-- Tab 01: 凭据归集 -->
+            <!-- Tab 01: 点一点 · 智能管账 -->
             <div v-if="activeShowcase === 'batch'" key="batch" class="stage-grid">
               <div class="stage-left">
-                <h3 class="stage-title">月末一拖即入，<br />自动生成分录</h3>
+                <h3 class="stage-title">流水发票一拖即入，<br />确认即可入账</h3>
                 <p class="stage-desc">
-                  无需日常琐碎记账。月末将网银流水、发票包与平台交易账单一键拖入，AI 自动生成准则分录。
+                  无需繁琐记账。月末将银行流水、发票包与平台账单拖入，AI 自动预制分录，老板确认即完成入账。
                 </p>
                 <div class="stage-bullets">
-                  <div class="stage-bullet"><i class="ri-check-line" /><span>网银流水自适应解析，智能匹配会计科目</span></div>
-                  <div class="stage-bullet"><i class="ri-check-line" /><span>发票智能识别，税率分流与明细提取</span></div>
-                  <div class="stage-bullet"><i class="ri-check-line" /><span>凭证与原始票据双向挂接，全程留痕可查</span></div>
+                  <div class="stage-bullet"><i class="ri-checkbox-circle-line" /><span><b>① 硬规则直解</b>：税费、手续费等确定性项精准硬确认，零误差不走大模型</span></div>
+                  <div class="stage-bullet"><i class="ri-sparkling-line" /><span><b>② AI 语义推导</b>：依据交易对手与备注推导分录给出依据，人工点一点确认</span></div>
+                  <div class="stage-bullet"><i class="ri-brain-line" /><span><b>③ 专属记忆沉淀</b>：纠正一次即永久沉淀为企业专属规则，系统越用越准</span></div>
                 </div>
               </div>
               <div class="stage-right">
@@ -559,6 +703,18 @@ const complianceEvidence = [
                       </div>
                     </div>
 
+                    <!-- AI 财务专家入账建议气泡 -->
+                    <div class="agent-advice-bubble">
+                      <div class="advice-head">
+                        <i class="ri-lightbulb-flash-line text-amber" />
+                        <span class="advice-title">AI 财务官入账建议</span>
+                        <span class="advice-badge">合规节税推荐</span>
+                      </div>
+                      <p class="advice-content">
+                        💡 识别到技术服务采购 ¥30,000.00，建议适用小微增值税 1% 优惠入账，预计当期节税 ¥600.00。
+                      </p>
+                    </div>
+
                     <!-- 生成凭证单据 -->
                     <div class="voucher-card">
                       <div class="voucher-top">
@@ -586,7 +742,7 @@ const complianceEvidence = [
                       </div>
                       <div class="voucher-bottom">
                         <span class="match-hint"><i class="ri-link-m" />已自动关联招行流水回单 (尾号 8802) · 附发票凭证</span>
-                        <span class="btn-confirm-demo">一键确认入账</span>
+                        <span class="btn-confirm-demo"><i class="ri-cursor-fill" /> 点一点采纳</span>
                       </div>
                     </div>
                   </div>
@@ -594,58 +750,51 @@ const complianceEvidence = [
               </div>
             </div>
 
-            <!-- Tab 02: 流水对平 -->
+            <!-- Tab 02: 问一问 · 随身财务顾问 -->
             <div v-else-if="activeShowcase === 'reconcile'" key="reconcile" class="stage-grid">
               <div class="stage-left">
-                <h3 class="stage-title">微信与企银流水，<br />10 秒自动对平</h3>
+                <h3 class="stage-title">财税疑难随时发问，<br />给出合规方案</h3>
                 <p class="stage-desc">
-                  深度勾稽每一笔银行出入与微信商户收款，自动核销往来账目，智能拦截重复入账。
+                  垫资怎么拿回？合同怎么签省税？随时提问，AI 结合公司真实账面给出清晰合规路径。
                 </p>
                 <div class="stage-bullets">
-                  <div class="stage-bullet"><i class="ri-check-line" /><span>企银流水 100% 自动对平，余额分毫不差</span></div>
-                  <div class="stage-bullet"><i class="ri-check-line" /><span>微信商户商业收款核销，零散交易自动匹配</span></div>
-                  <div class="stage-bullet"><i class="ri-check-line" /><span>重复到账与多次付款实时预警拦截</span></div>
+                  <div class="stage-bullet"><i class="ri-check-line" /><span>联动真实账本数据，量身定制合规方案</span></div>
+                  <div class="stage-bullet"><i class="ri-check-line" /><span>金税四期口径预警，拦截公私混同与 20% 分红个税雷区</span></div>
+                  <div class="stage-bullet"><i class="ri-check-line" /><span>咨询方案一键转化为合规凭据草稿，闭环落地</span></div>
                 </div>
               </div>
               <div class="stage-right">
                 <div class="mockup-window">
                   <div class="window-bar">
                     <div class="window-dots"><span class="dot red" /><span class="dot yellow" /><span class="dot green" /></div>
-                    <span class="window-title">智能流水核销与勾稽监控</span>
-                    <span class="window-status text-emerald"><i class="ri-refresh-line" /> 实时对平中</span>
+                    <span class="window-title">SoloBooks AI 财务军师 · 实时咨询工作台</span>
+                    <span class="window-status text-emerald"><i class="ri-checkbox-circle-line" /> 7×24h 在线解答</span>
                   </div>
                   <div class="window-content">
-                    <div class="recon-detail-list">
-                      <div class="recon-card-item success">
-                        <div class="recon-card-icon"><i class="ri-bank-line" /></div>
-                        <div class="recon-card-main">
-                          <div class="recon-card-row">
-                            <b>企业基本户流水 · 招商银行</b>
-                            <span class="status-pill green"><i class="ri-check-line" />已全部平账</span>
-                          </div>
-                          <p>共 26 笔交易 · 收入 ¥64,800.00 · 支出 ¥22,150.00，均已关联记账凭证</p>
+                    <div class="advisor-dialog-body">
+                      <div class="advisor-msg user">
+                        <div class="msg-avatar"><i class="ri-user-smile-line" /></div>
+                        <div class="msg-bubble">
+                          <div class="msg-author">创始人（你）</div>
+                          <div class="msg-text">我用个人卡替公司垫了 3.8 万元采购设备，怎么转回给我合规不被查税？</div>
                         </div>
                       </div>
-
-                      <div class="recon-card-item success">
-                        <div class="recon-card-icon"><i class="ri-wechat-pay-line" /></div>
-                        <div class="recon-card-main">
-                          <div class="recon-card-row">
-                            <b>微信商业收款 · 客户分期与零散付款</b>
-                            <span class="status-pill green"><i class="ri-check-line" />自动核销</span>
+                      <div class="advisor-msg assistant">
+                        <div class="msg-avatar"><i class="ri-chat-3-line" /></div>
+                        <div class="msg-bubble">
+                          <div class="msg-author">SoloBooks AI 财务官 · 实时处方</div>
+                          <div class="advisor-warning-alert">
+                            <i class="ri-alert-fill" />
+                            <span><b>风险拦截：</b>切勿直接由公司转账给个人并挂“其他应收款”，税局认定视同分红将面临 20%（¥7,600）个税风险。</span>
                           </div>
-                          <p>共 17 笔商户结算资金 · 自动按客户合同号匹配应收账款明细</p>
-                        </div>
-                      </div>
-
-                      <div class="recon-card-item warning">
-                        <div class="recon-card-icon"><i class="ri-shield-flash-line" /></div>
-                        <div class="recon-card-main">
-                          <div class="recon-card-row">
-                            <b>智能防重看门狗拦截</b>
-                            <span class="status-pill amber"><i class="ri-alert-line" />已智能拦截</span>
+                          <div class="msg-text">
+                            <b>合规解决路径：</b><br />
+                            走系统【垫资冲销通道】，凭个人付款凭据与设备发票入账冲销，公户附言“还垫资款”转回个人，合法免税。
                           </div>
-                          <p>检测到 ¥1,200.00 微信收款与网银转账日期及摘要高度吻合，已阻止重复计收</p>
+                          <div class="advisor-action-row">
+                            <span class="btn-advisor-action"><i class="ri-file-add-line" /> 一键生成垫资冲销单</span>
+                            <span class="advisor-action-tag"><i class="ri-shield-check-line" /> 0个税风险 · 凭证合规冲平</span>
+                          </div>
                         </div>
                       </div>
                     </div>
@@ -654,72 +803,7 @@ const complianceEvidence = [
               </div>
             </div>
 
-            <!-- Tab 03: 越用越准（专属记忆规则） -->
-            <div v-else-if="activeShowcase === 'memory'" key="memory" class="stage-grid">
-              <div class="stage-left">
-                <h3 class="stage-title">确认一次，<br />下月自动记住</h3>
-                <p class="stage-desc">
-                  每一笔你确认过的流水，都会沉淀为你们公司专属的记账规则。下月同类流水进来自动优先命中——不用反复教，系统越用越懂你的生意。
-                </p>
-                <div class="stage-bullets">
-                  <div class="stage-bullet"><i class="ri-check-line" /><span>每家企业独立记忆，确认即学会，账目数据不混用</span></div>
-                  <div class="stage-bullet"><i class="ri-check-line" /><span>对手方、用途、金额区间多维识别，命中与纠正全程留痕</span></div>
-                  <div class="stage-bullet"><i class="ri-check-line" /><span>规则透明可管理：可查看、可修改、可停用</span></div>
-                </div>
-              </div>
-              <div class="stage-right">
-                <div class="mockup-window">
-                  <div class="window-bar">
-                    <div class="window-dots"><span class="dot red" /><span class="dot yellow" /><span class="dot green" /></div>
-                    <span class="window-title">企业专属分类规则库</span>
-                    <span class="window-status text-emerald"><i class="ri-brain-line" /> 已记住 32 条规则</span>
-                  </div>
-                  <div class="window-content">
-                    <div class="recon-detail-list">
-                      <div class="recon-card-item success">
-                        <div class="recon-card-icon"><i class="ri-cloud-line" /></div>
-                        <div class="recon-card-main">
-                          <div class="recon-card-row">
-                            <b>「腾讯云」服务器月结扣费</b>
-                            <span class="status-pill green"><i class="ri-check-line" />命中 9 次</span>
-                          </div>
-                          <p>¥328.00 自动归类「管理费用 - 服务器订阅费」，无需 AI 重新分析</p>
-                        </div>
-                      </div>
-
-                      <div class="recon-card-item success">
-                        <div class="recon-card-icon"><i class="ri-user-3-line" /></div>
-                        <div class="recon-card-main">
-                          <div class="recon-card-row">
-                            <b>客户「李先生」项目尾款回款</b>
-                            <span class="status-pill green"><i class="ri-check-line" />命中 4 次</span>
-                          </div>
-                          <p>自动认领「应收账款 - 官网项目」，金额区间 ¥8,000–12,000 已学习</p>
-                        </div>
-                      </div>
-
-                      <div class="recon-card-item warning">
-                        <div class="recon-card-icon"><i class="ri-file-edit-line" /></div>
-                        <div class="recon-card-main">
-                          <div class="recon-card-row">
-                            <b>你纠正过一次，规则已升级</b>
-                            <span class="status-pill blue"><i class="ri-arrow-up-line" />v1 → v2</span>
-                          </div>
-                          <p>「支付宝」提现手续费由「管理费用」修正为「财务费用」，此后同类流水按新规则命中</p>
-                        </div>
-                      </div>
-
-                      <div class="memory-footer-hint">
-                        <i class="ri-shield-check-line" />
-                        <span>全部规则可查看、可修改、可停用 · 记忆仅属于你们公司</span>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <!-- Tab 04: 月末结账 -->
+            <!-- Tab 03: 月末结账 -->
             <div v-else-if="activeShowcase === 'closing'" key="closing" class="stage-grid">
               <div class="stage-left">
                 <h3 class="stage-title">4 步向导结账，<br />报税数据直出</h3>
@@ -782,7 +866,7 @@ const complianceEvidence = [
               </div>
             </div>
 
-            <!-- Tab 05: 经营报表 -->
+            <!-- Tab 04: 经营报表 -->
             <div v-else-if="activeShowcase === 'dashboard'" key="dashboard" class="stage-grid">
               <div class="stage-left">
                 <h3 class="stage-title">实时财务三张表，<br />看懂企业经营</h3>
@@ -791,8 +875,8 @@ const complianceEvidence = [
                 </p>
                 <div class="stage-bullets">
                   <div class="stage-bullet"><i class="ri-check-line" /><span>标准三张表实时联动生成，无需等待代账滞后汇报</span></div>
-                  <div class="stage-bullet"><i class="ri-check-line" /><span>真实净利润与现金流跑道测算，掌控经营底牌</span></div>
-                  <div class="stage-bullet"><i class="ri-check-line" /><span>客户应收账款账龄预警，逾期回款随时提醒</span></div>
+                  <div class="stage-bullet"><i class="ri-check-line" /><span>研发费用辅助账自动归集：基于入驻园区研发补助实战，流水工时自动打标，轻松申报科小与税惠</span></div>
+                  <div class="stage-bullet"><i class="ri-check-line" /><span>真实净利润与现金流跑道测算，应收账款账龄智能预警</span></div>
                 </div>
               </div>
               <div class="stage-right">
@@ -825,12 +909,21 @@ const complianceEvidence = [
                         <span class="kpi-trend warning">2 笔均处于 30 天账期内</span>
                       </div>
                     </div>
+
+                    <div class="audit-share-banner">
+                      <div class="share-icon-wrap"><i class="ri-share-forward-box-line" /></div>
+                      <div class="share-info">
+                        <b>Solo Audit Share 专属协审链接</b>
+                        <span>https://solobooks.net/share/cpa_9a8f27... (投资人与银行免注册只读在线验账)</span>
+                      </div>
+                      <span class="btn-copy-share"><i class="ri-file-copy-line" /> 复制链接</span>
+                    </div>
                   </div>
                 </div>
               </div>
             </div>
 
-            <!-- Tab 06: AI 连接 (MCP & Skills) -->
+            <!-- Tab 05: AI 连接 (MCP & Skills) -->
             <div v-else-if="activeShowcase === 'mcp'" key="mcp" class="stage-grid">
               <div class="stage-left">
                 <h3 class="stage-title">原生支持 MCP + Skills，<br />打造懂小微财税的数字员工</h3>
@@ -921,9 +1014,11 @@ const complianceEvidence = [
     <section id="compare" class="section section-compare">
       <div class="section-inner">
         <div class="section-top text-center">
-          <p class="section-tag">清晰对比</p>
-          <h2 class="section-headline">为什么不找传统代账，而选梭罗记账？</h2>
-          <p class="section-subtitle">不止于省下代账费——告别“应付税局的黑盒死账”，做懂财务的清醒掌舵人，养出随时可尽调的合规公司。</p>
+          <p class="section-tag">合规优先 · 方案对比</p>
+          <h2 class="section-headline">为什么不用传统代账？</h2>
+          <p class="section-subtitle">
+            金税四期“以数治税、穿透监管”，过去廉价代账留下的公私不分与糊涂烂账成了定时炸弹。规范透明，才是小微企业的立身之本。
+          </p>
         </div>
 
         <div class="compare-grid">
@@ -936,7 +1031,7 @@ const complianceEvidence = [
             <!-- 梭罗记账高亮方案 -->
             <div class="solo-solution">
               <div class="solo-solution-label">
-                <i class="ri-book-open-line" />梭罗记账
+                梭罗 AI 财务官
               </div>
               <div class="solo-solution-text">{{ comp.solo }}</div>
             </div>
@@ -957,14 +1052,105 @@ const complianceEvidence = [
       </div>
     </section>
 
+    <!-- 5.5 创始人手记：为什么我们要做梭罗记账？ (Origin Story) -->
+    <section id="story" class="section section-story">
+      <div class="section-inner">
+        <div class="story-card">
+          <div class="story-header text-center">
+            <span class="story-badge">
+              <i class="ri-quill-pen-line" />
+              <span>创始人真实手记</span>
+            </span>
+            <h2 class="story-title">原本，这只是我们写给自己用的工具</h2>
+            <p class="story-sub">
+              从评选入驻政府科技园区、获得官方研发补助支持，到踩遍小微记账的所有坑——这是一位创业者做给更多创业者的干净账税系统。
+            </p>
+          </div>
+
+          <div class="story-grid">
+            <!-- 左侧：亲身踩过的三难困境 -->
+            <div class="story-pane story-pain">
+              <div class="pane-head">
+                <span class="pane-tag pain-tag">切身体会的小微三难</span>
+                <h3 class="pane-title">找代账糊涂、自记账繁琐、招会计太贵</h3>
+              </div>
+              <div class="story-pains-list">
+                <div class="pain-box">
+                  <div class="pain-icon-wrap"><i class="ri-close-line" /></div>
+                  <div class="pain-content">
+                    <b>找过外部廉价代账</b>
+                    <p>200 块一个月，只管填表不管账，发票乱塞、往来乱挂。金税四期大数据一穿透，全是随时暴雷的个税与补税炸弹；</p>
+                  </div>
+                </div>
+                <div class="pain-box">
+                  <div class="pain-icon-wrap"><i class="ri-close-line" /></div>
+                  <div class="pain-content">
+                    <b>用过市面自记账产品</b>
+                    <p>满屏都是死板复杂的会计术语和大表格，既不专业又难用，根本无法长期坚持；</p>
+                  </div>
+                </div>
+                <div class="pain-box">
+                  <div class="pain-icon-wrap"><i class="ri-close-line" /></div>
+                  <div class="pain-content">
+                    <b>想招专职会计坐班</b>
+                    <p>一年 8~12 万的刚性成本，对于初创小团队、一人公司来说，养专职财务实在太重太奢侈。</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 右侧：自己造工具 + 专家打磨 + 开放共创 -->
+            <div class="story-pane story-resolve">
+              <div class="pane-head">
+                <span class="pane-tag resolve-tag">从自用到开放共创</span>
+                <h3 class="pane-title">索性自己造，并与专业财务反复打磨</h3>
+              </div>
+              <div class="story-resolve-text">
+                <p>
+                  既然市面上没有称心的，<b>我们索性结合工程师的自动化能力，为自己开发了这套系统</b>。
+                  后来我们找了资深专业财务朋友，严格对照《小企业会计准则 (2013)》反复打磨：从硬规则直解、AI推导到规则记忆，把底层借贷平衡、已过账只准红冲、私卡垫资隔离等专业规矩一件件焊死在底层。
+                </p>
+                <p>
+                  身边很多创业朋友、独立主理人看我们用得顺畅，纷纷问能不能用。我们才决定<b>开源复式记账内核破除锁客，正式上线商业云端版</b>。
+                </p>
+                <p class="resolve-highlight">
+                  目前系统正在面向技术、设计、咨询、电商、实体等更多行业深度测试。我们真诚欢迎你来试用，并给出宝贵的使用反馈与批评意见。
+                </p>
+              </div>
+
+              <!-- 背书信赖胶囊条 -->
+              <div class="story-badges-row">
+                <div class="s-badge-item">
+                  <i class="ri-government-line text-blue" />
+                  <span>政府园区入驻评审</span>
+                </div>
+                <div class="s-badge-item">
+                  <i class="ri-funds-box-line text-emerald" />
+                  <span>科技创新研发补助支持</span>
+                </div>
+                <div class="s-badge-item">
+                  <i class="ri-shield-check-line text-indigo" />
+                  <span>资深 CPA 联合打磨</span>
+                </div>
+                <div class="s-badge-item">
+                  <i class="ri-user-smile-line text-amber" />
+                  <span>多行业创业者测试中</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- 6. 账本迁移：历史账套导入与全量导出 (Migration) -->
     <section id="migrate" class="section section-migrate">
       <div class="section-inner">
         <div class="section-top text-center">
           <p class="section-tag">无痛迁移</p>
-          <h2 class="section-headline">换账不搬家，<br class="hero-br-mobile" />历史账本一键带走</h2>
+          <h2 class="section-headline">前任代账账套，<br class="hero-br-mobile" />一键导入洗干净</h2>
           <p class="section-subtitle">
-            从传统代账或其他财务软件迁入，历史凭证不必重录；<br class="hero-br-mobile" />账本随时完整导出，不做锁定。
+            直接导入历史科目余额表，AI 自动扫描挂账风险；账套随时完整导出，绝不锁定。
           </p>
         </div>
 
@@ -1021,8 +1207,8 @@ const complianceEvidence = [
       <div class="section-inner">
         <div class="section-top text-center">
           <p class="section-tag">量身打造</p>
-          <h2 class="section-headline">谁在用梭罗记账？</h2>
-          <p class="section-subtitle">独立开发者、工作室与小微团队的真实生产力工具。</p>
+          <h2 class="section-headline">适合谁用？</h2>
+          <p class="section-subtitle">专为需要账目清爽、合规规范的小微团队与一人公司设计。</p>
         </div>
 
         <div class="persona-grid">
@@ -1049,18 +1235,18 @@ const complianceEvidence = [
       </div>
     </section>
 
-    <!-- 8. 合规保障 (Slide 8) -->
+    <!-- 8. 安全与合规保障 (Slide 8) -->
     <section id="trust" class="section section-trust">
       <div class="section-inner">
         <div class="section-top text-center">
-          <p class="section-tag">合规保障与未来期许</p>
-          <h2 class="section-headline">按你期许的公司样子管账</h2>
+          <p class="section-tag">数据安全与合规</p>
+          <h2 class="section-headline">企业级数据安全，底线经得起查验</h2>
           <p class="section-subtitle">
-            好公司不是融到资才开始规范财务。从第一天起做到票、流、账、税 100% 勾稽，让账本随时接得住银行授信、政策补贴与投资人尽调。
+            全链路双向加密、多层账号防护仅本人可访问、AI 商业数据绝不入训练集。
           </p>
         </div>
 
-        <!-- 3 大核心合规保障卡片 -->
+        <!-- 4 大核心安全与合规卡片 -->
         <div class="compliance-evidence-grid">
           <div v-for="e in complianceEvidence" :key="e.title" class="evidence-card">
             <div class="evidence-icon-wrap">
@@ -1078,18 +1264,151 @@ const complianceEvidence = [
       </div>
     </section>
 
-    <!-- 9. 底部精简 CTA 与页脚 (整合为最终幻灯片) -->
+    <!-- 9. 开源社区与商业定价方案 (Pricing) -->
+    <section id="pricing" class="section section-pricing">
+      <div class="section-inner">
+        <div class="section-top text-center">
+          <p class="section-tag">方案与定价</p>
+          <h2 class="section-headline">你可以把数据留在自己电脑里，也可以交给我们全自动打理</h2>
+          <p class="section-subtitle">
+            核心代码公开，数据自主不锁客；或直接开启开箱即用的云端全自动记账。
+          </p>
+        </div>
+
+        <div class="pricing-grid">
+          <div
+            v-for="tier in pricingTiers"
+            :key="tier.key"
+            class="pricing-card"
+            :class="{ 'is-popular': tier.popular, [`tier-${tier.badgeType}`]: true }"
+          >
+            <!-- 推荐标签 -->
+            <div v-if="tier.badge" class="pricing-badge" :class="`badge-${tier.badgeType}`">
+              <i v-if="tier.popular" class="ri-fire-line" />
+              <i v-else-if="tier.badgeType === 'neutral'" class="ri-sparkling-2-line" />
+              <i v-else class="ri-shield-star-line" />
+              <span>{{ tier.badge }}</span>
+            </div>
+
+            <!-- 卡片头部：名称、适用对象、价格 -->
+            <div class="pricing-header">
+              <h3 class="tier-name">{{ tier.name }}</h3>
+              <p class="tier-target">{{ tier.target }}</p>
+              <div class="tier-price-box">
+                <span class="price-currency">¥</span>
+                <span class="price-num">{{ tier.price }}</span>
+                <span class="price-unit">/ {{ tier.unit }}</span>
+              </div>
+              <p class="tier-desc">{{ tier.desc }}</p>
+            </div>
+
+            <!-- 分割线 -->
+            <div class="pricing-divider" />
+
+            <!-- 特性列表 -->
+            <ul class="pricing-features">
+              <li
+                v-for="(f, idx) in tier.features"
+                :key="idx"
+                class="feature-row"
+                :class="{ 'is-excluded': !f.included }"
+              >
+                <div class="feature-icon">
+                  <i v-if="f.included" class="ri-check-line" />
+                  <i v-else class="ri-close-line" />
+                </div>
+                <div class="feature-text">
+                  <span class="feature-main">{{ f.text }}</span>
+                  <span v-if="f.note" class="feature-note">（{{ f.note }}）</span>
+                </div>
+              </li>
+            </ul>
+
+            <!-- 操作按钮 -->
+            <div class="pricing-action">
+              <button
+                class="pricing-btn"
+                :class="{ 'btn-popular': tier.popular, 'btn-ghost': !tier.popular && tier.key === 'trial', 'btn-pro': tier.key === 'pro' }"
+                @click="handlePricingAction(tier.btnAction)"
+              >
+                <span>{{ tier.btnText }}</span>
+                <i v-if="tier.btnAction === 'github'" class="ri-external-link-line" />
+                <i v-else class="ri-arrow-right-line" />
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 开源社区版：本地快速启动 -->
+        <div class="docker-callout">
+          <div class="docker-callout-left">
+            <div class="docker-badge">
+              <i class="ri-github-fill" />
+              <span>开源社区版 · 永久免费可自行部署</span>
+            </div>
+            <p class="docker-title">全功能开源无阉割，终端一行命令本地私有化部署</p>
+            <p class="docker-sub">
+              自备服务器与大模型 API Key 即可完整运行全套功能，财务数据 100% 保存在本地。
+            </p>
+          </div>
+          <div class="docker-callout-right">
+            <div class="docker-code-box">
+              <code>{{ dockerCmd }}</code>
+              <button
+                class="docker-copy-btn"
+                :class="{ copied: copiedDocker }"
+                :aria-label="copiedDocker ? '已复制' : '复制命令'"
+                @click="copyDockerCmd"
+              >
+                <i :class="copiedDocker ? 'ri-check-line' : 'ri-file-copy-line'" />
+                <span>{{ copiedDocker ? '已复制' : '复制' }}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 9.5 常见问题（FAQ）：文案与 seo.ts 的 FAQPage 共用 content/faq.ts -->
+    <section id="faq" class="section section-faq">
+      <div class="section-inner">
+        <div class="section-top text-center">
+          <p class="section-tag">常见问题</p>
+          <h2 class="section-headline">关于使用与免费，先回答这几个问题</h2>
+          <p class="section-subtitle">更完整的免费边界与自托管条件，见免费财务软件专题页。</p>
+        </div>
+        <div class="home-faq-list">
+          <details v-for="item in HOME_FAQ" :key="item.q" class="home-faq-item">
+            <summary>{{ item.q }}</summary>
+            <p>{{ item.a }}</p>
+          </details>
+        </div>
+        <p class="home-faq-more">
+          <a href="/free" @click.prevent="router.push('/free')">查看完整免费边界与自托管说明 →</a>
+        </p>
+      </div>
+    </section>
+
+    <!-- 10. 底部精简 CTA 与页脚 (整合为最终幻灯片) -->
     <section class="landing-slide-end">
       <div class="cta-banner">
         <div class="cta-glow-mesh" />
         <div class="cta-inner text-center">
-          <h2 class="cta-title">让专属 AI CFO，打理你的公司账目</h2>
-          <p class="cta-sub">免费注册，1 分钟建立企业专属智能账本。</p>
+          <h2 class="cta-title">给公司配一个懂业务的 AI 财务官</h2>
+          <p class="cta-sub">告别外包糊涂账，做一本规范透明、经得起查验的干净账本。</p>
           <div class="cta-buttons">
             <button class="island-cta-btn" @click="router.push('/login')">
-              <span>免费注册 / 登录</span>
+              <span>免费开启清爽账本</span>
               <span class="btn-arrow-icon"><i class="ri-arrow-right-line" /></span>
             </button>
+          </div>
+
+          <!-- 开放共创测试提示 -->
+          <div class="cta-co-build-bar">
+            <span class="co-build-pill"><i class="ri-compass-3-line" /> 开放共测</span>
+            <span class="co-build-text">
+              目前系统正面向技术、设计、咨询、电商、实体等更多行业开放测试。诚邀体验并反馈真实意见，与我们一起打磨更懂创业者的账税工具。
+            </span>
           </div>
         </div>
       </div>
@@ -1104,7 +1423,7 @@ const complianceEvidence = [
             </div>
           </div>
           <nav class="footer-nav">
-            <a href="/learn">学习中心</a>
+            <a href="/free" @click.prevent="router.push('/free')">免费说明</a>
             <a href="/agreement" target="_blank">服务协议</a>
             <a href="/privacy" target="_blank">隐私政策</a>
             <a href="/login">进入系统</a>
@@ -1149,8 +1468,7 @@ const complianceEvidence = [
 .landing-page {
   min-height: 100vh;
   width: 100%;
-  /* 必须用 clip 而非 hidden：hidden 会把根节点变成滚动容器，破坏内部 sticky 吸顶导航 */
-  overflow-x: clip;
+  overflow-x: hidden;
   background-color: #f8fafc;
   color: #0f172a;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Noto Sans SC", sans-serif;
@@ -1431,7 +1749,7 @@ const complianceEvidence = [
 .proof-val {
   font-size: 26px;
   font-weight: 800;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Noto Sans SC", sans-serif;
   color: #0f172a;
   line-height: 1.15;
   margin-bottom: 6px;
@@ -1503,6 +1821,33 @@ const complianceEvidence = [
 
 .island-cta-btn:hover .btn-arrow-icon {
   transform: translateX(2px);
+}
+
+.hero-scan-btn {
+  height: 48px;
+  padding: 0 22px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border-radius: 999px;
+  background: #ffffff;
+  color: #1747b0;
+  border: 1px solid rgba(23, 71, 176, 0.25);
+  font-size: 14.5px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 2px 10px rgba(23, 71, 176, 0.06);
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.hero-scan-btn:hover {
+  background: #edf3ff;
+  border-color: #1747b0;
+  transform: translateY(-1px);
+}
+
+.hero-scan-btn:active {
+  transform: scale(0.97);
 }
 
 
@@ -1902,6 +2247,70 @@ const complianceEvidence = [
   color: #5b6a7c;
 }
 
+/* ── 9.5 常见问题 (FAQ) ── */
+.section-faq {
+  background: #ffffff;
+}
+
+.home-faq-list {
+  max-width: 820px;
+  margin: 0 auto;
+}
+
+.home-faq-item {
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.home-faq-item summary {
+  padding: 18px 0;
+  color: #0f172a;
+  cursor: pointer;
+  font-size: 16px;
+  font-weight: 700;
+  list-style: none;
+}
+
+.home-faq-item summary::-webkit-details-marker {
+  display: none;
+}
+
+.home-faq-item summary::after {
+  content: '+';
+  float: right;
+  color: #1747b0;
+  font-size: 20px;
+  line-height: 1;
+}
+
+.home-faq-item[open] summary::after {
+  content: '−';
+}
+
+.home-faq-item p {
+  margin: 0 0 18px;
+  padding-right: 24px;
+  color: #475569;
+  font-size: 14.5px;
+  line-height: 1.9;
+}
+
+.home-faq-more {
+  max-width: 820px;
+  margin: 22px auto 0;
+  text-align: right;
+  font-size: 14px;
+}
+
+.home-faq-more a {
+  color: #1747b0;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.home-faq-more a:hover {
+  text-decoration: underline;
+}
+
 /* ── 3. 四大核心支柱 (Four Pillars) ── */
 .section-pillars {
   background: #f8fafc;
@@ -2035,8 +2444,7 @@ const complianceEvidence = [
   border-radius: 12px;
   border: 1px solid #e2e8f0;
   width: 100%;
-  /* 980px：5 个 tab 单行不折字所需宽度（配合 tab 按钮的 white-space: nowrap） */
-  max-width: 980px;
+  max-width: 860px;
   box-sizing: border-box;
   margin: 0 auto 32px;
 }
@@ -2052,8 +2460,6 @@ const complianceEvidence = [
   font-size: 13.5px;
   font-weight: 600;
   color: #5b6a7c;
-  /* 禁止逐字折行（"凭据归 集"），窄屏由 nav-bar 横向滚动兜底 */
-  white-space: nowrap;
   cursor: pointer;
   transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
   position: relative;
@@ -2321,28 +2727,6 @@ const complianceEvidence = [
 .status-pill.amber {
   background: #fffbeb;
   color: #d97706;
-}
-
-.status-pill.blue {
-  background: #eaf1fe;
-  color: var(--solo-info);
-}
-
-.memory-footer-hint {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  padding: 10px 12px;
-  border: 1px dashed #cdd9e8;
-  border-radius: 8px;
-  background: #f8fafc;
-  font-size: 12px;
-  color: #5b6a7c;
-}
-
-.memory-footer-hint i {
-  color: #0f7354;
 }
 
 /* 结账向导卡片 */
@@ -3020,12 +3404,12 @@ const complianceEvidence = [
   border-bottom: 1px solid #e2e8f0;
 }
 
-/* ── 合规保障 3 大核心卡片 ── */
+/* ── 合规与数据安全 4 大核心保障卡片 ── */
 .compliance-evidence-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 24px;
-  max-width: 1140px;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 20px;
+  max-width: 1200px;
   margin: 0 auto;
 }
 
@@ -3033,7 +3417,7 @@ const complianceEvidence = [
   background: #f8fafc;
   border: 1px solid #e2e8f0;
   border-radius: 12px;
-  padding: 32px 26px;
+  padding: 24px 20px;
   display: flex;
   flex-direction: column;
   box-shadow: 0 2px 8px rgba(15, 23, 42, 0.02);
@@ -3333,6 +3717,11 @@ const complianceEvidence = [
   margin-left: auto;
 }
 
+.drawer-badge.highlight {
+  background: #dcfce7;
+  color: var(--solo-income);
+}
+
 .mobile-drawer-bottom {
   padding-top: 8px;
   border-top: 1px solid #f1f5f9;
@@ -3507,7 +3896,8 @@ const complianceEvidence = [
   }
 
   .compliance-evidence-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 16px;
   }
 }
 
@@ -3524,12 +3914,6 @@ const complianceEvidence = [
 
   .mobile-sticky-bar {
     display: flex;
-  }
-
-  /* 吸底操作栏展示期间，全局内测浮钮上移避让，避免遮挡"免费试用"主 CTA。
-     整条选择器必须包进 :global（fab 属于子组件，scoped 属性选择器匹配不到） */
-  :global(html.landing-cta-bar-shown .beta-contact-fab) {
-    bottom: 86px;
   }
 
   .nav-links {
@@ -4092,4 +4476,868 @@ const complianceEvidence = [
     padding: 8px 12px;
   }
 }
+
+/* ── 高维定位新增视觉组件 ── */
+.hero-kicker-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid rgba(23, 71, 176, 0.18);
+  box-shadow: 0 2px 10px rgba(23, 71, 176, 0.06);
+  padding: 6px 14px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #1747b0;
+  margin-bottom: 20px;
+  backdrop-filter: blur(8px);
+}
+
+.agent-advice-bubble {
+  background: #fffdf5;
+  border: 1px solid #fef08a;
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  box-shadow: 0 2px 8px rgba(217, 119, 6, 0.05);
+}
+
+.advice-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.advice-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: #854d0e;
+}
+
+.advice-badge {
+  font-size: 10px;
+  font-weight: 600;
+  background: #fef9c3;
+  color: var(--solo-warning);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.advice-content {
+  margin: 0;
+  font-size: 11.5px;
+  color: #713f12;
+  line-height: 1.5;
+}
+
+/* 问一问实时顾问对话模拟 */
+.advisor-dialog-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.advisor-msg {
+  display: flex;
+  gap: 10px;
+}
+
+.advisor-msg.user {
+  flex-direction: row-reverse;
+}
+
+.msg-avatar {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  flex-shrink: 0;
+}
+
+.advisor-msg.user .msg-avatar {
+  background: #e2e8f0;
+  color: #334155;
+}
+
+.advisor-msg.assistant .msg-avatar {
+  background: #edf3ff;
+  color: #1747b0;
+}
+
+.msg-bubble {
+  max-width: 88%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.advisor-msg.user .msg-bubble {
+  align-items: flex-end;
+}
+
+.msg-author {
+  font-size: 11px;
+  font-weight: 600;
+  color: #64748b;
+}
+
+.advisor-msg.user .msg-text {
+  background: #1747b0;
+  color: #ffffff;
+  padding: 8px 12px;
+  border-radius: 10px 2px 10px 10px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.advisor-msg.assistant .msg-bubble {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 2px 10px 10px 10px;
+  padding: 12px;
+}
+
+.advisor-warning-alert {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  background: #fff1f2;
+  border: 1px solid #fecdd3;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 11px;
+  color: #9f1239;
+  line-height: 1.45;
+  margin-bottom: 6px;
+}
+
+.advisor-warning-alert i {
+  color: #e11d48;
+  font-size: 14px;
+  margin-top: 1px;
+}
+
+.advisor-msg.assistant .msg-text {
+  font-size: 12px;
+  color: #1e293b;
+  line-height: 1.6;
+}
+
+.advisor-action-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 6px;
+  padding-top: 8px;
+  border-top: 1px dashed #e2e8f0;
+}
+
+.btn-advisor-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: #1747b0;
+  color: #ffffff;
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.advisor-action-tag {
+  font-size: 10.5px;
+  color: #0f7354;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* 协审链接分享横幅 */
+.audit-share-banner {
+  margin-top: 12px;
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.share-icon-wrap {
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  background: #edf3ff;
+  color: #1747b0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  flex-shrink: 0;
+}
+
+.share-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.share-info b {
+  font-size: 12px;
+  color: #0f172a;
+}
+
+.share-info span {
+  font-size: 11px;
+  color: #64748b;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.btn-copy-share {
+  font-size: 11px;
+  font-weight: 600;
+  color: #1747b0;
+  background: #edf3ff;
+  border: 1px solid #dbeafe;
+  padding: 4px 8px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+/* ── 开源社区与商业定价方案 (Pricing) ── */
+.section-pricing {
+  background: #f8fafc;
+  position: relative;
+}
+
+.pricing-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 20px;
+  align-items: stretch;
+  margin-bottom: 28px;
+}
+
+.pricing-card {
+  position: relative;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 14px;
+  padding: 24px 22px;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.03), 0 4px 12px -2px rgba(0, 0, 0, 0.03);
+  transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+}
+
+.pricing-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px -4px rgba(15, 23, 42, 0.08);
+}
+
+.pricing-card.is-popular {
+  border: 2px solid #2563eb;
+  background: linear-gradient(180deg, #ffffff 0%, #f9fbff 100%);
+  box-shadow: 0 8px 30px -4px rgba(37, 99, 235, 0.12);
+}
+
+.pricing-card.tier-premium {
+  border-color: #cbd5e1;
+  background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+}
+
+/* 顶部徽标 */
+.pricing-badge {
+  position: absolute;
+  top: -12px;
+  left: 20px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  line-height: 1.4;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.06);
+}
+
+.pricing-badge.badge-primary {
+  background: #2563eb;
+  color: #ffffff;
+  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.3);
+}
+
+.pricing-badge.badge-neutral {
+  background: #0f172a;
+  color: #f8fafc;
+}
+
+.pricing-badge.badge-premium {
+  background: #475569;
+  color: #f8fafc;
+}
+
+/* 头部信息 */
+.pricing-header {
+  margin-top: 4px;
+}
+
+.tier-name {
+  font-size: 18px;
+  font-weight: 700;
+  color: #0f172a;
+  margin: 0 0 4px 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.tier-target {
+  font-size: 11.5px;
+  color: #64748b;
+  margin: 0 0 14px 0;
+  font-weight: 500;
+}
+
+.tier-price-box {
+  display: flex;
+  align-items: baseline;
+  gap: 3px;
+  margin-bottom: 10px;
+}
+
+.price-currency {
+  font-size: 18px;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.price-num {
+  font-size: 34px;
+  font-weight: 800;
+  color: #0f172a;
+  line-height: 1;
+  letter-spacing: -0.5px;
+}
+
+.is-popular .price-num {
+  color: #1747b0;
+}
+
+.price-unit {
+  font-size: 12px;
+  color: #64748b;
+  margin-left: 2px;
+}
+
+.tier-desc {
+  font-size: 12.5px;
+  color: #475569;
+  line-height: 1.5;
+  min-height: 38px;
+  margin: 0;
+}
+
+.pricing-divider {
+  height: 1px;
+  background: #f1f5f9;
+  margin: 16px 0;
+}
+
+/* 特性清单 */
+.pricing-features {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 20px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 1;
+}
+
+.feature-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #334155;
+}
+
+.feature-icon {
+  margin-top: 2px;
+  font-size: 14px;
+  flex-shrink: 0;
+  color: #16a34a;
+}
+
+.feature-row.is-excluded {
+  color: #94a3b8;
+}
+
+.feature-row.is-excluded .feature-icon {
+  color: #cbd5e1;
+}
+
+.feature-text {
+  flex: 1;
+}
+
+.feature-main {
+  font-weight: 500;
+}
+
+.feature-note {
+  font-size: 11px;
+  color: #64748b;
+  margin-left: 2px;
+}
+
+.is-excluded .feature-note {
+  color: #94a3b8;
+}
+
+/* 按钮区 */
+.pricing-action {
+  margin-top: auto;
+}
+
+.pricing-btn {
+  width: 100%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 10px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  border: 1px solid transparent;
+}
+
+.pricing-btn.btn-popular {
+  background: #2563eb;
+  color: #ffffff;
+  border-color: #2563eb;
+  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.25);
+}
+
+.pricing-btn.btn-popular:hover {
+  background: #1d4ed8;
+  border-color: #1d4ed8;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(37, 99, 235, 0.35);
+}
+
+.pricing-btn.btn-ghost {
+  background: #f8fafc;
+  color: #334155;
+  border-color: #cbd5e1;
+}
+
+.pricing-btn.btn-ghost:hover {
+  background: #edf2f7;
+  color: #0f172a;
+  border-color: #94a3b8;
+}
+
+.pricing-btn.btn-pro {
+  background: #ffffff;
+  color: #0f172a;
+  border-color: #94a3b8;
+}
+
+.pricing-btn.btn-pro:hover {
+  background: #0f172a;
+  color: #ffffff;
+  border-color: #0f172a;
+}
+
+/* ── 底部 Docker Callout ── */
+.docker-callout {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  background: #0f172a;
+  color: #f8fafc;
+  border-radius: 12px;
+  padding: 18px 24px;
+  box-shadow: 0 8px 24px -4px rgba(15, 23, 42, 0.15);
+  border: 1px solid #1e293b;
+}
+
+.docker-callout-left {
+  flex: 1;
+  min-width: 0;
+}
+
+.docker-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(255, 255, 255, 0.1);
+  color: #93c5fd;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 4px;
+  margin-bottom: 6px;
+}
+
+.docker-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: #ffffff;
+  margin: 0 0 3px 0;
+}
+
+.docker-sub {
+  font-size: 11.5px;
+  color: #94a3b8;
+  margin: 0;
+  line-height: 1.4;
+}
+
+.docker-callout-right {
+  flex-shrink: 0;
+}
+
+.docker-code-box {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: #1e293b;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  padding: 7px 12px;
+}
+
+.docker-code-box code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  color: #38bdf8;
+  user-select: all;
+  white-space: nowrap;
+}
+
+.docker-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: #e2e8f0;
+  background: #334155;
+  border: 1px solid #475569;
+  border-radius: 5px;
+  padding: 4px 9px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.docker-copy-btn:hover {
+  background: #475569;
+  color: #ffffff;
+}
+
+.docker-copy-btn.copied {
+  background: #166534;
+  border-color: #22c55e;
+  color: #ffffff;
+}
+
+/* 响应式调整 */
+@media (max-width: 900px) {
+  .pricing-grid {
+    grid-template-columns: 1fr;
+    gap: 20px;
+  }
+
+  .docker-callout {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 14px;
+    padding: 16px;
+  }
+
+  .docker-code-box {
+    overflow-x: auto;
+    justify-content: space-between;
+  }
+
+  .docker-code-box code {
+    font-size: 11px;
+  }
+}
+
+/* ── 5.5 创始人真实手记 (Origin Story) ── */
+.section-story {
+  background: #ffffff;
+  position: relative;
+}
+
+.story-card {
+  background: linear-gradient(180deg, #f8fafc 0%, #ffffff 100%);
+  border: 1px solid #e2e8f0;
+  border-radius: 16px;
+  padding: 36px 32px;
+  box-shadow: 0 4px 20px -2px rgba(15, 23, 42, 0.05);
+}
+
+.story-header {
+  margin-bottom: 28px;
+}
+
+.story-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #eff6ff;
+  border: 1px solid #dbeafe;
+  color: #1d4ed8;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 12px;
+  border-radius: 999px;
+  margin-bottom: 12px;
+}
+
+.story-title {
+  font-size: 24px;
+  font-weight: 800;
+  color: #0f172a;
+  letter-spacing: -0.4px;
+  margin: 0 0 8px 0;
+}
+
+.story-sub {
+  font-size: 13.5px;
+  color: #64748b;
+  max-width: 680px;
+  margin: 0 auto;
+  line-height: 1.55;
+}
+
+.story-grid {
+  display: grid;
+  grid-template-columns: 1fr 1.1fr;
+  gap: 28px;
+  align-items: stretch;
+}
+
+.story-pane {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+}
+
+.pane-head {
+  margin-bottom: 18px;
+}
+
+.pane-tag {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 4px;
+  margin-bottom: 6px;
+}
+
+.pain-tag {
+  background: #fff1f2;
+  color: #e11d48;
+}
+
+.resolve-tag {
+  background: #f0fdf4;
+  color: #16a34a;
+}
+
+.pane-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #0f172a;
+  margin: 0;
+}
+
+.story-pains-list {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.pain-box {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.pain-icon-wrap {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #ffe4e6;
+  color: #e11d48;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.pain-content b {
+  display: block;
+  font-size: 13px;
+  color: #1e293b;
+  margin-bottom: 2px;
+}
+
+.pain-content p {
+  font-size: 12px;
+  color: #64748b;
+  line-height: 1.45;
+  margin: 0;
+}
+
+.story-resolve-text {
+  font-size: 13px;
+  color: #334155;
+  line-height: 1.65;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 1;
+}
+
+.story-resolve-text p {
+  margin: 0;
+}
+
+.resolve-highlight {
+  background: #f8fafc;
+  border-left: 3px solid #2563eb;
+  padding: 8px 12px;
+  border-radius: 0 6px 6px 0;
+  font-size: 12.5px;
+  color: var(--solo-info) !important;
+}
+
+.story-badges-row {
+  margin-top: 20px;
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
+  padding-top: 16px;
+  border-top: 1px dashed #e2e8f0;
+}
+
+.s-badge-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: #334155;
+  background: #f8fafc;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid #f1f5f9;
+}
+
+.s-badge-item i {
+  font-size: 14px;
+}
+
+/* 底部 CTA 开放共测卡条 */
+.cta-co-build-bar {
+  margin-top: 24px;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  box-shadow: 0 2px 12px rgba(15, 23, 42, 0.06);
+  padding: 8px 18px;
+  border-radius: 999px;
+  max-width: 680px;
+}
+
+.co-build-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  color: #1d4ed8;
+  font-size: 11.5px;
+  font-weight: 700;
+  padding: 3px 10px;
+  border-radius: 999px;
+  flex-shrink: 0;
+}
+
+.co-build-text {
+  font-size: 12.5px;
+  color: #334155;
+  line-height: 1.5;
+  text-align: left;
+}
+
+@media (max-width: 900px) {
+  .story-card {
+    padding: 24px 16px;
+  }
+
+  .story-grid {
+    grid-template-columns: 1fr;
+    gap: 18px;
+  }
+
+  .story-title {
+    font-size: 20px;
+  }
+
+  .story-badges-row {
+    grid-template-columns: 1fr;
+  }
+
+  .cta-co-build-bar {
+    flex-direction: column;
+    border-radius: 12px;
+    align-items: flex-start;
+    padding: 12px 14px;
+    margin-top: 18px;
+  }
+}
+
+
+
 </style>

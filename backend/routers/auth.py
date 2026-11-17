@@ -487,9 +487,12 @@ async def update_profile(req: dict, ctx: AuthContext = Depends(require_auth)):
 @router.post("/companies")
 async def auth_create_company(req: dict, ctx: AuthContext = Depends(require_auth)):
     """Create a new company for current user."""
+    from services.quota_service import ensure_within_company_limit
+
     name = req.get("name")
     if not name:
         raise HTTPException(status_code=400, detail="缺少主体名称")
+    await ensure_within_company_limit(ctx.user_id)
     # 提取除 name 以外的其它字段作为 extra
     extra = {k: v for k, v in req.items() if k != 'name'}
     company = await create_company(ctx.user_id, name, extra)

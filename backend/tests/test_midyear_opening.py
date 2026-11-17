@@ -99,6 +99,8 @@ async def test_midyear_opening_balance_and_ytd_accumulation(midyear_session):
     assert res["voucherStatus"] == "posted"
     assert "ytdEntry" in res
     assert res["ytdEntry"]["voucherStatus"] == "posted"
+    # 老公司仍从 1 月起算；成立当年的起点另测
+    assert "1-5 月损益累计发生额" in res["ytdEntry"]["title"]
 
     # 验证资产负债凭证发生日期为 2026-06-01
     assert res["occurDate"] == "2026-06-01"
@@ -186,6 +188,121 @@ async def test_year_start_snapshot_round_trip_with_midyear_opening(midyear_sessi
 
 
 @pytest.mark.asyncio
+async def test_trial_balance_snapshot_round_trip_without_touching_ledger(midyear_session):
+    """导入原表快照随期初凭证落库，能原样读回，且不改变凭证行。
+
+    核对页只展示源表逐行金额与处理结果：缺列（None）必须保持缺失，
+    不能变成 "0.00"；快照是 metadata，不得影响会计分录与试算平衡。
+    """
+    from sqlalchemy import select
+
+    session = midyear_session
+    token = await issue_step_up_token(
+        session, company_id="c_test", user_id="owner_u1", action="adjust_opening_balance",
+    )
+    snapshot = [
+        {
+            "row_no": 1,
+            "original_code": "1002",
+            "original_name": "银行存款",
+            "partner_name": "",
+            "year_start_debit": "18377.71",
+            "year_start_credit": None,
+            "ytd_debit": "10000.00",
+            "ytd_credit": "16062.62",
+            "ending_debit": "12315.09",
+            "ending_credit": "0",
+            "target_code": "1002",
+            "target_name": "银行存款",
+            "status": "matched",
+            "note": "",
+        },
+        {
+            "row_no": 2,
+            "original_code": "1002004",
+            "original_name": "银行存款-招商银行5719",
+            "ending_debit": "12315.09",
+            "ending_credit": "0",
+            "target_code": "",
+            "target_name": "",
+            "status": "skipped_rollup",
+            "note": "金额已含在保留的上级合计行",
+        },
+        {
+            "row_no": 3,
+            "original_code": "合计",
+            "original_name": "",
+            "ending_debit": "12315.09",
+            "ending_credit": "12315.09",
+            "status": "skipped_total",
+            "note": "原表合计/总计行，不入账",
+        },
+    ]
+    await save_opening_balances(
+        "c_test",
+        2026,
+        [
+            {"account_code": "1002", "account_name": "银行存款", "debit_balance": "12315.09", "credit_balance": "0"},
+            {"account_code": "3001", "account_name": "实收资本", "debit_balance": "0", "credit_balance": "12315.09"},
+        ],
+        user_id="owner_u1",
+        step_up_token=token,
+        request_id="req-trial-balance",
+        start_period="2026-10",
+        trial_balance_items=snapshot,
+        trial_balance_columns={"code": "科目编码", "endingDebit": "期末余额借方"},
+        session=session,
+    )
+
+    details = await get_opening_details("c_test", 2026, session=session)
+    assert len(details["trial_balance_items"]) == 3
+    first = details["trial_balance_items"][0]
+    assert first["year_start_debit"] == "18377.71"
+    assert first["year_start_credit"] is None
+    assert first["ytd_debit"] == "10000.00"
+    assert first["status"] == "matched"
+    assert details["trial_balance_items"][1]["status"] == "skipped_rollup"
+    assert details["trial_balance_columns"] == {
+        "code": "科目编码",
+        "endingDebit": "期末余额借方",
+    }
+
+    # 快照只进 metadata：期初凭证仍只有资产负债两条线
+    lines = (
+        await session.execute(
+            select(JournalLine).where(JournalLine.journal_entry_id == "opening-c_test-2026")
+        )
+    ).scalars().all()
+    assert len(lines) == 2
+    assert {line.account_code for line in lines} == {"1002", "3001"}
+
+
+@pytest.mark.asyncio
+async def test_opening_without_trial_balance_snapshot_returns_empty_not_backfilled(midyear_session):
+    """老账套没有原表快照：返回空列表，不能拿期初明细伪造一张「原表」。"""
+    session = midyear_session
+    token = await issue_step_up_token(
+        session, company_id="c_test", user_id="owner_u1", action="adjust_opening_balance",
+    )
+    await save_opening_balances(
+        "c_test",
+        2026,
+        [
+            {"account_code": "1002", "account_name": "银行存款", "debit_balance": "100", "credit_balance": "0"},
+            {"account_code": "3001", "account_name": "实收资本", "debit_balance": "0", "credit_balance": "100"},
+        ],
+        user_id="owner_u1",
+        step_up_token=token,
+        request_id="req-no-trial-balance",
+        start_period="2026-06",
+        session=session,
+    )
+    details = await get_opening_details("c_test", 2026, session=session)
+    assert details["trial_balance_items"] == []
+    assert details["trial_balance_columns"] is None
+
+
+@pytest.mark.asyncio
 async def test_opening_and_year_start_keep_partner_dimension(midyear_session):
     """期初与年初快照都要保留客商：报表按「科目 + 客商」方向重分类要靠它。
 
@@ -255,6 +372,78 @@ async def test_year_start_unknown_when_midyear_opening_has_no_snapshot(midyear_s
     items, known = await get_year_start_balances("c_test", 2026, session=session)
     assert items == []
     assert known is False
+
+
+@pytest.mark.asyncio
+async def test_march_founded_company_uses_inception_month_for_ytd(midyear_session):
+    """2026-03 成立、2026-06 启用：成立月与启用月分开，YTD 标题从 3 月起。"""
+    session = midyear_session
+    company = await session.get(Company, "c_test")
+    company.payload = {
+        **(company.payload or {}),
+        "startDate": "2026-06-01",
+        "incorporationDate": "2026-03-15",
+    }
+    await session.flush()
+
+    token = await issue_step_up_token(
+        session, company_id="c_test", user_id="owner_u1", action="adjust_opening_balance",
+    )
+    res = await save_opening_balances(
+        "c_test",
+        2026,
+        [
+            {"account_code": "1002", "account_name": "银行存款", "debit_balance": "10000", "credit_balance": "0"},
+            {"account_code": "3001", "account_name": "实收资本", "debit_balance": "0", "credit_balance": "10000"},
+        ],
+        user_id="owner_u1",
+        step_up_token=token,
+        request_id="req-march-founded",
+        start_period="2026-06",
+        ytd_items=[
+            {"account_code": "5602", "account_name": "管理费用", "debit_balance": "1000", "credit_balance": "0"},
+        ],
+        year_start_known=True,
+        session=session,
+    )
+
+    assert "3-5 月损益累计发生额" in res["ytdEntry"]["title"]
+    items, known = await get_year_start_balances("c_test", 2026, session=session)
+    assert items == []
+    assert known is True
+    details = await get_opening_details("c_test", 2026, session=session)
+    assert details["year_start_known"] is True
+
+
+@pytest.mark.asyncio
+async def test_ytd_falls_back_to_january_without_incorporation_date(midyear_session):
+    """未填成立日期时，不能拿 6 月启用日冒充成立月，否则 1-5 月损益会漏。"""
+    session = midyear_session
+    company = await session.get(Company, "c_test")
+    company.payload = {**(company.payload or {}), "startDate": "2026-06-01"}
+    await session.flush()
+
+    token = await issue_step_up_token(
+        session, company_id="c_test", user_id="owner_u1", action="adjust_opening_balance",
+    )
+    res = await save_opening_balances(
+        "c_test",
+        2026,
+        [
+            {"account_code": "1002", "account_name": "银行存款", "debit_balance": "10000", "credit_balance": "0"},
+            {"account_code": "3001", "account_name": "实收资本", "debit_balance": "0", "credit_balance": "10000"},
+        ],
+        user_id="owner_u1",
+        step_up_token=token,
+        request_id="req-no-incorporation",
+        start_period="2026-06",
+        ytd_items=[
+            {"account_code": "5602", "account_name": "管理费用", "debit_balance": "1000", "credit_balance": "0"},
+        ],
+        session=session,
+    )
+
+    assert "1-5 月损益累计发生额" in res["ytdEntry"]["title"]
 
 
 @pytest.mark.asyncio

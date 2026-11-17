@@ -53,6 +53,7 @@ class HealthScanRequest(BaseModel):
     answers: Optional[Dict[str, StrictStr]] = None
     profile: Optional[Dict[str, Any]] = None
     balanceMeta: Optional[Dict[str, Any]] = None
+    useAi: bool = False
 
 
 @router.post("/analyze")
@@ -74,6 +75,7 @@ async def analyze_health_scan(req: HealthScanRequest, request: Request):
             answers=req.answers,
             profile=req.profile,
             balanceMeta=req.balanceMeta,
+            use_ai=req.useAi,
             client_ip=client_ip,
         )
         return {"ok": True, "report": report}

@@ -125,7 +125,7 @@ usePageRefresh(() => Promise.all([reloadTaskInbox(), reloadReadiness(), entrySto
         @click="openCopilot"
       >
         <template #icon><i class="ri-chat-3-line" /></template>
-        录入凭证 / 问 AI CFO
+        录入凭证 / 问 AI 财务官
       </NButton>
     </header>
 

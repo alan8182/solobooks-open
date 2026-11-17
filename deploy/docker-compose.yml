@@ -40,8 +40,13 @@ services:
       # 默认清华源（与 Dockerfile ARG 默认一致），海外构建可设 PIP_INDEX_URL 覆盖
       args:
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+    # --forwarded-allow-ips：生产是「宿主 nginx → 容器 nginx → uvicorn」两跳代理。
+    # 不信任转发头时 request.client.host 是 Docker 网关 IP，所有用户共用一个 IP：
+    # 短信 60 秒同 IP 限流会变成全站共享，登录失败锁定也会误伤所有人。
+    # 只信任环回与 Docker 私网段；uvicorn 从右往左取第一个非信任地址，客户端
+    # 自带伪造的 X-Forwarded-For 前缀不会被采信。
     command: >
-      sh -c "cd /app && DATABASE_URL=$$MIGRATION_DATABASE_URL alembic upgrade head && exec uvicorn main:app --host 0.0.0.0 --port 80"
+      sh -c "cd /app && DATABASE_URL=$$MIGRATION_DATABASE_URL alembic upgrade head && exec uvicorn main:app --host 0.0.0.0 --port 80 --proxy-headers --forwarded-allow-ips=127.0.0.1,172.16.0.0/12"
     environment:
       - HOST=0.0.0.0
       - PORT=80
@@ -75,6 +80,14 @@ services:
       - MAIL_INBOUND_DOMAIN=${MAIL_INBOUND_DOMAIN:-}
       - MAIL_POLL_SECONDS=${MAIL_POLL_SECONDS:-180}
       - MAIL_INBOUND_MAX_ATTACHMENT_MB=${MAIL_INBOUND_MAX_ATTACHMENT_MB:-50}
+      # 支付宝收款（docs/alipay-payment-integration.md）：三项配齐才启用支付；
+      # ALIPAY_GATEWAY 留空走 config 默认生产网关，沙箱联调在 .env 显式覆盖
+      - ALIPAY_APP_ID=${ALIPAY_APP_ID:-}
+      - ALIPAY_PRIVATE_KEY=${ALIPAY_PRIVATE_KEY:-}
+      - ALIPAY_PUBLIC_KEY=${ALIPAY_PUBLIC_KEY:-}
+      - ALIPAY_GATEWAY=${ALIPAY_GATEWAY:-}
+      # 商业化额度卡口：开源自部署默认 0（不限制）；官方云端 SaaS 设 1 开启免费试用月 10 万 token 限制
+      - QUOTA_ENFORCEMENT_ENABLED=${QUOTA_ENFORCEMENT_ENABLED:-0}
     depends_on:
       postgres:
         condition: service_healthy

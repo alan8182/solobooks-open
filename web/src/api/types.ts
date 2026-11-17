@@ -83,6 +83,8 @@ export interface CompanyInfo {
   industryTemplateVersion?: number
   industryTemplateAppliedAt?: string
   startDate?: string
+  /** 营业执照成立日期；成立早于账套启用时用于期初损益累计起点 */
+  incorporationDate?: string
   taxId?: string
   restrictedIndustry?: boolean
   /** 增值税申报周期（小规模可按税局核定选月报/季报） */
@@ -107,6 +109,7 @@ export interface CreateCompanyRequest {
   industry?: string
   industryCode?: string
   startDate?: string
+  incorporationDate?: string
   taxId?: string
   restrictedIndustry?: boolean
   vatFilingCycle?: string
@@ -933,6 +936,116 @@ export interface ComparisonResponse {
   expense_change_percent: Money | null
   profit_change_percent: Money | null
   category_breakdown: ComparisonItem[]
+}
+
+// ── 现金流滚动预测与业务归因 ──
+export interface ManualCashEvent {
+  id: string
+  name: string
+  type: 'inflow' | 'outflow'
+  amount: number | string
+  date?: string
+  repeat?: 'none' | 'monthly' | 'quarterly' | 'yearly'
+  repeatDay?: number | null
+  confidence?: 'high' | 'medium' | 'low'
+  enabled: boolean
+}
+
+export interface TimelineCashEvent {
+  id: string
+  date: string
+  name: string
+  type: 'inflow' | 'outflow'
+  amount: number
+  confidence: string
+  repeat: string
+  source: 'manual' | 'system_tax'
+  enabled: boolean
+}
+
+export interface CashForecastConfig {
+  defaultArDays: number
+  defaultApDays: number
+  partnerCreditDays: Record<string, number>
+  safetyCashThreshold: number | null
+  manualCashEvents?: ManualCashEvent[]
+}
+
+export interface DailyCashPoint {
+  date: string
+  inflow: number
+  outflow: number
+  net: number
+  balance: number
+}
+
+export interface OverdueReceivableItem {
+  partnerId: string
+  partnerName: string
+  amount: number
+  daysOverdue: number
+  oldestDate: string
+}
+
+export interface CashForecastResponse {
+  asOf: string
+  horizonDays: number
+  scenario: 'neutral' | 'optimistic' | 'pessimistic' | string
+  currentCash: number
+  endingCash: number
+  minBalance: number
+  minBalanceDate: string
+  safetyThreshold: number
+  runwayMonths: number | null
+  isDeficitProjected: boolean
+  deficitDate: string | null
+  dailyPoints: DailyCashPoint[]
+  overdueReceivables: OverdueReceivableItem[]
+  timelineEvents?: TimelineCashEvent[]
+  monthlyBurnRate: number
+  scenarioSummary: string
+}
+
+export interface DriverItem {
+  key: string
+  name: string
+  baseAmount: number
+  compareAmount: number
+  deltaAmount: number
+  changePercent: number | null
+  tag: string
+}
+
+export interface AnomalyItem {
+  category: string
+  title: string
+  amount: number
+  historyAvgAmount: number
+  growthRate: number | null
+  reason: string
+}
+
+export interface BridgeStep {
+  name: string
+  amount: number
+  type: 'profit' | 'add' | 'sub' | 'cash'
+  note: string
+}
+
+export interface BusinessAttributionResponse {
+  baseMonth: string
+  compareMonth: string
+  baseProfit: number
+  compareProfit: number
+  profitDelta: number
+  topIncomeDrivers: DriverItem[]
+  topExpenseDrivers: DriverItem[]
+  anomalies: AnomalyItem[]
+  netProfit: number
+  netCashFlow: number
+  profitToCashDiscrepancy: number
+  bridgeSteps: BridgeStep[]
+  plainSummary: string
 }
 
 // ===== Ledger Types =====

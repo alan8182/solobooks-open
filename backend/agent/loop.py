@@ -281,7 +281,7 @@ async def run_agent_stream(
                         result = {
                             "error": (
                                 "月度结账只能在「月度结账」向导中按系统规则执行。"
-                                "AI CFO 不能运行结账检查、生成结账动作或锁账；"
+                                "AI 财务官不能运行结账检查、生成结账动作或锁账；"
                                 "请引导用户打开 /closing-wizard 对应月份继续。"
                             )
                         }

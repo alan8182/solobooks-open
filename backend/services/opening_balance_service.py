@@ -13,10 +13,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.errors import AccountingError, ENTRY_POSTED_IMMUTABLE
 from core.money import ZERO, money, money_text
-from db.models import ChartAccount, JournalEntry, JournalLine
+from db.models import ChartAccount, Company, JournalEntry, JournalLine
 from db.session import session_scope
 from services.account_classification import is_profit_loss_code
 from services.accounting_core_service import (
+    book_start_month,
     consume_step_up_token,
     create_entry,
     require_role,
@@ -40,6 +41,23 @@ EXPENSE_REVENUE_CODES = frozenset([
 ])
 
 
+async def _company_inception_month(session: AsyncSession, company_id: str) -> date | None:
+    """公司成立月（月初）：主体档案 incorporationDate；缺失时回退账套启用月。
+
+    成立日期与启用日期是两个概念：3 月成立、6 月才建账的公司，只有成立月能
+    充当损益累计起点；只拿启用月会把 3-5 月漏掉。未填成立日期时保持旧行为。
+    """
+    company = await session.get(Company, company_id)
+    raw = str(((company.payload or {}) if company else {}).get("incorporationDate") or "").strip()
+    if raw:
+        try:
+            parsed = date.fromisoformat(raw[:10])
+            return date(parsed.year, parsed.month, 1)
+        except ValueError:
+            pass
+    return await book_start_month(session, company_id)
+
+
 def _is_expense_revenue(code: Any) -> bool:
     """损益/成本类判定：is_profit_loss_code 为主，白名单兜底。"""
     return is_profit_loss_code(code) or code in EXPENSE_REVENUE_CODES
@@ -58,6 +76,10 @@ def _entry_id(company_id: str, fiscal_year: int, generation: int = 1) -> str:
 
 def _ytd_entry_id(company_id: str, fiscal_year: int, generation: int = 1) -> str:
     return f"{_entry_id(company_id, fiscal_year, generation)}-ytd"
+
+
+def _month_range_text(start: int, end: int) -> str:
+    return f"{start} 月" if start == end else f"{start}-{end} 月"
 
 
 def _entry_generation(entry_id: str, company_id: str, fiscal_year: int) -> int:
@@ -331,6 +353,8 @@ async def get_year_start_balances(
     ]
     if items:
         return items, True
+    if (entry.metadata_json or {}).get("yearStartKnown"):
+        return [], True
     return [], entry.occurred_on.month == 1
 
 
@@ -575,11 +599,33 @@ async def get_opening_details(
         if isinstance(row, dict) and row.get("accountCode")
     ] if entry else []
 
+    # 导入原表快照：老账套没有这个键时返回空列表，不做任何回填或推断
+    trial_balance_items = [
+        row
+        for row in ((entry.metadata_json or {}).get("trialBalanceRows") or [])
+        if isinstance(row, dict)
+    ] if entry else []
+    trial_balance_columns = (
+        (entry.metadata_json or {}).get("trialBalanceColumns") or None
+    ) if entry else None
+    year_start_known = bool(
+        entry
+        and (
+            (entry.metadata_json or {}).get("yearStartKnown")
+            or year_start_items
+            or entry.occurred_on.month == 1
+        )
+    )
+
     return {
         "items": balance_items,
         "ytd_items": ytd_items,
         # 年初快照：重导时前端原样带回，不用重新解析 Excel
         "year_start_items": year_start_items,
+        "year_start_known": year_start_known,
+        # 导入原表快照：工作台「科目余额表」页签只读展示
+        "trial_balance_items": trial_balance_items,
+        "trial_balance_columns": trial_balance_columns,
         "start_period": start_period,
         "start_period_saved": bool(saved_start_period),
         "tax_memory": tax_memory,
@@ -657,8 +703,11 @@ async def save_opening_balances(
     start_period: str | None = None,
     ytd_items: list[dict[str, Any]] | None = None,
     year_start_items: list[dict[str, Any]] | None = None,
+    year_start_known: bool | None = None,
     tax_memory: dict[str, Any] | None = None,
     fixed_assets: list[dict[str, Any]] | None = None,
+    trial_balance_items: list[dict[str, Any]] | None = None,
+    trial_balance_columns: dict[str, str] | None = None,
     session: AsyncSession | None = None,
 ) -> dict[str, Any]:
     if session is None:
@@ -673,8 +722,11 @@ async def save_opening_balances(
                 start_period=start_period,
                 ytd_items=ytd_items,
                 year_start_items=year_start_items,
+                year_start_known=year_start_known,
                 tax_memory=tax_memory,
                 fixed_assets=fixed_assets,
+                trial_balance_items=trial_balance_items,
+                trial_balance_columns=trial_balance_columns,
                 session=owned_session,
             )
     await require_role(session, company_id, user_id, {"owner"})
@@ -703,6 +755,13 @@ async def save_opening_balances(
         pyear, pmonth = fiscal_year, 1
     occur_date = date(pyear, pmonth, 1)
 
+    # 损益累计的起点：成立当年从成立月起；更早成立的公司仍从 1 月起。
+    # 只影响提示文案与 YTD 凭证标题，金额仍由前端传入的 ytd_items 决定。
+    inception = await _company_inception_month(session, company_id)
+    ytd_start_month = 1
+    if inception is not None and inception.year == pyear and inception.month < pmonth:
+        ytd_start_month = inception.month
+
     # 跨年防双计：已有历史分录的年份，期初余额由历史派生；再手工录期初会重复计入
     prior_activity = await _has_activity_before(session, company_id, fiscal_year)
     if prior_activity:
@@ -728,7 +787,7 @@ async def save_opening_balances(
             earliest_text = f"（最早 {earliest.isoformat()}）" if earliest else ""
             raise AccountingError(
                 "OPENING_PRIOR_ACTIVITY",
-                f"{fiscal_year} 年 1-{pmonth - 1} 月已有 {prior_count} 条业务分录"
+                f"{fiscal_year} 年 {_month_range_text(ytd_start_month, pmonth - 1)}已有 {prior_count} 条业务分录"
                 f"{earliest_text}。期初余额应包含这些业务的结果，再生成期初凭证会重复计入；"
                 "请先冲销或删除这些分录，或把建账月份调到最早一笔业务之前",
                 409,
@@ -846,6 +905,31 @@ async def save_opening_balances(
         )
     ]
 
+    # 导入原表快照：只读核对用，不参与分录；缺列（None）必须保持 None，
+    # 不能落成 "0.00" 让界面把「原表没有这列」误读成零余额。
+    def _snapshot_amount(value: Any) -> str | None:
+        return None if value is None or value == "" else money_text(money(value))
+
+    trial_balance_payload = [
+        {
+            "row_no": int(item.get("row_no") or index + 1),
+            "original_code": str(item.get("original_code") or "").strip(),
+            "original_name": str(item.get("original_name") or "").strip(),
+            "partner_name": str(item.get("partner_name") or "").strip(),
+            "year_start_debit": _snapshot_amount(item.get("year_start_debit")),
+            "year_start_credit": _snapshot_amount(item.get("year_start_credit")),
+            "ytd_debit": _snapshot_amount(item.get("ytd_debit")),
+            "ytd_credit": _snapshot_amount(item.get("ytd_credit")),
+            "ending_debit": _snapshot_amount(item.get("ending_debit")),
+            "ending_credit": _snapshot_amount(item.get("ending_credit")),
+            "target_code": str(item.get("target_code") or "").strip(),
+            "target_name": str(item.get("target_name") or "").strip(),
+            "status": str(item.get("status") or "unmatched").strip(),
+            "note": str(item.get("note") or "").strip(),
+        }
+        for index, item in enumerate(trial_balance_items or [])
+    ]
+
     title_desc = f"{pyear} 年 {pmonth} 月期初余额" if pmonth > 1 else f"{fiscal_year} 年期初余额"
     # 换代：冲销过的旧代留作审计历史，重导必须用新 id（同 id 无法二次创建）
     generation = await _next_opening_generation(session, company_id, fiscal_year)
@@ -865,6 +949,10 @@ async def save_opening_balances(
             "voucherAuthority": "system",
             "voucherLines": {"debit": debit_lines, "credit": credit_lines},
             **({"yearStartBalances": year_start_payload} if year_start_payload else {}),
+            # 全 0 的年初快照没有行可存，用标记区分「已知的 0」和「无从得知」
+            **({"yearStartKnown": True} if year_start_known else {}),
+            **({"trialBalanceRows": trial_balance_payload} if trial_balance_payload else {}),
+            **({"trialBalanceColumns": trial_balance_columns} if trial_balance_columns else {}),
         },
         company_id=company_id,
         user_id=user_id,
@@ -927,7 +1015,7 @@ async def save_opening_balances(
                     "id": _ytd_entry_id(company_id, fiscal_year, generation),
                     "direction": "owner_transfer",
                     "amount": balanced_ytd_amount,
-                    "title": f"{pyear} 年 1-{pmonth - 1} 月损益累计发生额",
+                    "title": f"{pyear} 年 {_month_range_text(ytd_start_month, pmonth - 1)}损益累计发生额",
                     "category": "期初余额",
                     "occurDate": ytd_occur_date.isoformat(),
                     "sourceType": "opening_balance_ytd",

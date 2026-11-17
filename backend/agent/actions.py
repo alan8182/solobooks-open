@@ -424,6 +424,7 @@ async def approve_action(
                 "type": str(merged.get("type") or "有限责任公司").strip(),
                 "taxpayerType": str(merged.get("taxpayerType") or "小规模纳税人").strip(),
                 "startDate": str(merged.get("startDate") or "").strip(),
+                "incorporationDate": str(merged.get("incorporationDate") or "").strip(),
                 "taxId": tax_id,
                 "industry": str(merged.get("industry") or "").strip(),
                 "vatFilingCycle": str(merged.get("vatFilingCycle") or "quarter").strip(),

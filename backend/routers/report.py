@@ -27,6 +27,8 @@ from models.schemas import (
     EquityChangeRequest,
     IncomeStatementRequest, IncomeStatementResponse, IncomeStatementRow,
     ComparisonRequest, ComparisonResponse, ComparisonItem,
+    CashForecastRequest, CashForecastResponse, CashForecastConfigPayload,
+    BusinessAttributionRequest, BusinessAttributionResponse,
 )
 from core.errors import AccountingError
 from services.llm import chat_text_json, chat_text
@@ -52,6 +54,12 @@ from services.health_score_service import calculate_health_score
 from services.cit_adjustment_service import build_cit_adjustments
 from services.account_service import get_user_profile
 from services import company_entity_service, headcount_service
+from services.cash_forecast_service import (
+    calculate_cash_forecast,
+    get_cash_forecast_config,
+    save_cash_forecast_config,
+)
+from services.variance_attribution_service import get_business_attribution
 
 logger = logging.getLogger(__name__)
 
@@ -800,11 +808,34 @@ async def cit_assist(
     )
     auto_adjustment_total = d2(adjustments["totalIncrease"])
 
-    actual_profit = d2(
+    profit_before_loss = d2(
         total_profit + auto_adjustment_total + req.specificBusinessIncome - req.nonTaxableIncome
         - req.acceleratedDepreciationReduction - req.exemptDeduction
-        - req.incomeExemption - req.priorYearLoss
+        - req.incomeExemption
     )
+    from services.cit_tax_opening import apply_tax_opening, get_tax_opening_memo
+
+    # 未传第 24/30 行时回退期初税务备忘（仅其所属纳税年度生效）
+    opening = apply_tax_opening(
+        profit_before_loss,
+        await get_tax_opening_memo(ctx.company_id, session=session),
+        statement.period.fiscal_year_start.year,
+    )
+    prior_loss = req.priorYearLoss if req.priorYearLoss is not None else opening["lossDeducted"]
+    prior_loss = min(max(d2(prior_loss), Decimal("0")), max(profit_before_loss, Decimal("0")))
+    prior_loss_source = (
+        "人工确认" if req.priorYearLoss is not None
+        else ("期初税务备忘" if prior_loss > 0 else "未登记")
+    )
+    prepaid_tax = max(
+        d2(req.prepaidTax if req.prepaidTax is not None else opening["prepaidCitTax"]),
+        Decimal("0"),
+    )
+    prepaid_source = (
+        "人工确认" if req.prepaidTax is not None
+        else ("期初税务备忘" if prepaid_tax > 0 else "未登记")
+    )
+    actual_profit = d2(profit_before_loss - prior_loss)
     taxable_base = max(Decimal("0"), actual_profit)
     standard_tax = d2(taxable_base * Decimal("0.25"))
 
@@ -849,7 +880,7 @@ async def cit_assist(
     estimated_tax = d2(max(
         Decimal("0"),
         standard_tax - tax_reduction - req.taxCredit
-        - req.prepaidTax - req.specialBusinessPrepaidTax,
+        - prepaid_tax - req.specialBusinessPrepaidTax,
     ))
 
     fields = [
@@ -871,13 +902,13 @@ async def cit_assist(
         ("21", "减：资产加速折旧、摊销调减额", req.acceleratedDepreciationReduction, True, "人工确认"),
         ("22", "减：免税收入、减计收入、加计扣除", req.exemptDeduction, True, "人工确认"),
         ("23", "减：所得减免", req.incomeExemption, True, "人工确认"),
-        ("24", "减：弥补以前年度亏损", req.priorYearLoss, True, "人工确认"),
+        ("24", "减：弥补以前年度亏损", prior_loss, True, prior_loss_source),
         ("25", "实际利润额", actual_profit, False, "确定性计算"),
         ("26", "税率（25%）", Decimal("25.00"), False, "法定税率"),
         ("27", "应纳所得税额", standard_tax, False, "实际利润额×25%"),
         ("28", "减：减免所得税额", tax_reduction, False, "小型微利企业资格判断"),
         ("29", "减：抵免所得税额", req.taxCredit, True, "人工确认"),
-        ("30", "减：本年累计已预缴所得税额", req.prepaidTax, True, "人工确认"),
+        ("30", "减：本年累计已预缴所得税额", prepaid_tax, True, prepaid_source),
         ("31", "减：特定业务预缴所得税额", req.specialBusinessPrepaidTax, True, "人工确认"),
         ("32", "本期应补（退）所得税额", estimated_tax, False, "确定性计算"),
     ]
@@ -1563,6 +1594,24 @@ async def ai_diagnosis(
     except Exception:  # noqa: BLE001 —— 税负上下文失败不拖垮诊断
         tax_context = ""
 
+    # 注入现金流预测与利现差额归因上下文
+    forecast_context = ""
+    try:
+        fc = await calculate_cash_forecast(ctx.company_id, as_of="", horizon_days=60, scenario="neutral")
+        if fc.get("isDeficitProjected"):
+            forecast_context = f"未来60天预计将于 {fc.get('deficitDate')} 触及安全储备警戒线（最低现金额 ¥{money_text(fc.get('minBalance', 0))}）。"
+        else:
+            forecast_context = f"未来60天资金流稳健，预计最低现金额 ¥{money_text(fc.get('minBalance', 0))}，Runway 约 {fc.get('runwayMonths') or '充裕'} 个月。"
+    except Exception:
+        forecast_context = ""
+
+    attribution_context = ""
+    try:
+        att = await get_business_attribution(ctx.company_id, req.month, compare_mode="mom")
+        attribution_context = str(att.get("plainSummary") or "")
+    except Exception:
+        attribution_context = ""
+
     context = f"""请为这家小微企业生成本月经营诊断：
 
 【{req.month} 月度经营数据】
@@ -1574,6 +1623,12 @@ async def ai_diagnosis(
 
 【分类金额明细】
 {category_breakdown}
+
+【未来现金流状况】
+{forecast_context or '暂无'}
+
+【利润与现金差额归因】
+{attribution_context or '暂无'}
 
 【风险项目】
 {risk_entries if risk_entries else '无'}
@@ -1602,7 +1657,7 @@ async def ai_diagnosis(
         raise  # 配额超限保持 402
     except Exception:
         # 静默兜底可以，但不能无日志——否则"暂时无法生成"永远查不出原因
-        logger.exception("AI CFO 诊断生成失败 month=%s", req.month)
+        logger.exception("AI 财务官诊断生成失败 month=%s", req.month)
         return {
             "diagnosis": "暂时无法生成 AI 诊断，请稍后再试。",
             "keyMetrics": [],
@@ -1610,6 +1665,53 @@ async def ai_diagnosis(
             "disclaimer": "以上分析仅供经营参考，具体决策以专业财税人员意见为准",
             "generatedAt": _now_iso(),
         }
+
+
+@router.post("/report/cash-forecast", response_model=CashForecastResponse)
+async def cash_forecast(
+    req: CashForecastRequest,
+    ctx: AuthContext = Depends(require_auth),
+):
+    """滚动现金流预测（30 / 60 / 90 天，支持乐观/基准/悲观压力测试）。"""
+    result = await calculate_cash_forecast(
+        ctx.company_id,
+        as_of=req.as_of,
+        horizon_days=req.horizon_days,
+        scenario=req.scenario,
+    )
+    return CashForecastResponse(**result)
+
+
+@router.get("/report/cash-forecast-config")
+async def get_forecast_config(
+    ctx: AuthContext = Depends(require_auth),
+):
+    """获取公司的现金流预测与周期性收支配置。"""
+    return await get_cash_forecast_config(ctx.company_id)
+
+
+@router.put("/report/cash-forecast-config")
+async def update_forecast_config(
+    payload: CashForecastConfigPayload,
+    ctx: AuthContext = Depends(require_auth),
+):
+    """更新公司的现金流预测与周期性收支配置。"""
+    saved = await save_cash_forecast_config(ctx.company_id, payload.model_dump())
+    return saved
+
+
+@router.post("/report/attribution", response_model=BusinessAttributionResponse)
+async def business_attribution(
+    req: BusinessAttributionRequest,
+    ctx: AuthContext = Depends(require_auth),
+):
+    """业务波动归因分析与利现差额桥（Profit-to-Cash Bridge）。"""
+    result = await get_business_attribution(
+        ctx.company_id,
+        base_month=req.base_month,
+        compare_mode=req.compare_mode,
+    )
+    return BusinessAttributionResponse(**result)
 
 
 def _now_iso() -> str:

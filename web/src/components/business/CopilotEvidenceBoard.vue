@@ -152,7 +152,7 @@ const SNAPSHOT_PROMPTS = [
 
         <div class="quick-prompts-card">
           <div class="card-title"><i class="ri-line-chart-line" /> 财务智能探查</div>
-          <p class="card-desc">针对当前账期，让 AI CFO 深度分析：</p>
+          <p class="card-desc">针对当前账期，让 AI 财务官深度分析：</p>
           <div class="prompt-chips">
             <button
               v-for="p in SNAPSHOT_PROMPTS"

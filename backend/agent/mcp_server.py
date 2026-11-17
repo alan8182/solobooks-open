@@ -401,7 +401,7 @@ def build_mcp_server(name: str = "solobooks") -> FastMCP:
     mcp = FastMCP(
         name,
         instructions=(
-            "梭罗记账 SoloBooks：一人公司及小微企业的 AI CFO。工具按令牌绑定的公司隔离。"
+            "梭罗记账 SoloBooks：一人公司及小微企业的 AI 财务官。工具按令牌绑定的公司隔离。"
             "查询类工具可任意调用；propose_* 写入工具只产生待确认草稿，"
             "需要用户在梭罗记账产品内确认后才入账。最终锁账不对 MCP 暴露；"
             "结账检查结果中的 manualClose.url 是登录后网页入口。"

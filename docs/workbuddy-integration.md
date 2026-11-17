@@ -76,7 +76,7 @@
    - **服务地址**：`https://solobooks.cn/mcp`
    - **鉴权类型**：`Bearer Token`（提示用户输入 `sbk_...` 格式个人令牌）
 
-   > **平台格式审核硬性要求（2026-10-25 审核退回后补充，三处必须一致）**：
+   > **平台格式审核硬性要求（2026-10-25 / 2026-11-04 两次审核退回后补充）**：
    > 1. `connector-meta.json` 必须声明 `"auth_mode": "token"`（用户自填凭证）与
    >    `"minWorkbuddyVersion": "4.23.0"`；缺省 auth_mode 会被平台按「无需认证」处理，
    >    用户连接时不会出现凭证填写表单。
@@ -87,6 +87,10 @@
    > 3. 包根目录（与 `connector-meta.json` 同级）必须有 `token-schema.json`
    >    （含 `title` / `description` / `fields`），`fields[].key` 必须与 `mcp.json`
    >    中 `${...}` 的变量名完全一致，平台据此生成用户填写凭证的表单。
+   > 4. 包内 `mcp.json` 的 server 条目必须**显式声明 `type` 字段**（远程服务用
+   >    `"type": "http"`，本地进程用 `"type": "stdio"` + `command`）。平台静态审核（M2
+   >    连接字段完整）要求 type 可直接判读，只靠 `url` 推断会被判
+   >    「server type=None，且无法由 command 推断 stdio」退回（2026-11-04 审核退回后补充）。
    >
    > 上架包内 `mcp.json` 由平台读取并替换占位符；方式一手动本地配置请使用
    > `deploy/workbuddy/mcp.json.template`（该文件用于用户手填真实令牌，不走平台替换机制）。

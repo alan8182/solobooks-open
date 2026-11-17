@@ -4,7 +4,7 @@
  */
 
 /**
- * AI CFO · 交互工作台「上次对话记录」的 localStorage 读写。
+ * AI 财务官 · 交互工作台「上次对话记录」的 localStorage 读写。
  * 与 workspaceView / guideState 同一惯例：键名必须带账套维度
  * （`solo:<feature>:${companyId || 'default'}`），否则同账号切换账套会串对话。
  */

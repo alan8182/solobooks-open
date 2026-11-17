@@ -1,7 +1,7 @@
 <!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import {
   NCard,
   NButton,
@@ -33,6 +33,7 @@ import { setPassword, updateProfile } from '@/api/auth'
 use([CanvasRenderer, LineChart, GridComponent, TooltipComponent])
 
 const router = useRouter()
+const route = useRoute()
 const message = useMessage()
 const authStore = useAuthStore()
 const workspaceViewStore = useWorkspaceViewStore()
@@ -216,7 +217,26 @@ function maskPhone(phone?: string) {
   return phone.replace(/(\d{3})\d{4}(\d{4})/, '$1****$2')
 }
 
+// ── 套餐订阅摘要（完整对比与下单见独立页 /mine/plan）──
+const planInfo = computed(() => usageStore.summary?.quota ?? null)
+
+function goPlanPage(planCode?: string) {
+  void router.push(planCode ? { path: '/mine/plan', query: { plan: planCode } } : '/mine/plan')
+}
+
 onMounted(async () => {
+  // 支付宝同步回跳（return_url 302 带 orderNo）或旧版 ?upgrade= 入口，统一转发至独立订阅页
+  const orderNo = route.query.orderNo
+  if (typeof orderNo === 'string' && orderNo) {
+    void router.replace({ path: '/mine/plan', query: { orderNo } })
+    return
+  }
+  const upgrade = route.query.upgrade
+  if (typeof upgrade === 'string' && upgrade) {
+    void router.replace({ path: '/mine/plan', query: { plan: upgrade } })
+    return
+  }
+
   if (!authStore.user && authStore.token) {
     try {
       await authStore.fetchProfile()
@@ -266,6 +286,34 @@ onMounted(async () => {
       <div class="profile-tip">
         <i class="ri-information-line" />
         凭证署名（制单人/审核人/记账人）优先显示此昵称；未设置时显示掩码手机号。
+      </div>
+    </NCard>
+
+    <!-- 套餐订阅 -->
+    <NCard :bordered="false" class="settings-card mb-4">
+      <div class="card-section-title">我的套餐</div>
+      <div class="setting-item-row">
+        <div class="item-icon-box">
+          <i class="ri-vip-crown-line" />
+        </div>
+        <div class="item-info">
+          <div class="item-title">
+            <span>{{ planInfo?.planName || '免费体验版' }}</span>
+            <NTag v-if="planInfo?.planExpiresAt" size="tiny" type="info" :bordered="false">
+              {{ planInfo.planExpiresAt }} 到期
+            </NTag>
+          </div>
+          <div class="item-desc">
+            {{
+              planInfo?.planExpiresAt
+                ? '年付 500 万 Token 额度 · 最多 3 个账套，到期后自动回落免费体验版'
+                : '免费体验版 · 每月 10 万 Token、最多 3 个账套，升级标准版年享 500 万 Token'
+            }}
+          </div>
+        </div>
+        <NButton type="primary" secondary size="small" class="action-btn" @click="goPlanPage()">
+          套餐与订阅
+        </NButton>
       </div>
     </NCard>
 
@@ -329,12 +377,12 @@ onMounted(async () => {
             <span class="scene-tokens">{{ formatTokens(row.totalTokens) }}</span>
           </div>
         </div>
-        <div v-else class="usage-empty">本月还没有 AI 使用记录，去「AI CFO」试试连续记账吧。</div>
+        <div v-else class="usage-empty">本月还没有 AI 使用记录，去「AI 财务官」试试连续记账吧。</div>
 
         <div class="profile-tip">
           <i class="ri-information-line" />
-          统计口径：自然月内本人全部 AI 功能（AI CFO 对话、智能记账、单据识别、报表洞察等）的
-          token 消耗，跨账套合并计算；语音与图片识别按调用次数计。
+          统计口径：当前周期内本人全部 AI 功能（AI 财务官对话、智能记账、多模态票据识别、报表洞察等）的
+          token 消耗，跨账套合并计算。
         </div>
       </NSpin>
     </NCard>

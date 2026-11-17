@@ -1068,11 +1068,11 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
                 <button
                   type="button"
                   class="closing-ai-badge-btn"
-                  aria-label="打开 AI CFO 检查本月结账"
+                  aria-label="打开 AI 财务官检查本月结账"
                   @click="openClosingCopilot"
                 >
                   <i class="ri-sparkling-2-line" aria-hidden="true" />
-                  <span>AI CFO</span>
+                  <span>AI 财务官</span>
                 </button>
               </template>
               检查本月结账、解释差异并创建待确认修复草稿；最终锁账仍由你在此页确认。
@@ -3806,11 +3806,11 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
       </template>
     </SoloDrawer>
 
-    <!-- AI CFO 完整诊断弹窗 -->
+    <!-- AI 财务官完整诊断弹窗 -->
     <NModal
       v-model:show="showDiagnosisModal"
       preset="card"
-      title="AI CFO 月度深度诊断点评"
+      title="AI 财务官月度深度诊断点评"
       style="width: min(640px, 94vw);"
     >
       <div v-if="cfoDiagnosis" class="diagnosis-modal-content">
@@ -3846,7 +3846,7 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
 .cost-color { color: var(--solo-expense); }
 .money-color { color: var(--solo-income); }
 
-/* 标题主行、AI CFO 入口与申报提示 */
+/* 标题主行、AI 财务官入口与申报提示 */
 .closing-title-row {
   display: flex;
   align-items: center;

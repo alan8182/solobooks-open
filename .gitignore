@@ -116,3 +116,6 @@ archive/
 *.ttc
 __MACOSX/
 /梭罗记账-WorkBuddy连接器上架资料包.zip
+
+# 支付宝开放平台密钥工具产物（应用私钥绝不能进 git）
+支付宝密钥/

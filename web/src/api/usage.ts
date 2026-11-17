@@ -35,6 +35,12 @@ export interface QuotaState {
   bonusTokens: number
   usedTokens: number
   remainingTokens: number | null
+  /** 付费套餐到期日（ISO 日期串）；null/undefined = 不适用（trial 或管理端调整） */
+  planExpiresAt?: string | null
+  /** 最多可创建的账套数；null = 不限（开源自部署或未来代账机构版） */
+  maxCompanies?: number | null
+  /** 当前名下已创建的账套数 */
+  companyCount?: number
 }
 
 export interface MyUsageSummary {

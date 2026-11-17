@@ -244,7 +244,7 @@ async def _parse_receipt_from_bytes(
         code = 413 if ("超过" in msg or "最大" in msg) else 415
         raise HTTPException(status_code=code, detail=msg) from e
 
-    # ── 主路径：多模态模型直读图片（OpenAI 协议，qwen3.8-flash 等）────────
+    # ── 多模态模型直读图片（OpenAI 协议，计入用户套餐 token 消耗）────────
     data_url = f"data:{mime};base64,{base64.b64encode(content).decode('ascii')}"
     try:
         result = _ensure_receipt_dict(
@@ -252,7 +252,6 @@ async def _parse_receipt_from_bytes(
                 chat_vision_json,
                 RECEIPT_VL_V3_PROMPT,
                 data_url,
-                # 4096：DeepSeek 输出偏长，2048 会截断 JSON 导致误入 OCR 降级路径
                 max_tokens=4096,
                 scene="invoice_ocr",
                 user_id=ctx.user_id,
@@ -261,46 +260,12 @@ async def _parse_receipt_from_bytes(
         )
         ocr_text = str(result.get("rawText") or "") or result.get("explanation") or ""
     except AccountingError:
-        # 配额超限要变成 402 引导升级，不能静默降级到智谱 OCR 继续消耗
+        # 配额超限保持 402 引导升级
         raise
-    except Exception:
-        # ── 降级路径：智谱 OCR 提取文字 + 文本模型结构化 ─────────────────
-        try:
-            ocr_out = await zhipu_handwriting_ocr_bytes(
-                content,
-                filename,
-                mime,
-                scene="invoice_ocr",
-                user_id=ctx.user_id,
-                company_id=ctx.company_id,
-            )
-        except RuntimeError as e:
-            raise HTTPException(status_code=502, detail=str(e)) from e
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"智谱 OCR 网络错误：{e}") from e
-
-        ocr_text = (ocr_out.get("ocr_text") or "").strip()
-        if not ocr_text:
-            raise HTTPException(status_code=422, detail="未能识别图片内容，请换一张更清晰的照片。")
-
-        ocr_for_llm = ocr_text if len(ocr_text) <= _MAX_OCR_TEXT_FOR_LLM else ocr_text[:_MAX_OCR_TEXT_FOR_LLM]
-        user_msg = f"【文件名】{filename}\n【OCR原始文本】\n{ocr_for_llm}"
-
-        try:
-            result = _ensure_receipt_dict(
-                await asyncio.to_thread(
-                    chat_text_json,
-                    RECEIPT_FROM_OCR_V3_PROMPT,
-                    user_msg,
-                    max_tokens=1536,
-                    temperature=0.2,
-                    scene="invoice_ocr",
-                    user_id=ctx.user_id,
-                    company_id=ctx.company_id,
-                )
-            )
-        except (ValueError, RuntimeError) as e:
-            raise HTTPException(status_code=502, detail=f"记账模型解析失败：{e}") from e
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(status_code=502, detail=f"单据多模态识别失败：{e}") from e
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"单据识别服务异常：{e}") from e
 
     raw_out = ocr_text if len(ocr_text) <= _MAX_RAW_TEXT_RESPONSE else ocr_text[:_MAX_RAW_TEXT_RESPONSE]
     return RecordReceiptResponse(

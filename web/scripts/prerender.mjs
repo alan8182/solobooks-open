@@ -16,7 +16,7 @@ import { extname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { existsSync } from 'node:fs'
 import puppeteer from 'puppeteer-core'
-import { SPA_PAGES } from './public-pages.mjs'
+import { PRERENDER_ONLY_PAGES, SPA_PAGES } from './public-pages.mjs'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
 const DIST = join(ROOT, 'dist')
@@ -112,7 +112,7 @@ const browser = await puppeteer.launch({ executablePath: findBrowser(), headless
 
 try {
   mkdirSync(OUT, { recursive: true })
-  for (const page of SPA_PAGES) {
+  for (const page of [...SPA_PAGES, ...PRERENDER_ONLY_PAGES]) {
     const target = `http://127.0.0.1:${PORT}${page.path}`
     const p = await browser.newPage()
     await p.goto(target, { waitUntil: 'networkidle0', timeout: 60_000 })

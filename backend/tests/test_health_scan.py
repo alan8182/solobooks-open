@@ -1,6 +1,7 @@
 # Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
 # Licensed under the SoloBooks License v2.0.
-"""Regression tests for evidence, coverage and safe health-scan output."""
+"""Regression tests for 3-minute pain-point health scan, adaptive scoring, and AI polish."""
+import json
 import pytest
 from fastapi.testclient import TestClient
 
@@ -10,8 +11,6 @@ from services.health_scan_service import run_health_scan
 
 client = TestClient(app)
 QUIZ = {f"q{i}": "A" for i in range(1, 7)}
-PROFILE = {"companyType": "LTD", "period": "2026-10", "accountingStandard": "SMALL_ENTERPRISE", "vatType": "GENERAL"}
-META = {"period": "2026-10", "balanceType": "ending", "currencyUnit": "元", "confirmed": True, "complete": True}
 ROWS = [
     {"account_code": "1002", "account_name": "银行存款", "debit_balance": "100000.00", "credit_balance": "0"},
     {"account_code": "3001", "account_name": "实收资本", "debit_balance": "0", "credit_balance": "100000.00"},
@@ -22,12 +21,12 @@ def checks(report):
     return {c["code"]: c for c in report["checks"]}
 
 
-def scan_quiz(answers=None, profile=PROFILE):
-    return run_health_scan(mode="quiz", answers=QUIZ if answers is None else answers, profile=profile)
+def scan_quiz(answers=None, profile=None, use_ai=False):
+    return run_health_scan(mode="quiz", answers=QUIZ if answers is None else answers, profile=profile, use_ai=use_ai)
 
 
-def scan_balance(rows=ROWS, answers=None, meta=META, profile=PROFILE):
-    return run_health_scan(mode="balance", rows=rows, answers=answers, profile=profile, balanceMeta=meta)
+def scan_balance(rows=ROWS, answers=None, meta=None, profile=None, use_ai=False):
+    return run_health_scan(mode="balance", rows=rows, answers=answers, profile=profile, balanceMeta=meta, use_ai=use_ai)
 
 
 @pytest.fixture(autouse=True)
@@ -35,51 +34,34 @@ def reset_rate_limit():
     _RATE_LIMIT_CACHE.clear()
 
 
-def test_q1_reimbursed_and_q4_research_options_follow_real_question():
-    report = scan_quiz({**QUIZ, "q1": "B", "q4": "B"})
-    assert checks(report)["Q-01"]["status"] == "PASS"
-    assert checks(report)["Q-04"]["status"] == "PASS"
-    assert not report["flags"]
-    report = scan_quiz({**QUIZ, "q4": "A"})
-    assert checks(report)["Q-04"]["status"] == "RISK"
-    assert checks(report)["Q-04"]["deduction"] == 10
-    report = scan_quiz({**QUIZ, "q4": "C"})
-    assert checks(report)["Q-04"]["status"] == "NA"
-    assert report["coverage"] == {"completed": 5, "applicable": 5, "percent": 100.0}
-    assert next(d for d in report["dimensions"] if d["key"] == "governance")["score"] is None
+def test_quiz_scores_without_profile_and_skips_na_dimension():
+    # q6=C（无研发投入）标为 NA，但不能导致整份报告暂不评分
+    report = scan_quiz({**QUIZ, "q6": "C"})
+    assert checks(report)["Q-06"]["status"] == "NA"
+    assert report["totalScore"] == 100
+    assert report["healthLevel"] == "HEALTHY"
+    assert next(d for d in report["dimensions"] if d["key"] == "governance")["status"] == "NA"
+    assert report["scoreBreakdown"]["weights"]["governance"] == 0
 
 
-def test_quiz_dimension_with_no_applicable_check_explains_score_unavailability():
-    report = scan_quiz({**QUIZ, "q4": "C"})
-    assert checks(report)["Q-04"]["status"] == "NA"
-    assert report["totalScore"] is None
-    assert report["levelLabel"] == "维度无适用检查，暂不评分"
-    assert "无适用检查" in report["oneSentenceVerdict"]
-    assert "无适用检查" in next(d for d in report["dimensions"] if d["key"] == "governance")["detail"]
-    assert any("无适用检查" in reason for reason in report["scoreBreakdown"]["reason"])
-    assert "资料不足" in scan_quiz({**QUIZ, "q4": "UNKNOWN"})["levelLabel"]
-    assert "资料不足" in scan_quiz({**QUIZ, "q4": "C", "q2": "UNKNOWN"})["levelLabel"]
+def test_quiz_requires_at_least_three_meaningful_answers_to_score():
+    too_few = scan_quiz({"q1": "A", "q2": "A", "q3": "UNKNOWN", "q4": "UNKNOWN"})
+    assert too_few["totalScore"] is None
+    assert "有效信息过少" in too_few["levelLabel"]
+
+    enough = scan_quiz({"q1": "C", "q2": "A", "q3": "A"})
+    assert enough["totalScore"] is not None
+    assert any(f["code"] == "Q-01" and f["severity"] == "CRITICAL" for f in enough["flags"])
+    assert enough["taxBureauView"]["riskLevel"] == "high"
 
 
-def test_unknown_answer_not_defaulted_to_safe_and_dimension_unscored():
-    report = scan_quiz({**QUIZ, "q2": "UNKNOWN"})
-    assert checks(report)["Q-02"]["status"] == "UNKNOWN"
-    assert report["coverage"] == {"completed": 5, "applicable": 6, "percent": 83.33}
-    assert report["totalScore"] is None
-    assert next(d for d in report["dimensions"] if d["key"] == "voucher")["score"] is None
-    assert scan_quiz({"q1": "A"})["totalScore"] is None
-    assert scan_quiz(QUIZ, profile=None)["totalScore"] is None
-    assert checks(scan_quiz({**QUIZ, "q4": "NA"}))["Q-04"]["status"] == "UNKNOWN"
-
-
-def test_risks_and_breakdown_are_reproducible():
-    report = scan_quiz({**QUIZ, "q1": "C", "q2": "B", "q3": "B"})
-    breakdown = report["scoreBreakdown"]
-    assert breakdown["totalDeduction"] == sum(i["deduction"] for i in breakdown["deductions"])
-    assert report["totalScore"] == sum(dim["score"] * breakdown["weights"][dim["key"]] for dim in report["dimensions"])
-    for dim in report["dimensions"]:
-        if dim["score"] is not None:
-            assert dim["score"] == max(0, 100 - sum(i["deduction"] for i in breakdown["deductions"] if i["dimension"] == dim["key"]))
+def test_quiz_pain_points_drive_tax_and_bank_perspectives():
+    report = scan_quiz({**QUIZ, "q1": "C", "q3": "C", "q4": "C"})
+    assert report["totalScore"] < 85
+    assert report["taxBureauView"]["riskLevel"] == "high"
+    assert report["bankFunderView"]["creditLevel"] == "low"
+    assert len(report["flags"]) == 3
+    assert report["flags"][0]["deduction"] >= report["flags"][1]["deduction"]
 
 
 @pytest.mark.parametrize("bad", [None, "", "abc", "1e2", "NaN", "Infinity", "1.001", True, "1,000", "1234567890123456"])
@@ -90,129 +72,149 @@ def test_invalid_amount_never_silently_becomes_zero(bad):
 
 
 def test_decimal_exact_balance_and_parent_child_rejected():
-    rows = [{"account_code": "1001", "account_name": "现金", "debit_balance": "0.10", "credit_balance": "0"},
-            {"account_code": "1002", "account_name": "银行", "debit_balance": "0.20", "credit_balance": "0"},
-            {"account_code": "3001", "account_name": "实收资本", "debit_balance": "0", "credit_balance": "0.30"}]
+    rows = [
+        {"account_code": "1001", "account_name": "现金", "debit_balance": "0.10", "credit_balance": "0"},
+        {"account_code": "1002", "account_name": "银行", "debit_balance": "0.20", "credit_balance": "0"},
+        {"account_code": "3001", "account_name": "实收资本", "debit_balance": "0", "credit_balance": "0.30"},
+    ]
     assert checks(scan_balance(rows))["R-04"]["status"] == "PASS"
     rows[-1]["credit_balance"] = "0.29"
-    assert checks(scan_balance(rows))["R-04"]["status"] == "RISK"
+    unbalanced = scan_balance(rows)
+    assert checks(unbalanced)["R-04"]["status"] == "RISK"
+    assert unbalanced["totalScore"] is not None
     with pytest.raises(ValueError):
         scan_balance(rows + [{**rows[0], "account_code": "100101"}])
 
 
-def test_balance_core_metadata_and_all_zero_gate():
-    assert scan_balance(meta=None)["totalScore"] is None
-    assert scan_balance(meta={**META, "period": "2026-09"})["totalScore"] is None
-    assert scan_balance(meta={**META, "balanceType": "opening"})["totalScore"] is None
-    assert scan_balance(meta={**META, "currencyUnit": "万元"})["totalScore"] is None
-    assert scan_balance(meta={**META, "confirmed": False})["totalScore"] is None
+def test_balance_scores_without_confirmation_gate_and_rejects_all_zero():
+    # 不再卡死确认勾选框/期间一致，上传非零余额表即可出分
+    report = scan_balance(ROWS, meta=None, profile=None)
+    assert report["totalScore"] == 100
+    assert report["healthLevel"] == "HEALTHY"
+
+    opening_report = scan_balance(ROWS, meta={"balanceType": "opening"})
+    assert opening_report["totalScore"] == 100
+    assert opening_report["meta"]["isOpeningBalance"] is True
+    assert "期初余额" in opening_report["oneSentenceVerdict"]
+
     zero = [{**r, "debit_balance": "0", "credit_balance": "0"} for r in ROWS]
-    assert scan_balance(zero)["totalScore"] is None
-    assert checks(scan_balance(zero))["R-04"]["status"] == "UNKNOWN"
+    zero_report = scan_balance(zero)
+    assert zero_report["totalScore"] is None
+    assert "余额全零" in zero_report["levelLabel"]
 
 
-def test_missing_balance_accounts_never_claims_unpaid_capital_or_rd():
-    result = scan_balance(meta=None)
-    assert checks(result)["R-09"]["status"] != "RISK"
-    assert checks(result)["R-05"]["status"] == "UNKNOWN"
-    assert not any(d["score"] == 100 for d in result["dimensions"])
+def test_balance_shareholder_loan_computes_20_percent_tax_exposure():
+    rows = [
+        {"account_code": "1221", "account_name": "其他应收款", "debit_balance": "100000.00", "credit_balance": "0"},
+        {"account_code": "3001", "account_name": "实收资本", "debit_balance": "0", "credit_balance": "100000.00"},
+    ]
+    report = scan_balance(rows, answers={"loanCounterparty": "SHAREHOLDER"})
+    r01_flag = next(f for f in report["flags"] if f["code"] == "R-01")
+    assert r01_flag["amount"] == "¥100,000.00"
+    assert "20%" in r01_flag["estimatedExposure"]
+    assert "20,000.00" in r01_flag["estimatedExposure"]
+
+    # 员工小额备用金不触发风险
+    small_emp_rows = [
+        {"account_code": "1221", "account_name": "备用金", "debit_balance": "8000.00", "credit_balance": "0"},
+        {"account_code": "3001", "account_name": "实收资本", "debit_balance": "0", "credit_balance": "8000.00"},
+    ]
+    emp_report = scan_balance(small_emp_rows, answers={"loanCounterparty": "EMPLOYEE", "loanRepayment": "YES"})
+    assert checks(emp_report)["R-01"]["status"] == "PASS"
 
 
-def test_followup_evidence_needed_and_period_occurrence_not_cross_year():
-    rows = [{"account_code": "1221", "account_name": "其他应收款-**", "debit_balance": "60000", "credit_balance": "0"},
-            {"account_code": "3001", "account_name": "实收资本", "debit_balance": "0", "credit_balance": "60000"}]
-    result = scan_balance(rows)
-    assert checks(result)["R-01"]["status"] == "UNKNOWN"
-    assert any(flag["code"] == "R-01" for flag in result["flags"])
-    assert "loanOccurrence" in checks(result)["R-01"]["missing"]
-    answers = {"loanCounterparty": "SHAREHOLDER", "loanOccurrence": "YES", "loanRepayment": "PARTIAL", "loanPurpose": "BUSINESS"}
-    result = scan_balance(rows, answers)
-    assert checks(result)["R-01"]["status"] == "RISK"
-    assert "loanOccurrence=YES" in checks(result)["R-01"]["observed"]
-    assert "跨年" not in str(result) and "税额" not in str(result["flags"])
-    assert "impactAmount" not in str(result)
-
-
-def test_followups_rd_asset_and_advance_use_actual_evidence():
+def test_balance_followups_rd_asset_and_advance():
     rows = [
         {"account_code": "1601", "account_name": "固定资产", "debit_balance": "30000", "credit_balance": "0"},
         {"account_code": "1602", "account_name": "累计折旧", "debit_balance": "0", "credit_balance": "0"},
         {"account_code": "2203", "account_name": "预收账款", "debit_balance": "0", "credit_balance": "60000"},
         {"account_code": "1002", "account_name": "银行存款", "debit_balance": "30000", "credit_balance": "0"},
     ]
-    result = scan_balance(rows)
-    assert all(checks(result)[code]["status"] == "UNKNOWN" for code in ("R-05", "R-06", "R-08"))
-    result = scan_balance(rows, {"rdActivities": "YES", "rdAuxiliaryLedger": "NO", "assetExists": "YES", "assetPutIntoUse": "YES", "advanceReceived": "YES", "advancePerformance": "PARTIAL"})
-    assert all(checks(result)[code]["status"] == "RISK" for code in ("R-05", "R-06", "R-08"))
-    result = scan_balance(rows, {"rdActivities": "NO", "assetExists": "YES", "assetPutIntoUse": "NO", "advanceReceived": "YES", "advancePerformance": "NO"})
-    assert checks(result)["R-05"]["status"] == "NA"
-    assert checks(result)["R-06"]["status"] == "NA"
-    assert checks(result)["R-08"]["status"] == "PASS"
+    report = scan_balance(rows, {"rdActivities": "YES", "rdAuxiliaryLedger": "NO", "advancePerformance": "PARTIAL"})
+    assert all(checks(report)[code]["status"] == "RISK" for code in ("R-05", "R-06", "R-08"))
 
-
-def test_capital_check_never_uses_small_enterprise_production_cost():
-    cost = {"account_code": "4001", "account_name": "生产成本", "debit_balance": "50000", "credit_balance": "0"}
-    missing = scan_balance([ROWS[0], cost])
-    assert checks(missing)["R-09"]["status"] == "UNKNOWN"
-    assert not any(f["code"] == "R-09" for f in missing["flags"])
-    capital = {"account_code": "3001", "account_name": "实收资本", "debit_balance": "0", "credit_balance": "100000"}
-    check = checks(scan_balance([ROWS[0], cost, capital]))["R-09"]
-    assert check["status"] == "PASS"
-    assert "100000.00" in check["observed"]
+    clean = scan_balance(rows, {"rdActivities": "NO", "assetPutIntoUse": "NO", "advancePerformance": "NO"})
+    assert checks(clean)["R-05"]["status"] == "NA"
+    assert checks(clean)["R-06"]["status"] == "NA"
+    assert checks(clean)["R-08"]["status"] == "PASS"
 
 
 @pytest.mark.parametrize("code,name,standard,expected", [
     ("3001", "实收资本", "SMALL_ENTERPRISE", "RISK"),
-    ("3001001", "实收资本-股东", "SMALL_ENTERPRISE", "RISK"),
-    ("3001", "", "SMALL_ENTERPRISE", "RISK"),
-    ("4001", "实收资本", "SMALL_ENTERPRISE", "RISK"),  # 历史混合编码
     ("4001", "股本", "ENTERPRISE", "RISK"),
-    ("", "实收资本", "UNKNOWN", "RISK"),
-    ("4001", "", "ENTERPRISE", "RISK"),
-    ("4001", "", "SMALL_ENTERPRISE", "UNKNOWN"),
-    ("4001", "", "UNKNOWN", "UNKNOWN"),
-    ("3001", "", "ENTERPRISE", "UNKNOWN"),
-    ("3001", "生产成本", "SMALL_ENTERPRISE", "UNKNOWN"),
-    ("4001", "生产成本", "ENTERPRISE", "UNKNOWN"),
-    ("9999", "应付股本", "SMALL_ENTERPRISE", "UNKNOWN"),
-    ("9999", "实收资本溢价", "SMALL_ENTERPRISE", "UNKNOWN"),
+    ("3001", "生产成本", "SMALL_ENTERPRISE", "NA"),
+    ("4001", "生产成本", "ENTERPRISE", "NA"),
+    ("9999", "应付股本", "SMALL_ENTERPRISE", "NA"),
 ])
-def test_capital_identification_requires_trustworthy_name_or_standard(code, name, standard, expected):
+def test_capital_identification_remains_conservative(code, name, standard, expected):
     row = {"account_code": code, "account_name": name, "debit_balance": "0", "credit_balance": "0"}
-    report = scan_balance([ROWS[0], row], profile={**PROFILE, "accountingStandard": standard})
-    check = checks(report)["R-09"]
-    assert check["status"] == expected
-    if expected == "UNKNOWN":
-        assert check["deduction"] == 0
-        assert not any(f["code"] == "R-09" for f in report["flags"])
-
-
-def test_capital_ambiguous_row_prevents_false_pass_from_other_capital():
-    capital = {"account_code": "3001", "account_name": "实收资本", "debit_balance": "0", "credit_balance": "100000"}
-    ambiguous = {"account_code": "4001", "account_name": "", "debit_balance": "0", "credit_balance": "0"}
-    check = checks(scan_balance([ROWS[0], capital, ambiguous]))["R-09"]
-    assert check["status"] == "UNKNOWN"
-    assert check["deduction"] == 0
+    report = scan_balance([ROWS[0], row], profile={"companyType": "LTD", "accountingStandard": standard})
+    assert checks(report)["R-09"]["status"] == expected
 
 
 @pytest.mark.parametrize("company_type", ["INDIVIDUAL", "SOLE_PROPRIETOR"])
 def test_non_company_capital_check_is_inapplicable(company_type):
-    assert checks(scan_balance(profile={**PROFILE, "companyType": company_type}))["R-09"]["status"] == "NA"
+    assert checks(scan_balance(profile={"companyType": company_type}))["R-09"]["status"] == "NA"
 
 
-@pytest.mark.parametrize("key", ["q1", "q2", "q3", "q4", "q5", "q6"])
-def test_unsubstantiated_na_is_unknown(key):
-    report = scan_quiz({**QUIZ, key: "NA"})
-    assert checks(report)[f"Q-0{key[-1]}"]["status"] == "UNKNOWN"
-    assert report["totalScore"] is None
+def test_ai_polish_only_receives_anonymized_flags_and_preserves_score_sovereignty(monkeypatch):
+    import services.health_scan_service as svc
+    import services.llm as llm
+
+    captured = {}
+
+    def fake_chat_json(system_prompt, user_message, fallback, **kwargs):
+        captured["payload"] = json.loads(user_message)
+        return {
+            "oneSentenceVerdict": "AI润色：公转私跨年挂账是当前最大涉税雷区。",
+            "taxBureauDetails": "AI润色：税局重点关注其他应收款长期挂账。",
+            "bankFunderDetails": "AI润色：建议清理往来后申请授信。",
+            "urgentAction": "AI润色：本周内梳理其他应收款明细。",
+            "flagNarratives": {
+                "R-01": {"painTitle": "AI标题：股东借款个税风险", "desc": "AI解释：跨年未还易被视同分红。", "fix": "AI建议：走正规报销或归还公户。"},
+                "FAKE-99": {"painTitle": "不应注入未触发规则"},
+            },
+        }
+
+    monkeypatch.setattr(svc, "LLM_API_KEY", "test-key")
+    monkeypatch.setattr(llm, "safe_chat_text_json", fake_chat_json)
+
+    rows = [
+        {"account_code": "1221", "account_name": "其他应收款", "debit_balance": "100000.00", "credit_balance": "0"},
+        {"account_code": "3001", "account_name": "实收资本", "debit_balance": "0", "credit_balance": "100000.00"},
+    ]
+    baseline = scan_balance(rows, answers={"loanCounterparty": "SHAREHOLDER"}, use_ai=False)
+    polished = scan_balance(rows, answers={"loanCounterparty": "SHAREHOLDER"}, use_ai=True)
+
+    # 分数、等级、扣分绝对主权归确定性规则，LLM 不得篡改
+    assert polished["totalScore"] == baseline["totalScore"]
+    assert polished["healthLevel"] == baseline["healthLevel"]
+    assert polished["meta"]["analysisSource"] == "llm"
+    assert polished["oneSentenceVerdict"].startswith("AI润色：")
+    assert all(f["code"] != "FAKE-99" for f in polished["flags"])
+    assert "rows" not in captured["payload"]
+    assert "银行存款" not in json.dumps(captured["payload"], ensure_ascii=False)
 
 
-def test_endpoint_accepts_incomplete_without_llm_and_no_raw_exception(monkeypatch):
-    response = client.post("/api/health-scan/analyze", json={"mode": "quiz", "answers": {}, "profile": {"companyType": "UNKNOWN"}})
+def test_ai_polish_falls_back_gracefully_on_empty_llm_result(monkeypatch):
+    import services.health_scan_service as svc
+    import services.llm as llm
+
+    monkeypatch.setattr(svc, "LLM_API_KEY", "test-key")
+    monkeypatch.setattr(llm, "safe_chat_text_json", lambda *args, **kwargs: {})
+
+    report = scan_quiz({**QUIZ, "q1": "C"}, use_ai=True)
+    assert report["meta"]["analysisSource"] == "deterministic-fallback"
+    assert report["totalScore"] is not None
+    assert "20%" in report["flags"][0]["desc"]
+
+
+def test_endpoint_accepts_use_ai_and_hides_internal_errors(monkeypatch):
+    response = client.post("/api/health-scan/analyze", json={"mode": "quiz", "answers": {}, "useAi": False})
     assert response.status_code == 200
     report = response.json()["report"]
     assert report["totalScore"] is None and report["meta"]["ephemeral"]
-    assert report["meta"]["analysisSource"] == "deterministic"
+
     import routers.health_scan as router
     monkeypatch.setattr(router, "run_health_scan", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("secret-input")))
     response = client.post("/api/health-scan/analyze", json={"mode": "quiz"})

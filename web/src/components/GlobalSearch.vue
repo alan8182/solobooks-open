@@ -56,10 +56,10 @@ const DEFAULT_ACTIONS: CommandAction[] = [
   {
     id: 'act-copilot',
     type: 'action',
-    title: '记一笔 / 问 AI CFO',
+    title: '记一笔 / 问 AI 财务官',
     description: '通过一句话自然语言或图片记账',
     icon: 'ri-chat-3-line',
-    keywords: ['记一笔', '记账', 'ai', 'cfo', 'copilot', '对话', '问cfo', '问会计', 'jiyibi', 'jizhang'],
+    keywords: ['记一笔', '记账', 'ai', '财务官', 'cfo', 'copilot', '对话', '问财务官', '问会计', 'jiyibi', 'jizhang'],
     handler: () => router.push('/copilot'),
   },
   {

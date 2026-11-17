@@ -14,11 +14,19 @@ const POSTS_DIR = join(HERE, '..', 'learn', 'posts')
 // 需要浏览器预渲染的 SPA 路由。
 // /learn 系列不在此列：它们由 build-learn.mjs 直接产出静态 HTML，不走浏览器渲染。
 export const SPA_PAGES = [
-  { path: '/', changefreq: 'weekly', priority: '1.0', lastmod: '2026-10-30' },
-  { path: '/landing', changefreq: 'monthly', priority: '0.6', lastmod: '2026-10-30' },
+  { path: '/', changefreq: 'weekly', priority: '1.0', lastmod: '2026-11-17' },
+  { path: '/landing', changefreq: 'monthly', priority: '0.6', lastmod: '2026-11-17' },
+  { path: '/free', changefreq: 'weekly', priority: '0.9', lastmod: '2026-11-17' },
+  { path: '/audit-scan', changefreq: 'monthly', priority: '0.7', lastmod: '2026-11-17' },
   { path: '/ai-connect', changefreq: 'monthly', priority: '0.8', lastmod: '2026-10-30' },
   { path: '/agreement', changefreq: 'yearly', priority: '0.3', lastmod: '2026-10-30' },
   { path: '/privacy', changefreq: 'yearly', priority: '0.3', lastmod: '2026-10-30' },
+]
+
+// 只预渲染、不进 sitemap 的页面。代表性场景：保留可访问但不应被收录的旧版页面，
+// 需要直出 HTML 携带 noindex（JS 注入的 robots 对不执行 JS 的爬虫无效）。
+export const PRERENDER_ONLY_PAGES = [
+  { path: '/landing-old' },
 ]
 
 // /learn 文章清单：slug 即文件名，lastmod 取 front-matter 的 date

@@ -19,7 +19,7 @@
     "Generate the quarterly VAT and corporate income tax filing package"
   ],
   "icon": "icon.png",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "auth_mode": "token",
   "minWorkbuddyVersion": "4.23.0",
   "category": "finance",

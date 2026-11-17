@@ -5,15 +5,21 @@
 
 import * as XLSX from 'xlsx'
 import apiClient from '@/api/client'
+import { readWorkbookFromFile } from '@/utils/workbookFile'
 
 export interface ScanFlag {
   code: string
   name: string
+  painTitle?: string
   severity: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW'
   deduction: number
   amount?: string
+  estimatedExposure?: string
   desc: string
   fix: string
+  legalBasis?: string
+  ctaLabel?: string
+  ctaRoute?: string
 }
 
 export interface DimensionMetric {
@@ -58,6 +64,7 @@ export interface HealthScanReport {
     baselineVersion: string
     source?: 'backend'
     analysisSource?: string
+    isOpeningBalance?: boolean
   }
 }
 
@@ -65,8 +72,40 @@ export interface HealthScanPayload {
   mode: 'balance' | 'quiz'
   rows?: Record<string, unknown>[]
   answers?: Record<string, string>
-  profile?: { companyType: string; period: string; accountingStandard: string; vatType: string }
-  balanceMeta?: { period: string; balanceType: string; currencyUnit: string; confirmed: boolean; complete: boolean }
+  profile?: { companyType?: string; period?: string; accountingStandard?: string; vatType?: string }
+  balanceMeta?: { period?: string; balanceType?: string; currencyUnit?: string; confirmed?: boolean; complete?: boolean }
+  useAi?: boolean
+}
+
+export interface BalanceFollowupHints {
+  loanAmount: number
+  advanceAmount: number
+  hasLoanClue: boolean
+  hasAdvanceClue: boolean
+}
+
+/** 仅按表内真实金额提取最多 2 个需要补充确认的线索（不问无关题）。 */
+export function detectBalanceFollowups(rows: Record<string, unknown>[]): BalanceFollowupHints {
+  let loanAmount = 0
+  let advanceAmount = 0
+  for (const row of rows) {
+    const code = String(row.account_code ?? row.code ?? '')
+    const name = String(row.account_name ?? row.name ?? '')
+    const debit = Number(row.debit_balance ?? row.debit ?? 0) || 0
+    const credit = Number(row.credit_balance ?? row.credit ?? 0) || 0
+    if (code.startsWith('1221') || name.includes('其他应收款') || name.includes('备用金')) {
+      loanAmount += Math.max(0, debit - credit)
+    }
+    if (code.startsWith('2203') || code.startsWith('2205') || name.includes('预收账款') || name.includes('合同负债')) {
+      advanceAmount += Math.max(0, credit - debit)
+    }
+  }
+  return {
+    loanAmount,
+    advanceAmount,
+    hasLoanClue: loanAmount > 5000,
+    hasAdvanceClue: advanceAmount > 50000,
+  }
 }
 
 /** 不使用离线示例或第二套规则：失败时由页面提示并允许重试。 */
@@ -158,8 +197,7 @@ export async function parseBalanceFile(file: File): Promise<Record<string, unkno
 }
 
 export async function parseBalanceFileWithPreview(file: File): Promise<{ rows: Record<string, unknown>[]; preview: BalanceFilePreview }> {
-  const buffer = await file.arrayBuffer()
-  const workbook = XLSX.read(buffer, { type: 'array' })
+  const workbook = await readWorkbookFromFile(file)
   if (!workbook.SheetNames.length) {
     throw new Error('未读取到工作表')
   }
@@ -255,8 +293,11 @@ export async function parseBalanceFileWithPreview(file: File): Promise<{ rows: R
   }
 
   // ── 4. 提取数据行（剔除合计行、重复表头行、元信息行）──
+  // 真实导出常含大量零余额科目行（借贷列为空或占位符），按 0 处理即可参与
+  // 汇总，不应整表报错阻断。
   const out: Record<string, unknown>[] = []
   let singleSideMissing = 0
+  let emptyRowSkipped = 0
   let seq = 0
   for (let r = headerIdx + (isTwoLevel ? 2 : 1); r < grid.length; r++) {
     const row = grid[r] || []
@@ -280,13 +321,17 @@ export async function parseBalanceFileWithPreview(file: File): Promise<{ rows: R
     let credit = 0
     if (debitCol >= 0 || creditCol >= 0) {
       if (balanceAmountMissing(row[debitCol]) && balanceAmountMissing(row[creditCol])) {
-        throw new Error(`第 ${r + 1} 行借贷余额均为空或未确定，请核实并填写明确金额`)
+        emptyRowSkipped += 1
+        continue
       }
       if (balanceAmountMissing(row[debitCol]) || balanceAmountMissing(row[creditCol])) singleSideMissing += 1
       debit = debitCol >= 0 ? balanceToAmount(row[debitCol], r + 1) : 0
       credit = creditCol >= 0 ? balanceToAmount(row[creditCol], r + 1) : 0
     } else {
-      if (balanceAmountMissing(row[balanceCol])) throw new Error(`第 ${r + 1} 行余额为空或未确定，请核实并填写明确金额`)
+      if (balanceAmountMissing(row[balanceCol])) {
+        emptyRowSkipped += 1
+        continue
+      }
       const dir = balanceCellText(row[directionCol]).replace(/\s/g, '')
       const amt = balanceToAmount(row[balanceCol], r + 1)
       if (/^(贷|贷方)$/.test(dir)) credit = amt
@@ -304,22 +349,37 @@ export async function parseBalanceFileWithPreview(file: File): Promise<{ rows: R
   }
 
   if (!out.length) {
+    if (emptyRowSkipped > 0) {
+      throw new Error(`未识别到含金额的科目行：全部 ${emptyRowSkipped} 行余额为空或未确定，请确认金额列是否选对、文件是否为空白模板`)
+    }
     throw new Error('未识别到科目数据行：表头下方需存在科目明细（含科目编码或科目名称）')
   }
 
-  // 逐层核对直接子级的借贷净额，异向明细可在父级轧差；不一致不能静默漏数。
+  // 逐层核对直接子级的借贷净额，异向明细可在父级轧差。上传集里不允许出现任何
+  // 数字编码前缀关系（后端 _normalize_rows 直接拒绝），因此父级汇总行原则上
+  // 剔除、只留明细；两类例外按更可靠一侧保留：
+  // · 父级行自身为零（部分导出把父级清零）→ 以明细为准；
+  // · 明细与父级不一致 → 保留父级合计（导出方聚合行最可靠，明细缺失时不低估
+  //   金额），剔除其全部下级。外层判定优先于内层，避免父子同时保留。
   const codes = out.map(r => String(r.account_code))
   const numericCodes = codes.filter(c => /^\d{4,20}$/.test(c))
   if (new Set(numericCodes).size !== numericCodes.length) throw new Error('科目编码重复，请核对后重试')
   const ancestors = new Set<number>()
+  const droppedRows = new Set<number>()
+  let mismatchedParents = 0
   const cents = (row: Record<string, unknown>, key: string) => Math.round(Number(row[key]) * 100)
-  for (let i = 0; i < out.length; i++) {
+  const net = (row: Record<string, unknown>) => cents(row, 'debit_balance') - cents(row, 'credit_balance')
+  const parentIndexes = out
+    .map((_, i) => i)
+    .filter(i => /^\d{4,20}$/.test(codes[i]))
+    .filter(i => codes.some((c, j) => j !== i && /^\d{4,20}$/.test(c) && c.length > codes[i].length && c.startsWith(codes[i])))
+    // 编码更短 = 更外层；外层先判定，内层行为不得推翻外层结论
+    .sort((a, b) => codes[a].length - codes[b].length)
+  for (const i of parentIndexes) {
+    if (droppedRows.has(i)) continue // 已被更外层的保留父级覆盖
     const parent = codes[i]
-    if (!/^\d{4,20}$/.test(parent)) continue
     const descendants = codes.map((c, j) => ({ c, j })).filter(({ c }) => /^\d{4,20}$/.test(c) && c.length > parent.length && c.startsWith(parent))
-    if (!descendants.length) continue
     const children = descendants.filter(({ c }) => !descendants.some(other => other.c !== c && c.startsWith(other.c)))
-    const net = (row: Record<string, unknown>) => cents(row, 'debit_balance') - cents(row, 'credit_balance')
     let sum = 0
     for (const child of children) {
       const childNet = net(out[child.j])
@@ -328,10 +388,18 @@ export async function parseBalanceFileWithPreview(file: File): Promise<{ rows: R
     }
     const parentNet = net(out[i])
     if (!Number.isSafeInteger(parentNet)) throw new Error('余额合计超出支持范围')
-    if (sum !== parentNet) throw new Error(`科目 ${parent} 父子余额不一致，请核对明细后重试`)
-    ancestors.add(i)
+    if (sum === parentNet) {
+      ancestors.add(i)
+      continue
+    }
+    mismatchedParents += 1
+    if (parentNet === 0) {
+      ancestors.add(i) // 父级为零 → 以明细为准
+    } else {
+      for (const d of descendants) droppedRows.add(d.j) // 保留父级 → 下级全部剔除
+    }
   }
-  const leaves = out.filter((_, i) => !ancestors.has(i))
+  const leaves = out.filter((_, i) => !ancestors.has(i) && !droppedRows.has(i))
   const debitCents = leaves.reduce((sum, row) => sum + cents(row, 'debit_balance'), 0)
   const creditCents = leaves.reduce((sum, row) => sum + cents(row, 'credit_balance'), 0)
   if (!Number.isSafeInteger(debitCents) || !Number.isSafeInteger(creditCents)) throw new Error('余额合计超出支持范围')
@@ -348,7 +416,9 @@ export async function parseBalanceFileWithPreview(file: File): Promise<{ rows: R
   if (unit === 'unknown') warnings.push('金额单位未识别，请确认单位为元。')
   if (!periodMatch) warnings.push('未识别到期间，请确认报表期间。')
   if (singleSideMissing) warnings.push(`${singleSideMissing} 个科目行单侧余额为空或占位，已按零处理，请核对原表。`)
+  if (emptyRowSkipped) warnings.push(`已跳过 ${emptyRowSkipped} 行借贷余额均为空的科目行（零余额明细），不影响汇总。`)
   if (ancestors.size) warnings.push(`已核验并排除 ${ancestors.size} 个与直接子级净余额一致的父级科目，避免重复计算。`)
+  if (mismatchedParents) warnings.push(`${mismatchedParents} 个父级科目与下级明细合计不一致，已按其中更可靠的一侧计算，请核对导出文件。`)
   if (leaves.every(row => cents(row, 'debit_balance') === 0 && cents(row, 'credit_balance') === 0)) warnings.push('金额全部为 0，请确认不是空白模板或识别错误。')
   return {
     rows: leaves,

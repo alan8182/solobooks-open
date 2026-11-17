@@ -3,8 +3,8 @@
 
 """用户侧 AI 用量统计（只读）：从 llm_usage 埋点聚合本人（跨账套）的 token 消耗。
 
-口径与 services/llm.py 埋点一致：一行 = 一次逻辑调用；失败调用 token 为 0，
-计入调用次数不计入 token；ASR/OCR 无 token 数（记 0）。
+口径与 services/llm.py 埋点一致：一行 = 一次逻辑调用（含文本推理与多模态视觉识别）；
+失败调用 token 为 0，计入调用次数不计入 token。
 月度边界按 UTC 自然月（与管理端 routers/admin.py 的统计口径一致）；
 多维度管理统计见 /api/admin/usage/*，本服务仅提供用户本人的汇总视图。
 """

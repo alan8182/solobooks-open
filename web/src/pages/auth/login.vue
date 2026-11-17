@@ -1,6 +1,7 @@
 <!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { ref, watch, onUnmounted } from 'vue'
+import { useRoute } from 'vue-router'
 import {
   NInput,
   NButton,
@@ -19,6 +20,7 @@ import {
   resetPassword,
 } from '@/api/auth'
 import { useAuthStore } from '@/stores/auth'
+import { safeRedirectTarget } from '@/router/guards'
 
 // ICP 备案号，页脚自动展示并链接工信部网站
 const ICP_LICENSE = '浙ICP备2025195764号-7'
@@ -28,6 +30,14 @@ const PSB_RECORD_URL = 'https://beian.mps.gov.cn/#/query/webSearch?code=33011002
 
 const message = useMessage()
 const authStore = useAuthStore()
+const route = useRoute()
+
+// 官网定价区 CTA（/landing → /login?plan=xxx）：登录成功后直接进入升级流程。
+// trial 为免费体验版本身，不视为购买意向。
+const planIntent =
+  typeof route.query.plan === 'string' && route.query.plan && route.query.plan !== 'trial'
+    ? route.query.plan
+    : ''
 
 const activeTab = ref<'code' | 'password'>('code')
 const errorMsg = ref('')
@@ -100,7 +110,14 @@ async function finishLogin(resp: Awaited<ReturnType<typeof loginByPhoneCode>>) {
   } catch { /* ignore */ }
   // Reload the app from its authenticated entry point. This avoids a stale
   // login route or a rejected client-side navigation swallowing the jump.
-  window.location.replace('/')
+  // 带套餐意向时直达独立订阅页 /mine/plan?plan=xxx；
+  // 否则若有安全的站内 redirect（如 /console、/console/users）则优先回跳。
+  const redirectTarget = safeRedirectTarget(route.query.redirect)
+  window.location.replace(
+    planIntent
+      ? `/mine/plan?plan=${encodeURIComponent(planIntent)}`
+      : redirectTarget || '/',
+  )
 }
 
 function apiDetail(err: unknown, fallback: string): string {
@@ -259,7 +276,7 @@ async function handleForgotReset() {
             <span class="logo-sub">SoloBooks</span>
           </div>
         </div>
-        <p class="subtitle">懂财务、重合规的一人公司与小微企业 AI CFO</p>
+        <p class="subtitle">懂财务、重合规的一人公司与小微企业 AI 财务官</p>
       </div>
 
       <NAlert v-if="errorMsg" type="error" closable class="mb-4" @close="errorMsg = ''">

@@ -133,15 +133,24 @@ describe('parseBalanceFile 公开工具健壮性（真实导出格式回归）',
     expect(result.preview.selectedColumns).toMatchObject({ debit: 4, credit: 5 })
   })
 
-  it.each([['', ''], ['—', '-'], ['', '—']])('双侧空白或不确定值 %s / %s 不得作为零提交', async (debit, credit) => {
-    await expect(parseBalanceFileWithPreview(makeFile([
-      ['期间：2026年9月', '单位：元'],
+  it.each([['', ''], ['—', '-'], ['', '—']])('双侧空白或不确定值 %s / %s：混合时跳过该行并提示，不作为零提交', async (debit, credit) => {
+    const { rows, preview } = await parseBalanceFileWithPreview(makeFile([
       ['科目编码', '科目名称', '期末借方余额', '期末贷方余额'],
       ['1001', '库存现金', debit, credit], ['1002', '银行存款', 10, ''],
-    ]))).rejects.toThrow('借贷余额均为空或未确定')
+    ]))
+    expect(rows.map(r => r.account_code)).toEqual(['1002'])
+    expect(rows[0].debit_balance).toBe(10)
+    expect(preview.warnings.join(' ')).toContain('借贷余额均为空')
   })
 
-  it.each(['', '—', '-'])('方向单列空值 %s 不得作为零提交', async (amount) => {
+  it('全部科目行余额均为空或未确定时报错（防错选空白列）', async () => {
+    await expect(parseBalanceFile(makeFile([
+      ['科目编码', '科目名称', '期末借方余额', '期末贷方余额'],
+      ['1001', '库存现金', '', '—'],
+    ]))).rejects.toThrow('余额为空或未确定')
+  })
+
+  it.each(['', '—', '-'])('方向单列空值 %s：唯一行空值时报错提示', async (amount) => {
     await expect(parseBalanceFileWithPreview(makeFile([
       ['科目编码', '科目名称', '方向', '期末余额'], ['1001', '库存现金', '平', amount],
     ]))).rejects.toThrow('余额为空或未确定')
@@ -194,11 +203,14 @@ describe('parseBalanceFile 公开工具健壮性（真实导出格式回归）',
     expect(rows[0].debit_balance).toBe(0)
   })
 
-  it('父子余额不一致时拒绝导入，避免遗漏父级金额', async () => {
-    await expect(parseBalanceFile(makeFile([
+  it('父子余额不一致时保留父级合计行（明细缺失不低估金额）并提示核对', async () => {
+    const { rows, preview } = await parseBalanceFileWithPreview(makeFile([
       ['科目编码', '科目名称', '期末借方余额', '期末贷方余额'],
       ['1002', '银行存款', 200, 0], ['1002001', '银行存款-张三', 100, 0],
-    ]))).rejects.toThrow('父子余额不一致')
+    ]))
+    expect(rows.map(r => r.account_code)).toEqual(['1002'])
+    expect(preview.debitTotal).toBe(200)
+    expect(preview.warnings.join(' ')).toContain('不一致')
   })
 
   it('异向子级按借贷净额逐级核对，保留明细两侧金额', async () => {
@@ -215,11 +227,14 @@ describe('parseBalanceFile 公开工具健壮性（真实导出格式回归）',
     expect(result.preview.warnings.join(' ')).toContain('净余额一致')
   })
 
-  it('异向子级净额不一致时仍然拒绝', async () => {
-    await expect(parseBalanceFile(makeFile([
+  it('异向子级净额不一致时保留父级合计并提示核对', async () => {
+    const { rows, preview } = await parseBalanceFileWithPreview(makeFile([
       ['科目编码', '科目名称', '期末借方余额', '期末贷方余额'],
       ['1221', '其他应收款', 71, 0], ['122101', '其他应收款', 100, 0], ['122102', '其他应收款', 0, 30],
-    ]))).rejects.toThrow('父子余额不一致')
+    ]))
+    expect(rows.map(r => r.account_code)).toEqual(['1221'])
+    expect(preview.debitTotal).toBe(71)
+    expect(preview.warnings.join(' ')).toContain('不一致')
   })
 
   it('多层父子逐级核对并提示去重', async () => {
@@ -290,5 +305,67 @@ describe('parseBalanceFile 公开工具健壮性（真实导出格式回归）',
       ['银行存款', 200],
     ]
     await expect(parseBalanceFile(makeFile(rows))).rejects.toThrow('未识别到表头行')
+  })
+
+  it('第三方导出（期初/本期/累计/期末单行表头 + 大量零余额空行 + 父子层级）完整解析', async () => {
+    // 复刻财务软件单行表头导出：全空明细行不阻断，父级汇总行剔除，期末列汇总平衡
+    const rows = [
+      ['科目编码', '科目名称', '科目级别', '期初余额-借方', '期初余额-贷方', '本期发生额-借方', '本期发生额-贷方', '本年累计发生额-借方', '本年累计发生额-贷方', '期末余额-借方', '期末余额-贷方'],
+      ['1001', '库存现金', '1', '50', '', '', '', '', '', '50', ''],
+      ['1002', '银行存款', '1', '18327.71', '', '158900.42', '164963.04', '158900.42', '164963.04', '12265.09', ''],
+      ['1002001', '银行存款-招商银行', '2', '18327.71', '', '158900.42', '164963.04', '158900.42', '164963.04', '12265.09', ''],
+      ['1002002', '银行存款-工商银行', '2', '', '', '', '', '', '', '', ''],
+      ['1122', '应收账款', '1', '2157.42', '', '', '', '', '', '2157.42', ''],
+      ['1122001', '应收账款-甲公司', '2', '543.3', '', '', '', '', '', '543.3', ''],
+      ['1122002', '应收账款-乙公司', '2', '', '', '', '', '', '', '', ''],
+      ['1122003', '应收账款-丙公司', '2', '1614.12', '', '', '', '', '', '1614.12', ''],
+      ['2202', '应付账款', '1', '', '4219', '', '', '', '', '', '4469'],
+      ['2202001', '应付账款-丁公司', '2', '', '2400', '', '', '', '', '', '2400'],
+      ['2202002', '应付账款-戊公司', '2', '', '2069', '', '', '', '', '', '2069'],
+      ['2202003', '应付账款-己公司', '2', '', '', '', '', '', '', '', ''],
+      ['4001', '实收资本', '1', '', '', '', '', '', '', '', '10003.51'],
+    ]
+    const { rows: parsed, preview } = await parseBalanceFileWithPreview(makeFile(rows))
+    // 父级 1002/1122/2202 剔除、全空行 1002002/1122002/2202003 跳过，剩 7 个叶行
+    expect(parsed).toHaveLength(7)
+    const byCode = Object.fromEntries(parsed.map(r => [r.account_code, r]))
+    expect(byCode['1002001'].debit_balance).toBe(12265.09)
+    expect(byCode['2202002'].credit_balance).toBe(2069)
+    expect(byCode['1002']).toBeUndefined()
+    expect(preview.balanceType).toBe('ending')
+    expect(preview.debitTotal).toBeCloseTo(14472.51, 2)
+    expect(preview.creditTotal).toBeCloseTo(14472.51, 2)
+    expect(preview.warnings.some(w => w.includes('借贷余额均为空'))).toBe(true)
+    expect(preview.warnings.some(w => w.includes('已核验并排除 3 个'))).toBe(true)
+  })
+
+  it('父子金额不一致时保留父级合计（明细缺失不低估金额）并提示核对', async () => {
+    const rows = [
+      ['科目编码', '科目名称', '期末余额-借方', '期末余额-贷方'],
+      ['1001', '库存现金', '50', ''],
+      ['1401', '长期股权投资', '', '8000'],
+      ['140101', '长期股权投资-A公司', '', '5000'],
+      ['140102', '长期股权投资-B公司', '', '1000'],
+    ]
+    const { rows: parsed, preview } = await parseBalanceFileWithPreview(makeFile(rows))
+    // 明细合计 6000 ≠ 父级 8000 → 保留父级 1401，剔除 140101/140102
+    const byCode = Object.fromEntries(parsed.map(r => [r.account_code, r]))
+    expect(byCode['1401'].credit_balance).toBe(8000)
+    expect(byCode['140101']).toBeUndefined()
+    expect(preview.debitTotal).toBe(50)
+    expect(preview.creditTotal).toBe(8000)
+    expect(preview.warnings.some(w => w.includes('不一致'))).toBe(true)
+  })
+
+  it('父级为零而明细有数时以明细为准', async () => {
+    const rows = [
+      ['科目编码', '科目名称', '期末余额-借方', '期末余额-贷方'],
+      ['1601', '固定资产', '0.00', '0.00'],
+      ['160101', '固定资产-设备', '', '3000'],
+    ]
+    const { rows: parsed } = await parseBalanceFileWithPreview(makeFile(rows))
+    const byCode = Object.fromEntries(parsed.map(r => [r.account_code, r]))
+    expect(byCode['160101'].credit_balance).toBe(3000)
+    expect(byCode['1601']).toBeUndefined()
   })
 })
