@@ -237,83 +237,38 @@ async def query_sub_ledger(
 
 
 async def query_partner_balances(company_id: str, account_code: str, month: str) -> dict[str, Any]:
-    """核算项目余额表：按往来单位汇总某科目的期初/本期借贷/期末。
+    """核算项目余额表（旧兼容入口）：按往来单位汇总某科目的期初/本期借贷/期末。
 
-    与科目余额表同口径（法定账表按记账期间 period_start 归集）。
-    没有 partner_id 的行归入"未指定往来单位"组，而不是被丢掉——
-    数据不丢是这张表能被会计信任的前提。
+    统一委托给 ``auxiliary_ledger_service.query_auxiliary_balances``，
+    自动获得同期间冲销对剔除与主数据名称一致性保障，响应结构保持向后兼容。
     """
-    start, end = _month_range(month)
-    async with session_scope() as session:
-        rows = (
-            await session.execute(
-                select(JournalEntry, JournalLine)
-                .join(JournalLine, JournalLine.journal_entry_id == JournalEntry.id)
-                .where(
-                    JournalEntry.company_id == company_id,
-                    JournalEntry.status.in_(POSTED_STATUSES),
-                    JournalEntry.period_start <= end,
-                    JournalLine.company_id == company_id,
-                    JournalLine.account_code.startswith(account_code),
-                )
-            )
-        ).all()
+    from services.auxiliary_ledger_service import query_auxiliary_balances
 
-    buckets: dict[str, dict[str, Any]] = {}
-    for entry, line in rows:
-        auxiliary = line.auxiliary if isinstance(line.auxiliary, dict) else {}
-        partner_id = str(auxiliary.get("partner_id") or "")
-        partner_name = str(auxiliary.get("partner_name") or "") or "未指定往来单位"
-        bucket = buckets.setdefault(
-            partner_id or "__unassigned__",
-            {
-                "partnerId": partner_id,
-                "partnerName": partner_name,
-                "opening": ZERO,
-                "debit": ZERO,
-                "credit": ZERO,
-            },
-        )
-        amount = money(line.amount)
-        if entry.period_start < start:
-            bucket["opening"] += amount if line.direction == "debit" else -amount
-        elif line.direction == "debit":
-            bucket["debit"] += amount
-        else:
-            bucket["credit"] += amount
+    result = await query_auxiliary_balances(
+        company_id, "partner", month, account_code=account_code, include_zero=False
+    )
 
-    items: list[dict[str, Any]] = []
-    total_debit = ZERO
-    total_credit = ZERO
-    unassigned: dict[str, Any] | None = None
-    for bucket in buckets.values():
-        closing = bucket["opening"] + bucket["debit"] - bucket["credit"]
-        item = {
-            "partnerId": bucket["partnerId"],
-            "partnerName": bucket["partnerName"],
-            "opening": money_text(bucket["opening"]),
-            "debit": money_text(bucket["debit"]),
-            "credit": money_text(bucket["credit"]),
-            "closing": money_text(closing),
-            "unassigned": bucket["partnerId"] == "",
+    def _compat_row(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "partnerId": row["itemId"],
+            "partnerName": row["itemName"],
+            "opening": row["opening"],
+            "debit": row["debit"],
+            "credit": row["credit"],
+            "closing": row["closing"],
+            "unassigned": row["unassigned"],
         }
-        if item["unassigned"]:
-            unassigned = item
-        else:
-            items.append(item)
-        # 合计含"未指定往来单位"组：这张表的合计必须与科目余额表同数，
-        # 否则会计一眼就能看出少了钱，整张表失去可信度。
-        total_debit += bucket["debit"]
-        total_credit += bucket["credit"]
 
+    items = [_compat_row(item) for item in result["items"]]
     items.sort(key=lambda row: row["partnerName"])
+    unassigned = _compat_row(result["unassigned"]) if result["unassigned"] else None
     return {
         "accountCode": account_code,
         "month": month,
         "items": items,
         "unassigned": unassigned,
-        "totalDebit": money_text(total_debit),
-        "totalCredit": money_text(total_credit),
+        "totalDebit": result["totalDebit"],
+        "totalCredit": result["totalCredit"],
     }
 
 

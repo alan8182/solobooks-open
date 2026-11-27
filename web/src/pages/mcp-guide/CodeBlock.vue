@@ -202,7 +202,7 @@ const pathRows = computed(() => {
 
 .path-row code {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  word-break: break-all;
+  overflow-wrap: anywhere;
 }
 
 .path-row.active {

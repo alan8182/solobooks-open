@@ -8,6 +8,7 @@ import {
 } from 'naive-ui'
 import type { TreeOption } from 'naive-ui'
 import apiClient from '@/api/client'
+import { AUXILIARY_KIND_META, isAuxiliaryKind } from '@/utils/auxiliary'
 
 interface AccountNode {
   id: string
@@ -23,6 +24,7 @@ interface AccountNode {
   is_active: boolean
   quantity_enabled?: boolean
   unit?: string | null
+  auxiliary_kinds?: string[]
   created_at: string
   updated_at: string
   children: AccountNode[]
@@ -271,6 +273,14 @@ function renderSuffix(info: { option: TreeOption }) {
   
   if (opt.is_system && opt.level > 0) {
     children.push(h('span', { class: 'system-badge' }, '内置'))
+  }
+
+  const auxKinds: string[] = opt.accountNode?.auxiliary_kinds || []
+  if (opt.level > 0 && auxKinds.length > 0) {
+    for (const k of auxKinds) {
+      if (!isAuxiliaryKind(k)) continue
+      children.push(h('span', { class: 'aux-kind-badge' }, AUXILIARY_KIND_META[k].shortLabel))
+    }
   }
 
   const actions: any[] = []
@@ -1009,6 +1019,17 @@ onMounted(loadTree)
   color: var(--solo-text-muted);
   background: var(--solo-border-light);
   border: 1px solid var(--solo-border);
+  border-radius: 4px;
+}
+
+.aux-kind-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 5px;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--solo-primary);
+  background: var(--solo-bg-blue-soft);
   border-radius: 4px;
 }
 

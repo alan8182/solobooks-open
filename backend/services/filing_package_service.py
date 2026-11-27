@@ -128,10 +128,12 @@ async def _cit_estimate(
     """小型微利企业所得税预缴估算（A200000 口径的精简版）。
 
     与 /report/cit-assist 同源（build_statement_data 的利润表本年累计），
-    并执行同一套确定性纳税调整（招待费/广宣费限额、罚款滞纳金、无票支出）。
+    并执行同一套确定性纳税调整（招待/广宣/三项经费/捐赠限额、罚款滞纳金、无票支出）。
     """
     statement = await build_statement_data(user_id, company_id, period, "quarter")
     from services.cit_adjustment_service import build_cit_adjustments
+    from services.cit_carryforward_service import compute_carryforward_ledger
+    from services.cit_tax_opening import apply_tax_opening, get_tax_opening_memo
 
     profit = statement.profit_ytd or {}
     total_profit = _d2(profit.get("total_profit", 0))
@@ -146,18 +148,32 @@ async def _cit_estimate(
         if (occurred := str(entry.get("occurDate") or "")[:10])
         and statement.period.fiscal_year_start.isoformat() <= occurred <= period_range.end.isoformat()
     ]
+    tax_memo = await get_tax_opening_memo(company_id)
+    ledger = compute_carryforward_ledger(
+        entries,
+        statement.period.fiscal_year_start.year,
+        profit,
+        entity_type="ltd",
+        opening_memo=tax_memo,
+        target_period_end=period_range.end,
+    )
     adjustments = build_cit_adjustments(
-        year_entries, profit, statement.period.fiscal_year_start, period_range.end,
+        year_entries,
+        profit,
+        statement.period.fiscal_year_start,
+        period_range.end,
+        carryforward_ledger=ledger,
     )
     auto_increase = _d2(adjustments.get("totalIncrease") or 0)
+    auto_decrease = _d2(adjustments.get("totalDecrease") or 0)
+    net_adjustment = _d2(adjustments.get("netAdjustment") or 0)
 
-    profit_before_loss = _d2(total_profit + auto_increase)
-    from services.cit_tax_opening import apply_tax_opening, get_tax_opening_memo
+    profit_before_loss = _d2(total_profit + net_adjustment)
 
     # 期初税务备忘（仅在其所属纳税年度内生效）：第 24 行弥补亏损、第 30 行已预缴
     opening = apply_tax_opening(
         profit_before_loss,
-        await get_tax_opening_memo(company_id),
+        tax_memo,
         statement.period.fiscal_year_start.year,
     )
     taxable_base = max(Decimal("0"), profit_before_loss - opening["lossDeducted"])
@@ -175,9 +191,11 @@ async def _cit_estimate(
         )
         if prepaid > preferential_tax:
             note += "已预缴税额覆盖本期应纳，本期无需补缴。"
+    if auto_decrease > 0:
+        note = f"已自动抵减以前年度跨年结转费用 {auto_decrease} 元（纳税调减）；" + note
     if auto_increase > 0:
         note = (
-            f"已按规则自动纳税调增 {auto_increase}（招待费/广宣费限额、罚款滞纳金、无票支出），"
+            f"已按规则自动纳税调增 {auto_increase}（招待/广宣/三项经费/捐赠限额、罚款滞纳金、无票支出），"
             + note
         )
 
@@ -187,7 +205,9 @@ async def _cit_estimate(
         "cost": _f(cost),
         "totalProfit": _f(total_profit),
         "autoAdjustmentTotal": _f(auto_increase),
+        "autoDecreaseTotal": _f(auto_decrease),
         "autoAdjustments": adjustments.get("items", []),
+        "carryforwardLedger": adjustments.get("carryforwardLedger", []),
         "taxableBase": _f(taxable_base),
         "standardTax": _f(standard_tax),
         "preferentialTax": _f(preferential_tax),
@@ -252,7 +272,7 @@ async def _cross_check(
             return True
         voucher = entry.get("voucherLines") or {}
         for line in (voucher.get("credit") or []):
-            if str(line.get("accountCode") or "") in {"5001", "5051", "1012001", "1012"}:
+            if str(line.get("accountCode") or "") in {"5001", "5051", "1012001", "1012002", "1012"}:
                 return True
         return False
 

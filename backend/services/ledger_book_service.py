@@ -23,6 +23,7 @@ from __future__ import annotations
 import calendar
 import hashlib
 import json
+import math
 from collections import defaultdict
 from datetime import date
 from decimal import Decimal
@@ -49,6 +50,10 @@ MAX_LINES = 200_000
 #   明细账 16 行 + 期初 + 合计 → 约 810px
 # 取值一旦顶满可用高度，Chrome 会把整页推到下一页，页码与物理页立刻错位
 #（实测 24 行时 20 页的册子打出 31 页）。改字号或纸型必须同步改这里。
+# 目录每页条目数：后端分页、前端目录分页、PDF 目录渲染必须同口径，
+# 否则目录页码与账页页脚会对不上（A3 真相唯一）。
+TOC_ROWS_PER_PAGE = 38
+
 PAGE_SIZE = {
     "balance": 12,
     # detail 曾取 11：年度册中「2026-05 银行存款」一类对方科目密集的页面会撑到
@@ -946,11 +951,23 @@ def _paginate(book: dict[str, Any]) -> dict[str, Any]:
         )
         page += page_count
 
+    general = book.get("general")
+    active_journals = [journal for journal in book["journals"] if journal["rows"]]
+    # 目录条目：余额表 1 + 总账 0/1 + 每本明细账 1 + 每本日记账 1 + 序时账 0/1 + 两条另册参考
+    toc_rows = (
+        1
+        + (1 if (general and general.get("items")) else 0)
+        + len(book["details"])
+        + len(active_journals)
+        + (1 if book["chronological"]["items"] else 0)
+        + 2
+    )
+    toc_pages = max(1, math.ceil(toc_rows / TOC_ROWS_PER_PAGE))
+
     add("cover", "cover", "封面", 1)
-    add("toc", "toc", "目录", 1)
+    add("toc", "toc", "目录", toc_pages)
     add("balance", "balance", "科目余额表", _page_count(len(book["balance"]["items"]), "balance"))
 
-    general = book.get("general")
     if general and general.get("items"):
         # 总账一科目一页（12 个月 + 本年合计），不被跨页割开
         add("general", "general", "总账", max(1, len(general["items"])))
@@ -964,9 +981,7 @@ def _paginate(book: dict[str, Any]) -> dict[str, Any]:
             code=detail["code"],
         )
 
-    for journal in book["journals"]:
-        if not journal["rows"]:
-            continue
+    for journal in active_journals:
         add(
             f"journal:{journal['kind']}",
             "journal",
@@ -989,4 +1004,5 @@ def _paginate(book: dict[str, Any]) -> dict[str, Any]:
         "sections": sections,
         "totalPages": page - 1,
         "pageSize": dict(PAGE_SIZE),
+        "tocRowsPerPage": TOC_ROWS_PER_PAGE,
     }

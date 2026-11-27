@@ -9,12 +9,19 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from services.database import get_conn
-from services.account_mapper import CATEGORY_TO_ACCOUNT
+from services.account_mapper import (
+    CATEGORY_TO_ACCOUNT,
+    GROUP_ORDER,
+    category_group,
+    is_alias_category,
+)
 
 # Direction lookup — every category in CATEGORY_TO_ACCOUNT must be mapped.
 _DIRECTION_MAP = {
     # ── 收入类 ──
-    "主营业务收入": "income", "其他业务收入": "income", "营业外收入": "income", "利息收入": "income",
+    "主营业务收入": "income", "其他业务收入": "income", "营业外收入": "income",
+    "非流动资产处置净收益": "income", "政府补助": "income", "捐赠收益": "income", "盘盈收益": "income",
+    "利息收入": "income",
     "往来退款": "income",
 
     # ── 资本与往来 / 资产负债表科目 ──
@@ -56,7 +63,7 @@ def _cat_sort(name: str, base: int) -> int:
         "原材料采购", "商品采购", "生产成本", "研发支出-费用化支出", "人力成本", "员工福利费",
         "差旅费", "办公费", "业务招待费", "推广费",
         "租金物业", "运费及物流", "水电通讯费", "信息技术服务费",
-        "银行及金融手续费", "税费缴纳", "所得税费用",
+        "银行及金融手续费", "税费缴纳", "个税代缴", "所得税费用",
         "固定资产", "设备采购", "无形资产", "预付账款",
         "营业外支出", "其他支出",
     ]
@@ -232,6 +239,7 @@ async def delete_category(company_id: str, category_id: str) -> bool:
 
 def list_account_mapping() -> List[Dict[str, Any]]:
     """下发「分类 → 科目」权威映射（单一来源：account_mapper.CATEGORY_TO_ACCOUNT）。"""
+    group_rank = {name: idx * 100 for idx, name in enumerate(GROUP_ORDER)}
     return [
         {
             "category": name,
@@ -239,8 +247,11 @@ def list_account_mapping() -> List[Dict[str, Any]]:
             "accountCode": info.get("accountCode"),
             "accountName": info.get("accountName"),
             "accountType": info.get("accountType", ""),
+            "group": category_group(name),
+            "isAlias": is_alias_category(name),
+            "sortOrder": group_rank.get(category_group(name), 900) + index,
         }
-        for name, info in CATEGORY_TO_ACCOUNT.items()
+        for index, (name, info) in enumerate(CATEGORY_TO_ACCOUNT.items())
     ]
 
 
@@ -257,6 +268,10 @@ AMBIGUITY_GROUPS: Dict[str, List[str]] = {
     "营业外收入": ["主营业务收入", "其他业务收入", "营业外收入"],
     # 其他支出（管理费用-其他）只对支出方向有意义，前端按流水方向过滤后再展示
     "往来款": ["往来款", "主营业务收入", "营业外收入", "其他支出"],
+    # 财税库行/金库通用扣款通道（如「税费社保」）无法仅凭摘要区分正常缴税、社保、
+    # 个税代缴、罚款、滞纳金或所得税——社保费自 2020 年起由税务代收，摘要与
+    # 增值税缴款完全同形，没有「社保」字样也必须让用户能选到正确去向。
+    "税费缴纳": ["税费缴纳", "社保公积金", "个税代缴", "罚款支出", "税收滞纳金", "所得税费用"],
 }
 
 

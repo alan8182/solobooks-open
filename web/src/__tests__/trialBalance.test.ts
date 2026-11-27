@@ -5,7 +5,9 @@
 
 import { describe, expect, it } from 'vitest'
 import {
+  filterTrialBalanceRows,
   normalizeTrialBalanceRows,
+  trialBalanceAccountDepth,
   trialBalanceTotals,
   type TrialBalanceRow,
 } from '@/utils/trialBalance'
@@ -71,5 +73,24 @@ describe('trial balance snapshot helpers', () => {
     // 没有合计行时不出数：上下级重复行相加会虚增
     expect(withoutTotal.debit.ending).toBeNull()
     expect(withoutTotal.credit.ending).toBeNull()
+  })
+
+  it('computes account depth and filters zero/status/query rows consistently', () => {
+    expect(trialBalanceAccountDepth('1002')).toBe(0)
+    expect(trialBalanceAccountDepth('2211001')).toBe(1)
+    expect(trialBalanceAccountDepth('2221001005')).toBe(2)
+
+    const sample = [
+      row({ row_no: 1, original_code: '1001', original_name: '库存现金', status: 'matched' }),
+      row({ row_no: 2, original_code: '1122', original_name: '应收账款', status: 'skipped_rollup' }),
+      row({ row_no: 3, original_code: '1122002', original_name: '应收账款-创信保险', partner_name: '创信保险', status: 'skipped_zero' }),
+      row({ row_no: 4, original_code: '2211001', original_name: '应付职工薪酬-职工薪酬', status: 'unmatched' }),
+    ]
+
+    expect(filterTrialBalanceRows(sample, { hideZero: true }).map(r => r.row_no)).toEqual([1, 2, 4])
+    expect(filterTrialBalanceRows(sample, { statusFilter: 'zero', hideZero: true }).map(r => r.row_no)).toEqual([3])
+    // 搜索时即使开启了隐藏零余额，也应命中零余额行，不让会计搜不到往来户
+    expect(filterTrialBalanceRows(sample, { hideZero: true, query: '创信' }).map(r => r.row_no)).toEqual([3])
+    expect(filterTrialBalanceRows(sample, { statusFilter: 'unmatched' }).map(r => r.row_no)).toEqual([4])
   })
 })

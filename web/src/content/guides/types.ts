@@ -13,7 +13,15 @@
  * - `updatedAt` 必须跟着改，界面会显示「截图更新于 YYYY-MM」，避免用户照旧图操作；
  * - 截图一律放 `public/guides/<guideId>/`，WebP，宽度 1200。
  */
-export type GuideId = 'wechat-bill' | 'bank-statement' | 'tax-registration' | 'iit'
+export type GuideId =
+  | 'wechat-bill'
+  | 'alipay-bill'
+  | 'bank-statement'
+  | 'invoice-list'
+  | 'tax-registration'
+  | 'iit'
+  | 'social-insurance'
+  | 'social-enrollment'
 
 export interface GuideImage {
   /** public 下的绝对路径，例如 /guides/wechat-bill/01.webp */
@@ -44,5 +52,17 @@ export interface Guide {
   sourceUrl: string
   /** 顶部提醒，放合规要点或「什么时候可以跳过」 */
   notice?: string
+  /**
+   * 官方办理入口（如电子税务局）。有值时抽屉顶部和触发点旁会给一个直接跳转的链接，
+   * 用户不必先读完步骤再自己找网址。必须是已核实的官方地址。
+   */
+  entry?: {
+    label: string
+    /** 兜底地址：主体没填注册地时用（如税局省份地图） */
+    url: string
+    hint?: string
+    /** 按主体注册地解析成各省电子税务局；填了注册地就不用再选一次 */
+    companyRegion?: boolean
+  }
   steps: GuideStep[]
 }

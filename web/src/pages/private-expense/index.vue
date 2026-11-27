@@ -561,6 +561,10 @@ usePageRefresh(loadData)
       </NCard>
     </NSpin>
 
+    <p class="pe-disclaimer">
+      提示：私账垫资冲销与余额测算基于您录入的记录及一般财务规则生成，仅供内部对账参考，不构成法定税务筹划或合规担保；实际资金往来与税前扣除请确保原始凭据真实合法，并以主管税务机关口径为准。
+    </p>
+
     <!-- Delete confirm -->
     <NModal
       v-model:show="showDeleteModal"
@@ -824,6 +828,13 @@ usePageRefresh(loadData)
   margin-top: 16px;
   display: flex;
   justify-content: center;
+}
+
+.pe-disclaimer {
+  margin: 12px 2px 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--solo-text-muted);
 }
 
 @media (max-width: 768px) {

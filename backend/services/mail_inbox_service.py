@@ -28,8 +28,9 @@ from db.session import session_scope
 INBOX_DIR = Path(__file__).resolve().parent.parent / "data" / "inbox"
 MAX_ATTACHMENT_BYTES = MAIL_INBOUND_MAX_ATTACHMENT_MB * 1024 * 1024
 
-# 与现有导入管线（前端 SheetJS）一致的附件白名单；加密压缩包等一律留档不导入
-SUPPORTED_EXTS = {"xlsx", "xls", "csv"}
+# 与现有导入管线一致的附件白名单；加密压缩包等一律留档不导入。
+# xml/zip/ofd/pdf：数电票原件通道（电子凭证会计数据标准，Phase 1 单据整理）
+SUPPORTED_EXTS = {"xlsx", "xls", "csv", "xml", "zip", "ofd", "pdf"}
 
 # 地址码字符集：小写字母数字、去易混淆字符（0/o/1/i/l），10 位 ≈ 47 bit 熵
 _CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
@@ -85,8 +86,18 @@ def guess_import_kind(filename: str) -> str:
     即可，因此这里只求「常见命名直接命中」，不做模糊兜底。
     """
     name = filename.lower()
+    ext = _normalize_ext(filename)
+    # 数电票原件：电子税务局下载的 XML/ZIP（dzfp_*.zip 不带「发票」字样）与 OFD 版式
+    if ext in {"xml", "zip", "ofd"}:
+        return "invoice"
+    if ext == "pdf" and any(k in filename for k in ("发票", "电子发票")):
+        return "invoice"
     if "微信" in filename or "wechat" in name:
         return "wechat_bill"
+    # 支付宝账单文件名通常含「支付宝」和「业务明细/对账单」，必须排在银行之前，
+    # 否则会被「对账单」关键词误判成银行流水。
+    if "支付宝" in filename or "alipay" in name:
+        return "alipay_bill"
     if any(k in filename for k in ("流水", "对账单", "银行")) or any(
         k in name for k in ("bank", "statement")
     ):

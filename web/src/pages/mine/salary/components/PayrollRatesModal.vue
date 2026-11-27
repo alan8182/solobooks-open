@@ -30,6 +30,7 @@ const fileInputRef = ref<HTMLInputElement | null>(null)
 const isDragging = ref(false)
 const localRates = ref<PayrollRates | null>(null)
 const ratesRecalculate = ref(true)
+const syncHousingRates = ref(true)
 
 const form = ref({
   socialPersonal: 10.5,
@@ -55,12 +56,15 @@ watch(() => props.show, async (visible) => {
     try {
       const data: any = await getPayrollRates()
       localRates.value = data
+      const hp = toPercentNumber(data.rates.housingPersonal)
+      const hc = toPercentNumber(data.rates.housingCompany)
       form.value = {
         socialPersonal: toPercentNumber(data.rates.socialPersonal),
         socialCompany: toPercentNumber(data.rates.socialCompany),
-        housingPersonal: toPercentNumber(data.rates.housingPersonal),
-        housingCompany: toPercentNumber(data.rates.housingCompany),
+        housingPersonal: hp,
+        housingCompany: hc,
       }
+      syncHousingRates.value = Math.abs(hc - hp) < 0.001
     } catch {
       message.error('加载社保公积金比例失败')
     } finally {
@@ -68,6 +72,29 @@ watch(() => props.show, async (visible) => {
     }
   }
 })
+
+function onHousingCompanyChange(val: number | null) {
+  const next = Number(val ?? 0)
+  form.value.housingCompany = next
+  if (syncHousingRates.value) {
+    form.value.housingPersonal = next
+  }
+}
+
+function onHousingPersonalChange(val: number | null) {
+  const next = Number(val ?? 0)
+  form.value.housingPersonal = next
+  if (syncHousingRates.value) {
+    form.value.housingCompany = next
+  }
+}
+
+function onSyncHousingToggle(linked: boolean) {
+  syncHousingRates.value = linked
+  if (linked) {
+    form.value.housingPersonal = form.value.housingCompany
+  }
+}
 
 function closeModal() {
   emit('update:show', false)
@@ -94,6 +121,12 @@ async function handleFileProcess(file: File) {
     }
     if (res.housingPersonal > 0) {
       form.value.housingPersonal = toPercentNumber(res.housingPersonal)
+    }
+    if (
+      (res.housingCompany > 0 || res.housingPersonal > 0) &&
+      Math.abs(form.value.housingCompany - form.value.housingPersonal) >= 0.001
+    ) {
+      syncHousingRates.value = false
     }
     message.success(`已提取${res.province || ''}社保费率，已自动填入下方表单`)
   } catch (err: any) {
@@ -183,7 +216,7 @@ async function handleSave() {
     :show="show"
     preset="card"
     title="社保公积金比例（本账套）"
-    style="width: min(560px, 92vw); border-radius: 14px"
+    style="width: min(560px, 92vw); border-radius: var(--solo-radius-lg)"
     @update:show="closeModal"
   >
     <NSpin :show="loading">
@@ -206,7 +239,7 @@ async function handleSave() {
         <NSpin :show="recognizing" size="small">
           <div class="dropzone-content">
             <div class="dropzone-title">
-              <span class="icon">📷</span>
+              <i class="ri-screenshot-2-line icon" />
               <span class="text">智能提取：粘贴或上传税务局核定表截图</span>
             </div>
             <p class="dropzone-desc">
@@ -224,29 +257,68 @@ async function handleSave() {
         </div>
       </div>
 
-      <NForm label-placement="left" label-width="96" style="margin-top: 14px">
-        <NFormItem label="个人社保">
-          <NInputNumber v-model:value="form.socialPersonal" :min="0" :max="100" :precision="2" :step="0.5" style="width: 100%">
-            <template #suffix>%</template>
-          </NInputNumber>
-        </NFormItem>
-        <NFormItem label="个人公积金">
-          <NInputNumber v-model:value="form.housingPersonal" :min="0" :max="100" :precision="2" :step="1" style="width: 100%">
-            <template #suffix>%</template>
-          </NInputNumber>
-        </NFormItem>
-        <NFormItem label="单位社保">
-          <NInputNumber v-model:value="form.socialCompany" :min="0" :max="100" :precision="2" :step="0.5" style="width: 100%">
-            <template #suffix>%</template>
-          </NInputNumber>
-        </NFormItem>
-        <NFormItem label="单位公积金">
-          <NInputNumber v-model:value="form.housingCompany" :min="0" :max="100" :precision="2" :step="1" style="width: 100%">
-            <template #suffix>%</template>
-          </NInputNumber>
-        </NFormItem>
+      <NForm label-placement="left" label-width="92" style="margin-top: 14px">
+        <div class="rates-group">
+          <div class="rates-group-header">
+            <span class="rates-group-title">社保比例（五险合计）</span>
+            <span class="rates-group-sub">单位与个人按当地社保口径分别填写</span>
+          </div>
+          <div class="rates-two-col">
+            <NFormItem label="单位社保" class="rates-form-item">
+              <NInputNumber v-model:value="form.socialCompany" :min="0" :max="100" :precision="2" :step="0.5" style="width: 100%">
+                <template #suffix>%</template>
+              </NInputNumber>
+            </NFormItem>
+            <NFormItem label="个人社保" class="rates-form-item">
+              <NInputNumber v-model:value="form.socialPersonal" :min="0" :max="100" :precision="2" :step="0.5" style="width: 100%">
+                <template #suffix>%</template>
+              </NInputNumber>
+            </NFormItem>
+          </div>
+        </div>
+
+        <div class="rates-group">
+          <div class="rates-group-header">
+            <span class="rates-group-title">住房公积金比例</span>
+            <label class="rates-sync-toggle">
+              <NSwitch :value="syncHousingRates" size="small" @update:value="onSyncHousingToggle" />
+              <span>单位与个人同比例</span>
+            </label>
+          </div>
+          <div class="rates-two-col">
+            <NFormItem label="单位公积金" class="rates-form-item">
+              <NInputNumber
+                :value="form.housingCompany"
+                :min="0"
+                :max="100"
+                :precision="2"
+                :step="1"
+                style="width: 100%"
+                @update:value="onHousingCompanyChange"
+              >
+                <template #suffix>%</template>
+              </NInputNumber>
+            </NFormItem>
+            <NFormItem label="个人公积金" class="rates-form-item">
+              <NInputNumber
+                :value="form.housingPersonal"
+                :min="0"
+                :max="100"
+                :precision="2"
+                :step="1"
+                style="width: 100%"
+                @update:value="onHousingPersonalChange"
+              >
+                <template #suffix>%</template>
+              </NInputNumber>
+            </NFormItem>
+          </div>
+          <p class="rates-group-note">
+            多数城市要求单位与个人比例一致（5%～12%）；如当地允许不同（如广州等），关闭联动即可分别填写，不缴可填 0。
+          </p>
+        </div>
       </NForm>
-      <p v-if="localRates && !localRates.isCustomized && !recognizedInfo" class="modal-hint muted">
+      <p v-if="localRates && !localRates.isCustomized && !recognizedInfo && localRates.defaults" class="modal-hint muted">
         已按企业注册地（{{ localRates.regionDesc || '系统默认基准' }}）自动预设：单位社保 {{ ratesPercent(Number(localRates.defaults.socialCompany)) }} · 个人社保 {{ ratesPercent(Number(localRates.defaults.socialPersonal)) }}
       </p>
       <div class="rates-recalc-row">
@@ -266,8 +338,8 @@ async function handleSave() {
 <style scoped>
 .ocr-dropzone {
   border: 1px dashed var(--solo-border);
-  border-radius: var(--solo-radius-md);
-  background: var(--solo-bg-hover);
+  border-radius: var(--solo-radius);
+  background: var(--solo-bg-soft);
   padding: 12px 14px;
   cursor: pointer;
   transition: all 0.2s ease;
@@ -292,7 +364,8 @@ async function handleSave() {
   color: var(--solo-text-primary);
 }
 .dropzone-title .icon {
-  font-size: 14px;
+  font-size: 15px;
+  color: var(--solo-primary);
 }
 .dropzone-desc {
   font-size: 12px;
@@ -339,12 +412,65 @@ async function handleSave() {
   gap: 8px;
   margin-top: 14px;
   padding: 10px 12px;
-  background: var(--solo-bg-hover);
-  border-radius: var(--solo-radius-md);
+  background: var(--solo-bg-soft);
+  border-radius: var(--solo-radius);
 }
 .recalc-hint {
   font-size: 12px;
   color: var(--solo-text-secondary);
   line-height: 1.4;
+}
+.rates-group {
+  padding: 12px 14px;
+  border-radius: var(--solo-radius);
+  background: var(--solo-bg-soft);
+  margin-bottom: 12px;
+}
+.rates-group-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.rates-group-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--solo-text-primary);
+}
+.rates-group-sub {
+  font-size: 11.5px;
+  color: var(--solo-text-muted);
+}
+.rates-sync-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--solo-text-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+.rates-two-col {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 14px;
+}
+.rates-form-item {
+  margin-bottom: 0;
+}
+.rates-form-item :deep(.n-form-item-feedback-wrapper) {
+  display: none;
+}
+.rates-group-note {
+  margin: 8px 0 0;
+  font-size: 11.5px;
+  color: var(--solo-text-muted);
+  line-height: 1.45;
+}
+@media (max-width: 520px) {
+  .rates-two-col {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

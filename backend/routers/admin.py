@@ -21,7 +21,16 @@ from sqlalchemy import func, select, text
 
 from config import LLM_PRICE_TABLE
 from core.plans import PLAN_CATALOG, get_plan
-from db.models import AgentAction, AuthUser, Company, CompanyMember, IndustryTemplate, JournalEntry, LlmUsage
+from db.models import (
+    AgentAction,
+    AiTokenLedger,
+    AuthUser,
+    Company,
+    CompanyMember,
+    IndustryTemplate,
+    JournalEntry,
+    LlmUsage,
+)
 from db.session import session_scope
 from deps.auth import AuthContext, require_admin
 from services import quota_service
@@ -319,6 +328,8 @@ class AdminUserPatchRequest(BaseModel):
     plan_anchor_at: Optional[str] = Field(None, alias="planAnchorAt")
     plan_expires_at: Optional[str] = Field(None, alias="planExpiresAt")
     quota_bonus_tokens: Optional[int] = Field(None, alias="quotaBonusTokens")
+    # AI 点数永久余额（1 点 = 1 token）：管理员直接设定新余额，差额写流水留痕
+    token_balance: Optional[int] = Field(None, alias="tokenBalance")
 
 
 async def _write_audit_log(
@@ -434,6 +445,7 @@ def _user_summary(user: AuthUser, company_count: int = 0, roles: Optional[list] 
         "planName": plan.name,
         "planAnchorAt": user.plan_anchor_at or "",
         "quotaBonusTokens": int(getattr(user, "quota_bonus_tokens", 0) or 0),
+        "tokenBalance": int(getattr(user, "token_balance", 0) or 0),
         "companyCount": company_count,
         "roles": roles or [],
         "createdAt": user.created_at,
@@ -534,6 +546,8 @@ async def admin_patch_user(
         raise HTTPException(status_code=422, detail=f"无效套餐编码: {req.plan_code}")
     if req.quota_bonus_tokens is not None and req.quota_bonus_tokens < 0:
         raise HTTPException(status_code=422, detail="赠送额度不能为负数")
+    if req.token_balance is not None and req.token_balance < 0:
+        raise HTTPException(status_code=422, detail="AI 点数余额不能为负数")
 
     actions = []
     if req.is_disabled is not None:
@@ -544,11 +558,17 @@ async def admin_patch_user(
         actions.append("change_plan")
     if req.quota_bonus_tokens is not None:
         actions.append("update_quota_bonus")
+    if req.token_balance is not None:
+        actions.append("update_token_balance")
     if not actions:
         raise HTTPException(status_code=422, detail="未提供任何要修改的字段")
 
     plan_touched = (
-        req.plan_code is not None or anchor_provided or expires_provided or req.quota_bonus_tokens is not None
+        req.plan_code is not None
+        or anchor_provided
+        or expires_provided
+        or req.quota_bonus_tokens is not None
+        or req.token_balance is not None
     )
 
     async with session_scope() as session:
@@ -564,6 +584,7 @@ async def admin_patch_user(
             "planAnchorAt": user.plan_anchor_at or "",
             "planExpiresAt": user.plan_expires_at or "",
             "quotaBonusTokens": int(getattr(user, "quota_bonus_tokens", 0) or 0),
+            "tokenBalance": int(getattr(user, "token_balance", 0) or 0),
         }
         if req.is_disabled is not None:
             user.is_disabled = req.is_disabled
@@ -577,6 +598,23 @@ async def admin_patch_user(
             user.plan_expires_at = expires_to_set
         if req.quota_bonus_tokens is not None:
             user.quota_bonus_tokens = req.quota_bonus_tokens
+        if req.token_balance is not None:
+            old_balance = int(getattr(user, "token_balance", 0) or 0)
+            new_balance = int(req.token_balance)
+            delta = new_balance - old_balance
+            user.token_balance = new_balance
+            if delta:
+                # 人工调整也必须留只增流水，保证余额可解释（A2 审计只增）。
+                session.add(
+                    AiTokenLedger(
+                        user_id=user.user_id,
+                        kind="admin_grant" if delta > 0 else "admin_deduct",
+                        delta_tokens=delta,
+                        balance_after=new_balance,
+                        note=f"管理员调整 AI 点数余额（{old_balance} → {new_balance}）",
+                        created_by=admin.user_id,
+                    )
+                )
         after = {
             "isDisabled": bool(user.is_disabled),
             "isPlatformAdmin": bool(user.is_platform_admin),
@@ -584,6 +622,7 @@ async def admin_patch_user(
             "planAnchorAt": user.plan_anchor_at or "",
             "planExpiresAt": user.plan_expires_at or "",
             "quotaBonusTokens": int(getattr(user, "quota_bonus_tokens", 0) or 0),
+            "tokenBalance": int(getattr(user, "token_balance", 0) or 0),
         }
 
     if plan_touched:
@@ -914,3 +953,86 @@ async def admin_cleanup(
     }
 
               
+
+
+# ---------------------------------------------------------------------------
+# 订单管理 + 全额退款（/console 订单页）。
+# 幂等不走 company_id 体系的 Idempotency-Key（平台级操作无公司维度）：
+# billing_refunds.out_request_no 唯一约束 + 支付宝同号幂等已兜住双击/重试。
+# ---------------------------------------------------------------------------
+
+class AdminRefundRequest(BaseModel):
+    reason: str = Field(min_length=1, description="退款原因（必填，进退款记录与管理审计）")
+
+
+@router.get("/billing/orders")
+async def admin_billing_orders(
+    query: str = "",
+    status: str = "",
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100, alias="pageSize"),
+    _admin: AuthContext = Depends(require_admin),
+):
+    """订单列表：订单号/用户ID/支付宝流水号模糊搜索 + 状态筛选 + 分页。"""
+    from services import billing_service
+
+    return await billing_service.admin_list_orders(
+        query=query, status=status, page=page, page_size=page_size
+    )
+
+
+@router.get("/billing/orders/{order_no}")
+async def admin_billing_order_detail(
+    order_no: str,
+    _admin: AuthContext = Depends(require_admin),
+):
+    """订单详情：订单字段 + 退款记录 + 通知日志最近 20 条。"""
+    from services import billing_service
+
+    return await billing_service.admin_get_order(order_no)
+
+
+@router.post("/billing/orders/{order_no}/refund")
+async def admin_billing_order_refund(
+    order_no: str,
+    req: AdminRefundRequest,
+    admin: AuthContext = Depends(require_admin),
+):
+    """全额退款（同步结果为准）；原因必填，成功后收回用户套餐权益。"""
+    from services import billing_service
+
+    result = await billing_service.admin_refund_order(
+        order_no, operator_user_id=admin.user_id, reason=req.reason
+    )
+    refunds = result.get("refunds") or []
+    await _write_audit_log(
+        admin.user_id,
+        "billing_refund",
+        order_no,
+        {
+            "reason": req.reason.strip(),
+            "amount": result.get("amount"),
+            "refundStatus": refunds[0].get("status") if refunds else None,
+        },
+        target_type="billing_order",
+    )
+    return result
+
+
+@router.post("/billing/orders/{order_no}/query")
+async def admin_billing_order_query(
+    order_no: str,
+    admin: AuthContext = Depends(require_admin),
+):
+    """只读校准：alipay.trade.query 展示网关真实状态，不改本地任何数据。"""
+    from services import billing_service
+
+    result = await billing_service.admin_query_order(order_no)
+    await _write_audit_log(
+        admin.user_id,
+        "billing_query",
+        order_no,
+        {"gatewayFound": result.get("gatewayTrade") is not None},
+        target_type="billing_order",
+    )
+    return result

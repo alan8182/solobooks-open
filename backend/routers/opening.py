@@ -17,6 +17,7 @@ from services.opening_balance_service import (
     get_opening_details,
     reset_opening_balances,
     save_opening_balances,
+    save_tax_opening_memory,
 )
 from services.accounting_core_service import get_idempotent_response, save_idempotent_response
 
@@ -82,6 +83,17 @@ class ResetOpeningRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
     fiscal_year: int
     reason: Optional[str] = "期初数据冲销重置"
+
+
+class UpdateTaxMemoryRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    fiscal_year: int
+    start_period: Optional[str] = None
+    prior_year_loss: Decimal = Decimal("0")
+    prepaid_cit_tax: Decimal = Decimal("0")
+    carryforward_advertising: Optional[Decimal] = None
+    carryforward_education: Optional[Decimal] = None
+    carryforward_donations: Optional[List[dict]] = None
 
 
 @router.get("/balances")
@@ -179,3 +191,31 @@ async def balance_status(
     session: AsyncSession = Depends(get_db_session),
 ):
     return await check_balanced(ctx.company_id, fiscal_year, session=session)
+
+
+@router.put("/tax-memory")
+async def update_tax_memory(
+    req: UpdateTaxMemoryRequest,
+    request: Request,
+    ctx: AuthContext = Depends(require_auth),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """独立保存企业所得税期初抵扣基数（不触及期初会计凭证，锁账后也可补填）。"""
+    request_id = (
+        request.headers.get("X-Request-ID")
+        or f"opening-tax-memory:{ctx.company_id}:{req.fiscal_year}"
+    )
+    tax_memory = await save_tax_opening_memory(
+        ctx.company_id,
+        req.fiscal_year,
+        prior_year_loss=req.prior_year_loss,
+        prepaid_cit_tax=req.prepaid_cit_tax,
+        start_period=req.start_period,
+        carryforward_advertising=req.carryforward_advertising,
+        carryforward_education=req.carryforward_education,
+        carryforward_donations=req.carryforward_donations,
+        user_id=ctx.user_id,
+        request_id=request_id,
+        session=session,
+    )
+    return {"ok": True, "tax_memory": tax_memory}

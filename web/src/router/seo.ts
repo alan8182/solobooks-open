@@ -12,9 +12,9 @@ import { FREE_FAQ, HOME_FAQ, faqPageJsonLd } from '@/content/faq'
 // 预渲染器产出每页 TDK 的数据源，改这里即可全站生效。
 export const SITE_URL = 'https://solobooks.cn'
 export const SITE_NAME = '梭罗记账 SoloBooks'
-export const DEFAULT_TITLE = '梭罗记账 SoloBooks｜小微企业的驻场 AI 财务官'
+export const DEFAULT_TITLE = '梭罗记账 SoloBooks｜不做糊涂账，合规用梭罗'
 export const DEFAULT_DESCRIPTION =
-  '梭罗记账（SoloBooks），面向新一代小微企业、创业团队与一人公司的驻场 AI 财务官：点一点把账做清爽，问一问把公司养值钱。规范记账、公私合规、数据自主，让经营账本清晰可查。'
+  '梭罗记账（SoloBooks），不做糊涂账，合规用梭罗：面向小微企业的驻场 AI 财务官，遵循小企业会计准则，AI 预制入账、老板点一点确认，公私分明、数据 100% 归企业；支持 0 元云端版与自托管。'
 
 export interface SeoMeta {
   /** 搜索结果与浏览器标签标题，自动追加「 · 梭罗记账 SoloBooks」品牌后缀 */
@@ -47,7 +47,7 @@ const FREE_SOFTWARE_JSON_LD: Record<string, unknown> = {
           name: '云端免费试用版',
           price: '0',
           priceCurrency: 'CNY',
-          description: '每月 10 万 AI Token，最多 3 个企业账套',
+          description: '新用户首月 20 万 AI Token（新人可 ¥1 扩容至 100 万），次月起每月 10 万，最多 3 个企业账套',
         },
         {
           '@type': 'Offer',
@@ -75,7 +75,7 @@ const PAGE_SEO: Record<string, SeoMeta> = {
   FreeSoftware: {
     title: '免费财务软件怎么选？云端免费试用与自托管永久免费',
     description:
-      '小微企业、一人公司找免费财务软件，先分清两种免费：0 元云端免费试用版（每月 10 万 Token、3 个账套），以及源码可用、可自行部署的自托管版（永久免费、数据留在本地）。含免费边界、成本对比与常见问题。',
+      '小微企业、一人公司找免费财务软件，先分清两种免费：0 元云端免费试用版（新用户首月 20 万 Token，新人可 ¥1 扩容至 100 万，次月起每月 10 万、3 个账套），以及源码可用、可自行部署的自托管版（永久免费、数据留在本地）。含免费边界、成本对比与常见问题。',
     canonical: '/free',
     jsonLd: FREE_SOFTWARE_JSON_LD,
   },
@@ -87,7 +87,7 @@ const PAGE_SEO: Record<string, SeoMeta> = {
   },
   Login: {
     title: '登录',
-    description: '登录梭罗记账，让 AI 帮你把账记简单、把经营看清楚。',
+    description: '登录梭罗记账，不做糊涂账，合规用梭罗：面向小微企业的驻场 AI 财务官。',
     canonical: '/login',
   },
   Agreement: { title: '服务协议', canonical: '/agreement' },

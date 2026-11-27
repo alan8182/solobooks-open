@@ -11,6 +11,7 @@ from services.invoice_service import parse_invoice_rows, classify_invoice, impor
 from services.invoice_llm_prompts import INVOICE_COLUMN_MAPPING_PROMPT
 from services.llm import safe_chat_text_json
 from services.audit_service import log_action
+from services.setup_readiness_service import require_migration_opening_ready
 
 router = APIRouter(prefix="/api/invoice", tags=["invoice"], dependencies=[Depends(require_auth)])
 
@@ -31,6 +32,7 @@ class ParseColumnsRequest(BaseModel):
 @router.post("/parse")
 async def parse_invoice(req: ParseRowsRequest, ctx: AuthContext = Depends(require_auth)):
     """Parse and validate invoice rows."""
+    await require_migration_opening_ready(ctx.company_id)
     result = await parse_invoice_rows(req.rows, company_id=ctx.company_id)
     return result
 
@@ -41,6 +43,7 @@ async def import_invoice(
     ctx: AuthContext = Depends(require_auth),
 ):
     """Import invoices as accounting entries."""
+    await require_migration_opening_ready(ctx.company_id)
     result = await import_invoices(ctx.company_id, ctx.user_id, req.rows, classify=req.classify)
     await log_action(ctx.company_id, ctx.user_id, "import", "invoice", None,
                      {"count": result.get("imported"), "total": result.get("total")})
@@ -50,6 +53,7 @@ async def import_invoice(
 @router.post("/parse-columns")
 async def parse_invoice_columns(req: ParseColumnsRequest, ctx: AuthContext = Depends(require_auth)):
     """LLM column mapping for invoice Excel."""
+    await require_migration_opening_ready(ctx.company_id)
     prompt = INVOICE_COLUMN_MAPPING_PROMPT.format(columns=", ".join(req.columns))
     fallback = [{"column": c, "mapping": None} for c in req.columns]
     result = await asyncio.to_thread(
@@ -93,6 +97,7 @@ async def classify_entry_invoice(
         "tax_amount": entry.get("tax_amount") or entry.get("vatAmount") or 0,
         "tax_rate": entry.get("tax_rate") or entry.get("vatRate") or "",
         "direction": entry.get("direction", "expense"),
+        "remark": entry.get("remark") or "",
         "business_context": req.business_context if req else None,
     }
     

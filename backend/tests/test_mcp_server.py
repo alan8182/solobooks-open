@@ -187,13 +187,13 @@ class TestPatTokenService:
 
 class TestMcpToolRegistration:
     async def test_open_tools_registered(self):
-        """MCP 暴露 20 个只读工具与 7 个草稿/对账闭环工具，但不暴露锁账工具。"""
+        """MCP 暴露 24 个只读工具与 7 个草稿/对账闭环工具，但不暴露锁账工具。"""
         from agent.mcp_server import MCP_READ_TOOLS, MCP_WRITE_TOOLS, mcp
 
         tools = await mcp.list_tools()
         names = {t.name for t in tools}
         assert names == MCP_READ_TOOLS | MCP_WRITE_TOOLS
-        assert len(names) == 27
+        assert len(names) == 31
         assert "get_advance_balances" in names
         assert "list_intangible_assets" in names
         assert "list_private_expenses" in names

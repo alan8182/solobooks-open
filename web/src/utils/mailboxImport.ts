@@ -26,6 +26,7 @@ export const IMPORT_KIND_LABELS: Record<InboxImportKind, string> = {
   invoice: '发票',
   bank: '银行流水',
   wechat_bill: '微信账单',
+  alipay_bill: '支付宝账单',
   unknown: '未识别类型',
 }
 

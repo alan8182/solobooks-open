@@ -11,7 +11,7 @@
 export interface ClosingImportCounts {
   /** 本月发票行数（发票台账本月口径） */
   invoiceCount: number
-  /** 本月微信/平台账单笔数（服务端已导入记录） */
+  /** 本月平台账单（微信/支付宝）笔数（服务端已导入记录） */
   wechatBillCount: number
   /** 本月银行流水笔数（月度口径，不是账套全量） */
   bankStatementCount: number
@@ -24,10 +24,10 @@ export interface ClosingImportGap {
   label: string
 }
 
-/** 三类单据的展示名与判定顺序固定：发票 → 微信账单 → 银行流水，与第 1 步卡片编号一致 */
+/** 三类单据的展示名与判定顺序固定：发票 → 平台账单 → 银行流水，与第 1 步卡片编号一致 */
 const IMPORT_CATEGORY_LABELS: ReadonlyArray<{ key: ClosingImportCategoryKey; label: string }> = [
   { key: 'invoice', label: '发票' },
-  { key: 'wechat', label: '微信账单' },
+  { key: 'wechat', label: '平台账单' },
   { key: 'bank', label: '银行流水' },
 ]
 

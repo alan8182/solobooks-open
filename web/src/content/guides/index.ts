@@ -1,8 +1,12 @@
 // Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks license v2.0.
 
 import type { Guide, GuideId } from './types'
+import { alipayBillGuide } from './alipay-bill'
 import { bankStatementGuide } from './bank-statement'
 import { iitGuide } from './iit'
+import { invoiceListGuide } from './invoice-list'
+import { socialEnrollmentGuide } from './social-enrollment'
+import { socialInsuranceGuide } from './social-insurance'
 import { taxRegistrationGuide } from './tax-registration'
 import { wechatBillGuide } from './wechat-bill'
 
@@ -13,9 +17,13 @@ import { wechatBillGuide } from './wechat-bill'
  */
 const GUIDES: Record<GuideId, Guide> = {
   'wechat-bill': wechatBillGuide,
+  'alipay-bill': alipayBillGuide,
   'bank-statement': bankStatementGuide,
+  'invoice-list': invoiceListGuide,
   'tax-registration': taxRegistrationGuide,
   iit: iitGuide,
+  'social-insurance': socialInsuranceGuide,
+  'social-enrollment': socialEnrollmentGuide,
 }
 
 /** 需要独立页面（而不是抽屉）的指引：内容长、图多，用户是「专门来看」的 */

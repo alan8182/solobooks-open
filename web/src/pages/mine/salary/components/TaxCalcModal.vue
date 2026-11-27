@@ -13,6 +13,7 @@ const props = defineProps<{
   target: SalaryRecord | null
   selectedMonth: string
   initialSpecialAdditional: number
+  readonly?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -77,7 +78,7 @@ function closeModal() {
 }
 
 function handleApply() {
-  if (!taxPreview.value) return
+  if (props.readonly || !taxPreview.value) return
   const taxDue = Number(taxPreview.value.taxDue || 0)
   emit('apply', taxDue)
   closeModal()
@@ -88,10 +89,14 @@ function handleApply() {
   <NModal
     :show="show"
     preset="card"
-    :title="`${target?.employee_name || ''} · ${selectedMonth} 个税累计预扣试算`"
-    style="width: min(640px, 94vw); border-radius: 14px"
+    :title="`${target?.employee_name || ''} · ${selectedMonth} ${readonly ? '个税计算明细' : '个税累计预扣试算'}`"
+    style="width: min(640px, 94vw); border-radius: var(--solo-radius-lg)"
     @update:show="closeModal"
   >
+    <p v-if="readonly" class="readonly-banner">
+      <i class="ri-lock-line" />
+      当月工资表已锁定，仅支持查看测算明细
+    </p>
     <p class="modal-hint">
       按国家累计预扣法试算：累计收入 − 累计减除费用（5000元/月）− 累计个人社保公积金 − 累计专项附加扣除。试算结果仅供参考，申报纳税以自然人税收管理系统（个税扣缴端）申报数据为准。
     </p>
@@ -109,12 +114,14 @@ function handleApply() {
         </span>
       </NFormItem>
       <NFormItem label="专项附加/月">
-        <NInputNumber v-model:value="taxForm.specialAdditional" :min="0" :precision="2" :step="500" style="width: 100%" @update:value="runTaxPreview">
+        <span v-if="readonly" class="calc-static">{{ formatMoney(taxForm.specialAdditional) }}</span>
+        <NInputNumber v-else v-model:value="taxForm.specialAdditional" :min="0" :precision="2" :step="500" style="width: 100%" @update:value="runTaxPreview">
           <template #prefix>¥</template>
         </NInputNumber>
       </NFormItem>
       <NFormItem label="其他扣除/月">
-        <NInputNumber v-model:value="taxForm.otherDeduction" :min="0" :precision="2" :step="200" style="width: 100%" @update:value="runTaxPreview">
+        <span v-if="readonly" class="calc-static">{{ formatMoney(taxForm.otherDeduction) }}</span>
+        <NInputNumber v-else v-model:value="taxForm.otherDeduction" :min="0" :precision="2" :step="200" style="width: 100%" @update:value="runTaxPreview">
           <template #prefix>¥</template>
         </NInputNumber>
       </NFormItem>
@@ -176,14 +183,28 @@ function handleApply() {
     <template #footer>
       <NSpace justify="end">
         <NButton @click="closeModal">关闭</NButton>
-        <NButton :loading="loading" @click="runTaxPreview">重新试算</NButton>
-        <NButton type="primary" :disabled="!taxPreview" @click="handleApply">填入本期个税</NButton>
+        <template v-if="!readonly">
+          <NButton :loading="loading" @click="runTaxPreview">重新试算</NButton>
+          <NButton type="primary" :disabled="!taxPreview" @click="handleApply">填入本期个税</NButton>
+        </template>
       </NSpace>
     </template>
   </NModal>
 </template>
 
 <style scoped>
+.readonly-banner {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 10px;
+  padding: 8px 12px;
+  border-radius: var(--solo-radius);
+  background: var(--solo-bg-soft);
+  color: var(--solo-text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+}
 .modal-hint {
   font-size: 12.5px;
   color: var(--solo-text-secondary);
@@ -197,9 +218,11 @@ function handleApply() {
   padding: 16px 0;
 }
 .calc-static {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
   font-size: 14px;
   font-weight: 600;
   color: var(--solo-text-primary);
+  font-variant-numeric: tabular-nums;
 }
 .calc-sub {
   font-size: 12px;
@@ -210,8 +233,8 @@ function handleApply() {
 .tax-breakdown {
   margin-top: 14px;
   padding: 12px 14px;
-  background: var(--solo-bg-hover, rgba(0, 0, 0, 0.02));
-  border-radius: var(--solo-radius-md, 8px);
+  background: var(--solo-bg-soft);
+  border-radius: var(--solo-radius);
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -231,6 +254,10 @@ function handleApply() {
   justify-content: space-between;
   font-size: 12.5px;
   color: var(--solo-text-secondary);
+}
+.tax-line strong {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  font-variant-numeric: tabular-nums;
 }
 .tax-line.emphasis {
   padding: 6px 0;

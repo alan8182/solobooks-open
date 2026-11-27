@@ -1054,8 +1054,20 @@ async def test_salary_close_check_blocks_only_missing_accrual():
     payroll = next(item for item in checks["checks"] if item["code"] == "PAYROLL_ACCRUAL")
     assert payroll["status"] == "passed"
     assert checks["canClose"] is True
+    # 当月计提、次月发放是权责发生制的正常节奏，不在当月结账时报「未发放」。
     notices = {item["code"] for item in checks["notices"]}
-    assert "SALARY_PAYABLE_OUTSTANDING" in notices
+    assert "SALARY_PAYABLE_OUTSTANDING" not in notices
+
+    # 到了次月结账仍未发放，才真正超期：提示并给出最早欠发月份。
+    async with session_scope() as session:
+        next_checks = await period_close_checks(session, "c-sal-close", "2027-08")
+    notice = next(
+        item for item in next_checks["notices"]
+        if item["code"] == "SALARY_PAYABLE_OUTSTANDING"
+    )
+    assert notice["suggestedMonth"] == "2027-07"
+    assert notice["records"][0]["businessPeriod"] == "2027-07"
+    assert "超过次月发薪窗口" in notice["message"]
 
 
 @pytest.mark.asyncio
@@ -1106,6 +1118,132 @@ async def test_bank_salary_payment_cannot_be_booked_as_expense_directly():
 
     assert exc_info.value.status_code == 409
     assert exc_info.value.detail["code"] == "SALARY_REQUIRES_PAYROLL"
+
+
+@pytest.mark.asyncio
+async def test_business_context_overrides_tax_social_security_statement_to_non_operating_expense(monkeypatch):
+    await _setup_company("c-bank-tax-ss-penalty")
+
+    from fastapi import HTTPException
+    from db.session import session_scope
+    from deps.auth import AuthContext
+    from routers.bank import ConfirmSuggestionRequest, confirm_suggestion
+    from services import llm
+    from services.bank_service import classify_single_statement, ensure_bank_schema
+    from services.database import get_conn
+    from services.entry_service import get_entry
+
+    await ensure_bank_schema()
+    conn = await get_conn()
+    try:
+        await conn.execute(
+            "INSERT INTO bank_statements (id, company_id, transaction_date, description, amount, balance, statement_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+            (
+                "stmt-tax-penalty", "c-bank-tax-ss-penalty", "2027-10-15",
+                "税费社保 (对方: 金库杭州市余杭区支库)",
+                "-200.00", "stmt-tax-penalty", "2027-10-15T00:00:00+00:00",
+            ),
+        )
+        await conn.execute(
+            "INSERT INTO bank_statements (id, company_id, transaction_date, description, amount, balance, statement_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+            (
+                "stmt-pure-ss-guard", "c-bank-tax-ss-penalty", "2027-10-16",
+                "社会保险费扣款",
+                "-800.00", "stmt-pure-ss-guard", "2027-10-16T00:00:00+00:00",
+            ),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    # 无业务说明时不得把「税费社保」通道直接判成社保（2026-10 个税逾期罚款
+    # 曾被判 221102 社保公积金并提示去工资表核销）：先给税费缴纳模糊组让用户拍板；
+    # 补充个税罚款说明后一律走 LLM 重判为营业外支出（5711）
+    initial = await classify_single_statement("c-bank-tax-ss-penalty", "stmt-tax-penalty")
+    assert initial["category"] == "税费缴纳"
+    assert initial["requiresConfirmation"] is True
+    assert not initial.get("requiresSalarySettlement")
+
+    # 摘要明确写了险种时仍归工资模块
+    pure_ss = await classify_single_statement("c-bank-tax-ss-penalty", "stmt-pure-ss-guard")
+    assert pure_ss["category"] == "社保公积金"
+
+    llm_calls = []
+
+    def fake_llm(system_prompt, user_message, fallback, **kwargs):
+        llm_calls.append(user_message)
+        return {
+            "direction": "expense",
+            "category": "罚款支出",
+            "accountCode": "5711011",
+            "accountName": "营业外支出-罚款支出",
+            "title": "未及时申报个税罚款",
+            "confidence": 0.96,
+            "reason": "未及时申报个税被税务局罚款属于税务行政处罚，应计入营业外支出-罚款支出",
+        }
+
+    monkeypatch.setattr(llm, "safe_chat_text_json", fake_llm)
+    reclassified = await classify_single_statement(
+        "c-bank-tax-ss-penalty",
+        "stmt-tax-penalty",
+        "这笔是未及时申报个税被税务局罚了200元",
+    )
+    assert len(llm_calls) == 1
+    assert "用户补充说明：这笔是未及时申报个税被税务局罚了200元" in llm_calls[0]
+    assert reclassified["category"] == "罚款支出"
+    assert reclassified["accountCode"] == "5711011"
+
+    # 纯社保扣款（未写说明且无「税」字）仍被拦回工资模块
+    async with session_scope() as session:
+        with pytest.raises(HTTPException) as exc_info:
+            await confirm_suggestion(
+                ConfirmSuggestionRequest(
+                    statement_id="stmt-pure-ss-guard",
+                    type="new",
+                    new_entry={
+                        "direction": "expense",
+                        "amount": 800,
+                        "category": "其他支出",
+                        "accountCode": "5602999",
+                        "title": "社会保险费",
+                    },
+                ),
+                ctx=AuthContext(user_id="owner-1", company_id="c-bank-tax-ss-penalty"),
+                request=None,
+                session=session,
+                idempotency_key=None,
+            )
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["code"] == "PAYROLL_LIABILITY_REQUIRES_PAYROLL"
+
+    # 税费社保通道改判为罚款支出（5711011）后，提交确认必须正常入账并对账
+    async with session_scope() as session:
+        confirmed = await confirm_suggestion(
+            ConfirmSuggestionRequest(
+                statement_id="stmt-tax-penalty",
+                type="new",
+                new_entry={
+                    "direction": "expense",
+                    "amount": 200,
+                    "category": reclassified["category"],
+                    "accountCode": reclassified["accountCode"],
+                    "accountName": reclassified["accountName"],
+                    "occurDate": "2027-10-15",
+                    "title": reclassified["title"],
+                    "remark": "业务说明：这笔是未及时申报个税被税务局罚了200元",
+                },
+            ),
+            ctx=AuthContext(user_id="owner-1", company_id="c-bank-tax-ss-penalty"),
+            request=None,
+            session=session,
+            idempotency_key=None,
+        )
+    assert confirmed["status"] == "created"
+    saved = await get_entry(confirmed["entryId"], user_id="owner-1", company_id="c-bank-tax-ss-penalty")
+    assert saved["category"] == "罚款支出"
+    assert saved["voucherLines"]["debit"][0]["accountCode"] == "5711011"
 
 
 @pytest.mark.asyncio
@@ -1592,8 +1730,10 @@ async def test_company_region_auto_matches_payroll_rates():
 
 @pytest.mark.asyncio
 async def test_salary_sheet_auto_carries_forward_previous_month():
-    """首次填报工资/社保/公积金后，后续月份草稿自动延续上月数据，并支持灵活修改。"""
+    """跨月开表自动延续固定工资与回填五险一金，一次性奖金/扣款清零并重算累计个税。"""
+    from services.rd_allocation_service import replace_salary_allocations
     from services.salary_service import (
+        accrue_salary_sheet,
         get_or_create_salary_sheet,
         update_salary_records,
         create_employee,
@@ -1619,16 +1759,17 @@ async def test_salary_sheet_auto_carries_forward_previous_month():
         hire_date="2026-11-01",
     )
 
-    # 2. 2026-10 月工资表：此时只有张三在职
+    # 2. 2026-10 月工资表：此时只有张三在职，且无上月表
     sheet_10 = await get_or_create_salary_sheet(company_id, "2026-10")
+    assert sheet_10["carryForward"]["hasPreviousSheet"] is False
     assert len(sheet_10["records"]) == 1
     rec_a_10 = sheet_10["records"][0]
     assert rec_a_10["employee_name"] == "张三"
 
-    # 3. 用户在 10 月录入/回填了税局实缴社保与奖金补贴
+    # 3. 用户在 10 月录入/回填税局实缴社保、固定津贴与一次性奖金/扣款，并确认计提
     update_data = [{
         "id": rec_a_10["id"],
-        "base_salary": "12000.00",
+        "base_salary": "10000.00",
         "bonus": "1000.00",
         "allowance": "500.00",
         "deduction": "200.00",
@@ -1640,27 +1781,41 @@ async def test_salary_sheet_auto_carries_forward_previous_month():
     }]
     updated_10 = await update_salary_records(company_id, "2026-10", update_data)
     rec_a_10_up = updated_10["records"][0]
-    assert rec_a_10_up["net_salary"] == "11750.00"  # 12000 + 1000 + 500 - 200 - 1400 - 150
-    assert rec_a_10_up["total_cost"] == "15900.00"  # 13300 + 2600
+    assert rec_a_10_up["net_salary"] == "9750.00"  # 10000 + 1000 + 500 - 200 - 1400 - 150
+    assert rec_a_10_up["total_cost"] == "13900.00"  # 11300 + 2600
+    await replace_salary_allocations(company_id, "owner-1", "2026-10", [])
+    await accrue_salary_sheet(company_id, "owner-1", "2026-10")
 
-    # 4. 2026-11 月自动创建工资表：张三自动延续 10 月数据，李四走花名册初始值
+    # 4. 2026-11 月自动创建工资表：
+    #    - 张三沿用花名册基本工资(10000)、固定津贴(500)、回填五险一金(800/600 & 2000/600)
+    #    - 上月一次性奖金(1000)与考勤扣款(200)自动清零为 0.00
+    #    - 累计预扣法重算个税：(11300+10500 - 10000 - 2800)*3% - 150 = 120.00
     sheet_11 = await get_or_create_salary_sheet(company_id, "2026-11")
     assert len(sheet_11["records"]) == 2
     rec_a_11 = next(r for r in sheet_11["records"] if r["employee_id"] == emp_a["id"])
     rec_b_11 = next(r for r in sheet_11["records"] if r["employee_id"] == emp_b["id"])
 
-    # 张三（老员工）：全额延续 10 月的实缴明细与发放参数
-    assert rec_a_11["base_salary"] == "12000.00"
-    assert rec_a_11["bonus"] == "1000.00"
+    assert rec_a_11["base_salary"] == "10000.00"
+    assert rec_a_11["bonus"] == "0.00"
     assert rec_a_11["allowance"] == "500.00"
-    assert rec_a_11["deduction"] == "200.00"
+    assert rec_a_11["deduction"] == "0.00"
     assert rec_a_11["personal_social_insurance"] == "800.00"
     assert rec_a_11["personal_housing_fund"] == "600.00"
     assert rec_a_11["company_social_insurance"] == "2000.00"
     assert rec_a_11["company_housing_fund"] == "600.00"
-    assert rec_a_11["personal_tax"] == "150.00"
-    assert rec_a_11["net_salary"] == "11750.00"
-    assert rec_a_11["total_cost"] == "15900.00"
+    assert rec_a_11["personal_tax"] == "120.00"
+    assert rec_a_11["net_salary"] == "8980.00"  # 10500 - 1400 - 120
+    assert rec_a_11["total_cost"] == "13100.00"  # 10500 + 2600
+
+    cf = sheet_11["carryForward"]
+    assert cf["hasPreviousSheet"] is True
+    assert cf["sourceMonth"] == "2026-10"
+    assert cf["isIdenticalToPrevious"] is False
+    assert cf["clearedBonusTotal"] == "1000.00"
+    assert cf["clearedDeductionTotal"] == "200.00"
+    assert any("一次性奖金" in reason for reason in cf["changeReasons"])
+    assert any("考勤扣款" in reason for reason in cf["changeReasons"])
+    assert any("新增员工：李四" in reason for reason in cf["changeReasons"])
 
     # 李四（新员工）：走初始配置
     assert rec_b_11["base_salary"] == "8000.00"
@@ -1670,10 +1825,10 @@ async def test_salary_sheet_auto_carries_forward_previous_month():
     # 5. 留有修改入口：当月微调张三的奖金与税额
     up_11 = [{
         "id": rec_a_11["id"],
-        "base_salary": "12000.00",
-        "bonus": "2000.00",  # 本月奖金调整为 2000
+        "base_salary": "10000.00",
+        "bonus": "2000.00",
         "allowance": "500.00",
-        "deduction": "200.00",
+        "deduction": "0.00",
         "personal_social_insurance": "800.00",
         "personal_housing_fund": "600.00",
         "company_social_insurance": "2000.00",
@@ -1683,7 +1838,1533 @@ async def test_salary_sheet_auto_carries_forward_previous_month():
     res_11 = await update_salary_records(company_id, "2026-11", up_11)
     rec_a_11_mod = next(r for r in res_11["records"] if r["employee_id"] == emp_a["id"])
     assert rec_a_11_mod["bonus"] == "2000.00"
-    assert rec_a_11_mod["net_salary"] == "12720.00"  # 14300 - 1400 - 180
+    assert rec_a_11_mod["net_salary"] == "10920.00"  # 12500 - 1400 - 180
+
+
+@pytest.mark.asyncio
+async def test_employee_independent_housing_fund_base_and_ss_clamp_isolation(monkeypatch):
+    """员工独立公积金基数：None 跟随社保、0 停缴、独立正数不被社保下限错拉高。"""
+    import config
+    from services.salary_service import (
+        create_employee, get_or_create_salary_sheet, save_payroll_rates,
+    )
+
+    monkeypatch.setattr(config, "SOCIAL_SECURITY_BASE_MIN", 7460)
+    await _setup_company("c-sal-hf-base")
+    await save_payroll_rates("c-sal-hf-base", {
+        "socialPersonal": "0.10",
+        "socialCompany": "0.20",
+        "housingPersonal": "0.08",
+        "housingCompany": "0.08",
+    })
+
+    emp_follow = await create_employee("c-sal-hf-base", "甲跟随", "技术部", 10000, 5000, housing_fund_base=None)
+    emp_lower = await create_employee("c-sal-hf-base", "乙独立低基数", "技术部", 10000, 7460, housing_fund_base=2690)
+    emp_zero = await create_employee("c-sal-hf-base", "丙不缴公积金", "技术部", 10000, 7460, housing_fund_base=0)
+
+    assert emp_follow["housing_fund_base"] is None
+    assert Decimal(emp_lower["housing_fund_base"]) == Decimal("2690.00")
+    assert Decimal(emp_zero["housing_fund_base"]) == Decimal("0.00")
+
+    sheet = await get_or_create_salary_sheet("c-sal-hf-base", "2027-07")
+    by_emp = {r["employee_id"]: r for r in sheet["records"]}
+
+    # 甲：未设置独立基数，社保被兜底到 7460，公积金同样跟随 7460 -> 7460*8%=596.80
+    assert Decimal(by_emp[emp_follow["id"]]["personal_social_insurance"]) == Decimal("746.00")
+    assert Decimal(by_emp[emp_follow["id"]]["personal_housing_fund"]) == Decimal("596.80")
+
+    # 乙：显式设公积金基数 2690，不被社保下限 7460 拉高 -> 2690*8%=215.20
+    assert Decimal(by_emp[emp_lower["id"]]["personal_social_insurance"]) == Decimal("746.00")
+    assert Decimal(by_emp[emp_lower["id"]]["personal_housing_fund"]) == Decimal("215.20")
+    assert Decimal(by_emp[emp_lower["id"]]["company_housing_fund"]) == Decimal("215.20")
+
+    # 丙：公积金基数 0 -> 社保照常算 746.00，公积金严格为 0.00
+    assert Decimal(by_emp[emp_zero["id"]]["personal_social_insurance"]) == Decimal("746.00")
+    assert Decimal(by_emp[emp_zero["id"]]["personal_housing_fund"]) == Decimal("0.00")
+    assert Decimal(by_emp[emp_zero["id"]]["company_housing_fund"]) == Decimal("0.00")
+
+
+@pytest.mark.asyncio
+async def test_asymmetric_housing_fund_rates_and_sheet_calculation():
+    """单位与个人公积金比例不同（如单位 8%、个人 10%）时各自精确算入工资与待缴额。"""
+    from services.salary_service import (
+        create_employee, get_or_create_salary_sheet, recalculate_draft_withholdings, save_payroll_rates,
+    )
+
+    await _setup_company("c-sal-hf-asym")
+    await save_payroll_rates("c-sal-hf-asym", {
+        "socialPersonal": "0.10",
+        "socialCompany": "0.20",
+        "housingPersonal": "0.10",
+        "housingCompany": "0.08",
+    })
+    await create_employee("c-sal-hf-asym", "丁员工", "运营部", 12000, 6000, housing_fund_base=5000)
+
+    sheet = await get_or_create_salary_sheet("c-sal-hf-asym", "2027-08")
+    rec = sheet["records"][0]
+    # 个人：6000*10%(600) + 5000*10%(500) = 1100；单位：6000*20%(1200) + 5000*8%(400) = 1600
+    assert Decimal(rec["personal_housing_fund"]) == Decimal("500.00")
+    assert Decimal(rec["company_housing_fund"]) == Decimal("400.00")
+    assert Decimal(rec["personal_social_security"]) == Decimal("1100.00")
+    assert Decimal(rec["company_social_security"]) == Decimal("1600.00")
+    assert Decimal(sheet["housingFundDue"]) == Decimal("900.00")
+
+    # 改成单位 7%、个人 9% 重算草稿
+    await save_payroll_rates("c-sal-hf-asym", {"housingCompany": "0.07", "housingPersonal": "0.09"})
+    recalculated = await recalculate_draft_withholdings("c-sal-hf-asym", "2027-08")
+    rec2 = recalculated["records"][0]
+    assert Decimal(rec2["personal_housing_fund"]) == Decimal("450.00")
+    assert Decimal(rec2["company_housing_fund"]) == Decimal("350.00")
+    assert Decimal(recalculated["housingFundDue"]) == Decimal("800.00")
+
+
+@pytest.mark.asyncio
+async def test_update_single_employee_housing_fund_base_recalculates_only_target_and_skips_accrued():
+    """编辑单个员工并联动重算草稿：只重算该员工、汇总全表公积金，且对已计提月份安全无害。"""
+    from deps.auth import AuthContext
+    from routers.salary import EmployeeUpdate, update_employee
+    from services.salary_service import (
+        accrue_salary_sheet, create_employee, get_or_create_salary_sheet,
+        save_payroll_rates, update_salary_records,
+    )
+
+    await _setup_company("c-sal-single-recalc")
+    await save_payroll_rates("c-sal-single-recalc", {
+        "socialPersonal": "0.10",
+        "socialCompany": "0.20",
+        "housingPersonal": "0.10",
+        "housingCompany": "0.10",
+    })
+    emp1 = await create_employee("c-sal-single-recalc", "员工一", "研发部", 10000, 5000)
+    emp2 = await create_employee("c-sal-single-recalc", "员工二", "行政部", 8000, 4000)
+    sheet = await get_or_create_salary_sheet("c-sal-single-recalc", "2027-09")
+
+    rec2 = next(r for r in sheet["records"] if r["employee_id"] == emp2["id"])
+    # 先手工修改员工二当月奖金与实缴公积金，确保局部重算不会覆盖无关员工
+    await update_salary_records("c-sal-single-recalc", "2027-09", [{
+        "id": rec2["id"],
+        "base_salary": "8000.00",
+        "bonus": "1500.00",
+        "allowance": "0.00",
+        "deduction": "0.00",
+        "personal_social_insurance": "400.00",
+        "personal_housing_fund": "300.00",
+        "company_social_insurance": "800.00",
+        "company_housing_fund": "300.00",
+        "personal_tax": "0.00",
+    }])
+
+    ctx = AuthContext(user_id="owner-1", company_id="c-sal-single-recalc")
+    updated_emp1 = await update_employee(
+        emp1["id"],
+        EmployeeUpdate(housing_fund_base=Decimal("2500.00")),
+        month="2027-09",
+        recalculate=True,
+        ctx=ctx,
+    )
+    assert Decimal(updated_emp1["housing_fund_base"]) == Decimal("2500.00")
+
+    sheet_after = await get_or_create_salary_sheet("c-sal-single-recalc", "2027-09")
+    r1_after = next(r for r in sheet_after["records"] if r["employee_id"] == emp1["id"])
+    r2_after = next(r for r in sheet_after["records"] if r["employee_id"] == emp2["id"])
+    assert Decimal(r1_after["personal_housing_fund"]) == Decimal("250.00")
+    assert Decimal(r1_after["company_housing_fund"]) == Decimal("250.00")
+    assert Decimal(r2_after["bonus"]) == Decimal("1500.00")
+    assert Decimal(r2_after["personal_housing_fund"]) == Decimal("300.00")
+    assert Decimal(sheet_after["housingFundDue"]) == Decimal("1100.00")  # (250+250) + (300+300)
+
+    # 重置回 None（同社保基数 5000）
+    reset_emp1 = await update_employee(
+        emp1["id"],
+        EmployeeUpdate(housing_fund_base=None),
+        month="2027-09",
+        recalculate=True,
+        ctx=ctx,
+    )
+    assert reset_emp1["housing_fund_base"] is None
+    sheet_reset = await get_or_create_salary_sheet("c-sal-single-recalc", "2027-09")
+    r1_reset = next(r for r in sheet_reset["records"] if r["employee_id"] == emp1["id"])
+    assert Decimal(r1_reset["personal_housing_fund"]) == Decimal("500.00")
+
+    # 计提过账后，再次改档案带 recalculate=True 应忽略而非报错，且不动已计提工资表
+    from datetime import date
+    from db.session import session_scope
+    from services.rd_allocation_service import replace_salary_allocations
+    from services.rd_service import create_project
+
+    async with session_scope() as session:
+        proj = await create_project(
+            session, "c-sal-single-recalc", "owner-1",
+            {
+                "code": "RD-HF-1",
+                "name": "研发专项",
+                "type": "self_started",
+                "status": "active",
+                "startDate": date(2027, 1, 1),
+                "endDate": date(2027, 12, 31),
+            },
+            request_id="t-hf-single",
+        )
+    await replace_salary_allocations("c-sal-single-recalc", "owner-1", "2027-09", [{
+        "employeeId": emp1["id"], "projectId": proj["id"],
+        "allocationRate": 1, "allocationBasis": "工时100%",
+    }])
+    await accrue_salary_sheet("c-sal-single-recalc", "owner-1", "2027-09")
+    await update_employee(
+        emp1["id"],
+        EmployeeUpdate(housing_fund_base=Decimal("0")),
+        month="2027-09",
+        recalculate=True,
+        ctx=ctx,
+    )
+    sheet_accrued = await get_or_create_salary_sheet("c-sal-single-recalc", "2027-09")
+    r1_accrued = next(r for r in sheet_accrued["records"] if r["employee_id"] == emp1["id"])
+    assert Decimal(r1_accrued["personal_housing_fund"]) == Decimal("500.00")
+
+
+@pytest.mark.asyncio
+async def test_save_payroll_rates_partial_update_preserves_region_defaults():
+    """部分更新费率（仅传公积金）时保留注册地省市预设社保费率，不退回系统默认 25%。"""
+    from db.models import Company
+    from db.session import session_scope
+    from sqlalchemy import select
+    from services.salary_service import save_payroll_rates
+
+    await _setup_company("c-sal-hz-partial")
+    async with session_scope() as session:
+        comp = (await session.execute(select(Company).where(Company.company_id == "c-sal-hz-partial"))).scalar_one()
+        comp.payload = {**(comp.payload or {}), "name": "杭州星辰科技有限公司"}
+
+    saved = await save_payroll_rates("c-sal-hz-partial", {"housingPersonal": "0.12", "housingCompany": "0.12"})
+    assert Decimal(saved["rates"]["socialCompany"]) == Decimal("0.262")
+    assert Decimal(saved["rates"]["socialPersonal"]) == Decimal("0.105")
+    assert Decimal(saved["rates"]["housingPersonal"]) == Decimal("0.12")
+    assert Decimal(saved["rates"]["housingCompany"]) == Decimal("0.12")
+
+
+@pytest.mark.asyncio
+async def test_update_employee_coerces_bool_flags_to_int_for_postgres(monkeypatch):
+    """编辑员工时将 is_owner/is_active 布尔值强转为精确 int（非 bool），防止 PostgreSQL asyncpg 报类型错。"""
+    import services.salary_service as salary_service
+    from deps.auth import AuthContext
+    from routers.salary import EmployeeUpdate, update_employee as route_update_employee
+
+    await _setup_company("c-sal-pg-flags")
+    emp = await salary_service.create_employee(
+        "c-sal-pg-flags", "杨云飞", "行政部", 5000, 5122, housing_fund_base=5000
+    )
+
+    captured_updates: list[tuple[str, list]] = []
+    real_get_conn = salary_service.get_conn
+
+    class _ConnSpy:
+        def __init__(self, inner):
+            self._inner = inner
+
+        async def execute(self, sql, params=None):
+            if sql.startswith("UPDATE employees SET "):
+                captured_updates.append((sql, list(params or [])))
+            if params is not None:
+                return await self._inner.execute(sql, params)
+            return await self._inner.execute(sql)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    async def spy_get_conn():
+        return _ConnSpy(await real_get_conn())
+
+    monkeypatch.setattr(salary_service, "get_conn", spy_get_conn)
+    ctx = AuthContext(user_id="owner-1", company_id="c-sal-pg-flags")
+
+    # 1. 路由层传 EmployeeUpdate(is_owner=False, ...) 模拟前端编辑保存
+    res_false = await route_update_employee(
+        emp["id"],
+        EmployeeUpdate(
+            name="杨云飞",
+            department="行政部",
+            base_salary=Decimal("5000.00"),
+            social_security_base=Decimal("5122.00"),
+            housing_fund_base=Decimal("5000.00"),
+            is_owner=False,
+        ),
+        ctx=ctx,
+    )
+    assert res_false["is_owner"] == 0
+    assert Decimal(res_false["housing_fund_base"]) == Decimal("5000.00")
+
+    # 2. 直接传 bool flags 给 service，验证 is_active=True / is_owner=True 同样强转为精确 int
+    res_true = await salary_service.update_employee(
+        "c-sal-pg-flags",
+        emp["id"],
+        {"is_owner": True, "is_active": True},
+    )
+    assert res_true is not None and res_true["is_owner"] == 1
+
+    # 3. 显式传 is_owner=None 时忽略该非空标记列，不触发 NOT NULL 违约
+    res_none = await salary_service.update_employee(
+        "c-sal-pg-flags",
+        emp["id"],
+        {"is_owner": None, "name": "杨云飞"},
+    )
+    assert res_none is not None and res_none["is_owner"] == 1
+
+    assert len(captured_updates) == 3
+    sql0, params0 = captured_updates[0]
+    assert "is_owner = ?" in sql0
+    assert params0[5] == 0 and type(params0[5]) is int
+
+    sql1, params1 = captured_updates[1]
+    assert "is_active = ?" in sql1 and "is_owner = ?" in sql1
+    assert params1[0] == 1 and type(params1[0]) is int
+    assert params1[1] == 1 and type(params1[1]) is int
+
+    sql2, _ = captured_updates[2]
+    assert "is_owner = ?" not in sql2
+
+
+@pytest.mark.asyncio
+async def test_unaccrue_salary_sheet_reverses_accrual_and_allows_reaccrue():
+    """已过账工资计提可合规红字冲销并退回草稿，幂等且改完可重新计提。"""
+    cid = "c-sal-unaccrue-ok"
+    await _setup_company(cid)
+
+    from sqlalchemy import select
+    from db.models import JournalEntry
+    from db.session import session_scope
+    from services.rd_allocation_service import replace_salary_allocations
+    from services.salary_service import (
+        accrue_salary_sheet, create_employee, get_or_create_salary_sheet,
+        unaccrue_salary_sheet, update_salary_records,
+    )
+
+    await create_employee(cid, "周十", "行政部", 10000, 6000)
+    sheet = await get_or_create_salary_sheet(cid, "2027-10")
+    await replace_salary_allocations(cid, "owner-1", "2027-10", [])
+    await update_salary_records(cid, "2027-10", [
+        {**sheet["records"][0], "personal_tax": "500.00"},
+    ])
+    accrued = await accrue_salary_sheet(cid, "owner-1", "2027-10")
+    assert accrued["status"] == "accrued"
+    first_voucher_id = accrued["accrual_voucher_id"]
+
+    # 撤销确认：生成红字冲销凭证，计提分录全部归零，退回草稿且 generation 递增
+    unaccrued = await unaccrue_salary_sheet(
+        cid, "owner-1", "2027-10", reason="漏算奖金重算", request_id="req-unaccrue-1",
+    )
+    assert unaccrued["status"] == "draft"
+    assert unaccrued["accrual_voucher_id"] is None
+    assert unaccrued["alreadyDraft"] is False
+    assert unaccrued["reversalVoucherId"]
+    assert int(unaccrued["accrual_generation"]) == 1
+
+    async with session_scope() as session:
+        orig = (await session.execute(select(JournalEntry).where(JournalEntry.id == first_voucher_id))).scalar_one()
+        rev = (await session.execute(select(JournalEntry).where(JournalEntry.id == unaccrued["reversalVoucherId"]))).scalar_one()
+        assert orig.status == "reversed"
+        assert rev.status == "posted"
+        assert rev.reversal_of_id == first_voucher_id
+
+    for code in ("221101", "221102", "221104", "2221012"):
+        assert await _account_net_balance(cid, code) == 0, f"{code} 撤销确认后未归零"
+
+    # 重复调用幂等，不生成第二张冲销凭证
+    idem = await unaccrue_salary_sheet(
+        cid, "owner-1", "2027-10", reason="重复点击", request_id="req-unaccrue-2",
+    )
+    assert idem["status"] == "draft"
+    assert idem["alreadyDraft"] is True
+    assert idem["reversalVoucherId"] is None
+
+    # 修改奖金后重计提成功
+    await update_salary_records(cid, "2027-10", [
+        {**unaccrued["records"][0], "bonus": "2000.00"},
+    ])
+    re_accrued = await accrue_salary_sheet(cid, "owner-1", "2027-10")
+    assert re_accrued["status"] == "accrued"
+    assert re_accrued["accrual_voucher_id"] != first_voucher_id
+    assert await _account_net_balance(cid, "221101") != 0
+
+
+@pytest.mark.asyncio
+async def test_unaccrue_salary_sheet_blocks_when_downstream_payment_active():
+    """存在已过账/待复核的发放或税费缴纳凭证时，拦截撤销确认。"""
+    cid = "c-sal-unaccrue-block"
+    await _setup_company(cid)
+
+    from services.rd_allocation_service import replace_salary_allocations
+    from services.salary_service import (
+        accrue_salary_sheet, create_employee, get_or_create_salary_sheet,
+        pay_salary_sheet, unaccrue_salary_sheet,
+    )
+
+    await create_employee(cid, "吴十一", "行政部", 8000, 5000)
+    await get_or_create_salary_sheet(cid, "2027-10")
+    await replace_salary_allocations(cid, "owner-1", "2027-10", [])
+    accrued = await accrue_salary_sheet(cid, "owner-1", "2027-10")
+    await pay_salary_sheet(cid, "owner-1", "2027-10", pay_date="2027-11-05")
+
+    with pytest.raises(ValueError, match="工资发放"):
+        await unaccrue_salary_sheet(cid, "owner-1", "2027-10", reason="误操作撤销")
+
+    still = await get_or_create_salary_sheet(cid, "2027-10")
+    assert still["accrual_voucher_id"] == accrued["accrual_voucher_id"]
+    assert still["status"] == "paid"
+
+
+@pytest.mark.asyncio
+async def test_unaccrue_salary_sheet_blocks_when_period_closed():
+    """已关账月份禁止绕过期间校验静默冲销到次月，必须抛出 PERIOD_CLOSED。"""
+    cid = "c-sal-unaccrue-closed"
+    await _setup_company(cid)
+
+    from datetime import date
+    from sqlalchemy import select
+    from core.errors import PERIOD_CLOSED, AccountingError
+    from db.models import AccountingPeriod
+    from db.session import session_scope
+    from services.rd_allocation_service import replace_salary_allocations
+    from services.salary_service import (
+        accrue_salary_sheet, create_employee, get_or_create_salary_sheet,
+        unaccrue_salary_sheet,
+    )
+
+    await create_employee(cid, "郑十二", "行政部", 8000, 5000)
+    await get_or_create_salary_sheet(cid, "2027-10")
+    await replace_salary_allocations(cid, "owner-1", "2027-10", [])
+    await accrue_salary_sheet(cid, "owner-1", "2027-10")
+
+    async with session_scope() as session:
+        period = (
+            await session.execute(
+                select(AccountingPeriod).where(
+                    AccountingPeriod.company_id == cid,
+                    AccountingPeriod.period_start == date(2027, 10, 1),
+                )
+            )
+        ).scalar_one()
+        period.status = "closed"
+
+    with pytest.raises(AccountingError) as exc_info:
+        await unaccrue_salary_sheet(cid, "owner-1", "2027-10", reason="关账期间尝试撤销")
+    assert exc_info.value.code == PERIOD_CLOSED
+
+
+@pytest.mark.asyncio
+async def test_unaccrue_salary_sheet_deletes_pending_review_accrual_voucher():
+    """复核模式下待复核计提凭证撤回时直接删除草稿/待审凭证并退回草稿。"""
+    cid = "c-sal-unaccrue-pr"
+    await _setup_company(cid)
+
+    from sqlalchemy import select
+    from db.models import AuthUser, Company, CompanyMember, JournalEntry
+    from db.session import session_scope
+    from services.rd_allocation_service import replace_salary_allocations
+    from services.salary_service import (
+        accrue_salary_sheet, create_employee, get_or_create_salary_sheet,
+        unaccrue_salary_sheet,
+    )
+
+    now = "2027-01-01T00:00:00+00:00"
+    async with session_scope() as session:
+        company = (await session.execute(select(Company).where(Company.company_id == cid))).scalar_one()
+        company.posting_policy = "maker_checker"
+        if await session.get(AuthUser, "reviewer-1") is None:
+            session.add(AuthUser(
+                user_id="reviewer-1", openid="", phone="", phone_verified_at="",
+                wechat_openid_bound_at="", current_company_id=cid,
+                nickname="复核员", avatar="", created_at=now, last_login_at=now, updated_at=now,
+            ))
+        session.add(CompanyMember(company_id=cid, user_id="reviewer-1", role="accountant", status="active"))
+
+    await create_employee(cid, "王十四", "行政部", 9000, 6000)
+    await get_or_create_salary_sheet(cid, "2027-10")
+    await replace_salary_allocations(cid, "owner-1", "2027-10", [])
+    accrued = await accrue_salary_sheet(cid, "owner-1", "2027-10")
+    assert accrued["status"] == "pending_review"
+    pending_id = accrued["accrual_voucher_id"]
+
+    res = await unaccrue_salary_sheet(
+        cid, "owner-1", "2027-10", reason="待复核撤回重改", request_id="req-unaccrue-pr",
+    )
+    assert res["status"] == "draft"
+    assert res["reversalVoucherId"] is None
+    assert res["alreadyDraft"] is False
+
+    async with session_scope() as session:
+        row = (await session.execute(select(JournalEntry).where(JournalEntry.id == pending_id))).scalar_one_or_none()
+        assert row is None
+
+    re_accrued = await accrue_salary_sheet(cid, "owner-1", "2027-10")
+    assert re_accrued["status"] == "pending_review"
+    assert re_accrued["accrual_voucher_id"] != pending_id
+
+
+@pytest.mark.asyncio
+async def test_unaccrue_salary_sheet_cascade_reverses_payments_and_unmatches_bank_statement():
+    """已发薪完结态启用 include_payments=True：原子红冲全部工资与税费凭证、解绑银行流水对账，退回草稿可重发。"""
+    cid = "c-sal-unaccrue-cascade"
+    await _setup_company(cid)
+
+    from services.bank_service import _ensure_schema as _ensure_bank_schema
+    from services.database import get_conn
+    from services.rd_allocation_service import replace_salary_allocations
+    from services.salary_service import (
+        _ensure_db_ready, accrue_salary_sheet, apply_salary_payment_from_statement,
+        create_employee, get_or_create_salary_sheet, pay_payroll_liability,
+        pay_salary_sheet, unaccrue_salary_sheet, update_salary_records,
+    )
+
+    await _ensure_db_ready()
+    await _ensure_bank_schema()
+
+    await create_employee(cid, "陈十五", "行政部", 12000, 6000)
+    sheet = await get_or_create_salary_sheet(cid, "2027-10")
+    await replace_salary_allocations(cid, "owner-1", "2027-10", [])
+    sheet = await update_salary_records(cid, "2027-10", [
+        {**sheet["records"][0], "personal_tax": "300.00"},
+    ])
+    accrued = await accrue_salary_sheet(cid, "owner-1", "2027-10")
+    net_salary = accrued["records"][0]["net_salary"]
+
+    # 插入银行流水并完成发薪自动核销，再依次缴纳社保、公积金、个税
+    stmt_id = "stmt-sal-cascade-1"
+    conn = await get_conn()
+    try:
+        await conn.execute(
+            "INSERT INTO bank_statements (id, company_id, transaction_date, description, amount, balance, statement_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+            (stmt_id, cid, "2027-11-10", "代发10月工资", f"-{net_salary}", stmt_id, "2027-11-10T00:00:00+00:00"),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    paid_res = await apply_salary_payment_from_statement(
+        cid, "owner-1", "2027-10", stmt_id, request_id="req-sal-pay-cascade",
+    )
+    assert paid_res["linked"] is True
+    await pay_payroll_liability(cid, "owner-1", "2027-10", "social_security", pay_date="2027-11-12")
+    await pay_payroll_liability(cid, "owner-1", "2027-10", "housing_fund", pay_date="2027-11-12")
+    settled = await pay_payroll_liability(cid, "owner-1", "2027-10", "tax", pay_date="2027-11-12")
+    assert settled["status"] == "paid"
+    assert settled["ssPaymentStatus"] == "posted"
+    assert settled["hfPaymentStatus"] == "posted"
+    assert settled["taxPaymentStatus"] == "posted"
+
+    # 连带冲销重算
+    unaccrued = await unaccrue_salary_sheet(
+        cid, "owner-1", "2027-10",
+        reason="发薪完结后发现奖金漏发",
+        request_id="req-unaccrue-cascade",
+        include_payments=True,
+    )
+    assert unaccrued["status"] == "draft"
+    assert unaccrued["alreadyDraft"] is False
+    assert unaccrued["accrual_voucher_id"] is None
+    assert unaccrued["payment_voucher_id"] is None
+    assert unaccrued["ss_paid_voucher_id"] is None
+    assert unaccrued["hf_paid_voucher_id"] is None
+    assert unaccrued["tax_paid_voucher_id"] is None
+    assert len(unaccrued["reversedVoucherIds"]) == 5
+    assert unaccrued["unmatchedStatementCount"] == 1
+
+    # 银行流水对账必须彻底解绑
+    conn = await get_conn()
+    try:
+        stmt_row = await (await conn.execute(
+            "SELECT matched_entry_id FROM bank_statements WHERE company_id = ? AND id = ?",
+            (cid, stmt_id),
+        )).fetchone()
+        match_rows = await (await conn.execute(
+            "SELECT entry_id FROM bank_statement_matches WHERE company_id = ? AND statement_id = ?",
+            (cid, stmt_id),
+        )).fetchall()
+        assert stmt_row is not None and stmt_row["matched_entry_id"] is None
+        assert len(match_rows) == 0
+    finally:
+        await conn.close()
+
+    # 所有往来挂账与银行科目净额归零
+    for code in ("221101", "221102", "221105", "221104", "2221012", "1002"):
+        assert await _account_net_balance(cid, code) == 0, f"{code} 连带冲销后未归零"
+
+    # 改奖金后重新计提并发薪缴纳，不得撞来源唯一性冲突
+    await update_salary_records(cid, "2027-10", [
+        {**unaccrued["records"][0], "bonus": "1000.00"},
+    ])
+    re_accrued = await accrue_salary_sheet(cid, "owner-1", "2027-10")
+    assert re_accrued["status"] == "accrued"
+    re_paid = await pay_salary_sheet(cid, "owner-1", "2027-10", pay_date="2027-11-15")
+    assert re_paid["status"] == "paid"
+
+
+@pytest.mark.asyncio
+async def test_unaccrue_salary_sheet_cascade_rolls_back_atomically_when_payment_period_closed():
+    """次月发薪期间已关账而计提月未关账时，连带冲销必须整笔原子回滚，绝不半截冲销。"""
+    cid = "c-sal-unaccrue-atomic"
+    await _setup_company(cid)
+
+    from datetime import date
+    from sqlalchemy import select
+    from core.errors import PERIOD_CLOSED, AccountingError
+    from db.models import AccountingPeriod, JournalEntry
+    from db.session import session_scope
+    from services.rd_allocation_service import replace_salary_allocations
+    from services.salary_service import (
+        accrue_salary_sheet, create_employee, get_or_create_salary_sheet,
+        pay_salary_sheet, unaccrue_salary_sheet,
+    )
+
+    await create_employee(cid, "林十六", "行政部", 8000, 5000)
+    await get_or_create_salary_sheet(cid, "2027-10")
+    await replace_salary_allocations(cid, "owner-1", "2027-10", [])
+    accrued = await accrue_salary_sheet(cid, "owner-1", "2027-10")
+    paid = await pay_salary_sheet(cid, "owner-1", "2027-10", pay_date="2027-11-08")
+
+    # 仅关闭 2027-11（发薪月），2027-10（计提月）保持未关账
+    async with session_scope() as session:
+        nov_period = (
+            await session.execute(
+                select(AccountingPeriod).where(
+                    AccountingPeriod.company_id == cid,
+                    AccountingPeriod.period_start == date(2027, 11, 1),
+                )
+            )
+        ).scalar_one()
+        nov_period.status = "closed"
+
+    with pytest.raises(AccountingError) as exc_info:
+        await unaccrue_salary_sheet(
+            cid, "owner-1", "2027-10",
+            reason="跨月部分关账测试",
+            request_id="req-unaccrue-atomic",
+            include_payments=True,
+        )
+    assert exc_info.value.code == PERIOD_CLOSED
+
+    # 原计提与发放凭证均须维持 posted，工资表保持 paid
+    async with session_scope() as session:
+        acc_entry = await session.get(JournalEntry, accrued["accrual_voucher_id"])
+        pay_entry = await session.get(JournalEntry, paid["payment_voucher_id"])
+        assert acc_entry is not None and acc_entry.status == "posted"
+        assert pay_entry is not None and pay_entry.status == "posted"
+
+    still = await get_or_create_salary_sheet(cid, "2027-10")
+    assert still["status"] == "paid"
+    assert still["accrual_voucher_id"] == accrued["accrual_voucher_id"]
+    assert still["payment_voucher_id"] == paid["payment_voucher_id"]
+
+
+@pytest.mark.asyncio
+async def test_opening_month_salary_payment_settles_opening_221101_balance():
+    """建账首月（2026-10-01 启用）发放 9 月工资：冲销 221101 期初贷方余额，不记费用、不超额冲销。"""
+    cid = "c-sal-opening-settle"
+    await _setup_company(cid)
+
+    from fastapi import HTTPException
+    from sqlalchemy import select
+    from db.models import Company, JournalEntry, JournalLine, SourceTransaction
+    from db.session import session_scope
+    from deps.auth import AuthContext
+    from routers.bank import ConfirmSuggestionRequest, confirm_suggestion
+    from services.accounting_core_service import issue_step_up_token
+    from services.bank_service import ensure_bank_schema
+    from services.database import get_conn
+    from services.opening_balance_service import save_opening_balances
+
+    async with session_scope() as session:
+        company = (await session.execute(select(Company).where(Company.company_id == cid))).scalar_one()
+        company.payload = {**(company.payload or {}), "startDate": "2026-10-01"}
+        token = await issue_step_up_token(
+            session, company_id=cid, user_id="owner-1", action="adjust_opening_balance"
+        )
+        await save_opening_balances(
+            cid,
+            2026,
+            [
+                {"account_code": "1002", "account_name": "银行存款", "debit_balance": "50000.00", "credit_balance": "0.00"},
+                {"account_code": "221101", "account_name": "应付职工薪酬-工资", "debit_balance": "0.00", "credit_balance": "9250.00"},
+                {"account_code": "3001", "account_name": "实收资本", "debit_balance": "0.00", "credit_balance": "40750.00"},
+            ],
+            user_id="owner-1",
+            step_up_token=token,
+            request_id="req-open-sal-1",
+            start_period="2026-10",
+            session=session,
+        )
+
+    await ensure_bank_schema()
+    conn = await get_conn()
+    try:
+        for sid in ("stmt-open-sal-1", "stmt-open-sal-2"):
+            await conn.execute(
+                "INSERT INTO bank_statements (id, company_id, transaction_date, description, amount, balance, statement_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+                (
+                    sid, cid, "2026-10-12", "APP移动代发 · 26年9月工资",
+                    "-9250.00", sid, "2026-10-12T00:00:00+00:00",
+                ),
+            )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    # 1) 未显式传入 settleOpeningPayroll 时，仍保持 409 拦截并在 detail.openingPayroll 返回可冲销提示
+    async with session_scope() as session:
+        with pytest.raises(HTTPException) as exc_info:
+            await confirm_suggestion(
+                ConfirmSuggestionRequest(
+                    statement_id="stmt-open-sal-1",
+                    type="new",
+                    new_entry={
+                        "direction": "expense",
+                        "amount": 9250,
+                        "category": "工资发放",
+                        "title": "APP移动代发 · 26年9月工资",
+                    },
+                ),
+                ctx=AuthContext(user_id="owner-1", company_id=cid),
+                request=None,
+                session=session,
+                idempotency_key=None,
+            )
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["code"] == "SALARY_REQUIRES_PAYROLL"
+    assert exc_info.value.detail["openingPayroll"]["canSettle"] is True
+    assert exc_info.value.detail["openingPayroll"]["availableOpeningCredit"] == "9250.00"
+
+    # 2) 显式携带 settleOpeningPayroll=True 后，冲销 221101（借 221101 / 贷 1002），禁止借记 5602001
+    async with session_scope() as session:
+        res = await confirm_suggestion(
+            ConfirmSuggestionRequest(
+                statement_id="stmt-open-sal-1",
+                type="new",
+                settleOpeningPayroll=True,
+                new_entry={
+                    "direction": "expense",
+                    "amount": 9250,
+                    "category": "工资发放",
+                    "title": "APP移动代发 · 26年9月工资",
+                },
+            ),
+            ctx=AuthContext(user_id="owner-1", company_id=cid),
+            request=None,
+            session=session,
+            idempotency_key=None,
+        )
+    assert res["status"] == "created"
+    assert res["settledOpeningPayroll"] is True
+    entry_id = res["entryId"]
+
+    async with session_scope() as session:
+        entry = await session.get(JournalEntry, entry_id)
+        assert entry is not None
+        src = await session.get(SourceTransaction, entry.source_transaction_id)
+        assert src is not None and src.source_type == "opening_payroll_settlement"
+        lines = (
+            await session.execute(select(JournalLine).where(JournalLine.journal_entry_id == entry_id))
+        ).scalars().all()
+        debits = [(l.account_code, Decimal(l.amount)) for l in lines if l.direction == "debit"]
+        credits = [(l.account_code, Decimal(l.amount)) for l in lines if l.direction == "credit"]
+        assert debits == [("221101", Decimal("9250.00"))]
+        assert credits == [("1002", Decimal("9250.00"))]
+
+    # 3) 同额第二笔再次携带 settleOpeningPayroll=True，因期初余额已被冲减至 0，必须被 409 拦截
+    async with session_scope() as session:
+        with pytest.raises(HTTPException) as exc_dup:
+            await confirm_suggestion(
+                ConfirmSuggestionRequest(
+                    statement_id="stmt-open-sal-2",
+                    type="new",
+                    settleOpeningPayroll=True,
+                    new_entry={
+                        "direction": "expense",
+                        "amount": 9250,
+                        "category": "工资发放",
+                        "title": "APP移动代发 · 26年9月工资",
+                    },
+                ),
+                ctx=AuthContext(user_id="owner-1", company_id=cid),
+                request=None,
+                session=session,
+                idempotency_key=None,
+            )
+    assert exc_dup.value.status_code == 409
+    assert exc_dup.value.detail["openingPayroll"]["canSettle"] is False
+    assert exc_dup.value.detail["openingPayroll"]["reason"] == "opening_balance_insufficient"
+
+
+@pytest.mark.asyncio
+async def test_opening_month_salary_payment_rejects_when_opening_221101_insufficient():
+    """期初 221101 余额为 0 时，即使带 settleOpeningPayroll=True 也必须拦截，绝不产生负负债。"""
+    cid = "c-sal-opening-insuff"
+    await _setup_company(cid)
+
+    from fastapi import HTTPException
+    from sqlalchemy import select
+    from db.models import Company
+    from db.session import session_scope
+    from deps.auth import AuthContext
+    from routers.bank import ConfirmSuggestionRequest, confirm_suggestion
+    from services.bank_service import ensure_bank_schema
+    from services.database import get_conn
+
+    async with session_scope() as session:
+        company = (await session.execute(select(Company).where(Company.company_id == cid))).scalar_one()
+        company.payload = {**(company.payload or {}), "startDate": "2026-10-01"}
+
+    await ensure_bank_schema()
+    conn = await get_conn()
+    try:
+        await conn.execute(
+            "INSERT INTO bank_statements (id, company_id, transaction_date, description, amount, balance, statement_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+            ("stmt-insuff", cid, "2026-10-12", "APP移动代发 · 26年9月工资", "-9250.00", "stmt-insuff", "2026-10-12T00:00:00+00:00"),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    async with session_scope() as session:
+        with pytest.raises(HTTPException) as exc_info:
+            await confirm_suggestion(
+                ConfirmSuggestionRequest(
+                    statement_id="stmt-insuff",
+                    type="new",
+                    settleOpeningPayroll=True,
+                    new_entry={
+                        "direction": "expense",
+                        "amount": 9250,
+                        "category": "工资发放",
+                        "title": "APP移动代发 · 26年9月工资",
+                    },
+                ),
+                ctx=AuthContext(user_id="owner-1", company_id=cid),
+                request=None,
+                session=session,
+                idempotency_key=None,
+            )
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["openingPayroll"]["eligible"] is True
+    assert exc_info.value.detail["openingPayroll"]["canSettle"] is False
+    assert exc_info.value.detail["openingPayroll"]["reason"] == "opening_balance_insufficient"
+
+
+@pytest.mark.asyncio
+async def test_ai_suggest_enriches_opening_payroll_settlement_metadata():
+    """ai_suggest_matches 对工资流水附带 payrollSettlement：有期初时返回 opening_balance，无期初时返回 opening_balance_missing。"""
+    from sqlalchemy import select
+    from db.models import Company
+    from db.session import session_scope
+    from services.accounting_core_service import issue_step_up_token
+    from services.bank_service import ai_suggest_matches, ensure_bank_schema
+    from services.database import get_conn
+    from services.opening_balance_service import save_opening_balances
+
+    cid_ok = "c-sal-ai-open-ok"
+    cid_miss = "c-sal-ai-open-miss"
+    await _setup_company(cid_ok)
+    await _setup_company(cid_miss)
+
+    async with session_scope() as session:
+        c_ok = (await session.execute(select(Company).where(Company.company_id == cid_ok))).scalar_one()
+        c_ok.payload = {**(c_ok.payload or {}), "startDate": "2026-10-01"}
+        token = await issue_step_up_token(
+            session, company_id=cid_ok, user_id="owner-1", action="adjust_opening_balance"
+        )
+        await save_opening_balances(
+            cid_ok,
+            2026,
+            [
+                {"account_code": "1002", "account_name": "银行存款", "debit_balance": "50000.00", "credit_balance": "0.00"},
+                {"account_code": "221101", "account_name": "应付职工薪酬-工资", "debit_balance": "0.00", "credit_balance": "9250.00"},
+                {"account_code": "3001", "account_name": "实收资本", "debit_balance": "0.00", "credit_balance": "40750.00"},
+            ],
+            user_id="owner-1",
+            step_up_token=token,
+            request_id="req-open-ai-ok",
+            start_period="2026-10",
+            session=session,
+        )
+        c_miss = (await session.execute(select(Company).where(Company.company_id == cid_miss))).scalar_one()
+        c_miss.payload = {**(c_miss.payload or {}), "startDate": "2026-10-01"}
+
+    await ensure_bank_schema()
+    conn = await get_conn()
+    try:
+        for cid, sid in ((cid_ok, "stmt-ai-ok"), (cid_miss, "stmt-ai-miss")):
+            await conn.execute(
+                "INSERT INTO bank_statements (id, company_id, transaction_date, description, amount, balance, statement_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+                (sid, cid, "2026-10-12", "APP移动代发 · 26年9月工资", "-9250.00", sid, "2026-10-12T00:00:00+00:00"),
+            )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    sugs_ok = await ai_suggest_matches(cid_ok, month="2026-10")
+    assert len(sugs_ok) == 1
+    assert sugs_ok[0]["payrollSettlement"]["mode"] == "opening_balance"
+    assert sugs_ok[0]["payrollSettlement"]["accountCode"] == "221101"
+    assert sugs_ok[0]["requiresReview"] is False
+
+    sugs_miss = await ai_suggest_matches(cid_miss, month="2026-10")
+    assert len(sugs_miss) == 1
+    assert sugs_miss[0]["payrollSettlement"]["mode"] == "opening_balance_missing"
+    assert sugs_miss[0]["requiresReview"] is True
+
+
+@pytest.mark.asyncio
+async def test_tax_channel_exact_social_due_attaches_payroll_settlement():
+    """税单号通道的社保扣款：摘要无法区分险种，但金额命中已计提社保应缴额时必须给工资表核销，而不是让用户猜税种。"""
+    cid = "c-sal-taxch-ss"
+    await _setup_company(cid)
+
+    from db.session import session_scope
+    from services.bank_service import (
+        _enrich_payroll_settlement_suggestions,
+        ensure_bank_schema,
+    )
+    from services.database import get_conn
+    from services.rd_allocation_service import replace_salary_allocations
+    from services.salary_service import (
+        accrue_salary_sheet,
+        create_employee,
+        get_or_create_salary_sheet,
+    )
+
+    await create_employee(cid, "钱一", "技术部", 8000, 5000)
+    sheet = await get_or_create_salary_sheet(cid, "2026-10")
+    await replace_salary_allocations(cid, "owner-1", "2026-10", [])
+    await accrue_salary_sheet(cid, "owner-1", "2026-10")
+
+    record = sheet["records"][0]
+    personal_ss = money_of(
+        Decimal(str(record["personal_social_security"])) - Decimal(str(record["personal_housing_fund"]))
+    )
+    company_ss = money_of(
+        Decimal(str(record["company_social_security"])) - Decimal(str(record["company_housing_fund"]))
+    )
+    due = money_of(personal_ss + company_ss)
+    assert await _account_net_balance(cid, "1002") == 0  # 计提不动银行
+
+    stmt_id = "stmt-taxch-ss"
+    await ensure_bank_schema()
+    conn = await get_conn()
+    try:
+        await conn.execute(
+            "INSERT INTO bank_statements (id, company_id, transaction_date, description, amount, balance, statement_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+            (
+                stmt_id, cid, "2026-11-10",
+                "税款 | 00TX:000990:20261110:000YST:实时缴税:税单号:433016261013026301 (对方: 暂收款)",
+                f"-{due}", stmt_id, "2026-11-10T00:00:00+00:00",
+            ),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    suggestions = [{
+        "statementId": stmt_id,
+        "statement": {
+            "date": "2026-11-10",
+            "description": "税款 | 00TX:000990:20261110:000YST:实时缴税:税单号:433016261013026301 (对方: 暂收款)",
+            "amount": f"-{due}",
+        },
+        "type": "new",
+        "confidence": 0.7,
+        "reason": "税费通道扣款",
+        "suggestedEntry": {
+            "direction": "expense",
+            "category": "税费缴纳",
+            "accountCode": "2221026",
+            "accountName": "应交增值税（小规模纳税人专用）",
+            "title": "税款",
+            "amount": due,
+        },
+    }]
+    await _enrich_payroll_settlement_suggestions(cid, suggestions)
+
+    sug = suggestions[0]
+    assert sug["payrollSettlement"]["mode"] == "salary_sheet"
+    assert sug["payrollSettlement"]["kind"] == "social_security"
+    assert sug["payrollSettlement"]["month"] == "2026-10"
+    assert Decimal(str(sug["payrollSettlement"]["amount"])) == due
+    # 分类必须被纠正：继续挂税费缴纳会让用户在 5 个税类候选里拍板
+    assert sug["suggestedEntry"]["category"] == "社保公积金"
+    assert sug["suggestedEntry"]["accountCode"] == "221102"
+    assert sug["requiresReview"] is False
+
+
+@pytest.mark.asyncio
+async def test_tax_channel_exact_iit_due_maps_to_iit_payable():
+    """税单号通道的个税扣款：命中工资表代扣个税应缴额时归入个税代缴（2221012），不是税费缴纳/所得税费用。"""
+    cid = "c-sal-taxch-tax"
+    await _setup_company(cid)
+
+    from services.bank_service import (
+        _enrich_payroll_settlement_suggestions,
+        ensure_bank_schema,
+    )
+    from services.database import get_conn
+    from services.rd_allocation_service import replace_salary_allocations
+    from services.salary_service import (
+        accrue_salary_sheet,
+        create_employee,
+        get_or_create_salary_sheet,
+        update_salary_records,
+    )
+
+    await create_employee(cid, "孙二", "技术部", 20000, 20000)
+    sheet = await get_or_create_salary_sheet(cid, "2026-10")
+    await replace_salary_allocations(cid, "owner-1", "2026-10", [])
+    await update_salary_records(cid, "2026-10", [
+        {**sheet["records"][0], "personal_tax": "1500.00"},
+    ])
+    await accrue_salary_sheet(cid, "owner-1", "2026-10")
+
+    stmt_id = "stmt-taxch-tax"
+    await ensure_bank_schema()
+    conn = await get_conn()
+    try:
+        await conn.execute(
+            "INSERT INTO bank_statements (id, company_id, transaction_date, description, amount, balance, statement_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+            (
+                stmt_id, cid, "2026-11-15",
+                "税款 | 00TX:000990:20261115:000YST:实时缴税:税单号:333016261000522728 (对方: 暂收款)",
+                "-1500.00", stmt_id, "2026-11-15T00:00:00+00:00",
+            ),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    suggestions = [{
+        "statementId": stmt_id,
+        "statement": {
+            "date": "2026-11-15",
+            "description": "税款 | 00TX:000990:20261115:000YST:实时缴税:税单号:333016261000522728 (对方: 暂收款)",
+            "amount": "-1500.00",
+        },
+        "type": "new",
+        "confidence": 0.7,
+        "reason": "税费通道扣款",
+        "suggestedEntry": {
+            "direction": "expense",
+            "category": "税费缴纳",
+            "accountCode": "2221026",
+            "accountName": "应交增值税（小规模纳税人专用）",
+            "title": "税款",
+            "amount": "1500.00",
+        },
+    }]
+    await _enrich_payroll_settlement_suggestions(cid, suggestions)
+
+    sug = suggestions[0]
+    assert sug["payrollSettlement"]["kind"] == "tax"
+    assert sug["payrollSettlement"]["month"] == "2026-10"
+    assert sug["suggestedEntry"]["category"] == "个税代缴"
+    assert sug["suggestedEntry"]["accountCode"] == "2221012"
+
+
+@pytest.mark.asyncio
+async def test_confirm_iit_category_routes_to_payroll_guard():
+    """银行页选「个税代缴」不得直接入账，必须 409 引导工资模块核销 2221012。"""
+    cid = "c-sal-taxch-guard"
+    await _setup_company(cid)
+
+    from services.bank_service import ensure_bank_schema
+    from services.database import get_conn
+
+    await ensure_bank_schema()
+    conn = await get_conn()
+    try:
+        await conn.execute(
+            "INSERT INTO bank_statements (id, company_id, transaction_date, description, amount, balance, statement_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+            (
+                "stmt-taxch-guard", cid, "2026-11-15",
+                "个人所得税缴纳",
+                "-800.00", "stmt-taxch-guard", "2026-11-15T00:00:00+00:00",
+            ),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    from fastapi import HTTPException
+    from db.session import session_scope
+    from routers.bank import ConfirmSuggestionRequest, confirm_suggestion
+    from deps.auth import AuthContext
+
+    async with session_scope() as session:
+        with pytest.raises(HTTPException) as exc_info:
+            await confirm_suggestion(
+                ConfirmSuggestionRequest(
+                    statement_id="stmt-taxch-guard",
+                    type="new",
+                    new_entry={
+                        "direction": "expense",
+                        "amount": 800,
+                        "category": "个税代缴",
+                        "accountCode": "2221012",
+                        "title": "个税缴纳",
+                    },
+                ),
+                ctx=AuthContext(user_id="owner-1", company_id=cid),
+                request=None,
+                session=session,
+                idempotency_key=None,
+            )
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["code"] == "PAYROLL_TAX_REQUIRES_PAYROLL"
+
+
+@pytest.mark.asyncio
+async def test_carry_forward_identical_month_marks_no_change_and_carries_rd_allocations():
+    """无奖金无变动月份自动带出后 isIdenticalToPrevious=True，并仅继承当月仍有效的研发工时分配。"""
+    from datetime import date
+    from db.session import session_scope
+    from services.rd_allocation_service import get_salary_allocations, replace_salary_allocations
+    from services.rd_service import create_project
+    from services.salary_service import (
+        accrue_salary_sheet,
+        create_employee,
+        get_or_create_salary_sheet,
+    )
+
+    cid = "c-cf-identical-rd"
+    await _setup_company(cid)
+
+    async with session_scope() as session:
+        valid_proj = await create_project(
+            session,
+            cid,
+            "owner-1",
+            {
+                "code": "RD-CF-ACTIVE",
+                "name": "跨月延续项目",
+                "type": "self_started",
+                "status": "active",
+                "startDate": date(2026, 1, 1),
+                "endDate": date(2026, 12, 31),
+            },
+            request_id="req-cf-proj-1",
+        )
+        expired_proj = await create_project(
+            session,
+            cid,
+            "owner-1",
+            {
+                "code": "RD-CF-EXPIRED",
+                "name": "9月结题项目",
+                "type": "self_started",
+                "status": "completed",
+                "startDate": date(2026, 1, 1),
+                "endDate": date(2026, 9, 30),
+            },
+            request_id="req-cf-proj-2",
+        )
+
+    emp = await create_employee(
+        cid, "研发老张", "研发部", Decimal("5000.00"), Decimal("5000.00"), hire_date="2026-01-01"
+    )
+    await get_or_create_salary_sheet(cid, "2026-09")
+    await replace_salary_allocations(
+        cid,
+        "owner-1",
+        "2026-09",
+        [
+            {
+                "employeeId": emp["id"],
+                "projectId": valid_proj["id"],
+                "allocationRate": 0.6,
+                "allocationBasis": "核心研发 60%",
+            },
+            {
+                "employeeId": emp["id"],
+                "projectId": expired_proj["id"],
+                "allocationRate": 0.4,
+                "allocationBasis": "一期收尾 40%",
+            },
+        ],
+    )
+    await accrue_salary_sheet(cid, "owner-1", "2026-09")
+
+    sheet_10 = await get_or_create_salary_sheet(cid, "2026-10")
+    cf = sheet_10["carryForward"]
+    assert cf["hasPreviousSheet"] is True
+    assert cf["sourceMonth"] == "2026-09"
+    assert cf["isIdenticalToPrevious"] is True
+    assert cf["changeReasons"] == []
+
+    allocs_10 = await get_salary_allocations(cid, "owner-1", "2026-10")
+    assert len(allocs_10) == 1
+    assert allocs_10[0]["projectId"] == valid_proj["id"]
+    assert Decimal(allocs_10[0]["allocationRate"]) == Decimal("0.600000") or Decimal(allocs_10[0]["allocationRate"]) == Decimal("0.6")
+
+
+@pytest.mark.asyncio
+async def test_carry_forward_and_sync_previous_respect_roster_updates():
+    """花名册调薪调基后新建草稿或手动重新同步上月，必须采用最新花名册基数并拒绝对已计提表同步。"""
+    from services.rd_allocation_service import replace_salary_allocations
+    from services.salary_service import (
+        accrue_salary_sheet,
+        create_employee,
+        get_or_create_salary_sheet,
+        sync_draft_sheet_from_previous,
+        update_employee,
+        update_salary_records,
+    )
+
+    cid = "c-cf-sync-roster"
+    await _setup_company(cid)
+
+    emp = await create_employee(
+        cid, "陈花名册", "行政部", Decimal("6000.00"), Decimal("5000.00"), hire_date="2026-09-01"
+    )
+    sheet_09 = await get_or_create_salary_sheet(cid, "2026-09")
+    await update_salary_records(
+        cid,
+        "2026-09",
+        [{**sheet_09["records"][0], "allowance": "300.00", "bonus": "500.00"}],
+    )
+    await replace_salary_allocations(cid, "owner-1", "2026-09", [])
+    await accrue_salary_sheet(cid, "owner-1", "2026-09")
+
+    # 10月草稿先按旧花名册开出，之后用户在10月改乱了奖金并在花名册调薪调基
+    sheet_10_init = await get_or_create_salary_sheet(cid, "2026-10")
+    await update_salary_records(
+        cid,
+        "2026-10",
+        [{**sheet_10_init["records"][0], "bonus": "9999.00"}],
+    )
+    await update_employee(
+        cid,
+        emp["id"],
+        {
+            "base_salary": Decimal("9000.00"),
+            "social_security_base": Decimal("8000.00"),
+        },
+    )
+
+    synced = await sync_draft_sheet_from_previous(cid, "2026-10", user_id="owner-1")
+    rec_10 = synced["records"][0]
+    assert rec_10["base_salary"] == "9000.00"
+    assert rec_10["allowance"] == "300.00"
+    assert rec_10["bonus"] == "0.00"
+    # 新社保公积金基数 8000 按默认杭州口径重算（个人 18.5%=1480，单位 33%=2640）
+    assert Decimal(rec_10["personal_social_security"]) == Decimal("1480.00")
+    assert Decimal(rec_10["company_social_security"]) == Decimal("2640.00")
+    assert any("基本工资" in r for r in synced["carryForward"]["changeReasons"])
+
+    # 已计提后禁止再同步覆盖
+    await accrue_salary_sheet(cid, "owner-1", "2026-10")
+    with pytest.raises(ValueError, match="仅草稿状态"):
+        await sync_draft_sheet_from_previous(cid, "2026-10", user_id="owner-1")
+
+
+@pytest.mark.asyncio
+async def test_opening_month_payroll_waterfall_settles_remaining_221101_for_personal_withholding():
+    """情况 A：旧账期初 221101 挂应发工资 11500（含个人代扣 2250），221102/221105 仅挂单位部分；首月发薪+扣社保+扣公积金瀑布冲销后全部清零。"""
+    cid = "c-sal-opening-waterfall"
+    await _setup_company(cid)
+
+    from sqlalchemy import select
+    from db.models import Company, JournalLine
+    from db.session import session_scope
+    from deps.auth import AuthContext
+    from routers.bank import ConfirmSuggestionRequest, confirm_suggestion
+    from services.accounting_core_service import issue_step_up_token
+    from services.bank_service import (
+        _evaluate_opening_payroll_settlement,
+        ai_suggest_matches,
+        ensure_bank_schema,
+    )
+    from services.database import get_conn
+    from services.opening_balance_service import save_opening_balances
+
+    async with session_scope() as session:
+        company = (await session.execute(select(Company).where(Company.company_id == cid))).scalar_one()
+        company.payload = {**(company.payload or {}), "startDate": "2026-10-01"}
+        token = await issue_step_up_token(
+            session, company_id=cid, user_id="owner-1", action="adjust_opening_balance"
+        )
+        await save_opening_balances(
+            cid,
+            2026,
+            [
+                {"account_code": "1002", "account_name": "银行存款", "debit_balance": "50000.00", "credit_balance": "0.00"},
+                {"account_code": "221101", "account_name": "应付职工薪酬-工资", "debit_balance": "0.00", "credit_balance": "11500.00"},
+                {"account_code": "221102", "account_name": "应付职工薪酬-单位社保", "debit_balance": "0.00", "credit_balance": "3000.00"},
+                {"account_code": "221105", "account_name": "应付职工薪酬-住房公积金", "debit_balance": "0.00", "credit_balance": "1000.00"},
+                {"account_code": "3001", "account_name": "实收资本", "debit_balance": "0.00", "credit_balance": "34500.00"},
+            ],
+            user_id="owner-1",
+            step_up_token=token,
+            request_id="req-open-wf",
+            start_period="2026-10",
+            session=session,
+        )
+
+    await ensure_bank_schema()
+    conn = await get_conn()
+    try:
+        for sid, dt, desc, amt in (
+            ("stmt-wf-sal", "2026-10-12", "APP移动代发 · 26年9月工资", "-9250.00"),
+            ("stmt-wf-ss", "2026-10-15", "社会保险费扣款（9月社保）", "-4250.00"),
+            ("stmt-wf-hf", "2026-10-16", "住房公积金扣款（9月公积金）", "-2000.00"),
+        ):
+            await conn.execute(
+                "INSERT INTO bank_statements (id, company_id, transaction_date, description, amount, balance, statement_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+                (sid, cid, dt, desc, amt, sid, f"{dt}T00:00:00+00:00"),
+            )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    # 1) 初始建议：工资 9250 提示冲销后剩余 2250.00 可用于后续个人代扣部分
+    sugs_1 = {s["statementId"]: s for s in await ai_suggest_matches(cid, month="2026-10")}
+    sal_sug = sugs_1["stmt-wf-sal"]
+    assert sal_sug["payrollSettlement"]["mode"] == "opening_balance"
+    assert sal_sug["payrollSettlement"]["remainingOpeningCredit"] == "2250.00"
+    assert "2250.00" in sal_sug["reason"]
+
+    async with session_scope() as session:
+        res_sal = await confirm_suggestion(
+            ConfirmSuggestionRequest(
+                statement_id="stmt-wf-sal",
+                type="new",
+                settleOpeningPayroll=True,
+                new_entry={
+                    "direction": "expense",
+                    "amount": 9250,
+                    "category": "工资发放",
+                    "title": "APP移动代发 · 26年9月工资",
+                },
+            ),
+            ctx=AuthContext(user_id="owner-1", company_id=cid),
+            request=None,
+            session=session,
+            idempotency_key=None,
+        )
+    async with session_scope() as session:
+        lines_sal = (
+            await session.execute(select(JournalLine).where(JournalLine.journal_entry_id == res_sal["entryId"]))
+        ).scalars().all()
+        assert {(l.account_code, Decimal(l.amount)) for l in lines_sal if l.direction == "debit"} == {
+            ("221101", Decimal("9250.00")),
+        }
+        assert {(l.account_code, Decimal(l.amount)) for l in lines_sal if l.direction == "credit"} == {
+            ("1002", Decimal("9250.00")),
+        }
+
+    # 2) 发薪完成后，社保 4250 建议自动拆分为 221102(3000) + 221101(1250)
+    sugs_2 = {s["statementId"]: s for s in await ai_suggest_matches(cid, month="2026-10")}
+    ss_sug = sugs_2["stmt-wf-ss"]
+    assert ss_sug["payrollSettlement"]["mode"] == "opening_balance"
+    assert ss_sug["payrollSettlement"]["allocations"] == [
+        {"accountCode": "221102", "accountName": "应付职工薪酬-单位社保", "amount": "3000.00"},
+        {"accountCode": "221101", "accountName": "应付职工薪酬-工资", "amount": "1250.00"},
+    ]
+    assert "221102" in ss_sug["reason"] and "221101" in ss_sug["reason"]
+
+    async with session_scope() as session:
+        res_ss = await confirm_suggestion(
+            ConfirmSuggestionRequest(
+                statement_id="stmt-wf-ss",
+                type="new",
+                settleOpeningPayroll=True,
+                new_entry={
+                    "direction": "expense",
+                    "amount": 4250,
+                    "category": "社保公积金",
+                    "title": "社会保险费扣款（9月社保）",
+                },
+            ),
+            ctx=AuthContext(user_id="owner-1", company_id=cid),
+            request=None,
+            session=session,
+            idempotency_key=None,
+        )
+    async with session_scope() as session:
+        lines_ss = (
+            await session.execute(select(JournalLine).where(JournalLine.journal_entry_id == res_ss["entryId"]))
+        ).scalars().all()
+        assert {(l.account_code, Decimal(l.amount)) for l in lines_ss if l.direction == "debit"} == {
+            ("221102", Decimal("3000.00")),
+            ("221101", Decimal("1250.00")),
+        }
+        assert {(l.account_code, Decimal(l.amount)) for l in lines_ss if l.direction == "credit"} == {
+            ("1002", Decimal("4250.00")),
+        }
+
+    # 3) 公积金 2000 建议自动拆分为 221105(1000) + 221101(1000)
+    sugs_3 = {s["statementId"]: s for s in await ai_suggest_matches(cid, month="2026-10")}
+    hf_sug = sugs_3["stmt-wf-hf"]
+    assert hf_sug["payrollSettlement"]["mode"] == "opening_balance"
+    assert hf_sug["payrollSettlement"]["allocations"] == [
+        {"accountCode": "221105", "accountName": "应付职工薪酬-住房公积金", "amount": "1000.00"},
+        {"accountCode": "221101", "accountName": "应付职工薪酬-工资", "amount": "1000.00"},
+    ]
+
+    async with session_scope() as session:
+        res_hf = await confirm_suggestion(
+            ConfirmSuggestionRequest(
+                statement_id="stmt-wf-hf",
+                type="new",
+                settleOpeningPayroll=True,
+                new_entry={
+                    "direction": "expense",
+                    "amount": 2000,
+                    "category": "社保公积金",
+                    "title": "住房公积金扣款（9月公积金）",
+                },
+            ),
+            ctx=AuthContext(user_id="owner-1", company_id=cid),
+            request=None,
+            session=session,
+            idempotency_key=None,
+        )
+    async with session_scope() as session:
+        lines_hf = (
+            await session.execute(select(JournalLine).where(JournalLine.journal_entry_id == res_hf["entryId"]))
+        ).scalars().all()
+        assert {(l.account_code, Decimal(l.amount)) for l in lines_hf if l.direction == "debit"} == {
+            ("221105", Decimal("1000.00")),
+            ("221101", Decimal("1000.00")),
+        }
+        assert {(l.account_code, Decimal(l.amount)) for l in lines_hf if l.direction == "credit"} == {
+            ("1002", Decimal("2000.00")),
+        }
+
+        # 4) 三笔冲销后，221101/221102/221104/221105 期初可用余额全部归零
+        rem_ss = await _evaluate_opening_payroll_settlement(
+            session,
+            cid,
+            {"transaction_date": "2026-10-20", "description": "9月社保", "amount": "-1.00"},
+            "liability",
+        )
+        assert rem_ss["availableOpeningCredit"] == "0.00"
+        assert rem_ss["canSettle"] is False
+
+
+@pytest.mark.asyncio
+async def test_opening_month_tax_channel_statement_exposes_opening_social_settlement():
+    """实时缴税通道流水不改动默认税费多义分类，但预附 payrollLiabilitySettlement 供切换「社保公积金」后一键冲销期初 221102+221101。"""
+    cid = "c-sal-tax-channel-open"
+    await _setup_company(cid)
+
+    from sqlalchemy import select
+    from db.models import Company, JournalEntry, JournalLine, SourceTransaction
+    from db.session import session_scope
+    from deps.auth import AuthContext
+    from routers.bank import ConfirmSuggestionRequest, confirm_suggestion
+    from services.accounting_core_service import issue_step_up_token
+    from services.bank_service import ai_suggest_matches, ensure_bank_schema
+    from services.database import get_conn
+    from services.opening_balance_service import save_opening_balances
+
+    async with session_scope() as session:
+        company = (await session.execute(select(Company).where(Company.company_id == cid))).scalar_one()
+        company.payload = {**(company.payload or {}), "startDate": "2026-10-01"}
+        token = await issue_step_up_token(
+            session, company_id=cid, user_id="owner-1", action="adjust_opening_balance"
+        )
+        await save_opening_balances(
+            cid,
+            2026,
+            [
+                {"account_code": "1002", "account_name": "银行存款", "debit_balance": "50000.00", "credit_balance": "0.00"},
+                {"account_code": "221101", "account_name": "应付职工薪酬-工资", "debit_balance": "0.00", "credit_balance": "2250.00"},
+                {"account_code": "221102", "account_name": "应付职工薪酬-单位社保", "debit_balance": "0.00", "credit_balance": "2445.00"},
+                {"account_code": "3001", "account_name": "实收资本", "debit_balance": "0.00", "credit_balance": "45305.00"},
+            ],
+            user_id="owner-1",
+            step_up_token=token,
+            request_id="req-open-tax-ch",
+            start_period="2026-10",
+            session=session,
+        )
+
+    await ensure_bank_schema()
+    conn = await get_conn()
+    try:
+        await conn.execute(
+            "INSERT INTO bank_statements (id, company_id, transaction_date, description, amount, balance, statement_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+            (
+                "stmt-tax-ch-ss",
+                cid,
+                "2026-10-10",
+                "暂收款·税款 · 00TX:000990:20261010:000YST26101017G7U3ZA:实时缴税:税单号:433016261013026301",
+                "-3670.00",
+                "stmt-tax-ch-ss",
+                "2026-10-10T00:00:00+00:00",
+            ),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    sugs = await ai_suggest_matches(cid, month="2026-10")
+    assert len(sugs) == 1
+    sug = sugs[0]
+    assert sug["suggestedEntry"]["category"] == "税费缴纳"
+    assert "payrollSettlement" not in sug
+    assert sug["suggestedEntry"].get("requiresSalarySettlement") is not True
+
+    liab = sug["payrollLiabilitySettlement"]
+    assert liab["mode"] == "opening_balance"
+    assert liab["allocations"] == [
+        {"accountCode": "221102", "accountName": "应付职工薪酬-单位社保", "amount": "2445.00"},
+        {"accountCode": "221101", "accountName": "应付职工薪酬-工资", "amount": "1225.00"},
+    ]
+    assert "221102" in liab["reason"] and "221101" in liab["reason"]
+
+    async with session_scope() as session:
+        res = await confirm_suggestion(
+            ConfirmSuggestionRequest(
+                statement_id="stmt-tax-ch-ss",
+                type="new",
+                settleOpeningPayroll=True,
+                new_entry={
+                    "direction": "expense",
+                    "amount": 3670,
+                    "category": "社保公积金",
+                    "title": "9月社保缴费",
+                },
+            ),
+            ctx=AuthContext(user_id="owner-1", company_id=cid),
+            request=None,
+            session=session,
+            idempotency_key=None,
+        )
+    assert res["settledOpeningPayroll"] is True
+
+    async with session_scope() as session:
+        entry = await session.get(JournalEntry, res["entryId"])
+        assert entry is not None
+        src = await session.get(SourceTransaction, entry.source_transaction_id)
+        assert src is not None and src.source_type == "opening_payroll_settlement"
+        lines = (
+            await session.execute(select(JournalLine).where(JournalLine.journal_entry_id == res["entryId"]))
+        ).scalars().all()
+        assert {(l.account_code, Decimal(l.amount)) for l in lines if l.direction == "debit"} == {
+            ("221102", Decimal("2445.00")),
+            ("221101", Decimal("1225.00")),
+        }
+        assert {(l.account_code, Decimal(l.amount)) for l in lines if l.direction == "credit"} == {
+            ("1002", Decimal("3670.00")),
+        }
+
+
+
+
 
 
 

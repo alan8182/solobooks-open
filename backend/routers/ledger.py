@@ -3,17 +3,25 @@
 
 """账本路由"""
 from datetime import datetime, timezone
+from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import Response
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from db.models import ChartAccount
+from core.chart_policy import auxiliary_kinds_for_account
+from db.models import AuthUser, ChartAccount
 from db.session import get_db_session
 from deps.auth import AuthContext, require_auth
 from models.schemas import AccountCreate, AccountUpdate, AccountNode
 from services.accounts_service import (
     create_account, update_account, delete_account, ensure_sub_account,
+)
+from services.auxiliary_ledger_service import (
+    query_auxiliary_balances,
+    query_auxiliary_combination,
+    query_auxiliary_sub_ledger,
 )
 from services.ledger_service import (
     get_balance_summary,
@@ -24,6 +32,7 @@ from services.ledger_service import (
     query_partner_balances,
     query_sub_ledger,
 )
+from services.ledger_book_pdf_service import render_ledger_book_pdf_async
 from services.ledger_book_service import (
     BookTooLarge,
     InvalidPeriod,
@@ -32,9 +41,13 @@ from services.ledger_book_service import (
 from services.ledger_book_snapshot_service import (
     SnapshotError,
     diff_snapshots,
+    find_matching_issued_snapshot,
     get_snapshot,
     issue_snapshot,
     list_snapshots,
+    render_snapshot_pdf,
+    render_snapshot_pdf_from_row_async,
+    safe_book_filename_part,
     void_snapshot,
 )
 from services.accounting_core_service import ensure_tenant
@@ -93,6 +106,7 @@ async def get_accounts(
                 "isLeaf": account.is_leaf,
                 "quantityEnabled": account.quantity_enabled,
                 "unit": account.unit,
+                "auxiliaryKinds": sorted(auxiliary_kinds_for_account(account.code)) if account.level > 0 else [],
             }
             for account in accounts
         ]
@@ -128,6 +142,7 @@ async def get_accounts_tree(
             "is_active": account.is_active,
             "quantity_enabled": account.quantity_enabled,
             "unit": account.unit,
+            "auxiliary_kinds": sorted(auxiliary_kinds_for_account(account.code)) if account.level > 0 else [],
             "created_at": account.created_at,
             "updated_at": account.updated_at,
             "children": [],
@@ -266,6 +281,98 @@ async def ledger_book(
         raise HTTPException(status_code=413, detail={"code": "BOOK_TOO_LARGE", "message": str(exc)}) from exc
 
 
+def _pdf_response(
+    pdf_bytes: bytes,
+    *,
+    filename: str,
+    content_hash: str,
+    pdf_sha256: str,
+    page_count: int,
+    status: str,
+    book_no: str | None = None,
+    archived: bool | None = None,
+) -> Response:
+    headers = {
+        "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
+        "X-Book-Content-Hash": content_hash,
+        "X-Book-Pdf-Sha256": pdf_sha256,
+        "X-Book-Page-Count": str(page_count),
+        "X-Book-Status": status,
+    }
+    if book_no:
+        headers["X-Book-No"] = book_no
+    if archived is not None:
+        # 1 = 直接下发的签发归档件；0 = 归档件缺失，本次只读现渲染（未落盘）
+        headers["X-Book-Pdf-Archived"] = "1" if archived else "0"
+    return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
+
+
+@router.get("/book/pdf")
+async def ledger_book_pdf(
+    month: str | None = None,
+    year: int | None = None,
+    scope: str = "month",
+    show_zero_rows: bool = False,
+    prefer_issued: bool = False,
+    ctx: AuthContext = Depends(require_auth),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """连续电子账簿 PDF 归档（封面 + 可点击目录 + 书签 + 账页 + 编制说明与签章）。"""
+    try:
+        book = await build_ledger_book(
+            ctx.company_id,
+            month=month,
+            year=year,
+            scope=scope,
+            include_zero_rows=show_zero_rows,
+        )
+    except InvalidPeriod as exc:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_PERIOD", "message": str(exc)}) from exc
+    except BookTooLarge as exc:
+        raise HTTPException(status_code=413, detail={"code": "BOOK_TOO_LARGE", "message": str(exc)}) from exc
+
+    meta = book.get("meta") or {}
+    if prefer_issued and not show_zero_rows:
+        book_kind = "yearly" if scope == "year" else "monthly"
+        period = str(meta.get("year") or "") if scope == "year" else str(meta.get("month") or "")
+        matched = await find_matching_issued_snapshot(
+            ctx.company_id,
+            book_kind=book_kind,
+            period=period,
+            content_hash_value=str(meta.get("contentHash") or ""),
+        )
+        if matched is not None:
+            rendered = await render_snapshot_pdf_from_row_async(matched)
+            return _pdf_response(
+                rendered["pdfBytes"],
+                filename=rendered["fileName"],
+                content_hash=rendered["contentHash"],
+                pdf_sha256=rendered["pdfSha256"],
+                page_count=rendered["pageCount"],
+                status=rendered["status"],
+                book_no=rendered["bookNo"],
+                archived=rendered["archivedPdf"],
+            )
+
+    generated_by = meta.get("generatedBy")
+    if not generated_by:
+        generated_by = (
+            await session.scalar(select(AuthUser.nickname).where(AuthUser.user_id == ctx.user_id))
+        ) or ctx.user_id
+    rendered = await render_ledger_book_pdf_async(book, snapshot_status=None, generated_by=str(generated_by))
+    company_name = safe_book_filename_part(meta.get("companyName"), "电子账簿")
+    period_label = f"{meta.get('year')}年度" if scope == "year" else str(meta.get("month") or "")
+    return _pdf_response(
+        rendered.pdf_bytes,
+        filename=f"{company_name}_电子账簿_{period_label}_预览.pdf",
+        content_hash=str(meta.get("contentHash") or ""),
+        pdf_sha256=rendered.pdf_sha256,
+        page_count=rendered.page_count,
+        status="preview",
+        archived=False,
+    )
+
+
 class IssueBookSnapshotRequest(BaseModel):
     month: str | None = None
     year: int | None = None
@@ -312,8 +419,15 @@ async def list_book_snapshots(
     period: str | None = None,
     ctx: AuthContext = Depends(require_auth),
 ):
-    """已签发账簿列表（不含 payload），用于判断当期是否已签发、是否已过期。"""
-    return {"items": await list_snapshots(ctx.company_id, period=period)}
+    """已签发账簿列表（不含 payload），用于判断当期是否已签发、是否已过期。
+
+    凭证册（book_kind='voucher'）在同一张表里但语义不同，账簿页列表排除它。
+    """
+    return {
+        "items": await list_snapshots(
+            ctx.company_id, period=period, include_kinds=("monthly", "yearly")
+        )
+    }
 
 
 @router.get("/book/snapshots/{snapshot_id}")
@@ -323,6 +437,25 @@ async def get_book_snapshot(snapshot_id: str, ctx: AuthContext = Depends(require
         return await get_snapshot(ctx.company_id, snapshot_id)
     except SnapshotError as exc:
         _raise_snapshot_error(exc)
+
+
+@router.get("/book/snapshots/{snapshot_id}/pdf")
+async def get_book_snapshot_pdf(snapshot_id: str, ctx: AuthContext = Depends(require_auth)):
+    """还原并下载已签发（或已作废）电子账簿快照 PDF。"""
+    try:
+        rendered = await render_snapshot_pdf(ctx.company_id, snapshot_id)
+    except SnapshotError as exc:
+        _raise_snapshot_error(exc)
+    return _pdf_response(
+        rendered["pdfBytes"],
+        filename=rendered["fileName"],
+        content_hash=rendered["contentHash"],
+        pdf_sha256=rendered["pdfSha256"],
+        page_count=rendered["pageCount"],
+        status=rendered["status"],
+        book_no=rendered["bookNo"],
+        archived=rendered["archivedPdf"],
+    )
 
 
 @router.get("/book/snapshots/{snapshot_id}/diff")
@@ -419,8 +552,64 @@ async def partner_balances(
     month: str,
     ctx: AuthContext = Depends(require_auth),
 ):
-    """核算项目余额表：按往来单位汇总某科目的期初/本期/期末。"""
+    """核算项目余额表（旧兼容入口）：按往来单位汇总某科目的期初/本期/期末。"""
     return await query_partner_balances(ctx.company_id, account_code, month)
+
+
+@router.get("/auxiliary-balances")
+async def auxiliary_balances(
+    kind: str = Query(..., description="辅助核算维度：partner / department / project / employee"),
+    month: str = Query(..., description="账期 YYYY-MM"),
+    account_code: str | None = Query(default=None, description="可选科目编码前缀（不传则汇总该维度全部允许科目）"),
+    include_zero: bool = Query(default=False, description="是否包含期初/本期/期末全零的启用档案"),
+    ctx: AuthContext = Depends(require_auth),
+):
+    """核算项目余额表：支持往来单位 / 部门 / 项目 / 职员四维度。"""
+    return await query_auxiliary_balances(
+        ctx.company_id,
+        kind,
+        month,
+        account_code=account_code,
+        include_zero=include_zero,
+    )
+
+
+@router.get("/auxiliary-sub-ledger")
+async def auxiliary_sub_ledger(
+    kind: str = Query(..., description="辅助核算维度：partner / department / project / employee"),
+    item_id: str = Query(..., description="档案 ID（或 __unassigned__ 查未指定项）"),
+    month: str = Query(..., description="账期 YYYY-MM"),
+    account_code: str | None = Query(default=None, description="可选科目编码前缀"),
+    ctx: AuthContext = Depends(require_auth),
+):
+    """核算项目明细账：指定维度与核算项目的逐笔分录流水与滚动余额。"""
+    return await query_auxiliary_sub_ledger(
+        ctx.company_id,
+        kind,
+        item_id,
+        month,
+        account_code=account_code,
+    )
+
+
+@router.get("/auxiliary-combination")
+async def auxiliary_combination(
+    row_dim: str = Query(..., description="行维度：account / partner / department / project / employee"),
+    col_dim: str = Query(..., description="列维度：account / partner / department / project / employee（不能与行维度相同）"),
+    month: str = Query(..., description="账期 YYYY-MM"),
+    metric: str = Query(default="net", description="统计口径：net（本期净发生）/ debit / credit / closing"),
+    account_code: str | None = Query(default=None, description="可选科目范围前缀，如 5602"),
+    ctx: AuthContext = Depends(require_auth),
+):
+    """核算项目组合表：任意两维交叉分析矩阵（部门×项目、科目×部门、科目×职员等）。"""
+    return await query_auxiliary_combination(
+        ctx.company_id,
+        row_dim,
+        col_dim,
+        month,
+        metric=metric,
+        account_code=account_code,
+    )
 
 
 @router.get("/advance-balances")

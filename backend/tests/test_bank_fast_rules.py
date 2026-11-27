@@ -201,6 +201,31 @@ def test_ordinary_service_fee_is_not_bank_fee_without_bank_charge_evidence():
     assert "没有银行手续费、转账费或账户管理费证据" in guarded["reason"]
 
 
+def test_corporate_ebanking_service_fee_passes_bank_fee_guard():
+    """银行自身网银/对公中间业务费用应通过银行手续费守卫，不被打回兜底。"""
+    stmt = {
+        "id": "stmt-ebank-fee",
+        "description": "企业银行各项费用 | 网上企业银行-网上企业银行服务费 (对方: 对公中间业务收入-网上其他收入)",
+        "amount": Decimal("-25.00"),
+        "transaction_date": "2026-10-02",
+    }
+
+    guarded = guard_statement_classification(
+        stmt,
+        {
+            "direction": "expense",
+            "category": "银行及金融手续费",
+            "accountCode": "5603002",
+            "accountName": "财务费用-手续费",
+            "confidence": 0.95,
+        },
+    )
+    assert guarded["category"] == "银行及金融手续费"
+    assert guarded["accountCode"] == "5603002"
+    assert guarded["confidence"] == 0.95
+    assert extract_statement_purpose_key(stmt["description"]) == "银行手续费"
+
+
 def test_prepayment_with_api_wording_is_not_forced_to_it_expense():
     """预付款性质优先按往来处理，不能仅因摘要出现 API 就费用化。"""
     stmt = {
@@ -510,6 +535,18 @@ async def test_rule_match_requires_review_for_refund_closed_period_and_amount_ju
     assert any("历史规则范围" in reason for reason in amount_match["reviewReasons"])
 
 
+async def _ensure_core_schema() -> None:
+    """工资/凭证/银行表单独跑本文件时也要在场（conftest 每轮重建测试库）。"""
+    from db.base import Base
+    import db.models  # noqa: F401
+    from db.session import get_engine
+    from services.bank_service import ensure_bank_schema
+
+    async with get_engine().begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    await ensure_bank_schema()
+
+
 async def _insert_statements(company_id: str, rows: list[tuple]) -> None:
     conn = await get_conn()
     try:
@@ -555,7 +592,102 @@ def test_ambiguity_groups_members_are_valid_categories():
     assert get_ambiguity_group("股东投入") == ["股东投入", "资本公积", "股东垫付"]
     # 往来款组：收入候选对比「是否确认为收入」，支出候选对比「暂付还是费用」
     assert get_ambiguity_group("往来款") == ["往来款", "主营业务收入", "营业外收入", "其他支出"]
+    # 税费缴纳组：金库通用通道仅凭摘要无法区分正常缴税、社保、个税、罚款、滞纳金或所得税
+    assert get_ambiguity_group("税费缴纳") == [
+        "税费缴纳", "社保公积金", "个税代缴", "罚款支出", "税收滞纳金", "所得税费用",
+    ]
     assert get_ambiguity_group("不存在的分类") == []
+
+
+@pytest.mark.asyncio
+async def test_tax_channel_statement_falls_into_tax_ambiguity_group(monkeypatch):
+    """回归 2026-10：「税费社保」通道 -200 是个税逾期申报罚款，不得被判社保。
+
+    摘要只有通用通道词时，确定性规则直接给「税费缴纳」模糊组，让用户在
+    社保公积金 / 个税代缴 / 罚款支出 / 税收滞纳金 / 所得税费用 里拍板；
+    不调 LLM、也不挂「需工资模块核销」。
+    """
+    from services import llm
+
+    company_id = "test_rule_tax_channel_co"
+    await _ensure_core_schema()
+    await _insert_statements(company_id, [
+        ("stmt-tax-channel", company_id, "2026-10-15",
+         "税费社保 (对方: 金库杭州市余杭区支库)", "-200.00", "1000.00",
+         "batch-ch", "2026-10-15T00:00:00Z"),
+    ])
+
+    llm_calls: list[str] = []
+    monkeypatch.setattr(llm, "safe_chat_text_json", lambda *a, **k: llm_calls.append("called"))
+
+    suggestions = await ai_suggest_matches(company_id, month="2026-10")
+    assert len(suggestions) == 1
+    sug = suggestions[0]
+    entry = sug["suggestedEntry"]
+    assert entry["category"] == "税费缴纳"
+    assert entry["accountCode"] == "2221026"
+    assert entry["requiresConfirmation"] is True
+    assert entry.get("requiresSalarySettlement") is not True
+    assert "payrollSettlement" not in sug
+    assert llm_calls == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_social_insurance_statement_still_routes_to_payroll():
+    """摘要写明险种时仍归工资模块核销，不被税费通道规则吞掉。"""
+    company_id = "test_rule_explicit_ss_co"
+    await _ensure_core_schema()
+    await _insert_statements(company_id, [
+        ("stmt-pure-ss", company_id, "2026-10-16",
+         "社会保险费扣款 (对方: 杭州市社会保险管理服务中心)", "-800.00", "1000.00",
+         "batch-ss", "2026-10-16T00:00:00Z"),
+    ])
+
+    suggestions = await ai_suggest_matches(company_id, month="2026-10")
+    assert len(suggestions) == 1
+    entry = suggestions[0]["suggestedEntry"]
+    assert entry["category"] == "社保公积金"
+    assert entry["accountCode"] == "221102"
+    assert entry["requiresSalarySettlement"] is True
+
+
+def test_guard_rejects_social_insurance_guess_for_tax_channel():
+    """模型偶发把通道词归社保时，确认前的闸门也要改回税费模糊组。"""
+    stmt = {
+        "id": "stmt-tax-channel-guard",
+        "description": "税费社保 (对方: 金库杭州市余杭区支库)",
+        "amount": Decimal("-200.00"),
+        "transaction_date": "2026-10-15 10:00:00",
+    }
+    guarded = guard_statement_classification(
+        stmt, {"direction": "expense", "category": "社保公积金"}
+    )
+    assert guarded["category"] == "税费缴纳"
+    assert guarded["accountCode"] == "2221026"
+    assert guarded["requiresConfirmation"] is True
+
+    # 收入方向不参与通道纠偏，不能把税务退费翻成支出
+    income_stmt = {**stmt, "amount": Decimal("200.00")}
+    unchanged = guard_statement_classification(
+        income_stmt, {"direction": "income", "category": "社保公积金"}
+    )
+    assert unchanged["category"] == "社保公积金"
+
+
+@pytest.mark.asyncio
+async def test_tax_payment_and_penalty_categories_do_not_save_auto_rule():
+    """税费缴纳模糊组及一次性罚款/滞纳金不得沉淀为对手方自动规则。"""
+    company_id = "test_no_tax_penalty_rule_co"
+    desc = "税费社保 (对方: 金库杭州市余杭区支库)"
+    for cat in ("税费缴纳", "罚款支出", "税收滞纳金"):
+        saved = await save_company_category_rule(
+            company_id,
+            desc,
+            Decimal("-200.00"),
+            cat,
+            source_statement_id="stmt-treasury-200",
+        )
+        assert saved is None, cat
 
 
 def test_wechat_refund_income_not_hijacked_by_settlement_rule():
@@ -595,9 +727,11 @@ async def test_refund_pair_suggests_offsetting_wanglai():
     by_id = {s["statementId"]: s for s in suggestions}
     assert set(by_id) == {"stmt-pay-1", "stmt-ref-1"}
     assert by_id["stmt-pay-1"]["rule"] == "refund_pair"
+    assert by_id["stmt-pay-1"]["pairedStatementId"] == "stmt-ref-1"
     assert by_id["stmt-pay-1"]["suggestedEntry"]["category"] == "往来款"
     assert by_id["stmt-pay-1"]["suggestedEntry"]["accountCode"] == "122199"
     assert by_id["stmt-ref-1"]["rule"] == "refund_pair"
+    assert by_id["stmt-ref-1"]["pairedStatementId"] == "stmt-pay-1"
     assert by_id["stmt-ref-1"]["suggestedEntry"]["category"] == "往来退款"
     assert by_id["stmt-ref-1"]["suggestedEntry"]["accountCode"] == "122199"
 
@@ -670,3 +804,133 @@ def test_entry_not_after_statement_period_guard():
     assert guard("", "2033-05-31") is True
     assert guard("2033-06-02", "") is True
     assert guard(None, None) is True
+
+
+def test_rule_match_demotes_unrelated_invoice_counterparty():
+    """回归 2026-10：社保金库扣款 -200 曾以「金额完全匹配」高置信推荐给
+    深度求索的发票——发票销方与流水对手方毫无关系时必须降置信并注明。"""
+    from services.bank_service import _try_rule_match
+
+    stmt = {
+        "id": "stmt-shebao",
+        "description": "税费社保 (对方: 金库杭州市余杭区支库)",
+        "amount": Decimal("-200.00"),
+        "transaction_date": "2026-10-15 10:00:00",
+    }
+    invoice_entry = {
+        "id": "entry-deepseek",
+        "title": "发票-杭州深度求索人工智能基础技术研究有限公司",
+        "amount": Decimal("200.00"),
+        "direction": "expense",
+        "occurDate": "2026-10-20",
+        "source": "invoice_import",
+    }
+    suggestion = _try_rule_match(stmt, [invoice_entry])
+
+    assert suggestion is not None
+    assert suggestion["confidence"] <= 0.60
+    assert "流水对方与发票销方不一致" in suggestion["reason"]
+
+
+def test_rule_match_keeps_related_invoice_counterparty():
+    """对方就是销方（直接付款）：高置信保持不变。"""
+    from services.bank_service import _try_rule_match
+
+    stmt = {
+        "id": "stmt-deepseek",
+        "description": "汇兑 | 附言: deepseek调用服务费 (对方: 杭州深度求索人工智能基础技术研究有限公司)",
+        "amount": Decimal("-200.00"),
+        "transaction_date": "2026-10-20 10:00:00",
+    }
+    invoice_entry = {
+        "id": "entry-deepseek",
+        "title": "发票-杭州深度求索人工智能基础技术研究有限公司",
+        "amount": Decimal("200.00"),
+        "direction": "expense",
+        "occurDate": "2026-10-20",
+        "source": "invoice_import",
+    }
+    suggestion = _try_rule_match(stmt, [invoice_entry])
+
+    assert suggestion is not None
+    assert suggestion["confidence"] >= 0.95
+    assert "不一致" not in suggestion["reason"]
+
+
+def test_rule_match_income_invoice_matches_buyer_not_seller():
+    """销项发票（income）应按购方（buyer_name）核对收款流水对方，不能拿本公司销方去比对。"""
+    from services.bank_service import _try_rule_match
+
+    stmt = {
+        "id": "stmt-income-buyer-ok",
+        "description": "提回对公户收款 | 26100900420688 (对方: 深圳市得同保险代理有限公司)",
+        "amount": Decimal("8794.30"),
+        "transaction_date": "2026-10-09 14:25:20",
+    }
+    invoice_entry = {
+        "id": "entry-income-1",
+        "title": "发票-杭州惠保信网络科技有限公司",
+        "buyer_name": "深圳市得同保险代理有限公司",
+        "amount": Decimal("8794.30"),
+        "direction": "income",
+        "occurDate": "2026-10-06",
+        "source": "invoice_import",
+    }
+    suggestion = _try_rule_match(stmt, [invoice_entry])
+
+    assert suggestion is not None
+    assert suggestion["confidence"] >= 0.95
+    assert suggestion["counterparty_mismatch"] is False
+    assert "不一致" not in suggestion["reason"]
+
+
+def test_rule_match_income_invoice_demotes_unrelated_buyer():
+    """销项发票购方与收款流水对方无关时，应降置信并提示与发票购方不一致。"""
+    from services.bank_service import _try_rule_match
+
+    stmt = {
+        "id": "stmt-income-buyer-mismatch",
+        "description": "提回对公户收款 | 结算款 (对方: 某无关贸易有限公司)",
+        "amount": Decimal("8794.30"),
+        "transaction_date": "2026-10-09 14:25:20",
+    }
+    invoice_entry = {
+        "id": "entry-income-2",
+        "title": "发票-杭州惠保信网络科技有限公司",
+        "buyer_name": "深圳市得同保险代理有限公司",
+        "amount": Decimal("8794.30"),
+        "direction": "income",
+        "occurDate": "2026-10-06",
+        "source": "invoice_import",
+    }
+    suggestion = _try_rule_match(stmt, [invoice_entry])
+
+    assert suggestion is not None
+    assert suggestion["confidence"] <= 0.60
+    assert suggestion["counterparty_mismatch"] is True
+    assert "流水对方与发票购方不一致" in suggestion["reason"]
+
+
+def test_rule_match_reimbursement_flow_via_merchant_in_memo():
+    """对方是报销人、但附言带商户名（≥3 字交集）：不误伤报销付款配对。"""
+    from services.bank_service import _try_rule_match
+
+    stmt = {
+        "id": "stmt-baidu",
+        "description": "汇兑 | 附言: 报销百度智能云云服务器3年续期费用 (对方: 杨云飞)",
+        "amount": Decimal("-1794.00"),
+        "transaction_date": "2026-10-26 10:00:00",
+    }
+    invoice_entry = {
+        "id": "entry-baidu",
+        "title": "发票-北京百度网讯科技有限公司",
+        "amount": Decimal("1794.00"),
+        "direction": "expense",
+        "occurDate": "2026-10-17",
+        "source": "invoice_import",
+    }
+    suggestion = _try_rule_match(stmt, [invoice_entry])
+
+    assert suggestion is not None
+    assert suggestion["confidence"] > 0.60
+    assert "不一致" not in suggestion["reason"]

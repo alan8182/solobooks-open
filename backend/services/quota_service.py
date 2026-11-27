@@ -25,7 +25,14 @@ from typing import Any
 
 import config
 from core.errors import CompanyLimitExceededError, QuotaExceededError
-from core.plans import DEFAULT_PLAN_CODE, PLAN_CATALOG, PlanDef, any_limit_configured, get_plan
+from core.plans import (
+    DEFAULT_PLAN_CODE,
+    FIRST_MONTH_PROMO_LOW_QUOTA_RATIO,
+    PLAN_CATALOG,
+    PlanDef,
+    any_limit_configured,
+    get_plan,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +106,50 @@ def _effective_plan(user_row: Any) -> PlanDef:
     return plan
 
 
+def effective_period_limit(plan: PlanDef, user_row: Any, today: date | None = None) -> int | None:
+    """当期基础配额上限（不含 quota_bonus_tokens、新人特惠与永久充值余额）。
+
+    trial 新用户注册后首月（created_at 起 1 个月内）按 first_month_token_quota（20 万）放行，
+    次月起自动恢复 token_quota（10 万）；已订阅过并到期回落的付费用户不重复享受首月额度。
+    """
+    if plan.token_quota is None:
+        return None
+    if plan.first_month_token_quota is not None and not getattr(user_row, "plan_expires_at", None):
+        ref_today = today or datetime.now(timezone.utc).date()
+        created = parse_iso_date(getattr(user_row, "created_at", None))
+        if created is not None and created <= ref_today < add_months(created, 1):
+            return plan.first_month_token_quota
+    return plan.token_quota
+
+
+def active_promo_tokens(user_row: Any, today: date | None = None) -> int:
+    """当前仍处于有效期内的「新人首月体验包」剩余点数（惰性到期，过期返回 0）。"""
+    balance = int(getattr(user_row, "promo_token_balance", 0) or 0)
+    if balance <= 0:
+        return 0
+    expires = parse_iso_date(getattr(user_row, "promo_expires_at", None))
+    if expires is None:
+        return 0
+    ref_today = today or datetime.now(timezone.utc).date()
+    if ref_today > expires:
+        return 0
+    return balance
+
+
+def is_first_month_promo_eligible(plan: PlanDef, user_row: Any) -> bool:
+    """是否有资格购买「新人首月 AI 体验包」（¥1 买 80 万 Token，30 天有效）。
+
+    条件：已启用额度卡口、当前为免费体验版、从未开通过年付套餐（plan_expires_at 为空）、
+    且从未购买过该体验包（promo_purchased_at 为空，含退款不恢复）。
+    """
+    return bool(
+        config.QUOTA_ENFORCEMENT_ENABLED
+        and plan.code == DEFAULT_PLAN_CODE
+        and not getattr(user_row, "plan_expires_at", None)
+        and not getattr(user_row, "promo_purchased_at", None)
+    )
+
+
 # ---------------------------------------------------------------------------
 # 周期计数（随 llm_usage 埋点同事务 upsert；dialect 感知 ON CONFLICT）
 # ---------------------------------------------------------------------------
@@ -132,8 +183,192 @@ def _plan_and_anchor_for(user_row: Any) -> tuple[PlanDef, date]:
     return plan, _anchor_date(user_row, datetime.now(timezone.utc).date())
 
 
-async def record_consumption_async(session: Any, *, user_id: str, tokens: int) -> None:
-    """在既有 async 埋点事务里累计周期计数。尽力而为，绝不抛出影响业务。"""
+def _overage_tokens(new_used: int, tokens: int, limit: int) -> int:
+    """本次调用中超出套餐额度的 token 数（充值余额应扣减的部分）。
+
+    计数行按「总用量」累加；超出 limit 的部分由充值余额承担。用累计口径
+    做差可保证多笔并发/连续调用只对新增的超额部分扣一次余额。
+    """
+    before = max(0, new_used - tokens - limit)
+    after = max(0, new_used - limit)
+    return max(0, after - before)
+
+
+def _overage_note(scene: str, model: str) -> str:
+    return f"AI 消耗超出套餐额度（{scene or 'other'} / {model or '-'}）"[:255]
+
+
+def _split_promo_overage(user: Any, overage: int) -> tuple[int, int]:
+    """超额消耗分配：优先扣有效期内新人特惠余额，剩余部分再扣永久充值余额。"""
+    if overage <= 0:
+        return 0, 0
+    active_promo = active_promo_tokens(user)
+    promo_deduct = min(active_promo, overage) if active_promo > 0 else 0
+    return promo_deduct, overage - promo_deduct
+
+
+async def _charge_balance_overage_async(
+    session: Any,
+    user: Any,
+    plan: PlanDef,
+    period_start: str,
+    tokens: int,
+    *,
+    scene: str = "",
+    model: str = "",
+) -> None:
+    """套餐额度用尽后，先扣有效期内新人特惠余额，再从永久充值余额扣减并写只增流水。"""
+    if not config.QUOTA_ENFORCEMENT_ENABLED or plan.token_quota is None:
+        return
+    from sqlalchemy import case, select, update
+
+    from db.models import AiTokenLedger, AuthUser, UserQuotaCounter
+
+    counter = (
+        await session.execute(
+            select(UserQuotaCounter.used_tokens).where(
+                UserQuotaCounter.user_id == user.user_id,
+                UserQuotaCounter.period_type == plan.period_type,
+                UserQuotaCounter.period_start == period_start,
+            )
+        )
+    ).scalar()
+    new_used = int(counter or 0)
+    base_limit = effective_period_limit(plan, user)
+    if base_limit is None:
+        return
+    limit = base_limit + int(getattr(user, "quota_bonus_tokens", 0) or 0)
+    overage = _overage_tokens(new_used, tokens, limit)
+    promo_deduct, overage = _split_promo_overage(user, overage)
+    if promo_deduct > 0:
+        await session.execute(
+            update(AuthUser)
+            .where(AuthUser.user_id == user.user_id)
+            .values(
+                promo_token_balance=case(
+                    (
+                        AuthUser.promo_token_balance >= promo_deduct,
+                        AuthUser.promo_token_balance - promo_deduct,
+                    ),
+                    else_=0,
+                )
+            )
+        )
+    if overage <= 0:
+        return
+    # 原子扣减：并发充值与消耗都落在同一行，避免读改写丢失更新。允许为负，
+    # 下一次充值会先抵扣欠费；卡口看到余额 <= 0 即停止放行新调用。
+    await session.execute(
+        update(AuthUser)
+        .where(AuthUser.user_id == user.user_id)
+        .values(token_balance=AuthUser.token_balance - overage)
+    )
+    balance_after = int(
+        (
+            await session.execute(
+                select(AuthUser.token_balance).where(AuthUser.user_id == user.user_id)
+            )
+        ).scalar_one()
+        or 0
+    )
+    session.add(
+        AiTokenLedger(
+            user_id=user.user_id,
+            kind="consume",
+            delta_tokens=-overage,
+            balance_after=balance_after,
+            note=_overage_note(scene, model),
+            created_by=user.user_id,
+        )
+    )
+    if balance_after < 0:
+        logger.warning(
+            "AI 充值余额透支 user=%s overage=%s balance=%s（等待充值抵扣）",
+            user.user_id, overage, balance_after,
+        )
+
+
+def _charge_balance_overage_sync(
+    session: Any,
+    user: Any,
+    plan: PlanDef,
+    period_start: str,
+    tokens: int,
+    *,
+    scene: str = "",
+    model: str = "",
+) -> None:
+    if not config.QUOTA_ENFORCEMENT_ENABLED or plan.token_quota is None:
+        return
+    from sqlalchemy import case, select, update
+
+    from db.models import AiTokenLedger, AuthUser, UserQuotaCounter
+
+    counter = session.execute(
+        select(UserQuotaCounter.used_tokens).where(
+            UserQuotaCounter.user_id == user.user_id,
+            UserQuotaCounter.period_type == plan.period_type,
+            UserQuotaCounter.period_start == period_start,
+        )
+    ).scalar()
+    new_used = int(counter or 0)
+    base_limit = effective_period_limit(plan, user)
+    if base_limit is None:
+        return
+    limit = base_limit + int(getattr(user, "quota_bonus_tokens", 0) or 0)
+    overage = _overage_tokens(new_used, tokens, limit)
+    promo_deduct, overage = _split_promo_overage(user, overage)
+    if promo_deduct > 0:
+        session.execute(
+            update(AuthUser)
+            .where(AuthUser.user_id == user.user_id)
+            .values(
+                promo_token_balance=case(
+                    (
+                        AuthUser.promo_token_balance >= promo_deduct,
+                        AuthUser.promo_token_balance - promo_deduct,
+                    ),
+                    else_=0,
+                )
+            )
+        )
+    if overage <= 0:
+        return
+    session.execute(
+        update(AuthUser)
+        .where(AuthUser.user_id == user.user_id)
+        .values(token_balance=AuthUser.token_balance - overage)
+    )
+    balance_after = int(
+        session.execute(
+            select(AuthUser.token_balance).where(AuthUser.user_id == user.user_id)
+        ).scalar_one()
+        or 0
+    )
+    session.add(
+        AiTokenLedger(
+            user_id=user.user_id,
+            kind="consume",
+            delta_tokens=-overage,
+            balance_after=balance_after,
+            note=_overage_note(scene, model),
+            created_by=user.user_id,
+        )
+    )
+    if balance_after < 0:
+        logger.warning(
+            "AI 充值余额透支 user=%s overage=%s balance=%s（等待充值抵扣）",
+            user.user_id, overage, balance_after,
+        )
+
+
+async def record_consumption_async(
+    session: Any, *, user_id: str, tokens: int, scene: str = "", model: str = ""
+) -> None:
+    """在既有 async 埋点事务里累计周期计数，并扣减充值余额超额部分。
+
+    尽力而为，绝不抛出影响业务；余额扣减失败会打 warning 留痕。
+    """
     try:
         from sqlalchemy import select
 
@@ -146,17 +381,23 @@ async def record_consumption_async(session: Any, *, user_id: str, tokens: int) -
             return
         plan, anchor = _plan_and_anchor_for(user)
         start, _end = current_period(plan, anchor, datetime.now(timezone.utc).date())
+        period_start = start.isoformat()
         await session.execute(
             _counter_upsert_stmt(
                 session.get_bind().dialect.name,
-                user_id, plan.period_type, start.isoformat(), tokens,
+                user_id, plan.period_type, period_start, tokens,
             )
         )
+        await _charge_balance_overage_async(
+            session, user, plan, period_start, tokens, scene=scene, model=model
+        )
     except Exception as exc:  # noqa: BLE001
-        logger.debug("quota counter 累计失败（忽略）: %s", exc)
+        logger.warning("quota counter / 充值余额累计失败（忽略）: %s", exc)
 
 
-def record_consumption_sync(session: Any, *, user_id: str, tokens: int) -> None:
+def record_consumption_sync(
+    session: Any, *, user_id: str, tokens: int, scene: str = "", model: str = ""
+) -> None:
     """同步版本：线程池上下文的埋点写路径使用。尽力而为，绝不抛出。"""
     try:
         from sqlalchemy import select
@@ -170,14 +411,18 @@ def record_consumption_sync(session: Any, *, user_id: str, tokens: int) -> None:
             return
         plan, anchor = _plan_and_anchor_for(user)
         start, _end = current_period(plan, anchor, datetime.now(timezone.utc).date())
+        period_start = start.isoformat()
         session.execute(
             _counter_upsert_stmt(
                 session.get_bind().dialect.name,
-                user_id, plan.period_type, start.isoformat(), tokens,
+                user_id, plan.period_type, period_start, tokens,
             )
         )
+        _charge_balance_overage_sync(
+            session, user, plan, period_start, tokens, scene=scene, model=model
+        )
     except Exception as exc:  # noqa: BLE001
-        logger.debug("quota counter 累计失败（忽略）: %s", exc)
+        logger.warning("quota counter / 充值余额累计失败（忽略）: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -227,12 +472,30 @@ def _assemble_state(
     end: date,
     used: int,
     company_count: int | None = None,
+    today: date | None = None,
 ) -> dict[str, Any]:
+    ref_today = today or datetime.now(timezone.utc).date()
     # 开源自部署关闭额度卡口时，对外统一返回不限量，避免前端误展示「已用完」
-    limit = plan.token_quota if config.QUOTA_ENFORCEMENT_ENABLED else None
+    base_limit = effective_period_limit(plan, user_row, today=ref_today)
+    limit = base_limit if config.QUOTA_ENFORCEMENT_ENABLED else None
     max_companies = plan.max_companies if config.QUOTA_ENFORCEMENT_ENABLED else None
     bonus = int(getattr(user_row, "quota_bonus_tokens", 0) or 0)
     effective = None if limit is None else limit + bonus
+    # 充值余额永久有效，不随周期重置；负数表示额度边界上的超额欠费，对外按 0 展示。
+    token_balance = int(getattr(user_row, "token_balance", 0) or 0)
+    promo_balance = active_promo_tokens(user_row, today=ref_today)
+    promo_expires_at = getattr(user_row, "promo_expires_at", None) if promo_balance > 0 else None
+    promo_eligible = is_first_month_promo_eligible(plan, user_row)
+    plan_remaining = max(0, effective - used) if effective is not None else None
+    promo_low_quota = bool(
+        promo_eligible
+        and effective is not None
+        and effective > 0
+        and (
+            used >= int(effective * FIRST_MONTH_PROMO_LOW_QUOTA_RATIO)
+            or ((plan_remaining or 0) + max(0, token_balance)) <= 0
+        )
+    )
     state: dict[str, Any] = {
         "planCode": plan.code,
         "planName": plan.name,
@@ -242,10 +505,21 @@ def _assemble_state(
         "limitTokens": limit,
         "bonusTokens": bonus,
         "usedTokens": used,
+        # 充值余额（原值，可能为负）；前端展示时取 max(0, tokenBalance)
+        "tokenBalance": token_balance,
+        # 新人首月体验包（30 天有效、先于永久余额扣减）
+        "promoTokenBalance": promo_balance,
+        "promoExpiresAt": promo_expires_at,
+        "promoEligible": promo_eligible,
+        "promoLowQuota": promo_low_quota,
         # 付费套餐到期日（ISO 日期串；None = 不适用）。到期后 _effective_plan 已按 trial 口径生效
         "planExpiresAt": getattr(user_row, "plan_expires_at", None),
-        # remaining 基于计数行；limit 为 None（未设限）时恒为 None
-        "remainingTokens": max(0, effective - used) if effective is not None else None,
+        # 可用合计 = 套餐本期剩余 + 有效期内特惠余额 + 充值余额；limit 为 None（未设限）时恒为 None
+        "remainingTokens": (
+            plan_remaining + promo_balance + max(0, token_balance)
+            if plan_remaining is not None
+            else None
+        ),
         # 账套上限（None = 不限；未来面向代账机构开放更多账套）
         "maxCompanies": max_companies,
     }
@@ -267,9 +541,10 @@ async def quota_state(user_id: str) -> dict[str, Any] | None:
         ).scalars().first()
         if user is None:
             return None
+        today = datetime.now(timezone.utc).date()
         plan = _effective_plan(user)
-        anchor = _anchor_date(user, datetime.now(timezone.utc).date())
-        start, end = current_period(plan, anchor, datetime.now(timezone.utc).date())
+        anchor = _anchor_date(user, today)
+        start, end = current_period(plan, anchor, today)
         counter = (
             await session.execute(
                 select(UserQuotaCounter).where(
@@ -288,7 +563,25 @@ async def quota_state(user_id: str) -> dict[str, Any] | None:
             ).scalar_one()
             or 0
         )
-        return _assemble_state(plan, user, start, end, used, company_count=company_count)
+        return _assemble_state(plan, user, start, end, used, company_count=company_count, today=today)
+
+
+async def is_paid_plan_active(user_id: str | None) -> bool:
+    """用户当前是否处于有效付费套餐（非 trial 且未过期）。"""
+    if not user_id:
+        return False
+    from sqlalchemy import select
+
+    from db.models import AuthUser
+    from db.session import session_scope
+
+    async with session_scope() as session:
+        user = (
+            await session.execute(select(AuthUser).where(AuthUser.user_id == user_id))
+        ).scalars().first()
+    if user is None:
+        return False
+    return _effective_plan(user).code != DEFAULT_PLAN_CODE
 
 
 async def ensure_within_company_limit(user_id: str | None) -> None:
@@ -364,7 +657,7 @@ def _load_state_sync(user_id: str) -> dict[str, Any] | None:
             ).scalars().first()
             # 卡口读计数行（PK 单行查询，快）；行缺失时回退聚合一次（含历史回填）
             used = int(counter.used_tokens) if counter else _period_usage_fallback(session, user_id, start, end)
-            return _assemble_state(plan, user, start, end, used)
+            return _assemble_state(plan, user, start, end, used, today=today)
     except Exception as exc:  # noqa: BLE001
         logger.debug("quota state 读取失败，按 fail-open 放行: %s", exc)
         return None
@@ -401,6 +694,9 @@ def ensure_within_quota(user_id: str | None) -> None:
             "periodEnd": state["periodEnd"],
             "limitTokens": state["limitTokens"],
             "usedTokens": state["usedTokens"],
+            "tokenBalance": state.get("tokenBalance", 0),
+            "promoTokenBalance": state.get("promoTokenBalance", 0),
+            "promoEligible": bool(state.get("promoEligible", False)),
         },
     )
 

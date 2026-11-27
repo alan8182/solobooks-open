@@ -7,6 +7,8 @@ import { useRoute, useRouter } from 'vue-router'
 import { NButton, NInput, NModal, NSelect, NSpin, useMessage } from 'naive-ui'
 import {
   diffLedgerBookSnapshots,
+  downloadLedgerBookPdf,
+  downloadLedgerBookSnapshotPdf,
   getLedgerBook,
   getLedgerBookSnapshot,
   issueLedgerBookSnapshot,
@@ -20,7 +22,7 @@ import {
   type LedgerDetailPage,
 } from '@/api/ledger'
 import { useAuthStore } from '@/stores/auth'
-import { exportLedgerBookToExcel } from '@/utils/export'
+import { exportLedgerBookToExcel, saveBlobFile } from '@/utils/export'
 import { reportErrorToast } from '@/utils/errorPresenter'
 import { SoloErrorState, SoloMonthPicker } from '@/components/ui'
 import { formatDate, getCurrentMonth } from '@/utils/format'
@@ -59,6 +61,8 @@ const diffLoading = ref(false)
 const diffData = ref<LedgerSnapshotDiff | null>(null)
 const voidReason = ref('')
 const voiding = ref(false)
+const downloadingPdf = ref(false)
+const downloadingSnapshotId = ref('')
 
 const yearOptions = computed(() =>
   Array.from({ length: 6 }, (_, index) => {
@@ -111,6 +115,47 @@ const generalItems = computed(() => book.value?.general?.items || [])
 const detailPages = computed(() => book.value?.details || [])
 const journalBooks = computed(() => (book.value?.journals || []).filter((item) => item.rows.length > 0))
 const chronologicalRows = computed(() => book.value?.chronological.items || [])
+
+interface TocRow {
+  label: string
+  page: string
+  key?: string
+  workbench?: boolean
+}
+
+/** 目录条目：与后端 _paginate 的 sections 同口径，页码直接取分页真值 */
+const tocRows = computed<TocRow[]>(() => {
+  const rows: TocRow[] = [
+    { label: '科目余额表', page: String(pageStart('balance')), key: 'balance' },
+  ]
+  if (generalItems.value.length) {
+    rows.push({ label: '总账', page: String(pageStart('general')), key: 'general' })
+  }
+  for (const page of detailPages.value) {
+    rows.push({
+      label: `${page.code} ${page.name} 明细账`,
+      page: String(pageStart(`detail:${page.code}`)),
+      key: `detail:${page.code}`,
+    })
+  }
+  for (const journal of journalBooks.value) {
+    rows.push({
+      label: journal.name,
+      page: String(pageStart(`journal:${journal.kind}`)),
+      key: `journal:${journal.kind}`,
+    })
+  }
+  if (chronologicalRows.value.length) {
+    rows.push({ label: '序时账', page: String(pageStart('chronological')), key: 'chronological' })
+  }
+  rows.push({ label: '多栏账、核算项目三表', page: '账簿工作台', workbench: true })
+  rows.push({ label: '研发支出辅助账、固定资产卡片', page: '另册' })
+  return rows
+})
+
+const tocPages = computed(() =>
+  chunks(tocRows.value, book.value?.pagination?.tocRowsPerPage || 38),
+)
 
 const balanceHint = computed(() => {
   const balance = book.value?.balance
@@ -211,9 +256,9 @@ function jumpToSheet(key: string) {
   container.scrollTo({ top: Math.max(0, target), behavior: 'auto' })
 }
 
-/** 目录里的「报表中心」条目：多栏账与核算项目余额没装进这本册子，直接跳过去看 */
-function jumpToReports() {
-  router.push({ path: '/reports', query: { month: month.value } })
+/** 目录里的「账簿工作台」条目：多栏账与核算项目三表不进已签发电子册，直接在工作台另册查打 */
+function jumpToBooks() {
+  router.push({ path: '/ledger/books', query: { book: 'partner-balances', month: month.value } })
 }
 
 function toggleNavExpand(key: string) {
@@ -346,7 +391,8 @@ async function issue() {
     book.value = detail.payload
     snapshotMode.value = { id: detail.id, bookNo: detail.bookNo, status: detail.status }
     await loadIssued()
-    message.success(`已签发正式账簿 ${detail.bookNo}，校验码 ${detail.contentHash.slice(0, 8)}`)
+    const pdfMark = detail.pdfSha256 ? `，PDF 已归档（${detail.pdfSha256.slice(0, 8)}）` : ''
+    message.success(`已签发正式账簿 ${detail.bookNo}${pdfMark}，校验码 ${detail.contentHash.slice(0, 8)}`)
   } catch (err) {
     message.error(accountingErrorText(err))
   } finally {
@@ -429,6 +475,45 @@ function print() {
   window.print()
 }
 
+async function downloadPdf() {
+  if (!book.value || downloadingPdf.value) return
+  downloadingPdf.value = true
+  const company = book.value.meta.companyName || '账套'
+  try {
+    if (snapshotMode.value) {
+      const blob = await downloadLedgerBookSnapshotPdf(snapshotMode.value.id)
+      saveBlobFile(blob, `${company}_电子账簿_${snapshotMode.value.bookNo}.pdf`)
+    } else if (latestIssued.value && !isStale.value && !showZeroRows.value) {
+      const blob = await downloadLedgerBookSnapshotPdf(latestIssued.value.id)
+      saveBlobFile(blob, `${company}_电子账簿_${latestIssued.value.bookNo}.pdf`)
+    } else {
+      const blob = await downloadLedgerBookPdf(buildParams())
+      const suffix = scope.value === 'year' ? `${year.value}年度` : month.value
+      saveBlobFile(blob, `${company}_电子账簿_${suffix}.pdf`)
+    }
+    message.success('电子账簿 PDF 已生成并开始下载')
+  } catch (err) {
+    reportErrorToast(message, err, '生成电子账簿 PDF 失败')
+  } finally {
+    downloadingPdf.value = false
+  }
+}
+
+async function downloadSnapshotPdf(item: LedgerBookSnapshotSummary) {
+  if (downloadingSnapshotId.value) return
+  downloadingSnapshotId.value = item.id
+  const company = book.value?.meta.companyName || '账套'
+  try {
+    const blob = await downloadLedgerBookSnapshotPdf(item.id)
+    saveBlobFile(blob, `${company}_电子账簿_${item.bookNo}.pdf`)
+    message.success(`已下载 ${item.bookNo} PDF`)
+  } catch (err) {
+    reportErrorToast(message, err, '下载快照 PDF 失败')
+  } finally {
+    downloadingSnapshotId.value = ''
+  }
+}
+
 function exportExcel() {
   if (!book.value) {
     message.warning('当前没有可导出的账簿数据')
@@ -466,13 +551,21 @@ usePageRefresh(load)
         <NSelect v-else v-model:value="year" :options="yearOptions" style="width: 120px;" />
       </div>
       <div class="toolbar-right">
+        <NButton secondary @click="router.push(`/vouchers/book?month=${month}`)">
+          <template #icon><i class="ri-booklet-line" /></template>
+          凭证册
+        </NButton>
         <NButton secondary :disabled="!book" @click="exportExcel">
           <template #icon><i class="ri-file-excel-2-line" /></template>
           导出 Excel
         </NButton>
-        <NButton type="primary" :disabled="!book" @click="print">
+        <NButton secondary :disabled="!book" @click="print">
           <template #icon><i class="ri-printer-line" /></template>
-          打印 / 导出 PDF
+          打印
+        </NButton>
+        <NButton type="primary" :disabled="!book" :loading="downloadingPdf" @click="downloadPdf">
+          <template #icon><i class="ri-file-pdf-2-line" /></template>
+          下载 PDF
         </NButton>
       </div>
     </div>
@@ -536,6 +629,15 @@ usePageRefresh(load)
         <span>{{ item.pageCount }} 页</span>
         <span class="history-hash">{{ item.contentHash.slice(0, 8) }}</span>
         <NButton text size="tiny" type="primary" @click="openSnapshot(item)">打开</NButton>
+        <NButton
+          text
+          size="tiny"
+          type="primary"
+          :loading="downloadingSnapshotId === item.id"
+          @click="downloadSnapshotPdf(item)"
+        >
+          下载 PDF
+        </NButton>
         <NButton v-if="canDiff(item)" text size="tiny" @click="openDiff(item)">与上一册比对</NButton>
         <NButton
           v-if="item.status === 'issued'"
@@ -583,29 +685,23 @@ usePageRefresh(load)
           </div>
         </section>
 
-        <!-- 目录（带页码） -->
-        <section class="page-sheet">
+        <!-- 目录（带页码；条目多时按后端 tocRowsPerPage 分页，页码自动顺延） -->
+        <section v-for="(tocChunk, pageIndex) in tocPages" :key="`toc-${pageIndex}`" class="page-sheet">
           <h3 class="section-title">目　录</h3>
           <ol class="toc">
-            <li class="toc-link" title="点击定位" @click="jumpToSheet('balance')"><span>科目余额表</span><i>{{ pageStart('balance') }}</i></li>
-            <li v-if="generalItems.length" class="toc-link" title="点击定位" @click="jumpToSheet('general')"><span>总账</span><i>{{ pageStart('general') }}</i></li>
-            <li v-for="page in detailPages" :key="page.code" class="toc-link" title="点击定位" @click="jumpToSheet(`detail:${page.code}`)">
-              <span>{{ page.code }} {{ page.name }} 明细账</span><i>{{ pageStart(`detail:${page.code}`) }}</i>
+            <li
+              v-for="row in tocChunk"
+              :key="row.label"
+              :class="{ 'toc-link': !!row.key || row.workbench, 'toc-ref': !row.key }"
+              :title="row.key ? '点击定位' : (row.workbench ? '点击前往会计账簿工作台' : '')"
+              @click="row.key ? jumpToSheet(row.key) : (row.workbench ? jumpToBooks() : undefined)"
+            >
+              <span>{{ row.label }}</span><i>{{ row.page }}</i>
             </li>
-            <li v-for="journal in journalBooks" :key="journal.kind" class="toc-link" title="点击定位" @click="jumpToSheet(`journal:${journal.kind}`)">
-              <span>{{ journal.name }}</span><i>{{ pageStart(`journal:${journal.kind}`) }}</i>
-            </li>
-            <li v-if="chronologicalRows.length" class="toc-link" title="点击定位" @click="jumpToSheet('chronological')">
-              <span>序时账</span><i>{{ pageStart('chronological') }}</i>
-            </li>
-            <li class="toc-ref toc-link" title="点击前往报表中心" @click="jumpToReports">
-              <span>多栏账、核算项目余额表</span><i>报表中心</i>
-            </li>
-            <li class="toc-ref"><span>研发支出辅助账、固定资产卡片</span><i>另册</i></li>
           </ol>
           <div class="page-footer">
             <span>{{ meta?.bookNo || '预览件' }}</span>
-            <span>第 {{ pageStart('toc') }} 页 共 {{ totalPages }} 页</span>
+            <span>第 {{ pageStart('toc') + pageIndex }} 页 共 {{ totalPages }} 页</span>
           </div>
         </section>
 

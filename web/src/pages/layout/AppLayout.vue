@@ -22,6 +22,7 @@ import SetupWelcomeModal from '@/components/business/SetupWelcomeModal.vue'
 import Sidebar from './Sidebar.vue'
 import Navbar from './Navbar.vue'
 import PageTabs from './PageTabs.vue'
+import QuotaLowBanner from './QuotaLowBanner.vue'
 import WorkspaceViewNotice from './WorkspaceViewNotice.vue'
 import WorkspaceViewSwitch from '@/components/layout/WorkspaceViewSwitch.vue'
 import GlobalSearch from '@/components/GlobalSearch.vue'
@@ -153,26 +154,30 @@ watch(isMobile, (mobile) => {
 })
 
 onMounted(async () => {
-  if (!authStore.isAuthenticated) {
-    router.push('/login')
-    return
-  }
+  // 加载态必须在任何出口收敛：早先的两个 return 不清 initializing，
+  // 一旦跳转被路由守卫弹回当前路由（登录态判定分裂），页面就永远停在「加载中...」。
   try {
-    await authStore.fetchProfile()
-  } catch {
-    router.push('/login')
-    return
-  }
+    if (!authStore.isAuthenticated) {
+      router.push('/login')
+      return
+    }
+    try {
+      await authStore.fetchProfile()
+    } catch {
+      router.push('/login')
+      return
+    }
 
-  try {
-    await entryStore.fetchEntries()
-  } catch (error) {
-    console.error('Failed to load ledger entries during app initialization', error)
+    try {
+      await entryStore.fetchEntries()
+    } catch (error) {
+      console.error('Failed to load ledger entries during app initialization', error)
+    }
+
+    maybeOpenL0()
   } finally {
     initializing.value = false
   }
-
-  maybeOpenL0()
 })
 </script>
 
@@ -189,6 +194,7 @@ onMounted(async () => {
       <PageTabs />
       <main class="content" data-page-scroll>
         <WorkspaceViewNotice />
+        <QuotaLowBanner />
         <!-- 标签保活：只有开着的标签在 include 里，关掉即释放内存 -->
         <router-view v-slot="{ Component, route: current }">
           <keep-alive :include="tabsStore.cachedViews" :max="14">

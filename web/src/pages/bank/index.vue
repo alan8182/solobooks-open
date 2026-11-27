@@ -1,14 +1,27 @@
 <!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
-import { computed, ref, h, onMounted, watch } from 'vue'
+import { computed, ref, h, onBeforeUnmount, onMounted, watch } from 'vue'
 import { accountingErrorText } from '@/utils/errors'
 import { useRouter } from 'vue-router'
 import {
-  NCard, NButton, NTag, NSpace, useMessage, NSpin,
+  NAlert, NCard, NButton, NTag, NSpace, useMessage, NSpin,
   NInput, NModal, NDataTable, NSelect, NDatePicker, useDialog,
   NCollapse, NCollapseItem,
 } from 'naive-ui'
 import apiClient from '@/api/client'
+import {
+  BANK_RECEIPT_ACCEPT,
+  bindBankReceipt,
+  downloadAttachmentBlob,
+  fetchAttachmentPreviewBlob,
+  listBankReceipts,
+  relinkBankReceipts,
+  uploadBankReceipts,
+  type BankReceiptUploadResult,
+  type VoucherAttachmentItem,
+} from '@/api/attachments'
+import { saveBlobFile } from '@/utils/download'
+import { applySalaryPayment, applyPayrollLiability } from '@/api/salary'
 import { getRdExpenseTypes, getRdProjects } from '@/api/rd'
 import type { RdExpenseTypeOption, RdProject } from '@/api/types'
 import { useDeleteConfirm } from '@/composables/useDeleteConfirm'
@@ -25,13 +38,23 @@ import { SoloDrawer, SoloEmpty, SoloStatusBadge } from '@/components/ui'
 import FileDropzone from '@/components/business/FileDropzone.vue'
 import GuideTrigger from '@/components/business/GuideTrigger.vue'
 import MailInboxCard from '@/components/business/MailInboxCard.vue'
+import OpeningGateAlert from '@/components/business/OpeningGateAlert.vue'
 import BossTrackNav from '@/components/business/BossTrackNav.vue'
 import BankCategoryRulesDrawer from './components/BankCategoryRulesDrawer.vue'
+import { useAuthStore } from '@/stores/auth'
 import { useWorkspaceViewStore } from '@/stores/workspaceView'
 
 const router = useRouter()
 const message = useMessage()
 const dialog = useDialog()
+const authStore = (() => {
+  try {
+    return useAuthStore()
+  } catch {
+    return null
+  }
+})()
+const openingBlocked = computed(() => Boolean(authStore?.openingBalanceRequired))
 const viewStore = useWorkspaceViewStore()
 const { confirmDelete } = useDeleteConfirm()
 
@@ -51,6 +74,206 @@ const checkedRowKeys = ref<Array<string | number>>([])
 const batchDeleting = ref(false)
 const repairingEffects = ref<Record<string, boolean>>({})
 const showCategoryRules = ref(false)
+
+const bankReceiptUploading = ref(false)
+const bankReceiptRelinking = ref(false)
+const bankReceiptResult = ref<BankReceiptUploadResult | null>(null)
+const bankReceipts = ref<VoucherAttachmentItem[]>([])
+
+const receiptsByStatement = computed<Record<string, VoucherAttachmentItem[]>>(() => {
+  const map: Record<string, VoucherAttachmentItem[]> = {}
+  for (const item of bankReceipts.value) {
+    if (!item.bankStatementId) continue
+    ;(map[item.bankStatementId] ||= []).push(item)
+  }
+  return map
+})
+
+const parkedReceipts = computed(() => bankReceipts.value.filter(item => !item.bankStatementId))
+
+async function loadBankReceipts() {
+  try {
+    const res = await listBankReceipts()
+    bankReceipts.value = res.items || []
+  } catch {
+    // 加载回单索引失败不阻断流水对账主流程
+  }
+}
+
+const showReceiptPreviewModal = ref(false)
+const previewStatement = ref<any>(null)
+const previewReceiptList = ref<VoucherAttachmentItem[]>([])
+const previewActiveIndex = ref(0)
+const receiptPreviewUrl = ref('')
+const receiptPreviewLoading = ref(false)
+const receiptPreviewFailed = ref(false)
+const activePreviewReceipt = computed(() => previewReceiptList.value[previewActiveIndex.value] || null)
+
+function revokeReceiptPreview() {
+  if (receiptPreviewUrl.value && typeof URL.revokeObjectURL === 'function') {
+    URL.revokeObjectURL(receiptPreviewUrl.value)
+  }
+  receiptPreviewUrl.value = ''
+}
+
+async function loadReceiptPreviewImage(item: VoucherAttachmentItem | null) {
+  revokeReceiptPreview()
+  receiptPreviewFailed.value = false
+  if (!item || typeof URL.createObjectURL !== 'function') return
+  receiptPreviewLoading.value = true
+  try {
+    const blob = await fetchAttachmentPreviewBlob(item.id)
+    if (showReceiptPreviewModal.value && activePreviewReceipt.value?.id === item.id) {
+      receiptPreviewUrl.value = URL.createObjectURL(blob)
+    }
+  } catch {
+    receiptPreviewFailed.value = true
+  } finally {
+    receiptPreviewLoading.value = false
+  }
+}
+
+function openReceiptPreview(row: any, receipts: VoucherAttachmentItem[]) {
+  previewStatement.value = row
+  previewReceiptList.value = receipts
+  previewActiveIndex.value = 0
+  showReceiptPreviewModal.value = true
+  void loadReceiptPreviewImage(receipts[0] || null)
+}
+
+function selectPreviewReceipt(index: number) {
+  previewActiveIndex.value = index
+  void loadReceiptPreviewImage(previewReceiptList.value[index] || null)
+}
+
+async function handleDownloadReceipt(item: VoucherAttachmentItem) {
+  try {
+    const blob = await downloadAttachmentBlob(item.id)
+    saveBlobFile(blob, item.fileName)
+  } catch (err) {
+    message.error(accountingErrorText(err, '下载回单失败'))
+  }
+}
+
+onBeforeUnmount(revokeReceiptPreview)
+
+const showBindReceiptModal = ref(false)
+const bindTargetStatement = ref<any>(null)
+const selectedBindReceiptId = ref<string | null>(null)
+const bindingReceipt = ref(false)
+
+const bindReceiptOptions = computed(() =>
+  parkedReceipts.value.map((item) => {
+    const meta = (item.parsedMeta || {}) as Record<string, unknown>
+    const txDate = String(meta.txDate || '').trim() || '缺日期'
+    const amount = String(meta.amount || '').trim() ? `¥${String(meta.amount)}` : '未识别金额'
+    const party =
+      meta.direction === 'expense'
+        ? String(meta.payeeName || meta.summary || '')
+        : String(meta.payerName || meta.summary || '')
+    const desc = party || item.fileName
+    const recNo = meta.receiptNo ? ` · #${String(meta.receiptNo)}` : ''
+    return {
+      label: `${txDate} · ${amount} · ${desc}${recNo}`,
+      value: item.id,
+    }
+  }),
+)
+
+function openBindReceiptModal(row: any) {
+  bindTargetStatement.value = row
+  const stmtAbs = Math.abs(Number(row.amount || 0))
+  const suggested = parkedReceipts.value.find((item) => {
+    const amt = Number((item.parsedMeta as Record<string, unknown> | undefined)?.amount || 0)
+    return stmtAbs > 0 && Math.abs(amt - stmtAbs) < 0.01
+  })
+  selectedBindReceiptId.value = suggested?.id || parkedReceipts.value[0]?.id || null
+  showBindReceiptModal.value = true
+}
+
+async function confirmBindReceipt() {
+  if (!bindTargetStatement.value || !selectedBindReceiptId.value) return
+  bindingReceipt.value = true
+  try {
+    await bindBankReceipt(selectedBindReceiptId.value, String(bindTargetStatement.value.id))
+    message.success('已绑定回单到当前流水')
+    showBindReceiptModal.value = false
+    await loadBankReceipts()
+  } catch (err) {
+    message.error(accountingErrorText(err, '绑定回单失败'))
+  } finally {
+    bindingReceipt.value = false
+  }
+}
+
+async function uploadBankReceiptBatch(files: File[]) {
+  if (!files.length) return false
+  bankReceiptUploading.value = true
+  try {
+    const res = await uploadBankReceipts(files, true)
+    bankReceiptResult.value = res
+    const { receiptTotal, matchedCount, parkedCount, statementPdfCount, duplicateCount } = res.summary
+    const parts: string[] = []
+    if (receiptTotal > 0) parts.push(`拆出回单 ${receiptTotal} 笔（已挂流水 ${matchedCount}，待挂 ${parkedCount}）`)
+    if (statementPdfCount > 0) parts.push(`对账单 PDF ${statementPdfCount} 份`)
+    if (duplicateCount > 0) parts.push(`重复跳过 ${duplicateCount} 份`)
+    message.success(parts.length ? parts.join(' · ') : '回单文件处理完成')
+    await loadBankReceipts()
+    return true
+  } catch (err) {
+    message.error(accountingErrorText(err, '上传银行回单失败'))
+    return false
+  } finally {
+    bankReceiptUploading.value = false
+  }
+}
+
+async function handleUnifiedBankUpload(files: File[]) {
+  const tableFiles = files.filter((f) => /\.(xlsx|xls|csv)$/i.test(f.name))
+  const receiptFiles = files.filter((f) => /\.(zip|pdf|png|jpe?g|webp)$/i.test(f.name))
+
+  if (!tableFiles.length && !receiptFiles.length) {
+    message.warning('暂不支持该文件格式，请上传 .xlsx / .xls / .csv 流水或 .zip / .pdf / 图片回单')
+    return
+  }
+
+  if (receiptFiles.length > 0) {
+    const ok = await uploadBankReceiptBatch(receiptFiles)
+    if (ok && tableFiles.length === 0) {
+      showExcelImport.value = false
+    }
+  }
+
+  if (tableFiles.length > 0) {
+    if (tableFiles.length > 1) {
+      message.info('每次预览导入 1 份流水表格，已为你加载第一份')
+    }
+    handleFile(tableFiles[0])
+  }
+}
+
+async function handleRelinkBankReceipts() {
+  bankReceiptRelinking.value = true
+  try {
+    const res = await relinkBankReceipts()
+    await loadBankReceipts()
+    if (bankReceiptResult.value) {
+      bankReceiptResult.value = {
+        ...bankReceiptResult.value,
+        summary: {
+          ...bankReceiptResult.value.summary,
+          matchedCount: bankReceiptResult.value.summary.matchedCount + res.relinked,
+          parkedCount: parkedReceipts.value.length,
+        },
+      }
+    }
+    message.success(res.relinked > 0 ? `已自动挂接 ${res.relinked} 笔银行回单到流水` : '当前没有可新挂接的待匹配回单')
+  } catch {
+    message.error('重新匹配回单失败')
+  } finally {
+    bankReceiptRelinking.value = false
+  }
+}
 
 const balanceSummary = computed(() => diffReport.value?.balance_reconciliation || null)
 const matchedEffectIssues = computed<any[]>(() => diffReport.value?.matched_effect_issues || [])
@@ -303,7 +526,7 @@ const importPreviewColumns = [
 ]
 
 
-const statementColumns = [
+const statementColumns = computed(() => [
   { type: 'selection' as const },
   {
     title: '日期', key: 'transaction_date', width: 110,
@@ -346,10 +569,40 @@ const statementColumns = [
   {
     title: '匹配状态', key: 'matched_entry_id', width: 100,
     // 38 行里通常 38 个「已匹配」。正常态只用灰点 + 灰字，把颜色留给「未匹配」——
-    // 这才是这张表真正需要眼睛停下来的地方。
+    // 已匹配行可点击直达对应记账凭证。
     render: (row: any) => row.matched_entry_id
-      ? h(SoloStatusBadge, { tone: 'neutral', plain: true }, () => '已匹配')
+      ? h(NButton, {
+          text: true,
+          size: 'tiny',
+          title: '点击查看关联记账凭证',
+          onClick: () => router.push(`/vouchers/${row.matched_entry_id}`),
+        }, () => h(SoloStatusBadge, { tone: 'neutral', plain: true }, () => '已匹配'))
       : h(SoloStatusBadge, { tone: 'warning', plain: true }, () => '未匹配'),
+  },
+  {
+    title: '回单', key: 'receipts', width: 92, align: 'center' as const,
+    render: (row: any) => {
+      const matched = receiptsByStatement.value[String(row.id)] || []
+      if (matched.length > 0) {
+        return h(NButton, {
+          size: 'tiny',
+          text: true,
+          type: 'primary',
+          title: '点击查看银行回单原件',
+          onClick: () => openReceiptPreview(row, matched),
+        }, () => matched.length > 1 ? `回单 (${matched.length})` : '查看回单')
+      }
+      if (parkedReceipts.value.length > 0) {
+        return h(NButton, {
+          size: 'tiny',
+          quaternary: true,
+          class: 'row-bind-receipt',
+          title: '从待挂回单中手动绑定到本条流水',
+          onClick: () => openBindReceiptModal(row),
+        }, () => '补绑')
+      }
+      return h('span', { style: 'color: var(--solo-text-muted);' }, '—')
+    },
   },
   {
     title: '操作', key: 'action', width: 90, align: 'center' as const,
@@ -365,7 +618,7 @@ const statementColumns = [
       })
     }, () => '删除')
   }
-]
+])
 
 async function loadStatements() {
   loading.value = true
@@ -378,7 +631,7 @@ async function loadStatements() {
       .sort()
       .at(-1)
     if (!diffReport.value && latestMonth) month.value = latestMonth
-    await loadDiff()
+    await Promise.all([loadDiff(), loadBankReceipts()])
   } catch {
     message.error('加载流水失败')
   } finally {
@@ -444,9 +697,9 @@ async function handleMatch() {
     ruleSuggestedIds.value = aiSuggestions.value.map(item => item.statementId)
     remainingAfterRules.value = Number(result.unmatched || 0)
     if (aiSuggestions.value.length === 0) {
-      message.info(remainingAfterRules.value > 0 ? '规则未找到匹配，可继续使用 AI 分析剩余流水' : '暂无未匹配流水')
+      message.info(remainingAfterRules.value > 0 ? '规则未找到匹配，可点击「AI 分析剩余流水」继续处理' : '暂无未匹配流水')
     } else {
-      message.success(`已生成 ${aiSuggestions.value.length} 条匹配候选，请逐条核对确认`)
+      message.success(`已找到 ${aiSuggestions.value.length} 条可匹配流水，请逐条核对确认`)
     }
   } catch {
     message.error('生成匹配候选失败')
@@ -478,7 +731,23 @@ async function handleAiSuggest() {
   }
 }
 
-async function confirmSuggestion(suggestion: any) {
+async function confirmSuggestion(
+  suggestion: any,
+  forceSettleOpening = false,
+  options?: { reimbursementPayer?: string }
+) {
+  const payroll = suggestion.payrollSettlement
+  if (!forceSettleOpening && payroll?.mode === 'opening_balance_missing') {
+    router.push('/mine/opening')
+    return
+  }
+  if (!forceSettleOpening && payroll?.mode === 'salary_module_required') {
+    router.push({
+      path: '/mine/salary',
+      query: payroll.suggestedMonth ? { month: payroll.suggestedMonth } : {},
+    })
+    return
+  }
   if (isRdSuggestion(suggestion)) {
     const selection = rdSelectionFor(suggestion.statementId)
     if (!selection.projectId || !selection.expenseType) {
@@ -488,6 +757,16 @@ async function confirmSuggestion(suggestion: any) {
   }
   aiConfirming.value[suggestion.statementId] = true
   try {
+    if (payroll?.mode === 'salary_sheet') {
+      const res: any = payroll.kind === 'salary'
+        ? await applySalaryPayment(payroll.month, suggestion.statementId)
+        : await applyPayrollLiability(payroll.month, payroll.kind, suggestion.statementId)
+      message.success(res?.linked ? `${payroll.month} ${payroll.label || '工资'}已核销` : `${payroll.label || '工资'}已确认，请检查流水关联`)
+      aiSuggestions.value = aiSuggestions.value.filter(s => s.statementId !== suggestion.statementId)
+      await loadStatements()
+      return
+    }
+
     const payload: any = {
       statement_id: suggestion.statementId,
       type: suggestion.type,
@@ -495,9 +774,16 @@ async function confirmSuggestion(suggestion: any) {
     if (suggestion.type === 'match') {
       payload.matched_entry_id = suggestion.matchedEntryId
       payload.matched_entry_ids = suggestion.matchedEntryIds || [suggestion.matchedEntryId]
-      payload.auto_post = true
+      if (options?.reimbursementPayer) {
+        payload.reimbursementPayer = options.reimbursementPayer
+      } else {
+        payload.auto_post = true
+      }
     } else {
       const rdSelection = rdSelectionFor(suggestion.statementId)
+      if (forceSettleOpening || payroll?.mode === 'opening_balance') {
+        payload.settleOpeningPayroll = true
+      }
       payload.new_entry = {
         ...suggestion.suggestedEntry,
         occurDate: suggestion.statement.date?.slice(0, 10),
@@ -511,12 +797,46 @@ async function confirmSuggestion(suggestion: any) {
       }
     }
     const result: any = await apiClient.post('/api/bank/confirm-suggestion', payload)
-    message.success(result.settlementStatus && result.settlementStatus !== 'posted'
-      ? '已关联原收款与手续费，结算凭证待过账，请前往凭证页处理' : '确认成功')
+    message.success(result.settledOpeningPayroll
+      ? '已冲销期初应付余额并完成对账'
+      : result.settlementStatus && result.settlementStatus !== 'posted'
+        ? '已关联原收款与手续费，结算凭证待过账，请前往凭证页处理'
+        : '确认成功')
     aiSuggestions.value = aiSuggestions.value.filter(s => s.statementId !== suggestion.statementId)
     await loadStatements()
-  } catch {
-    message.error('确认失败')
+  } catch (err: any) {
+    const detail = err?.response?.data?.detail
+    const code = detail?.code
+    if (code === 'SALARY_REQUIRES_PAYROLL' || code === 'PAYROLL_LIABILITY_REQUIRES_PAYROLL' || code === 'PAYROLL_TAX_REQUIRES_PAYROLL') {
+      const opening = detail?.openingPayroll
+      if (opening?.canSettle) {
+        dialog.info({
+          title: '可冲销开账前期初应付',
+          content: `该笔流水属于建账日（${opening.bookStartDate}）前遗留应付，「${opening.accountCode} ${opening.accountName}」期初可用贷方余额 ¥${opening.availableOpeningCredit}，是否直接冲销期初负债并完成对账？`,
+          positiveText: '立即冲销期初应付',
+          negativeText: '取消',
+          onPositiveClick: () => confirmSuggestion(suggestion, true),
+        })
+      } else if (opening?.eligible) {
+        dialog.warning({
+          title: '期初应付余额不足',
+          content: detail?.message || '请先到「期初设置」补录应付职工薪酬贷方期初余额。',
+          positiveText: '前往期初设置补录',
+          negativeText: '关闭',
+          onPositiveClick: () => { router.push('/mine/opening') },
+        })
+      } else {
+        dialog.warning({
+          title: '需通过工资模块核销',
+          content: detail?.message || '工资及社保公积金扣款需在工资模块先计提并按流水核销。',
+          positiveText: '前往工资模块',
+          negativeText: '关闭',
+          onPositiveClick: () => { router.push('/mine/salary') },
+        })
+      }
+    } else {
+      message.error(accountingErrorText(err) || '确认失败')
+    }
   } finally {
     delete aiConfirming.value[suggestion.statementId]
   }
@@ -667,11 +987,63 @@ usePageRefresh(loadStatements)
       <div class="header-right">
         <NSpace>
           <NButton size="small" @click="showCategoryRules = true">分类规则</NButton>
-          <NButton size="small" :loading="matching" @click="handleMatch">生成匹配候选</NButton>
+          <NButton size="small" :loading="matching" @click="handleMatch">智能对账</NButton>
           <NButton size="small" @click="openExcelImport">导入文件</NButton>
         </NSpace>
       </div>
     </div>
+
+    <OpeningGateAlert v-if="openingBlocked" />
+    <NAlert
+      v-if="bankReceiptResult"
+      :type="bankReceiptResult.summary.parkedCount > 0 ? 'warning' : 'success'"
+      closable
+      class="mb-4"
+      @close="bankReceiptResult = null"
+    >
+      <div class="receipt-alert-row">
+        <span>
+          银行回单归档：拆出 {{ bankReceiptResult.summary.receiptTotal }} 笔（已挂流水
+          {{ bankReceiptResult.summary.matchedCount }} · 待挂 {{ bankReceiptResult.summary.parkedCount }}）
+          <template v-if="bankReceiptResult.summary.statementPdfCount > 0">
+            · 标准对账单 {{ bankReceiptResult.summary.statementPdfCount }} 份
+          </template>
+          <template v-if="bankReceiptResult.summary.duplicateCount > 0">
+            · 重复跳过 {{ bankReceiptResult.summary.duplicateCount }}
+          </template>
+        </span>
+        <NButton
+          v-if="bankReceiptResult.summary.parkedCount > 0"
+          size="tiny"
+          quaternary
+          type="primary"
+          :loading="bankReceiptRelinking"
+          @click="handleRelinkBankReceipts"
+        >
+          重新匹配流水
+        </NButton>
+      </div>
+    </NAlert>
+    <NAlert
+      v-else-if="parkedReceipts.length > 0"
+      type="warning"
+      class="mb-4"
+    >
+      <div class="receipt-alert-row">
+        <span>
+          当前账套有 <strong>{{ parkedReceipts.length }}</strong> 笔待挂银行回单（尚未导入对应月份流水，或可在下方列表点「补绑」手动挂接）
+        </span>
+        <NButton
+          size="tiny"
+          quaternary
+          type="primary"
+          :loading="bankReceiptRelinking"
+          @click="handleRelinkBankReceipts"
+        >
+          重新匹配流水
+        </NButton>
+      </div>
+    </NAlert>
 
     <NSpin :show="loading">
       <section class="reconciliation-summary mb-4" aria-labelledby="reconciliation-title">
@@ -889,7 +1261,7 @@ usePageRefresh(loadStatements)
           :bordered="false"
           :single-line="true"
           :pagination="tablePagination"
-          :scroll-x="980"
+          :scroll-x="1060"
           size="small"
           @update:page="tablePage = $event"
           @update:page-size="tablePageSize = $event; tablePage = 1"
@@ -982,7 +1354,37 @@ usePageRefresh(loadStatements)
               <div class="suggestion-reason">{{ s.reason }}</div>
             </div>
             <div class="suggestion-actions">
-              <NButton size="small" type="primary" :loading="aiConfirming[s.statementId]" @click="confirmSuggestion(s)">确认</NButton>
+              <NButton
+                v-if="s.invoiceReimbursement"
+                size="small"
+                type="primary"
+                :loading="aiConfirming[s.statementId]"
+                @click="confirmSuggestion(s, false, { reimbursementPayer: s.invoiceReimbursement.suggestedPayer })"
+              >
+                按垫付报销入账（两步）
+              </NButton>
+              <NButton
+                v-if="s.invoiceReimbursement"
+                size="small"
+                tertiary
+                :loading="aiConfirming[s.statementId]"
+                @click="confirmSuggestion(s)"
+              >
+                按公户直付
+              </NButton>
+              <NButton v-else size="small" type="primary" :loading="aiConfirming[s.statementId]" @click="confirmSuggestion(s)">
+                {{
+                  s.payrollSettlement?.mode === 'salary_sheet'
+                    ? '核销工资/社保'
+                    : s.payrollSettlement?.mode === 'opening_balance'
+                      ? '冲销期初应付'
+                      : s.payrollSettlement?.mode === 'opening_balance_missing'
+                        ? '去期初设置补录'
+                        : s.payrollSettlement?.mode === 'salary_module_required'
+                          ? '去工资表核对'
+                          : '确认'
+                }}
+              </NButton>
               <NButton size="small" quaternary @click="dismissSuggestion(s.statementId)">忽略</NButton>
             </div>
           </div>
@@ -992,24 +1394,28 @@ usePageRefresh(loadStatements)
 
     <BankCategoryRulesDrawer v-model:show="showCategoryRules" />
 
-    <!-- Import Modal（CSV/Excel 统一走前端解析，CSV 弹窗已移除） -->
-    <NModal v-model:show="showExcelImport" title="导入银行流水文件" preset="card" style="width: min(760px, 92vw);">
+    <!-- 统一导入弹窗（流水表格走预览导入；回单 ZIP/PDF/图片自动拆单挂流水） -->
+    <NModal v-model:show="showExcelImport" title="导入银行流水 / 银行回单" preset="card" style="width: min(760px, 92vw);">
       <template v-if="excelStep === 'upload'">
-        <MailInboxCard collapsible :kinds="['bank']" @import="handleInboxImport" @error="message.error($event)" />
-        <FileDropzone
-          accept=".xlsx,.xls,.csv"
-          icon="ri-bank-line"
-          title="点击或拖拽银行流水文件上传"
-          subtitle="支持网银导出的 .xlsx / .xls / .csv，上传后先预览解析结果，确认后才写入流水"
-          @file="handleFile"
-          @error="message.error($event)"
-        />
+        <OpeningGateAlert v-if="openingBlocked" />
+        <template v-else>
+          <MailInboxCard collapsible :kinds="['bank']" @import="handleInboxImport" @error="message.error($event)" />
+          <FileDropzone
+            :accept="`.xlsx,.xls,.csv,${BANK_RECEIPT_ACCEPT}`"
+            :multiple="true"
+            :loading="bankReceiptUploading"
+            icon="ri-bank-line"
+            title="点击或拖拽银行流水 / 回单文件上传"
+            subtitle="支持 .xlsx / .xls / .csv（解析预览后导入流水）与 .zip / .pdf / 图片（自动拆单并挂接已有流水）"
+            @files="handleUnifiedBankUpload"
+            @error="message.error($event)"
+          />
+        </template>
         <div class="upload-tip">
           <h4>导入说明</h4>
           <ul>
-            <li>使用网银「交易明细 / 流水」导出的文件即可，系统会自动识别日期、金额、余额等关键列。</li>
-            <li>上传后先展示解析预览，核对无误再确认导入。</li>
-            <li>重复流水会自动跳过，同一份文件重复导入不会重复入库。</li>
+            <li><strong>银行流水明细（.xlsx / .xls / .csv）：</strong>使用网银「交易明细 / 流水」导出，上传后先预览解析结果，确认后再写入流水，重复流水会自动跳过。</li>
+            <li><strong>银行回单附件（.zip / .pdf / 图片）：</strong>上传网银导出的回单压缩包或单笔回单，系统自动拆单并匹配挂接到对应银行流水，不重复生成流水。</li>
           </ul>
           <GuideTrigger guide="bank-statement" label="不知道去哪下载？" hint="手机银行导出步骤" />
         </div>
@@ -1169,6 +1575,103 @@ usePageRefresh(loadStatements)
             @click="handleExcelImport"
           >
             确认导入 ({{ importPreview.rows.length }} 条)
+          </NButton>
+        </NSpace>
+      </template>
+    </NModal>
+
+    <!-- 银行回单原件预览弹窗 -->
+    <NModal
+      v-model:show="showReceiptPreviewModal"
+      preset="card"
+      title="银行回单"
+      style="width: min(880px, 94vw);"
+      @after-leave="revokeReceiptPreview"
+    >
+      <div v-if="previewReceiptList.length > 1" class="receipt-modal-tabs">
+        <NButton
+          v-for="(item, idx) in previewReceiptList"
+          :key="item.id"
+          size="tiny"
+          :type="idx === previewActiveIndex ? 'primary' : 'default'"
+          :secondary="idx !== previewActiveIndex"
+          @click="selectPreviewReceipt(idx)"
+        >
+          回单 {{ idx + 1 }}
+        </NButton>
+      </div>
+
+      <NSpin :show="receiptPreviewLoading">
+        <div class="receipt-preview-stage">
+          <img
+            v-if="receiptPreviewUrl"
+            :src="receiptPreviewUrl"
+            :alt="activePreviewReceipt?.fileName || '银行回单'"
+            class="receipt-preview-img"
+          />
+          <div v-else class="receipt-preview-empty">
+            {{ receiptPreviewFailed ? '回单图片加载失败，可点击下方「下载原件」' : '正在加载回单原件…' }}
+          </div>
+        </div>
+      </NSpin>
+
+      <template #footer>
+        <NSpace justify="space-between" align="center" style="width: 100%;">
+          <NButton
+            v-if="previewStatement?.matched_entry_id"
+            size="small"
+            quaternary
+            type="primary"
+            @click="showReceiptPreviewModal = false; router.push(`/vouchers/${previewStatement.matched_entry_id}`)"
+          >
+            查看关联凭证
+          </NButton>
+          <span v-else />
+          <NSpace>
+            <NButton
+              v-if="activePreviewReceipt"
+              size="small"
+              secondary
+              @click="handleDownloadReceipt(activePreviewReceipt)"
+            >
+              下载原件
+            </NButton>
+            <NButton size="small" @click="showReceiptPreviewModal = false">关闭</NButton>
+          </NSpace>
+        </NSpace>
+      </template>
+    </NModal>
+
+    <!-- 手动补绑待挂回单弹窗 -->
+    <NModal
+      v-model:show="showBindReceiptModal"
+      preset="card"
+      title="手动补绑待挂银行回单"
+      style="width: min(560px, 92vw);"
+    >
+      <div v-if="bindTargetStatement" class="bind-stmt-box">
+        <div><strong>流水日期：</strong>{{ String(bindTargetStatement.transaction_date || '').slice(0, 19) }}</div>
+        <div><strong>流水金额：</strong>{{ formatMoney(bindTargetStatement.amount) }}</div>
+        <div><strong>流水摘要：</strong>{{ bindTargetStatement.description || '—' }}</div>
+      </div>
+      <div class="bind-select-label">选择要绑定到本条流水的待挂回单：</div>
+      <NSelect
+        v-model:value="selectedBindReceiptId"
+        :options="bindReceiptOptions"
+        filterable
+        placeholder="按日期、金额、对方户名或回单号搜索"
+      />
+      <template #footer>
+        <NSpace justify="end">
+          <NButton size="small" @click="showBindReceiptModal = false">取消</NButton>
+          <NButton
+            size="small"
+            type="primary"
+            :disabled="!selectedBindReceiptId"
+            :loading="bindingReceipt"
+            @click="confirmBindReceipt"
+          >
+            确认绑定
           </NButton>
         </NSpace>
       </template>
@@ -1813,5 +2316,62 @@ usePageRefresh(loadStatements)
   display: flex;
   align-items: center;
   gap: 8px;
+}
+.receipt-alert-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.row-bind-receipt {
+  color: var(--solo-text-muted);
+}
+.row-bind-receipt:hover {
+  color: var(--solo-primary);
+}
+.receipt-modal-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.receipt-preview-stage {
+  min-height: 240px;
+  max-height: 68vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius-sm);
+  background: var(--solo-bg-page);
+  padding: 10px;
+  overflow: auto;
+}
+.receipt-preview-img {
+  max-width: 100%;
+  max-height: 64vh;
+  object-fit: contain;
+  display: block;
+}
+.receipt-preview-empty {
+  font-size: 13px;
+  color: var(--solo-text-muted);
+}
+.bind-stmt-box {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius-sm);
+  background: var(--solo-bg-page);
+  font-size: 13px;
+  color: var(--solo-text-primary);
+}
+.bind-select-label {
+  font-size: 12.5px;
+  color: var(--solo-text-secondary);
+  margin-bottom: 6px;
 }
 </style>

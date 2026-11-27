@@ -11,6 +11,7 @@ ENV PYTHONUNBUFFERED=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
+    fonts-wqy-zenhei \
     && rm -rf /var/lib/apt/lists/*
 
 # 先复制 requirements.txt 以利用 Docker 缓存

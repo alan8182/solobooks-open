@@ -55,10 +55,24 @@ const BOOK_GROUPS: { title: string; items: BookEntry[] }[] = [
       },
       {
         key: 'partner-balances',
-        label: '往来项目余额',
-        hint: '按往来单位汇总余额',
+        label: '核算项目余额表',
+        hint: '按往来/部门/项目/职员汇总余额',
         icon: 'ri-user-search-line',
         view: defineAsyncComponent(() => import('@/pages/report/partner-balances.vue')),
+      },
+      {
+        key: 'auxiliary-sub-ledger',
+        label: '核算项目明细账',
+        hint: '单项目逐笔分录与滚动余额',
+        icon: 'ri-file-list-2-line',
+        view: defineAsyncComponent(() => import('@/pages/report/auxiliary-sub-ledger.vue')),
+      },
+      {
+        key: 'auxiliary-combination',
+        label: '核算项目组合表',
+        hint: '两维交叉透视统计矩阵',
+        icon: 'ri-grid-line',
+        view: defineAsyncComponent(() => import('@/pages/report/auxiliary-combination.vue')),
       },
     ],
   },
@@ -91,7 +105,7 @@ function openWholeBook() {
     <header class="books-header">
       <div class="books-title-group">
         <h1 class="books-title">会计账簿</h1>
-        <p class="books-subtitle">五本账共用凭证底数，切换账册保留当前期间</p>
+        <p class="books-subtitle">七本账共用凭证底数，切换账册保留当前期间</p>
       </div>
 
       <div class="books-actions">

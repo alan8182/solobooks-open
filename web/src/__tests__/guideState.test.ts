@@ -4,8 +4,10 @@
  */
 
 import { beforeEach, describe, expect, it } from 'vitest'
+import { createPinia, setActivePinia } from 'pinia'
 import {
   ARCHIVE_AFTER_DAYS,
+  DEMO_TOUR_STEPS,
   EXPAND_WINDOW_DAYS,
   emptyGuideState,
   guideStorageKey,
@@ -15,6 +17,7 @@ import {
   resetGuideState,
   resolveChecklistDisplay,
   shouldOpenL0Modal,
+  useGuideStateStore,
   writeGuideState,
 } from '@/stores/guideState'
 import type { SetupReadiness } from '@/api/types'
@@ -77,6 +80,23 @@ describe('guide state storage', () => {
     resetGuideState('c1')
 
     expect(readGuideState('c1').collapsed).toBe(false)
+  })
+
+  it('normalises demoTourVisited and stays compatible with legacy storage', () => {
+    localStorage.setItem(guideStorageKey('c1'), JSON.stringify({ version: 1, collapsed: false }))
+    expect(readGuideState('c1').demoTourVisited).toEqual([])
+
+    writeGuideState('c1', {
+      demoTourVisited: ['reports', 'reports', 123 as unknown as string, 'bank'],
+    })
+    expect(readGuideState('c1').demoTourVisited).toEqual(['reports', 'bank'])
+
+    setActivePinia(createPinia())
+    const store = useGuideStateStore()
+    store.markDemoTourStep('closing')
+    store.markDemoTourStep('closing')
+    expect(store.state.demoTourVisited).toEqual(['closing'])
+    expect(DEMO_TOUR_STEPS.map((s) => s.key)).toEqual(['reports', 'bank', 'closing'])
   })
 })
 

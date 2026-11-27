@@ -77,6 +77,15 @@ const quotaPercent = computed(() => {
   const effective = quota.limitTokens + (quota.bonusTokens || 0)
   return Math.min(100, Math.round((quota.usedTokens / effective) * 100))
 })
+// 套餐本期剩余（不含充值点数）；usedTokens 含超出套餐后从点数扣减的部分
+const planRemainingTokens = computed(() => {
+  const quota = quotaInfo.value
+  if (!quota || quota.limitTokens === null) return null
+  const effective = quota.limitTokens + (quota.bonusTokens || 0)
+  return Math.max(0, effective - quota.usedTokens)
+})
+// 购买的 AI 点数余额（永久有效，1 点 = 1 token）
+const tokenBalance = computed(() => usageStore.summary?.quota?.tokenBalance ?? 0)
 
 function formatTokens(n: number): string {
   if (!n) return '0'
@@ -306,8 +315,8 @@ onMounted(async () => {
           <div class="item-desc">
             {{
               planInfo?.planExpiresAt
-                ? '年付 500 万 Token 额度 · 最多 3 个账套，到期后自动回落免费体验版'
-                : '免费体验版 · 每月 10 万 Token、最多 3 个账套，升级标准版年享 500 万 Token'
+                ? '年付 1000 万 Token 额度 · 最多 3 个账套，到期后自动回落免费体验版'
+                : '免费体验版 · 首月 20 万 Token（新人可 ¥1 扩容至 100 万），次月起每月 10 万 Token、最多 3 个账套，升级标准版年享 1000 万 Token'
             }}
           </div>
         </div>
@@ -359,8 +368,26 @@ onMounted(async () => {
             :status="quotaPercent >= 100 ? 'error' : 'default'"
           />
           <div class="quota-remaining">
-            {{ quotaPercent >= 100 ? '本期额度已用完，升级套餐或等待下期恢复' : `本期剩余 ${formatTokens(quotaInfo.remainingTokens ?? 0)} tokens` }}
+            <template v-if="quotaPercent >= 100">
+              {{
+                (quotaInfo?.promoTokenBalance ?? 0) > 0
+                  ? `套餐额度已用完，优先从新人体验包扣减（剩余 ${formatTokens(quotaInfo?.promoTokenBalance ?? 0)} 点）`
+                  : tokenBalance > 0
+                    ? `套餐额度已用完，后续自动从 AI 点数余额扣减（当前 ${formatTokens(tokenBalance)} 点）`
+                    : '本期额度已用完，升级套餐或等待下期恢复'
+              }}
+            </template>
+            <template v-else>
+              本期套餐剩余 {{ formatTokens(planRemainingTokens ?? 0) }} tokens
+            </template>
           </div>
+        </div>
+
+        <div v-if="tokenBalance !== 0" class="quota-token-balance">
+          <span>
+            AI 点数余额 <strong>{{ formatTokens(tokenBalance) }}</strong> 点（永久有效，套餐用尽后自动扣减）
+          </span>
+          <NButton text type="primary" size="tiny" @click="goPlanPage()">去充值</NButton>
         </div>
 
         <div v-if="usageScenes.length" class="usage-scenes">
@@ -449,6 +476,34 @@ onMounted(async () => {
               user?.wechat_bound
                 ? '已关联微信账号，支持与移动端/小程序免密快捷同步'
                 : '绑定微信后可在微信小程序同步登录并接收重要待办通知'
+            }}
+          </div>
+        </div>
+      </div>
+
+      <div class="item-divider" />
+
+      <!-- 微信（网页）：开放平台网站应用扫码登录，与小程序 wechat_bound 分开统计 -->
+      <div class="setting-item-row">
+        <div class="item-icon-box wechat-icon">
+          <i class="ri-wechat-line" />
+        </div>
+        <div class="item-info">
+          <div class="item-title">
+            <span>微信（网页）</span>
+            <NTag
+              size="tiny"
+              :type="user?.wechat_web_bound ? 'success' : 'default'"
+              :bordered="false"
+            >
+              {{ user?.wechat_web_bound ? '已绑定' : '未绑定' }}
+            </NTag>
+          </div>
+          <div class="item-desc">
+            {{
+              user?.wechat_web_bound
+                ? '已关联微信开放平台账号，可在电脑登录页微信扫码免密登录'
+                : '在电脑登录页使用微信扫码登录后将自动关联（首次需绑定手机号）'
             }}
           </div>
         </div>
@@ -848,6 +903,22 @@ onMounted(async () => {
   margin-top: 6px;
   font-size: 12px;
   color: var(--solo-text-muted);
+}
+.quota-token-balance {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 8px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--solo-bg-soft);
+  font-size: 12.5px;
+  color: var(--solo-text-secondary);
+}
+.quota-token-balance strong {
+  color: var(--solo-primary);
+  font-variant-numeric: tabular-nums;
 }
 @media (max-width: 640px) {
   .usage-summary {

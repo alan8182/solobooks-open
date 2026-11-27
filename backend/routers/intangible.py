@@ -42,6 +42,7 @@ from models.schemas import (
     IntangibleRejectRequest,
 )
 from services.accounting_core_service import ensure_tenant
+from services.setup_readiness_service import assert_migration_opening_ready
 from services.amortization_engine import (
     amortization_summary,
     get_runs,
@@ -114,6 +115,7 @@ async def create_intangible_asset(
     ctx: AuthContext = Depends(require_auth),
     session: AsyncSession = Depends(get_db_session),
 ):
+    await assert_migration_opening_ready(session, ctx.company_id)
     data = payload.model_dump()
     payment_method = data.pop("paymentMethod", "company_account")
     asset = await create_asset(
@@ -157,6 +159,7 @@ async def create_intangible_asset_from_entry(
     ctx: AuthContext = Depends(require_auth),
     session: AsyncSession = Depends(get_db_session),
 ):
+    await assert_migration_opening_ready(session, ctx.company_id)
     asset = await create_intangible_asset_from_entry_service(
         session,
         payload.model_dump(),

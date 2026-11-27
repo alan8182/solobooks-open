@@ -131,3 +131,159 @@ class TestEvaluateDeductibility:
     def test_contract_based_expense(self):
         assert evaluate_deductibility("contract", "has_receipt", False) is True
         assert evaluate_deductibility("contract", "", False) is None
+
+
+def _salary_accrual(
+    entry_id: str,
+    *,
+    payable_salary: str,
+    withheld_ss: str = "0.00",
+    withheld_iit: str = "0.00",
+    employer_ss: str = "0.00",
+    occur: str = "2026-06-30",
+) -> dict:
+    total = (
+        Decimal(payable_salary)
+        + Decimal(withheld_ss)
+        + Decimal(withheld_iit)
+        + Decimal(employer_ss)
+    )
+    return {
+        "id": entry_id,
+        "direction": "expense",
+        "amount": str(total),
+        "title": "计提员工工资及社保",
+        "category": "人力成本",
+        "sourceType": "salary_accrual",
+        "occurDate": occur,
+        "billingStatus": "has_receipt",
+        "voucherLines": {
+            "credit": [
+                {"accountCode": "221101", "amount": payable_salary},
+                {"accountCode": "221104", "amount": withheld_ss},
+                {"accountCode": "2221012", "amount": withheld_iit},
+                {"accountCode": "221102", "amount": employer_ss},
+            ],
+        },
+    }
+
+
+class TestPayrollCappedExpenses:
+    """三项经费（福利 14% / 工会 2% / 教育 8% 或个体户 2.5%）确定性计算。"""
+
+    def test_salary_accrual_gross_excludes_employer_ss_and_skips_salary_pay(self):
+        """应发工资基数 = 221101+221104+2221012，剔除 221102 单位社保且不与 salary_pay 重复。"""
+        entries = [
+            _salary_accrual(
+                "sal-1",
+                payable_salary="80000.00",
+                withheld_ss="15000.00",
+                withheld_iit="5000.00",
+                employer_ss="25000.00",
+            ),
+            # salary_pay 实发不应重复计入基数
+            {
+                "id": "sal-pay-1",
+                "direction": "expense",
+                "amount": "80000.00",
+                "title": "银行代发工资",
+                "category": "人力成本",
+                "sourceType": "salary_pay",
+                "occurDate": "2026-07-05",
+                "billingStatus": "has_receipt",
+            },
+            # 福利费 20,000：基数 100,000 × 14% = 14,000 → 调增 6,000
+            _expense("wel-1", "20000.00", "员工福利费", billing="has_invoice"),
+            # 工会经费 3,000：基数 100,000 × 2% = 2,000 → 调增 1,000
+            _expense("uni-1", "3000.00", "工会经费", billing="has_invoice"),
+            # 教育经费 10,000：企税 100,000 × 8% = 8,000 → 调增 2,000
+            _expense("edu-1", "10000.00", "职工教育经费", billing="has_invoice"),
+        ]
+        result = build_cit_adjustments(entries, _profit("1000000.00"))
+        assert result["salaryBase"] == Decimal("100000.00")
+        by_code = {item["code"]: item for item in result["items"]}
+        assert by_code["A105000-02"]["amount"] == Decimal("6000.00")
+        assert by_code["A105000-03"]["amount"] == Decimal("1000.00")
+        assert by_code["A105000-04"]["amount"] == Decimal("2000.00")
+        assert "可结转" in by_code["A105000-04"]["label"]
+        assert result["totalIncrease"] == Decimal("9000.00")
+
+    def test_iit_education_cap_uses_2_5_percent(self):
+        """个体户/个独职工教育经费按 2.5% 限额，且可剔除业主工资。"""
+        entries = [
+            _salary_accrual("sal-2", payable_salary="120000.00"),
+            _expense("edu-2", "5000.00", "职工教育经费", billing="has_invoice"),
+        ]
+        # 剔除业主工资 20,000 → 从业人员基数 100,000 → 2.5% = 2,500 → 调增 2,500
+        result = build_cit_adjustments(
+            entries,
+            _profit("500000.00"),
+            entity_type="individual_business",
+            exclude_salary=Decimal("20000.00"),
+        )
+        assert result["salaryBase"] == Decimal("100000.00")
+        assert result["items"][0]["code"] == "A105000-04"
+        assert result["items"][0]["amount"] == Decimal("2500.00")
+
+    def test_zero_salary_base_adds_back_all_three_items(self):
+        """当年工资基数为 0 时，三项经费全额调增并提示工资基数为 0。"""
+        entries = [_expense("wel-0", "5000.00", "员工福利费", billing="has_invoice")]
+        result = build_cit_adjustments(entries, _profit("200000.00"))
+        assert result["salaryBase"] == Decimal("0.00")
+        assert result["totalIncrease"] == Decimal("5000.00")
+        assert "基数为 0" in result["items"][0]["basis"]
+
+    def test_undocumented_welfare_only_goes_to_no_doc(self):
+        """无票福利费只进 A105000-30 全额调增，不叠加 14% 限额。"""
+        entries = [
+            _salary_accrual("sal-3", payable_salary="100000.00"),
+            _expense("wel-nodoc", "20000.00", "员工福利费", billing="no_document"),
+        ]
+        result = build_cit_adjustments(entries, _profit("500000.00"))
+        assert result["totalIncrease"] == Decimal("20000.00")
+        assert [item["code"] for item in result["items"]] == ["A105000-30"]
+
+
+class TestDonationCap:
+    """公益性捐赠支出：企税利润总额 12% / 个体户及个独应纳税所得额 30%。"""
+
+    def test_cit_donation_12_percent_of_total_profit(self):
+        entries = [_expense("don-1", "20000.00", "捐赠支出", billing="has_invoice")]
+        result = build_cit_adjustments(
+            entries,
+            {"revenue": "500000.00", "total_profit": "100000.00"},
+        )
+        # 100,000 × 12% = 12,000 → 调增 8,000
+        assert result["totalIncrease"] == Decimal("8000.00")
+        assert result["items"][0]["code"] == "A105000-17"
+        assert "公益捐赠票据" in result["items"][0]["basis"]
+
+    def test_cit_loss_profit_makes_donation_fully_added_back(self):
+        entries = [_expense("don-loss", "5000.00", "公益捐赠支出", billing="has_invoice")]
+        result = build_cit_adjustments(
+            entries,
+            {"revenue": "50000.00", "total_profit": "-10000.00"},
+        )
+        assert result["totalIncrease"] == Decimal("5000.00")
+
+    def test_iit_donation_30_percent_of_taxable_income_before_donation(self):
+        entries = [_expense("don-iit", "50000.00", "捐赠支出", billing="has_invoice")]
+        # 账面利润 110,000 + 已扣捐赠 50,000 - 减除费用 60,000 = 扣除捐赠前应纳税所得额 100,000
+        # 30% 限额 = 30,000 → 调增 20,000
+        result = build_cit_adjustments(
+            entries,
+            {"revenue": "500000.00", "total_profit": "110000.00"},
+            entity_type="individual_business",
+            pre_deductions=Decimal("60000.00"),
+        )
+        assert result["totalIncrease"] == Decimal("20000.00")
+        assert result["items"][0]["code"] == "A105000-17"
+
+    def test_undocumented_donation_only_goes_to_no_doc(self):
+        entries = [_expense("don-nodoc", "20000.00", "捐赠支出", billing="no_document")]
+        result = build_cit_adjustments(
+            entries,
+            {"revenue": "500000.00", "total_profit": "100000.00"},
+        )
+        assert result["totalIncrease"] == Decimal("20000.00")
+        assert [item["code"] for item in result["items"]] == ["A105000-30"]

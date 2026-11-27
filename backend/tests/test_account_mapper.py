@@ -317,3 +317,102 @@ class TestIncomeVatSeparation:
         hint = get_voucher_hint("income", "主营业务收入", "1000.00")
         assert len(hint["credit"]) == 1
         assert hint["credit"][0]["amount"] == Decimal("1000.00")
+
+
+class TestOptionASecondaryAccountsAndPromptSync:
+    """选项 A 全量 27 个业务二级科目 + 单一真相源 AI Prompt / 接口元数据同步测试。"""
+
+    OPTION_A_MAPPINGS = {
+        # 营业外支出 11 个
+        "罚款支出": ("expense", "5711011"),
+        "税收滞纳金": ("expense", "5711010"),
+        "捐赠支出": ("expense", "5711003"),
+        "赞助支出": ("expense", "5711002"),
+        "非流动资产处置净损失": ("expense", "5711001"),
+        "盘亏损失": ("expense", "5711004"),
+        "坏账损失": ("expense", "5711005"),
+        "存货毁损报废损失": ("expense", "5711006"),
+        "长期债券投资损失": ("expense", "5711007"),
+        "长期股权投资损失": ("expense", "5711008"),
+        "自然灾害损失": ("expense", "5711009"),
+        # 营业外收入 4 个
+        "政府补助": ("income", "5301002"),
+        "非流动资产处置净收益": ("income", "5301001"),
+        "捐赠收益": ("income", "5301003"),
+        "盘盈收益": ("income", "5301004"),
+        # 销售费用特色 6 个
+        "广告费": ("expense", "5601015"),
+        "展览费": ("expense", "5601009"),
+        "商品维修费": ("expense", "5601010"),
+        "装卸费": ("expense", "5601012"),
+        "包装费": ("expense", "5601013"),
+        "保险费": ("expense", "5601014"),
+        # 管理费用补齐 3 个
+        "修理费": ("expense", "5602003"),
+        "开办费": ("expense", "5602009"),
+        "研究费用": ("expense", "5602010"),
+        # 财务费用补齐 3 个
+        "利息费用": ("expense", "5603001"),
+        "汇兑损益": ("expense", "5603003"),
+        "现金折扣": ("expense", "5603004"),
+    }
+
+    def test_all_27_secondary_categories_mapped_and_balanced(self):
+        coa = _load_coa()
+        assert len(self.OPTION_A_MAPPINGS) == 27
+        for category, (direction, expected_code) in self.OPTION_A_MAPPINGS.items():
+            info = lookup(category)
+            assert info is not None, f"缺少二级科目映射: {category}"
+            assert info["accountCode"] == expected_code
+            assert expected_code in coa
+            assert chart_is_leaf(expected_code, coa[expected_code])
+            hint = get_voucher_hint(direction, category, "123.45", vat_rate="0.01")
+            assert len(hint["debit"]) == 1
+            assert len(hint["credit"]) == 1
+            if direction == "expense":
+                assert hint["debit"][0]["accountCode"] == expected_code
+                assert hint["credit"][0]["accountCode"] == "1002"
+            else:
+                assert hint["debit"][0]["accountCode"] == "1002"
+                assert hint["credit"][0]["accountCode"] == expected_code
+
+    def test_all_ai_prompts_sync_secondary_accounts_and_exclude_aliases(self):
+        from services.bank_ai_prompts import BANK_CLASSIFY_PROMPT
+        from services.classifier import BATCH_SPLIT_V3_PROMPT, CLASSIFIER_V3_PROMPT
+        from services.ocr import _CATEGORY_TABLE
+
+        coa = _load_coa()
+        for prompt in (BANK_CLASSIFY_PROMPT, CLASSIFIER_V3_PROMPT, BATCH_SPLIT_V3_PROMPT):
+            for code in ("5711011", "5711010", "5301002", "5601015", "5602003", "5603001", "5603003"):
+                assert code in prompt, f"Prompt 缺少科目代码 {code}"
+            assert "| 餐饮 |" not in prompt
+            assert "| 交通 |" not in prompt
+
+        for code in ("5711011", "5711010", "5601015", "5602003", "5603001"):
+            assert code in _CATEGORY_TABLE
+        assert "5301002" not in _CATEGORY_TABLE  # OCR 支出表不含营业外收入
+
+        # 渲染后的所有 Prompt 也必须只引用末级科目
+        for name, rendered in (
+            ("BANK_CLASSIFY_PROMPT", BANK_CLASSIFY_PROMPT),
+            ("CLASSIFIER_V3_PROMPT", CLASSIFIER_V3_PROMPT),
+            ("BATCH_SPLIT_V3_PROMPT", BATCH_SPLIT_V3_PROMPT),
+            ("OCR_CATEGORY_TABLE", _CATEGORY_TABLE),
+        ):
+            for match in re.finditer(r"\b(\d{4,7})\b", rendered):
+                code = match.group(1)
+                if code in coa:
+                    assert chart_is_leaf(code, coa[code]), f"{name} 渲染出非末级科目 {code}"
+
+    def test_list_account_mapping_exports_group_alias_and_sort_order(self):
+        from services.account_mapper import GROUP_ORDER
+        from services.category_service import list_account_mapping
+
+        items = {item["category"]: item for item in list_account_mapping()}
+        assert set(GROUP_ORDER) >= {item["group"] for item in items.values()}
+        assert items["罚款支出"]["group"] == "营业外支出"
+        assert items["罚款支出"]["isAlias"] is False
+        assert items["政府补助"]["direction"] == "income"
+        assert items["政府补助"]["group"] == "营业外收入"
+        assert items["餐饮"]["isAlias"] is True
+        assert isinstance(items["罚款支出"]["sortOrder"], int)

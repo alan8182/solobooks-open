@@ -52,6 +52,11 @@ class AuthUser(Base):
     phone: Mapped[str] = mapped_column(String(32), nullable=False, default="")
     phone_verified_at: Mapped[str] = mapped_column(Text, nullable=False, default="")
     wechat_openid_bound_at: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # 网站应用（开放平台扫码登录）身份，与上面的小程序 openid 严格分开；
+    # 只由微信网页登录的专用绑定函数写入，不参与 _persist_user 的通用 UPDATE。
+    wechat_web_openid: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
+    wechat_unionid: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
+    wechat_web_bound_at: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
     current_company_id: Mapped[str] = mapped_column(String(128), nullable=False, default="")
     nickname: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     avatar: Mapped[str] = mapped_column(Text, nullable=False, default="")
@@ -66,12 +71,50 @@ class AuthUser(Base):
     plan_code: Mapped[str] = mapped_column(String(32), nullable=False, default="trial", server_default="trial")
     plan_anchor_at: Mapped[str | None] = mapped_column(Text, nullable=True)
     quota_bonus_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    # AI 点数充值余额（1 点 = 1 token）：永久有效、跨套餐周期保留。
+    # 允许为负：额度边界上的一次调用可能超额，负值表示待充值抵扣的欠费。
+    token_balance: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    # 新人首月 AI 体验包（限时 30 天、每账号限购 1 次）：
+    # - promo_token_balance：特惠剩余点数，先于 token_balance 扣减，过期后惰性视为 0；
+    # - promo_expires_at：ISO 日期串（支付成功日 + 30 天），超过即失效；
+    # - promo_purchased_at：首次购买时间戳（退款后仍保留，防退后再刷首单）。
+    promo_token_balance: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    promo_expires_at: Mapped[str | None] = mapped_column(Text, nullable=True)
+    promo_purchased_at: Mapped[str | None] = mapped_column(Text, nullable=True)
     # 付费套餐到期日（ISO 日期串，同 plan_anchor_at 惯例）；None = 不适用（trial/管理员调整）
     # 过期后 quota_service._effective_plan 惰性按 trial 口径生效，无需 cron
     plan_expires_at: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[str] = mapped_column(Text, nullable=False)
     last_login_at: Mapped[str] = mapped_column(Text, nullable=False)
     updated_at: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+
+class WechatLoginTicket(Base):
+    """微信网页扫码的一次性登录/绑手机凭证。
+
+    明文 ticket 只写 HttpOnly cookie，库里只存 SHA-256；purpose 区分
+    ``login``（已有手机号的老用户直接登录）与 ``bind``（新用户/未绑手机）。
+    """
+
+    __tablename__ = "wechat_login_tickets"
+
+    ticket_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    openid: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    unionid: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
+    nickname: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
+    avatar: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    privacy_accepted_at: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    tos_version: Mapped[str] = mapped_column(String(32), nullable=False, default="", server_default="")
+    privacy_version: Mapped[str] = mapped_column(String(32), nullable=False, default="", server_default="")
+    purpose: Mapped[str] = mapped_column(String(16), nullable=False)
+    user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[str] = mapped_column(Text, nullable=False)
+    used_at: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+
+    __table_args__ = (
+        Index("ix_wechat_login_tickets_expires", "expires_at"),
+    )
 
 
 class Company(Base):
@@ -711,6 +754,45 @@ class LlmUsage(Base):
     )
 
 
+class AiTokenLedger(Base):
+    """AI 点数余额流水（充值、超额消耗、退款、管理调整）。
+
+    只增不改：余额的每一次变动都必须留一行，``balance_after`` 记录变动后的
+    余额快照。``order_no + kind`` 唯一约束兜住同一订单的重复入账/退款
+    （消费流水 order_no 为空，不参与该约束）。
+    """
+
+    __tablename__ = "ai_token_ledger"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer(), "sqlite"), primary_key=True, autoincrement=True
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("auth_users.user_id", ondelete="CASCADE"), nullable=False
+    )
+    # topup / consume / refund / admin_grant / admin_deduct
+    kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    # 正数入账，负数出账；单位 token（1 点 = 1 token）
+    delta_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    balance_after: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 充值/退款关联订单号；消费与管理调整为空
+    order_no: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    note: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('topup','consume','refund','admin_grant','admin_deduct')",
+            name="ck_ai_token_ledger_kind",
+        ),
+        UniqueConstraint("order_no", "kind", name="uq_ai_token_ledger_order_kind"),
+        Index("ix_ai_token_ledger_user_created", "user_id", "created_at"),
+    )
+
+
 class UserQuotaCounter(Base):
     """用户 AI 用量周期计数（配额体系预留）。
 
@@ -1038,6 +1120,12 @@ class Invoice(Base):
     tax_rate: Mapped[str] = mapped_column(String(16), nullable=False, default="", server_default="")
     item_name: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
     remark: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    # 电子税务局查验状态：用户人工标记（财会〔2020〕6号第三条「查验合法真实」），
+    # 系统不做验签，状态语义是「用户声明已查验」
+    verify_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="unverified", server_default="unverified"
+    )
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     partner_id: Mapped[str | None] = mapped_column(String(128))
     # 去重指纹：发票号存在时等于发票号，缺失时退化为 日期+对方+金额+方向
     dedup_fingerprint: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
@@ -1052,6 +1140,66 @@ class Invoice(Base):
         Index("ix_invoice_company_number", "company_id", "invoice_number"),
         Index("ix_invoice_company_date", "company_id", "invoice_date"),
         Index("ix_invoice_company_direction_date", "company_id", "direction", "invoice_date"),
+    )
+
+
+class Attachment(Base):
+    """原始凭证附件（发票 XML/PDF/OFD 原件 + 银行回单/对账单 + 支付截图/报销单/工资表等）。
+
+    原件不可变（A2）：入库后不更新内容，只允许 status='void' 作废标记 + 审计
+    留痕；磁盘文件只增不减，作废不删除文件。
+    - 发票原件挂 ``invoice_id``（SET NULL），可空 = 未匹配暂存（由 relink 按发票号回挂）；
+    - 银行回单挂 ``bank_statement_id``（随银行流水匹配动态迁移，``parent_attachment_id`` 指向原始批量 PDF）；
+    - 通用附件（支付截图/报销单/工资表/合同等）挂 ``journal_entry_id``（SET NULL），冲销重记时随 ``_rebind_invoice_after_repost`` 迁移（A3）；
+    - 期间级原件（如银行月度标准对账单）挂 ``period``（YYYY-MM）。
+    ``(company_id, content_sha256)`` 唯一实现文件级幂等。
+    """
+
+    __tablename__ = "attachments"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True, default=new_id)
+    company_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("auth_companies.company_id", ondelete="CASCADE"), nullable=False
+    )
+    invoice_id: Mapped[str | None] = mapped_column(String(128), ForeignKey("invoices.id", ondelete="SET NULL"))
+    bank_statement_id: Mapped[str | None] = mapped_column(String(128))
+    journal_entry_id: Mapped[str | None] = mapped_column(String(128), ForeignKey("journal_entries.id", ondelete="SET NULL"))
+    period: Mapped[str | None] = mapped_column(String(16))
+    parent_attachment_id: Mapped[str | None] = mapped_column(String(128), ForeignKey("attachments.id", ondelete="SET NULL"))
+    document_type: Mapped[str] = mapped_column(String(32), nullable=False, default="other", server_default="other")
+    file_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    file_ext: Mapped[str] = mapped_column(String(16), nullable=False, default="", server_default="")
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 落盘文件名（相对 ATTACHMENTS_DIR/{company_id[:12]}，内部命名 id.ext，不使用用户文件名拼路径）
+    stored_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # active=有效 / void=用户作废（文件保留，仅状态标记）
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active", server_default="active")
+    # 解析结果（XML 明细或回单识别字段 {receiptNo, txDate, amount, direction, payerName, payeeName, ...}）
+    parsed_json: Mapped[dict | None] = mapped_column(JSON_VALUE, nullable=True)
+    source: Mapped[str] = mapped_column(String(16), nullable=False, default="upload", server_default="upload")
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False, default="", server_default="")
+    voided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    void_reason: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "document_type IN ('einvoice_xml','einvoice_pdf','einvoice_ofd',"
+            "'bank_receipt','bank_receipt_batch','bank_statement_pdf',"
+            "'payment_screenshot','reimbursement_form','payroll_sheet','contract','other')",
+            name="ck_attachment_document_type",
+        ),
+        CheckConstraint("status IN ('active','void')", name="ck_attachment_status"),
+        UniqueConstraint("company_id", "content_sha256", name="uq_attachment_company_sha256"),
+        Index("ix_attachments_company_invoice", "company_id", "invoice_id"),
+        Index("ix_attachments_company_statement", "company_id", "bank_statement_id"),
+        Index("ix_attachments_company_entry", "company_id", "journal_entry_id"),
+        Index("ix_attachments_company_period", "company_id", "period"),
+        Index("ix_attachments_company_created", "company_id", "created_at"),
     )
 
 
@@ -1128,6 +1276,45 @@ class Project(Base):
     __table_args__ = (
         UniqueConstraint("company_id", "code", name="uq_project_company_code"),
         Index("ix_project_company_name", "company_id", "name"),
+    )
+
+
+class Employee(Base):
+    """职员档案：直接映射薪酬管理既有的 ``employees`` 表，避免名册与辅助核算两头分裂。
+
+    注意保留既有列类型（is_active 为 Integer 0/1、created_at/updated_at 为 Text），
+    以兼容 salary_service 裸 SQL 与 PostgreSQL 生产库既有 schema。
+    """
+
+    __tablename__ = "employees"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True, default=lambda: f"emp-{uuid4().hex[:12]}")
+    company_id: Mapped[str] = mapped_column(Text, nullable=False)
+    code: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    department: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    base_salary: Mapped[Decimal] = mapped_column(MONEY, nullable=False, default=Decimal("0.00"), server_default="0.0")
+    social_security_base: Mapped[Decimal] = mapped_column(MONEY, nullable=False, default=Decimal("0.00"), server_default="0.0")
+    housing_fund_base: Mapped[Decimal | None] = mapped_column(MONEY, nullable=True)
+    is_owner: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    hire_date: Mapped[str | None] = mapped_column(Text, nullable=True)
+    special_additional_deduction: Mapped[Decimal] = mapped_column(
+        MONEY, nullable=False, default=Decimal("0.00"), server_default="0.0"
+    )
+    is_active: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    created_at: Mapped[str] = mapped_column(Text, nullable=False, default=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: Mapped[str] = mapped_column(Text, nullable=False, default=lambda: datetime.now(timezone.utc).isoformat())
+
+    __table_args__ = (
+        Index("idx_employees_company", "company_id"),
+        Index(
+            "uq_employees_company_code_nonempty",
+            "company_id",
+            "code",
+            unique=True,
+            sqlite_where=text("code != ''"),
+            postgresql_where=text("code != ''"),
+        ),
     )
 
 
@@ -1770,13 +1957,19 @@ class LedgerBookSnapshot(Base):
     anchor: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False, default=dict)
     generated_by: Mapped[str | None] = mapped_column(String(128))
     generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # 签发时落盘的正式 PDF 归档件。历史行可能为空（迁移前签发）：下载时只读现渲染，
+    # 不用读操作回写数据库（A2），补齐走 scripts/repair_ledger_book_pdf.py 显式入口。
+    pdf_path: Mapped[str | None] = mapped_column(Text)
+    pdf_sha256: Mapped[str | None] = mapped_column(String(64))
+    pdf_size_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    pdf_generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     void_reason: Mapped[str | None] = mapped_column(Text)
     voided_by: Mapped[str | None] = mapped_column(String(128))
     voided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
         UniqueConstraint("company_id", "book_kind", "period", "book_no", name="uq_book_snapshot_number"),
-        CheckConstraint("book_kind IN ('monthly','yearly')", name="ck_book_snapshot_kind"),
+        CheckConstraint("book_kind IN ('monthly','yearly','voucher')", name="ck_book_snapshot_kind"),
         CheckConstraint("status IN ('issued','void')", name="ck_book_snapshot_status"),
         Index("ix_book_snapshot_company_period", "company_id", "period"),
     )
@@ -1945,8 +2138,21 @@ class BillingOrder(Base):
         String(128), ForeignKey("auth_users.user_id"), nullable=False
     )
     plan_code: Mapped[str] = mapped_column(String(32), nullable=False)
-    # 计费周期：第一版仅 annual（年付），列保留以便后续开月付
-    period: Mapped[str] = mapped_column(String(16), nullable=False, default="annual")
+    # 订单类型：plan 套餐订阅 / token_topup AI 点数充值 / first_month_promo 新人首月体验包（one_time）
+    order_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="plan", server_default="plan"
+    )
+    # 计费周期：annual（年付）/ one_time（一次性充值）；列保留以便后续开月付
+    period: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="annual", server_default="annual"
+    )
+    # 充值到账点数（1 点 = 1 token）；套餐订单为空
+    token_amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 支付渠道：alipay / wechat（微信 Native 扫码）。白名单在 create_order 应用层校验；
+    # 退款分发与通知路由按此判断（存量行由迁移 server_default 回填 alipay）
+    payment_channel: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="alipay", server_default="alipay"
+    )
     # 应付金额（元）：下单时取自 core/plans.py 唯一目录，支付回调时严格比对
     amount: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="created")
@@ -1972,7 +2178,7 @@ class BillingOrder(Base):
             "status IN ('created','paid','activated','closed','failed')",
             name="ck_billing_order_status",
         ),
-        CheckConstraint("period IN ('annual')", name="ck_billing_order_period"),
+        CheckConstraint("period IN ('annual','one_time')", name="ck_billing_order_period"),
         CheckConstraint("amount > 0", name="ck_billing_order_amount_positive"),
         Index("ix_billing_orders_user_created", "user_id", "created_at"),
         Index("ix_billing_orders_trade_no", "trade_no"),
@@ -1998,4 +2204,49 @@ class BillingNotifyLog(Base):
     payload: Mapped[dict] = mapped_column(JSON_VALUE, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class BillingRefund(Base):
+    """支付宝退款记录（管理端全额退款，alipay.trade.refund 同步结果为准）。
+
+    - out_request_no 唯一 = 退款幂等键（全额退款固定 {out_trade_no}R1），
+      并发双击/重复请求由唯一约束兜底读回既有记录；
+    - status: submitted → success/failed（网关受理中 → 同步结果落档）；
+    - 订单是否已退由本表派生（billing_orders.status 不加 refunded 枚举，
+      避免 SQLite 改 Check 约束要重建表）；
+    - raw_response 留网关原始业务节点（取证对账），管理动作另走 admin_audit_logs。
+    """
+
+    __tablename__ = "billing_refunds"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True, default=new_id)
+    out_trade_no: Mapped[str] = mapped_column(String(32), nullable=False)
+    trade_no: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    # 支付宝 out_request_no：同笔多次退款的区分号；全额退款固定 R1，天然幂等
+    out_request_no: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    refund_amount: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="submitted")
+    # 网关同步响应留档（code/subCode/msg，成功时另有 fund_change 等）
+    gateway_code: Mapped[str] = mapped_column(String(16), nullable=False, default="")
+    gateway_sub_code: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    gateway_msg: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    operator_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    raw_response: Mapped[dict | None] = mapped_column(JSON_VALUE, nullable=True)
+    refunded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('submitted','success','failed')",
+            name="ck_billing_refund_status",
+        ),
+        CheckConstraint("refund_amount > 0", name="ck_billing_refund_amount_positive"),
+        Index("ix_billing_refunds_out_trade_no", "out_trade_no"),
     )

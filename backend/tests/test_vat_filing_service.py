@@ -109,3 +109,33 @@ def test_vat_assist_respects_confirmed_billing_status():
     result = build_small_scale_vat_assist(entries, "2026-Q2", "quarter")
     assert result["blockingIssues"] == []
     assert result["readyToFile"] is True
+
+
+def test_vat_assist_splits_invoiced_and_uninvoiced_sales_for_form_mode():
+    """填表式申报要把未开票收入单独拆出来填附列资料（一）附1。
+
+    未确认开票状态的销售既不算已开票、也不算未开票收入，仍由 blockingIssues
+    拦截，不能被手卡默认当成未开票申报。
+    """
+    entries = [
+        entry("invoice", "2026-06-10", "1012", "5001", "30.00",
+              invoiceType="增值税普通发票", invoiceNumber="INV-001",
+              vatSalesCategory="services", vatSeparated=True),
+        entry("uninvoiced-sale", "2026-06-11", "1012", "5001", "50.00",
+              billingStatus="no_invoice", vatSalesCategory="services", vatSeparated=True),
+        entry("uninvoiced-refund", "2026-06-12", "5001", "1012", "20.00",
+              billingStatus="no_invoice", vatSalesCategory="services", vatSeparated=True),
+        entry("unconfirmed", "2026-06-13", "1012", "5001", "10.00",
+              vatSalesCategory="services", vatSeparated=True),
+    ]
+
+    result = build_small_scale_vat_assist(entries, "2026-Q2", "quarter")
+
+    assert result["invoicedSales"] == Decimal("30.00")
+    assert result["uninvoicedPositiveSales"] == Decimal("50.00")
+    assert result["uninvoicedNegativeSales"] == Decimal("-20.00")
+    assert result["uninvoicedSales"] == Decimal("30.00")
+    assert result["negativeSales"] == Decimal("-20.00")
+    assert result["totalSales"] == Decimal("70.00")
+    assert result["readyToFile"] is False
+    assert "1笔销售缺少发票类型或号码" in result["blockingIssues"][0]

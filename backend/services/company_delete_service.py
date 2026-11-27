@@ -16,11 +16,14 @@
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, Set
+from typing import Any, AsyncIterator, Dict, Set
 
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
+from config import TENANT_PURGE_DATABASE_URL
 from db.models import AdminAuditLog, AuthUser, Company
 from db.session import database_url, session_scope
 
@@ -62,6 +65,59 @@ def _is_postgres() -> bool:
     return database_url().startswith("postgresql")
 
 
+def _normalize_purge_url(raw: str) -> str:
+    """把专用连接串归一化为 asyncpg 异步方言；空值直接拒绝（失败关闭）。
+
+    与 db.session.database_url 的归一化口径保持一致，但**不回落到**应用
+    DATABASE_URL——应用角色不是数据库属主，拿它执行删除只会被触发器拒绝，
+    这正是收紧后的预期结果。
+    """
+    value = (raw or "").strip()
+    if not value:
+        raise ValueError(
+            "主体删除未配置专用数据库连接（TENANT_PURGE_DATABASE_URL 或 "
+            "MIGRATION_DATABASE_URL），拒绝执行"
+        )
+    if value.startswith("postgres://"):
+        return "postgresql+asyncpg://" + value[len("postgres://"):]
+    if value.startswith("postgresql://"):
+        return "postgresql+asyncpg://" + value[len("postgresql://"):]
+    if value.startswith("postgresql+psycopg://"):
+        return "postgresql+asyncpg://" + value[len("postgresql+psycopg://"):]
+    return value
+
+
+@asynccontextmanager
+async def _purge_session() -> AsyncIterator[AsyncSession]:
+    """主体删除专用会话。
+
+    PostgreSQL 上必须用数据库属主连接：不可变触发器只允许属主在
+    `solobooks.allow_tenant_purge=on` 时删除 posted/reversed 凭证与审计事件，
+    应用角色自己设置该 GUC 不再生效（迁移 e7c1a4d9f2b8）。
+    SQLite 仅测试/演练环境，沿用普通会话。
+    """
+    if not _is_postgres():
+        async with session_scope() as session:
+            yield session
+        return
+
+    try:
+        url = _normalize_purge_url(TENANT_PURGE_DATABASE_URL)
+    except ValueError as exc:
+        raise CompanyDeleteError(str(exc)) from exc
+
+    engine = create_async_engine(url, pool_pre_ping=True)
+    try:
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            async with session.begin():
+                await session.execute(
+                    text("SELECT set_config('solobooks.allow_tenant_purge', 'on', true)")
+                )
+                yield session
+    finally:
+        await engine.dispose()
+
+
 async def _all_tables(session) -> Set[str]:
     if _is_postgres():
         rows = await session.execute(
@@ -98,7 +154,7 @@ async def purge_company(
     user_id: str, company_id: str, confirm_name: str
 ) -> Dict[str, Any]:
     """永久删除主体及其全部业务数据；返回各表删除行数。"""
-    async with session_scope() as session:
+    async with _purge_session() as session:
         company = await session.get(Company, company_id)
         if company is None or company.owner_user_id != user_id:
             raise CompanyNotFoundError("主体不存在或无权删除")
@@ -113,12 +169,6 @@ async def purge_company(
         user = await session.get(AuthUser, user_id)
         if user is not None and user.current_company_id == company_id:
             raise CurrentCompanyDeleteError("请先切换到其他主体，再删除当前主体")
-
-        # 受控放行不可变触发器（仅 PG）
-        if _is_postgres():
-            await session.execute(
-                text("SELECT set_config('solobooks.allow_tenant_purge', 'on', true)")
-            )
 
         all_tables = await _all_tables(session)
         counts: Dict[str, int] = {}

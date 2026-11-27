@@ -26,7 +26,7 @@ const result = ref<ArchiveChecklistResponse | null>(null)
 type Filter = 'all' | 'missing' | 'compliant' | 'questionable'
 const filter = ref<Filter>('all')
 const keyword = ref('')
-const showGuide = ref(true)
+const showGuide = ref(false)
 
 // 后端 complianceStatus 为英文编码；旧后端只返回中文 compliance，这里兜底
 function statusOf(item: ArchiveItem): Filter {
@@ -44,9 +44,20 @@ const STATUS_TAG = {
 
 const DOC_LABEL: Record<string, string> = {
   has_invoice: '有发票',
-  has_receipt: '有收据',
+  invoice: '有发票',
+  einvoice: '电子发票',
+  has_receipt: '有回单/收据',
+  receipt: '有回单/收据',
+  reconciled: '已对账流水',
+  no_invoice: '无发票',
   no_document: '无单据',
+  none: '无单据',
   unknown: '未确认',
+}
+
+function docTypeLabel(docType?: string): string {
+  if (!docType) return '未确认'
+  return DOC_LABEL[docType] || docType
 }
 
 const items = computed(() => result.value?.items ?? [])
@@ -111,8 +122,8 @@ function exportCsv() {
   const body = rows.value.map((i) => {
     const tip = getEvidenceTip(i)
     return [
-      i.voucherNo, i.date, i.summary, i.category, i.amount, DOC_LABEL[i.docType] || i.docType,
-      i.invoiceNumber, STATUS_TAG[statusOf(i) as keyof typeof STATUS_TAG].label, i.riskTag, tip?.tip || '',
+      i.voucherNo, i.date, i.summary, i.category, i.amount, docTypeLabel(i.docType),
+      i.invoiceNumber, STATUS_TAG[statusOf(i) as keyof typeof STATUS_TAG].label, i.riskTag, i.missingReason || tip?.tip || '',
     ].map(esc).join(',')
   })
   const blob = new Blob(['\uFEFF' + [head.map(esc).join(','), ...body].join('\n')], { type: 'text/csv;charset=utf-8' })
@@ -157,31 +168,46 @@ onMounted(load)
               <span class="report-summary-label">归档合规率</span>
               <span class="report-summary-val" :class="rate === 100 ? 'income' : 'expense'">{{ rate }}%</span>
             </div>
-            <div class="report-summary-item">
+            <button
+              type="button"
+              class="report-summary-item summary-filter-btn"
+              :class="{ 'is-active': filter === 'compliant' }"
+              @click="filter = filter === 'compliant' ? 'all' : 'compliant'"
+            >
               <span class="report-summary-label">合规单据</span>
               <span class="report-summary-val income">{{ counts.compliant + counts.questionable }} 笔</span>
-            </div>
-            <div class="report-summary-item">
+            </button>
+            <button
+              type="button"
+              class="report-summary-item summary-filter-btn"
+              :class="{ 'is-active': filter === 'missing' }"
+              @click="filter = filter === 'missing' ? 'all' : 'missing'"
+            >
               <span class="report-summary-label">待补单据</span>
               <span class="report-summary-val expense">{{ counts.missing }} 笔</span>
-            </div>
+            </button>
             <div v-if="result.missingAmount !== undefined" class="report-summary-item">
-              <span class="report-summary-label">待补金额敞口（税前扣除风险）</span>
+              <span class="report-summary-label">待补金额</span>
               <span class="report-summary-val expense">{{ formatMoney(result.missingAmount) }}</span>
             </div>
-            <div class="report-summary-item">
-              <span class="report-summary-label">本期凭证总数</span>
+            <button
+              type="button"
+              class="report-summary-item summary-filter-btn"
+              :class="{ 'is-active': filter === 'all' }"
+              @click="filter = 'all'"
+            >
+              <span class="report-summary-label">本期凭证</span>
               <span class="report-summary-val">{{ counts.all }} 笔</span>
-            </div>
+            </button>
           </div>
         </NCard>
 
-        <!-- 归档证据链与老板避坑指南卡片 -->
+        <!-- 归档证据链与避坑指引卡片（默认收起，首屏优先展示单据列表） -->
         <div class="guide-banner no-print">
           <div class="guide-header" @click="showGuide = !showGuide">
             <div class="guide-title">
               <i class="ri-shield-check-line guide-icon" />
-              <span>老板必读：常见业务单据归档与证据链避坑指引</span>
+              <span>常见业务归档与避坑指引</span>
             </div>
             <NButton text size="tiny" class="guide-toggle">
               {{ showGuide ? '收起指南' : '展开指南' }}
@@ -242,42 +268,38 @@ onMounted(load)
               <NInput v-model:value="keyword" size="small" clearable placeholder="搜索凭证号 / 摘要 / 发票号" style="width: 260px;" />
             </div>
             <div class="report-table-wrapper">
-              <table class="report-table">
+              <table class="report-table archive-table">
                 <thead>
                   <tr>
-                    <th style="width: 100px;">凭证号</th>
-                    <th style="width: 105px;">发生日期</th>
-                    <th>摘要说明</th>
-                    <th style="width: 120px;">账目分类</th>
-                    <th style="text-align: right; width: 120px;">金额</th>
-                    <th style="width: 140px;">单据形式</th>
-                    <th style="width: 130px;">合规状态</th>
-                    <th style="width: 170px;">归档指引</th>
-                    <th class="no-print" style="width: 75px;">操作</th>
+                    <th style="width: 145px;">凭证 / 日期</th>
+                    <th style="min-width: 210px;">摘要说明</th>
+                    <th style="width: 105px;">账目分类</th>
+                    <th style="text-align: right; width: 96px;">金额</th>
+                    <th style="width: 120px;">单据形式</th>
+                    <th style="min-width: 210px;">归档状态与说明</th>
+                    <th class="no-print" style="width: 72px;">操作</th>
                   </tr>
                 </thead>
                 <tbody>
                   <tr v-for="(item, i) in rows" :key="item.id || i">
-                    <td>{{ item.voucherNo || '—' }}</td>
-                    <td>{{ formatDate(item.date) }}</td>
-                    <td>{{ item.summary }}</td>
+                    <td>
+                      <div class="voucher-no-cell">{{ item.voucherNo || '—' }}</div>
+                      <div class="sub">{{ formatDate(item.date) }}</div>
+                    </td>
+                    <td class="summary-cell">{{ item.summary }}</td>
                     <td>{{ item.category || '—' }}</td>
                     <td class="amount-cell">{{ formatMoney(item.amount) }}</td>
                     <td>
-                      {{ DOC_LABEL[item.docType] || item.docType }}
-                      <div v-if="item.invoiceNumber" class="sub">{{ item.invoiceNumber }}</div>
+                      {{ docTypeLabel(item.docType) }}
+                      <div v-if="item.invoiceNumber" class="sub mono-sub">{{ item.invoiceNumber }}</div>
                     </td>
                     <td>
                       <NSpace align="center" size="small">
                         <NTag size="small" :type="STATUS_TAG[statusOf(item) as keyof typeof STATUS_TAG].type" :bordered="false" round>
-                          {{ STATUS_TAG[statusOf(item) as keyof typeof STATUS_TAG].label }}
+                          {{ item.compliance === '无需外部单据' ? '无需补票' : STATUS_TAG[statusOf(item) as keyof typeof STATUS_TAG].label }}
                         </NTag>
                         <NTag v-if="item.riskTag" size="small" type="error" :bordered="false" round>{{ item.riskTag }}</NTag>
-                      </NSpace>
-                    </td>
-                    <td>
-                      <template v-if="getEvidenceTip(item)">
-                        <NTooltip trigger="hover">
+                        <NTooltip v-if="statusOf(item) === 'missing' && getEvidenceTip(item)" trigger="hover">
                           <template #trigger>
                             <span class="evidence-pill" :class="getEvidenceTip(item)?.level">
                               <i class="ri-lightbulb-line" />
@@ -286,15 +308,19 @@ onMounted(load)
                           </template>
                           <div class="tip-popover-content">{{ getEvidenceTip(item)?.tip }}</div>
                         </NTooltip>
-                      </template>
-                      <span v-else class="sub">—</span>
+                      </NSpace>
+                      <div v-if="item.missingReason" class="reason-sub" :class="{ 'is-missing': statusOf(item) === 'missing' }">
+                        {{ item.missingReason }}
+                      </div>
                     </td>
                     <td class="no-print">
-                      <NButton v-if="item.id" text type="primary" size="small" @click="openVoucher(item)">查凭证</NButton>
+                      <NButton v-if="item.id" text type="primary" size="small" @click="openVoucher(item)">
+                        {{ statusOf(item) === 'missing' ? '去补单据' : '查凭证' }}
+                      </NButton>
                     </td>
                   </tr>
                   <tr v-if="!rows.length">
-                    <td colspan="9" class="sub" style="text-align: center; padding: 24px;">没有符合条件的单据</td>
+                    <td colspan="7" class="sub" style="text-align: center; padding: 24px;">没有符合条件的单据</td>
                   </tr>
                 </tbody>
               </table>
@@ -354,6 +380,47 @@ onMounted(load)
   margin-bottom: 12px;
 }
 .sub { font-size: 12px; color: var(--solo-text-muted); }
+.voucher-no-cell {
+  font-family: var(--solo-font-mono);
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--solo-text-primary);
+  white-space: nowrap;
+}
+.archive-table .summary-cell {
+  min-width: 210px;
+  line-height: 1.45;
+  word-break: break-word;
+}
+.mono-sub {
+  font-family: var(--solo-font-mono);
+  word-break: break-all;
+}
+.reason-sub {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--solo-text-muted);
+}
+.reason-sub.is-missing {
+  color: var(--solo-expense);
+}
+.summary-filter-btn {
+  border: 1px solid transparent;
+  background: transparent;
+  border-radius: var(--solo-radius-sm);
+  padding: 6px 10px;
+  cursor: pointer;
+  text-align: left;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+.summary-filter-btn:hover {
+  background: var(--solo-bg-hover, var(--solo-bg-elevated));
+}
+.summary-filter-btn.is-active {
+  background: var(--solo-bg-blue-soft);
+  border-color: rgba(23, 71, 176, 0.22);
+}
 
 /* 指南卡片样式 */
 .guide-banner {
@@ -397,8 +464,13 @@ onMounted(load)
 }
 .guide-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-  gap: 16px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+@media (max-width: 720px) {
+  .guide-grid {
+    grid-template-columns: 1fr;
+  }
 }
 .guide-item {
   background: var(--solo-bg);

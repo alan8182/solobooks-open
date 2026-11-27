@@ -9,14 +9,23 @@ import { updateEntry } from '@/api/record'
 import { markDeadlineFiled } from '@/api/tax-filing'
 import { formatMoney } from '@/utils/format'
 import {
-  extractFilingPeriod,
+  buildTodoDisplayRows,
+  closingTodoRoute,
+  extractFilingDeadlineInfo,
+  extractTaxName,
+  formatTodoCardDesc,
+  formatTodoCardTitle,
   getActionLabel,
   getActionRoute,
   isFixedAssetTodo,
   isIntangibleAssetTodo,
+  showCardCheckbox,
+  todoCardBadge,
+  type TaxPeriodBundle,
 } from '@/utils/todoAction'
 import type { TodoItem } from '@/api/types'
 import { SoloEmpty } from '@/components/ui'
+import GuideTrigger from '@/components/business/GuideTrigger.vue'
 
 const router = useRouter()
 const route = useRoute()
@@ -40,9 +49,10 @@ const dismissingBatch = ref(false)
 const updatingBatch = ref(false)
 
 // 事项分类：分组展示顺序 + 元数据（Remix Icon）
-const CATEGORY_ORDER = ['filing', 'match', 'receipt', 'reimburse', 'billing', 'risk', 'intangible', 'other']
+const CATEGORY_ORDER = ['setup', 'filing', 'match', 'receipt', 'reimburse', 'billing', 'risk', 'intangible', 'other']
 
 const categoryMeta: Record<string, { label: string; icon: string }> = {
+  setup: { label: '建账配置', icon: 'ri-settings-3-line' },
   filing: { label: '待申报', icon: 'ri-calendar-check-line' },
   match: { label: '待配流水', icon: 'ri-arrow-left-right-line' },
   receipt: { label: '待补票据', icon: 'ri-file-receipt-line' },
@@ -55,6 +65,7 @@ const categoryMeta: Record<string, { label: string; icon: string }> = {
 
 // 旧后端未下发 category 字段时按 ruleId 兜底，保证分组不退化
 const ruleIdCategory: Record<string, string> = {
+  opening_balance_required: 'setup',
   filing_deadline: 'filing',
   unmatched_statement: 'match',
   missing_document: 'receipt',
@@ -166,6 +177,35 @@ function toggleGroup(category: string) {
   collapsedCats.value = next
 }
 
+function isIitWithholdingTodo(todo: TodoItem): boolean {
+  return todo.meta?.taxKind === 'iit_withholding' || String(todo.title || '').includes('个税扣缴')
+}
+
+function openSalaryForTodo(todo: TodoItem) {
+  const raw = String(todo.meta?.period || todo.title || '')
+  const match = raw.match(/\d{4}-\d{2}/)
+  router.push({ path: '/mine/salary', query: match ? { month: match[0] } : {} })
+}
+
+const SKIP_LLM_CATEGORIES = new Set(['filing', 'setup', 'intangible'])
+const SKIP_LLM_RULE_IDS = new Set([
+  'filing_deadline',
+  'personal_proxy_withholding',
+  'tax_registration_unsynced',
+  'opening_balance_required',
+  'fixed_asset_depreciation',
+  'intangible_review',
+  'intangible_expiry',
+  'intangible_asset_amortization',
+])
+
+function needsLlmAdvice(t: TodoItem): boolean {
+  if (t.done || t.dismissed) return false
+  if (SKIP_LLM_CATEGORIES.has(t.category || '')) return false
+  if (SKIP_LLM_RULE_IDS.has(String(t.meta?.ruleId || ''))) return false
+  return t.meta?.aiSuggestion?.source !== 'llm'
+}
+
 async function load(autoAi = true) {
   loading.value = true
   try {
@@ -173,8 +213,8 @@ async function load(autoAi = true) {
     todos.value = resp.todos ?? []
     autoResolved.value = resp.autoResolved ?? []
 
-    // 针对尚未得到 LLM 深度建议的条目，后台静默拉取一次
-    if (autoAi && todos.value.some((t) => !t.done && !t.dismissed && t.meta?.aiSuggestion?.source !== 'llm')) {
+    // 针对尚未得到 LLM 深度建议且需语义判断的条目，后台静默拉取一次
+    if (autoAi && todos.value.some(needsLlmAdvice)) {
       triggerAiAdvice()
     }
   } catch {
@@ -353,6 +393,7 @@ async function setNatureOwnerLoan(todo: TodoItem) {
 }
 
 function toggleSelect(todo: TodoItem, checked: boolean) {
+  if (checked && (todo.meta?.nonDismissible || todo.meta?.ruleId === 'opening_balance_required')) return
   if (checked) selectedKeys.value.add(todo.key)
   else selectedKeys.value.delete(todo.key)
 }
@@ -397,51 +438,14 @@ async function batchMarkDone() {
   await load()
 }
 
-// 征期税种聚合相关辅助（extractFilingPeriod 已收敛到 utils/todoAction）
-function extractTaxName(title: string): string {
-  return title
-    .replace(/^.+?-\s*/, '')
-    .replace(/（\d{4}[^）]*）\s*$/, '')
-    .trim()
-}
-
-interface TaxPeriodBundle {
-  period: string
-  items: TodoItem[]
-  urgentCount: number
-}
-
-function getPeriodBundles(items: TodoItem[]): { bundles: TaxPeriodBundle[]; singles: TodoItem[] } {
-  const periodMap = new Map<string, TodoItem[]>()
-  const singles: TodoItem[] = []
-
-  for (const item of items) {
-    if (item.meta?.ruleId === 'filing_deadline') {
-      const period = extractFilingPeriod(item.title)
-      if (!periodMap.has(period)) periodMap.set(period, [])
-      periodMap.get(period)!.push(item)
-    } else {
-      singles.push(item)
-    }
-  }
-
-  const bundles: TaxPeriodBundle[] = []
-  for (const [period, pItems] of periodMap.entries()) {
-    if (pItems.length >= 2) {
-      bundles.push({
-        period,
-        items: pItems,
-        urgentCount: pItems.filter((i) => i.priority === 'high').length,
-      })
-    } else {
-      singles.push(...pItems)
-    }
-  }
-
-  return { bundles, singles }
-}
-
+// 征期税种聚合：分组与渲染行顺序都收敛在 utils/todoAction，页面只负责展开状态
 const expandedTaxBundles = ref<Set<string>>(new Set())
+
+function displayRows(groupCategory: string, items: TodoItem[]): TodoItem[] {
+  // 聚合只用于「待申报」的待处理态；已办结列表仍按单卡平铺，避免历史记录被折叠成一张卡
+  if (groupCategory !== 'filing' || statusFilter.value !== 'pending') return items
+  return buildTodoDisplayRows(items, expandedTaxBundles.value)
+}
 
 function toggleTaxBundle(period: string) {
   const next = new Set(expandedTaxBundles.value)
@@ -538,17 +542,15 @@ function isEntryEditable(todo: TodoItem): boolean {
   return !status || status === 'draft' || status === 'pending_review'
 }
 
+function filingSetupTodos(items: TodoItem[]): TodoItem[] {
+  return items.filter((t) => t.meta?.ruleId === 'tax_registration_unsynced')
+}
+
 function shouldShowTodoItem(groupCategory: string, todo: TodoItem): boolean {
+  if (groupCategory === 'setup' && statusFilter.value === 'pending') return false
   if (groupCategory !== 'filing' || statusFilter.value !== 'pending') return true
-  if (todo.meta?.ruleId !== 'filing_deadline') return true
-  const period = extractFilingPeriod(todo.title)
-  const itemsInPeriod = filteredTodos.value.filter(
-    (t) => t.meta?.ruleId === 'filing_deadline' && extractFilingPeriod(t.title) === period,
-  )
-  if (itemsInPeriod.length >= 2 && !expandedTaxBundles.value.has(period)) {
-    return false
-  }
-  return true
+  // 折叠聚合卡的明细已由 displayRows 排除；这里只把税费种认定同步交给上面的前置配置卡
+  return todo.meta?.ruleId !== 'tax_registration_unsynced'
 }
 
 onMounted(() => {
@@ -668,7 +670,7 @@ usePageRefresh(load)
     <div v-if="autoResolved.length > 0" class="auto-resolved-banner">
       <div class="banner-left">
         <i class="ri-shield-check-fill banner-icon" />
-        <span>系统已自动为您静默核验 <strong>{{ autoResolved.length }}</strong> 笔内部资金划转/结息事项（无需手工开票），账目合规清楚。</span>
+        <span>系统已自动为您静默核验 <strong>{{ autoResolved.length }}</strong> 笔免开票/免补票事项（如内部划转、结息、税费回单等），账目合规清楚。</span>
       </div>
       <button type="button" class="banner-btn" @click="showSilentModal = !showSilentModal">
         {{ showSilentModal ? '收起明细' : '查看明细' }}
@@ -680,7 +682,7 @@ usePageRefresh(load)
     <div v-if="showSilentModal && autoResolved.length > 0" class="silent-items-wrapper">
       <div v-for="item in autoResolved" :key="item.id" class="silent-item-row">
         <div class="silent-item-info">
-          <span class="silent-item-tag">{{ item.categoryLabel || '自动免开票' }}</span>
+          <span class="silent-item-tag">{{ item.categoryLabel || '自动核验' }}</span>
           <strong class="silent-item-title">{{ item.title }}</strong>
           <span class="silent-item-date">{{ item.date }}</span>
           <p class="silent-item-reason">{{ item.reason }}</p>
@@ -732,27 +734,108 @@ usePageRefresh(load)
             v-show="filterTab !== 'all' || !collapsedCats.has(group.category)"
             class="todo-list"
           >
-            <!-- 征期税种多项智能聚合卡片：同周期 >= 2 项时集中呈现 -->
+            <!-- 建账前置必办提示条（不可忽略） -->
+            <template v-if="group.category === 'setup' && statusFilter === 'pending'">
+              <div
+                v-for="setupTodo in group.items"
+                :key="setupTodo.key"
+                class="filing-setup-banner setup-required-banner"
+              >
+                <div class="filing-setup-main">
+                  <div class="filing-setup-head">
+                    <span class="priority-pill urgent">前置必办</span>
+                    <strong class="filing-setup-title">{{ formatTodoCardTitle(setupTodo) }}</strong>
+                  </div>
+                  <p v-if="formatTodoCardDesc(setupTodo)" class="filing-setup-desc">
+                    {{ formatTodoCardDesc(setupTodo) }}
+                  </p>
+                </div>
+                <div class="filing-setup-actions">
+                  <NButton
+                    v-if="getActionRoute(setupTodo)"
+                    size="small"
+                    type="primary"
+                    @click="router.push(getActionRoute(setupTodo)!)"
+                  >
+                    {{ getActionLabel(setupTodo) }}
+                  </NButton>
+                  <NPopconfirm v-if="!setupTodo.meta?.nonDismissible" @positive-click="dismissTodo(setupTodo)">
+                    <template #trigger>
+                      <NButton text size="small" class="dismiss-btn" :loading="updating.has(setupTodo.key)">
+                        忽略
+                      </NButton>
+                    </template>
+                    确认忽略该配置提示？
+                  </NPopconfirm>
+                </div>
+              </div>
+            </template>
+
+            <!-- 待申报前置配置提示条 + 征期税种多项智能聚合卡片 -->
             <template v-if="group.category === 'filing' && statusFilter === 'pending'">
               <div
-                v-for="bundle in getPeriodBundles(group.items).bundles"
-                :key="bundle.period"
+                v-for="setupTodo in filingSetupTodos(group.items)"
+                :key="setupTodo.key"
+                class="filing-setup-banner"
+              >
+                <div class="filing-setup-main">
+                  <div class="filing-setup-head">
+                    <span class="priority-pill info">前置配置</span>
+                    <strong class="filing-setup-title">{{ formatTodoCardTitle(setupTodo) }}</strong>
+                  </div>
+                  <p v-if="formatTodoCardDesc(setupTodo)" class="filing-setup-desc">
+                    {{ formatTodoCardDesc(setupTodo) }}
+                  </p>
+                </div>
+                <div class="filing-setup-actions">
+                  <NButton
+                    v-if="getActionRoute(setupTodo)"
+                    size="small"
+                    type="primary"
+                    secondary
+                    @click="router.push(getActionRoute(setupTodo)!)"
+                  >
+                    {{ getActionLabel(setupTodo) }}
+                  </NButton>
+                  <NPopconfirm @positive-click="dismissTodo(setupTodo)">
+                    <template #trigger>
+                      <NButton text size="small" class="dismiss-btn" :loading="updating.has(setupTodo.key)">
+                        忽略
+                      </NButton>
+                    </template>
+                    确认忽略该配置提示？忽略后仍可在系统设置中同步。
+                  </NPopconfirm>
+                </div>
+              </div>
+            </template>
+
+            <!-- 聚合卡与单卡同一列表渲染：展开的明细紧跟在对应聚合卡下方 -->
+            <template v-for="todo in displayRows(group.category, group.items)" :key="todo.key">
+              <div
+                v-if="todo.meta?.bundle"
                 class="tax-bundle-box"
               >
                 <div class="bundle-main-row">
                   <div class="bundle-content">
                     <div class="bundle-header-row">
-                      <span v-if="bundle.urgentCount > 0" class="priority-pill urgent">紧急临期</span>
-                      <strong class="bundle-title">{{ bundle.period }} 税费综合申报（共 {{ bundle.items.length }} 项）</strong>
+                      <span
+                        v-if="todo.meta.bundle.isOverdue || todo.meta.bundle.statusLabel || todo.meta.bundle.urgentCount > 0"
+                        class="priority-pill"
+                        :class="todo.meta.bundle.isOverdue || todo.meta.bundle.urgentCount > 0 ? 'urgent' : 'info'"
+                      >{{ todo.meta.bundle.statusLabel || '紧急临期' }}</span>
+                      <strong class="bundle-title">{{ todo.meta.bundle.period }} 税费综合申报（共 {{ todo.meta.bundle.items.length }} 项）</strong>
+                      <span v-if="todo.meta.bundle.dueDate" class="bundle-due-meta" :class="{ 'is-overdue': todo.meta.bundle.isOverdue }">
+                        截止 {{ todo.meta.bundle.dueDate }}
+                      </span>
                     </div>
                     <div class="bundle-tax-tags">
-                      <span v-for="t in bundle.items" :key="t.key" class="bundle-tax-tag">
-                        <i class="ri-checkbox-circle-line" /> {{ extractTaxName(t.title) }}
+                      <span v-for="t in todo.meta.bundle.items" :key="t.key" class="bundle-tax-tag">
+                        <i class="ri-time-line" /> {{ extractTaxName(t.title) }}
                       </span>
                     </div>
                   </div>
                   <div class="bundle-actions">
-                    <NButton size="small" type="primary" @click="router.push('/tax-filing')">
+                    <NButton size="small" type="primary" @click="router.push(closingTodoRoute(todo.meta.bundle.items[0]))">
                       <template #icon><i class="ri-external-link-line" /></template>
                       申报向导
                     </NButton>
@@ -762,29 +845,25 @@ usePageRefresh(load)
                         { label: '一键全部标记在税局申报', key: 'filed' },
                         { label: '一键全部按零申报归档', key: 'zero' },
                       ]"
-                      @select="(key) => markAllTaxFiled(bundle, key === 'zero')"
+                      @select="(key) => markAllTaxFiled(todo.meta.bundle, key === 'zero')"
                     >
                       <NButton size="small" secondary>
                         一键办结 <i class="ri-arrow-down-s-line" />
                       </NButton>
                     </NDropdown>
-                    <NButton size="small" quaternary @click="toggleTaxBundle(bundle.period)">
-                      {{ expandedTaxBundles.has(bundle.period) ? '收起明细' : '查看各税种' }}
-                      <i :class="expandedTaxBundles.has(bundle.period) ? 'ri-arrow-up-s-line' : 'ri-arrow-down-s-line'" />
+                    <NButton size="small" quaternary @click="toggleTaxBundle(todo.meta.bundle.period)">
+                      {{ expandedTaxBundles.has(todo.meta.bundle.period) ? '收起明细' : '查看各税种' }}
+                      <i :class="expandedTaxBundles.has(todo.meta.bundle.period) ? 'ri-arrow-up-s-line' : 'ri-arrow-down-s-line'" />
                     </NButton>
                   </div>
                 </div>
               </div>
-            </template>
-
-            <!-- 单个待办卡片列表 -->
-            <template v-for="todo in group.items" :key="todo.key">
               <div
-                v-if="shouldShowTodoItem(group.category, todo)"
+                v-else-if="shouldShowTodoItem(group.category, todo)"
                 class="todo-card-wrapper"
                 :class="{ 'is-done': todo.done, 'is-selected': isBatchMode && selectedKeys.has(todo.key) }"
               >
-                <div class="card-select-area">
+                <div v-if="showCardCheckbox(todo, isBatchMode)" class="card-select-area">
                   <NCheckbox
                     :checked="isBatchMode ? selectedKeys.has(todo.key) : todo.done"
                     :disabled="updating.has(todo.key)"
@@ -797,32 +876,53 @@ usePageRefresh(load)
                 <div class="card-main-area">
                   <div class="card-headline-row">
                     <div class="title-with-priority">
-                      <span v-if="todo.priority === 'high'" class="priority-pill urgent">紧急</span>
-                      <span v-else-if="todo.priority === 'medium'" class="priority-pill medium">重要</span>
+                      <span
+                        v-if="todoCardBadge(todo)"
+                        class="priority-pill"
+                        :class="todoCardBadge(todo)!.tone"
+                      >{{ todoCardBadge(todo)!.label }}</span>
                       <span class="todo-title" :class="{ 'strike-through': todo.done }">
-                        {{ todo.title }}
+                        {{ formatTodoCardTitle(todo) }}
                       </span>
                     </div>
-                    <div class="card-meta-right" v-if="todo.amount">
-                      <span class="amount-val">{{ formatMoney(todo.amount) }}</span>
+                    <div
+                      v-if="todo.amount || (todo.meta?.ruleId === 'filing_deadline' && extractFilingDeadlineInfo(todo).dueDate) || (todo.meta?.ruleId === 'personal_proxy_withholding' && todo.meta?.dueDate)"
+                      class="card-meta-right"
+                    >
+                      <span
+                        v-if="todo.meta?.ruleId === 'personal_proxy_withholding' && todo.meta?.dueDate"
+                        class="due-date-meta"
+                      >
+                        截止 {{ todo.meta.dueDate }}
+                      </span>
+                      <span v-if="todo.amount" class="amount-val">{{ formatMoney(todo.amount) }}</span>
+                      <span
+                        v-else
+                        class="due-date-meta"
+                        :class="{ 'is-overdue': extractFilingDeadlineInfo(todo).isOverdue }"
+                      >
+                        截止 {{ extractFilingDeadlineInfo(todo).dueDate }}
+                      </span>
                     </div>
                   </div>
 
-                  <div v-if="todo.desc || todo.description" class="todo-desc-text">
-                    {{ todo.desc || todo.description }}
+                  <div v-if="formatTodoCardDesc(todo)" class="todo-desc-text">
+                    {{ formatTodoCardDesc(todo) }}
+                    <GuideTrigger
+                      v-if="isIitWithholdingTodo(todo)"
+                      guide="iit"
+                      label="个税怎么申报？"
+                      class="todo-desc-guide"
+                    />
                   </div>
 
-                  <!-- 💡 AI 顾问建议与大白话理由（为不懂财务的小白解惑） -->
-                  <div v-if="todo.meta?.aiSuggestion" class="todo-ai-box">
-                    <div class="ai-box-badge">
-                      <i class="ri-chat-3-line" />
-                      <span>{{ todo.meta.aiSuggestion.source === 'llm' ? 'AI 顾问建议' : '智能建议' }}</span>
-                    </div>
-                    <div class="ai-box-content">
-                      <div class="ai-reason-text">
-                        {{ todo.meta.aiSuggestion.reason }}
-                      </div>
-                    </div>
+                  <!-- 💡 单行轻量 AI 建议提示条（取消嵌套外框） -->
+                  <div v-if="todo.meta?.aiSuggestion?.reason" class="todo-ai-inline">
+                    <span class="ai-inline-label">
+                      <i class="ri-sparkling-2-line" />
+                      <span>{{ todo.meta.aiSuggestion.source === 'llm' ? 'AI 建议' : '智能建议' }}：</span>
+                    </span>
+                    <span class="ai-inline-text">{{ todo.meta.aiSuggestion.reason }}</span>
                   </div>
 
                   <!-- 动作操作条：未完成态 -->
@@ -834,11 +934,12 @@ usePageRefresh(load)
                           <NButton
                             size="small"
                             type="primary"
+                            :title="`关联「${todo.meta.candidateExpenseTitle}」核销`"
                             :loading="actingKeys.has(todo.key)"
                             @click="handleLinkInvoice(todo)"
                           >
                             <template #icon><i class="ri-link-m" /></template>
-                            关联「{{ todo.meta.candidateExpenseTitle }}」核销
+                            一键关联核销
                           </NButton>
                           <NButton size="small" secondary :loading="actingKeys.has(todo.key)" @click="handleSetPayer(todo, 'boss_personal', '老板垫付')">
                             记为老板垫付
@@ -922,7 +1023,41 @@ usePageRefresh(load)
                           已在税局申报
                         </NButton>
                         <NButton size="small" secondary :loading="actingKeys.has(todo.key)" @click="markFiled(todo, true)">
-                          本月零申报
+                          按零申报办结
+                        </NButton>
+                        <NButton
+                          v-if="isIitWithholdingTodo(todo)"
+                          size="small"
+                          quaternary
+                          @click="openSalaryForTodo(todo)"
+                        >
+                          <template #icon><i class="ri-coins-line" /></template>
+                          查看工资表
+                        </NButton>
+                      </template>
+
+                      <!-- 4.1 自然人代开发票代扣代缴 -->
+                      <template v-else-if="todo.meta?.ruleId === 'personal_proxy_withholding'">
+                        <NButton size="small" type="primary" :loading="updating.has(todo.key)" @click="toggleDone(todo)">
+                          <template #icon><i class="ri-checkbox-circle-line" /></template>
+                          已申报办结
+                        </NButton>
+                        <NButton
+                          size="small"
+                          secondary
+                          @click="router.push({ path: '/tools', query: { tool: 'labor-tax', ...(todo.amount ? { amount: String(todo.amount) } : {}) } })"
+                        >
+                          <template #icon><i class="ri-calculator-line" /></template>
+                          去算税
+                        </NButton>
+                        <GuideTrigger guide="iit" label="个税怎么申报？" />
+                        <NButton
+                          size="small"
+                          quaternary
+                          @click="router.push(todo.meta?.entryId ? `/vouchers/${todo.meta.entryId}` : '/invoices')"
+                        >
+                          {{ todo.meta?.entryId ? '查看凭证' : '查看发票' }}
+                          <i class="ri-arrow-right-line" />
                         </NButton>
                       </template>
 
@@ -960,7 +1095,7 @@ usePageRefresh(load)
                       </template>
                     </div>
 
-                    <div class="secondary-actions">
+                    <div v-if="!todo.meta?.nonDismissible" class="secondary-actions">
                       <NPopconfirm @positive-click="dismissTodo(todo)">
                         <template #trigger>
                           <NButton text size="small" class="dismiss-btn" :loading="updating.has(todo.key)">
@@ -1228,30 +1363,29 @@ usePageRefresh(load)
   color: var(--solo-income, #0f7354);
 }
 
-/* 💡 AI 建议提示条 */
-.todo-ai-box {
-  background: var(--solo-bg-blue-soft, #edf3ff);
-  border: 1px solid rgba(23, 71, 176, 0.15);
-  border-radius: 8px;
-  padding: 8px 12px;
-  margin-top: 4px;
-  margin-bottom: 6px;
+/* 💡 轻量内联 AI 建议条（左竖线替代嵌套大框） */
+.todo-ai-inline {
   display: flex;
-  flex-direction: column;
-  gap: 3px;
+  align-items: baseline;
+  gap: 6px;
+  padding: 5px 10px;
+  border-left: 2px solid var(--solo-primary);
+  border-radius: 0 6px 6px 0;
+  background: var(--solo-bg-blue-soft);
+  font-size: 12px;
+  line-height: 1.45;
 }
-.ai-box-badge {
+.ai-inline-label {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  font-size: 11.5px;
+  gap: 3px;
+  flex-shrink: 0;
   font-weight: 600;
-  color: var(--solo-primary, #1747b0);
+  color: var(--solo-primary);
 }
-.ai-reason-text {
-  font-size: 12.5px;
-  color: var(--solo-text-primary, #182230);
-  line-height: 1.45;
+.ai-inline-text {
+  color: var(--solo-text-secondary);
+  min-width: 0;
 }
 
 /* 顶部 4 格待办态势看板 */
@@ -1449,6 +1583,54 @@ usePageRefresh(load)
   gap: 10px;
 }
 
+/* 征期前置配置置顶引导条 */
+.filing-setup-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  border-radius: var(--solo-radius, 8px);
+  border: 1px solid rgba(23, 71, 176, 0.16);
+  border-left: 3px solid var(--solo-primary);
+  background: var(--solo-bg-blue-soft);
+}
+.setup-required-banner {
+  border-color: var(--solo-expense-bg);
+  border-left-color: var(--solo-expense);
+  background: var(--solo-warning-bg);
+}
+.filing-setup-main {
+  flex: 1;
+  min-width: 240px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.filing-setup-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.filing-setup-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--solo-text-primary);
+}
+.filing-setup-desc {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--solo-text-secondary);
+}
+.filing-setup-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
 /* 征期税种多项综合卡片 */
 .tax-bundle-box {
   background: var(--solo-bg-card, #ffffff);
@@ -1486,6 +1668,18 @@ usePageRefresh(load)
   font-weight: 650;
   color: var(--solo-text-primary, #182230);
 }
+.bundle-due-meta,
+.due-date-meta {
+  font-size: 12px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: var(--solo-text-muted);
+}
+.bundle-due-meta.is-overdue,
+.due-date-meta.is-overdue {
+  color: var(--solo-expense);
+  font-weight: 600;
+}
 .bundle-tax-tags {
   display: flex;
   align-items: center;
@@ -1511,13 +1705,13 @@ usePageRefresh(load)
   flex-wrap: wrap;
 }
 .todo-card-wrapper {
-  background: var(--solo-bg-card, #ffffff);
-  border: 1px solid var(--solo-border, #dde3ea);
+  background: var(--solo-bg-card);
+  border: 1px solid var(--solo-border);
   border-radius: var(--solo-radius-lg, 12px);
-  padding: 14px 18px;
+  padding: 12px 16px;
   display: flex;
   align-items: flex-start;
-  gap: 14px;
+  gap: 12px;
   transition: all 0.2s ease;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
 }
@@ -1543,7 +1737,7 @@ usePageRefresh(load)
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
 }
 .card-headline-row {
   display: flex;
@@ -1578,6 +1772,16 @@ usePageRefresh(load)
   color: var(--solo-warning);
   border: 1px solid rgba(160, 92, 16, 0.2);
 }
+.priority-pill.match {
+  background: var(--solo-income-bg);
+  color: var(--solo-income);
+  border: 1px solid rgba(15, 115, 84, 0.2);
+}
+.priority-pill.info {
+  background: var(--solo-info-bg);
+  color: var(--solo-primary);
+  border: 1px solid rgba(23, 71, 176, 0.16);
+}
 .todo-title {
   font-size: 14.5px;
   font-weight: 600;
@@ -1606,14 +1810,16 @@ usePageRefresh(load)
   line-height: 1.5;
   color: var(--solo-text-secondary, #586474);
 }
+.todo-desc-guide {
+  margin-left: 6px;
+}
 .card-actions-row {
   display: flex;
   justify-content: space-between;
   align-items: center;
   gap: 12px;
-  margin-top: 4px;
-  padding-top: 10px;
-  border-top: 1px dashed var(--solo-border, #edf0f4);
+  margin-top: 2px;
+  padding-top: 2px;
 }
 .primary-actions {
   display: flex;

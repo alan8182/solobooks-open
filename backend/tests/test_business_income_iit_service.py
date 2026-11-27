@@ -263,12 +263,25 @@ async def test_annual_settlement_assist_builds_card(monkeypatch):
     async def fake_statement(*_args, **_kwargs):
         return _FakeStatement()
 
-    async def fake_scan(_company_id: str, _fiscal_year: int):
-        return (
-            Decimal("8000.00"),  # 无票支出
-            [{"entryId": "e1", "title": "无票材料款", "occurDate": "2026-05-01", "amount": Decimal("8000.00")}],
-            Decimal("96000.00"),  # 全年人力成本（业主工资确认的参考基数）
-        )
+    async def fake_scan(_company_id: str, _fiscal_year: int, _profit_ytd=None, **_kwargs):
+        detail = [
+            {"entryId": "e1", "title": "无票材料款", "occurDate": "2026-05-01", "amount": Decimal("8000.00")}
+        ]
+        return {
+            "undocumented": Decimal("8000.00"),
+            "undocumentedDetail": detail,
+            "salaryPaid": Decimal("96000.00"),
+            "citAdjustments": {
+                "items": [{
+                    "code": "A105000-30",
+                    "label": "无合规扣除凭证支出调增",
+                    "amount": Decimal("8000.00"),
+                    "basis": "test",
+                    "detail": detail,
+                }],
+                "totalIncrease": Decimal("8000.00"),
+            },
+        }
 
     monkeypatch.setattr(
         "services.tax_filing_export_service.build_statement_data", fake_statement
@@ -349,8 +362,13 @@ async def test_owner_flag_and_auto_prefill(monkeypatch):
     async def fake_statement(*_args, **_kwargs):
         return _FakeStatement()
 
-    async def fake_scan(_company_id: str, _fiscal_year: int):
-        return Decimal("0"), [], Decimal("96000.00")
+    async def fake_scan(_company_id: str, _fiscal_year: int, _profit_ytd=None, **_kwargs):
+        return {
+            "undocumented": Decimal("0.00"),
+            "undocumentedDetail": [],
+            "salaryPaid": Decimal("96000.00"),
+            "citAdjustments": {"items": [], "totalIncrease": Decimal("0.00")},
+        }
 
     monkeypatch.setattr(
         "services.tax_filing_export_service.build_statement_data", fake_statement
@@ -501,10 +519,224 @@ async def test_annual_expense_scan_real_import_path():
         },
     })
 
-    undocumented, detail, salary_paid = await svc._annual_expense_scan("c-iit-scan", 2026)
-    assert undocumented == Decimal("8000.00")  # 仅无票材料款
-    assert salary_paid == Decimal("5000.00")  # 仅手工人力成本
-    assert [d["title"] for d in detail] == ["无票材料款"]
+    scan = await svc._annual_expense_scan("c-iit-scan", 2026)
+    assert scan["undocumented"] == Decimal("8000.00")  # 仅无票材料款
+    assert scan["salaryPaid"] == Decimal("5000.00")  # 仅手工人力成本
+    assert [d["title"] for d in scan["undocumentedDetail"]] == ["无票材料款"]
+
+
+@pytest.mark.asyncio
+async def test_annual_settlement_applies_deduction_limits_and_fines(monkeypatch):
+    """回归：个体户/个独 B 表年度汇算复用 CIT 限额与罚款调增规则，且不与无票重复调增。"""
+    from db.session import session_scope
+    from services import business_income_iit_service as svc
+    from services.accounting_core_service import create_entry, seed_accounts
+
+    class _FakeStatement:
+        profit_ytd = {
+            "revenue": Decimal("500000.00"),
+            "total_profit": Decimal("120000.00"),
+        }
+
+    async def fake_statement(*_args, **_kwargs):
+        return _FakeStatement()
+
+    monkeypatch.setattr(
+        "services.tax_filing_export_service.build_statement_data", fake_statement
+    )
+
+    await _ensure_schema()
+    await _create_company("c-iit-limits", "个体工商户")
+
+    async with session_scope() as session:
+        await seed_accounts(session, "c-iit-limits")
+
+    async def _post(entry_id: str, payload: dict) -> None:
+        async with session_scope() as session:
+            await create_entry(
+                session, payload,
+                company_id="c-iit-limits", user_id="u-iit",
+                request_id=entry_id, confirm=True,
+            )
+
+    # 1) 有票业务招待费 10,000（年收入 500,000 → min(6000, 2500)=2500 可扣 → 调增 7500）
+    await _post("lim-ent-doc", {
+        "id": "lim-ent-doc", "direction": "expense", "amount": "10000.00",
+        "title": "客户商务宴请", "category": "业务招待费", "occurDate": "2026-04-10",
+        "sourceType": "manual", "billingStatus": "has_invoice",
+        "invoiceType": "增值税电子普通发票", "invoiceNumber": "25312000000090001",
+        "voucherLines": {
+            "debit": [{"accountCode": "5602002", "accountName": "管理费用-业务招待费", "amount": "10000.00"}],
+            "credit": [{"accountCode": "1002", "accountName": "银行存款", "amount": "10000.00"}],
+        },
+    })
+    # 2) 有票广告宣传费 100,000（年收入 500,000 → 15% 限额 75,000 → 调增 25,000）
+    await _post("lim-ad-doc", {
+        "id": "lim-ad-doc", "direction": "expense", "amount": "100000.00",
+        "title": "线上广告投放", "category": "推广费", "occurDate": "2026-05-15",
+        "sourceType": "manual", "billingStatus": "has_invoice",
+        "invoiceType": "增值税电子普通发票", "invoiceNumber": "25312000000090002",
+        "voucherLines": {
+            "debit": [{"accountCode": "5601016", "accountName": "销售费用-业务宣传费", "amount": "100000.00"}],
+            "credit": [{"accountCode": "1002", "accountName": "银行存款", "amount": "100000.00"}],
+        },
+    })
+    # 3) 罚款滞纳金 2,000（全额调增 2,000，不计入无票支出）
+    await _post("lim-fine", {
+        "id": "lim-fine", "direction": "expense", "amount": "2000.00",
+        "title": "税收滞纳金", "category": "营业外支出", "occurDate": "2026-06-20",
+        "sourceType": "manual",
+        "voucherLines": {
+            "debit": [{"accountCode": "5711", "accountName": "营业外支出", "amount": "2000.00"}],
+            "credit": [{"accountCode": "1002", "accountName": "银行存款", "amount": "2000.00"}],
+        },
+    })
+    # 4) 无票业务招待费 3,000（仅进无票全额调增 3,000，不叠加限额）
+    await _post("lim-ent-nodoc", {
+        "id": "lim-ent-nodoc", "direction": "expense", "amount": "3000.00",
+        "title": "无票客户招待", "category": "业务招待费", "occurDate": "2026-07-05",
+        "sourceType": "manual", "billingStatus": "no_document",
+        "voucherLines": {
+            "debit": [{"accountCode": "5602002", "accountName": "管理费用-业务招待费", "amount": "3000.00"}],
+            "credit": [{"accountCode": "1002", "accountName": "银行存款", "amount": "3000.00"}],
+        },
+    })
+
+    card = await svc.build_annual_settlement_assist(
+        "u-iit", "c-iit-limits", 2026,
+        owner_salary=Decimal("10000"),
+    )
+    adj = card["adjustments"]
+    assert adj["ownerSalary"] == Decimal("10000.00")
+    assert adj["entertainmentExcess"] == Decimal("7500.00")
+    assert adj["advertisingExcess"] == Decimal("25000.00")
+    assert adj["finesAndPenalties"] == Decimal("2000.00")
+    assert adj["undocumentedExpenses"] == Decimal("3000.00")
+    # 合计调增 = 10000 + 7500 + 25000 + 2000 + 3000 = 47500
+    assert adj["total"] == Decimal("47500.00")
+    assert len(adj["items"]) == 4
+    # 应纳税所得额 = 120000 + 47500 - 60000 = 107500
+    assert card["taxableIncome"] == Decimal("107500.00")
+    assert any("业务招待费超限额调增 7500.00" in note for note in card["notes"])
+    assert any("广告费和业务宣传费超限额调增 25000.00" in note for note in card["notes"])
+    assert any("罚款、滞纳金 2000.00" in note for note in card["notes"])
+    assert any("年度无票支出 3000.00" in note for note in card["notes"])
+
+
+@pytest.mark.asyncio
+async def test_annual_settlement_applies_payroll_caps_and_donation(monkeypatch):
+    """回归：个体户 B 表三项经费（14%/2%/2.5%）剔除业主工资基数 + 公益性捐赠 30% 限额。"""
+    from db.session import session_scope
+    from services import business_income_iit_service as svc
+    from services.accounting_core_service import create_entry, seed_accounts
+
+    class _FakeStatement:
+        profit_ytd = {
+            "revenue": Decimal("500000.00"),
+            # 利润已扣除 50,000 捐赠；扣除捐赠前利润 160,000 + 业主工资 20,000 + 三项超额 7,000 - 减除 60,000 = 127,000
+            # 但为了算术整洁：total_profit = 103,000 → + 50,000(捐赠) + 7,000(三项超额) + 20,000(业主工资) - 60,000 = 120,000
+            "total_profit": Decimal("103000.00"),
+        }
+
+    async def fake_statement(*_args, **_kwargs):
+        return _FakeStatement()
+
+    monkeypatch.setattr(
+        "services.tax_filing_export_service.build_statement_data", fake_statement
+    )
+
+    await _ensure_schema()
+    await _create_company("c-iit-payroll-cap", "个体工商户")
+
+    async with session_scope() as session:
+        await seed_accounts(session, "c-iit-payroll-cap")
+
+    async def _post(entry_id: str, payload: dict) -> None:
+        async with session_scope() as session:
+            await create_entry(
+                session, payload,
+                company_id="c-iit-payroll-cap", user_id="u-iit",
+                request_id=entry_id, confirm=True,
+            )
+
+    # 计提工资：应发 120,000（221101=100,000 + 221104=20,000）+ 单位社保 10,000（不计入基数）
+    # 传入 owner_salary=20,000 → 从业人员基数 = 120,000 - 20,000 = 100,000
+    await _post("cap-sal-accrual", {
+        "id": "cap-sal-accrual", "direction": "expense", "amount": "130000.00",
+        "title": "2026年计提工资及社保", "category": "人力成本", "occurDate": "2026-06-30",
+        "sourceType": "salary_accrual", "billingStatus": "has_receipt",
+        "voucherLines": {
+            "debit": [{"accountCode": "5602001", "accountName": "管理费用-管理人员职工薪酬", "amount": "130000.00"}],
+            "credit": [
+                {"accountCode": "221101", "accountName": "应付职工薪酬-工资", "amount": "100000.00"},
+                {"accountCode": "221104", "accountName": "应付职工薪酬-代扣社保公积金", "amount": "20000.00"},
+                {"accountCode": "221102", "accountName": "应付职工薪酬-单位社保", "amount": "10000.00"},
+            ],
+        },
+    })
+    # 福利费 18,000：100,000×14% = 14,000 → 调增 4,000
+    await _post("cap-welfare", {
+        "id": "cap-welfare", "direction": "expense", "amount": "18000.00",
+        "title": "员工体检与过节福利", "category": "员工福利费", "occurDate": "2026-07-01",
+        "sourceType": "manual", "billingStatus": "has_invoice",
+        "invoiceType": "增值税电子普通发票", "invoiceNumber": "25312000000091001",
+        "voucherLines": {
+            "debit": [{"accountCode": "5602014", "accountName": "管理费用-职工福利费", "amount": "18000.00"}],
+            "credit": [{"accountCode": "1002", "accountName": "银行存款", "amount": "18000.00"}],
+        },
+    })
+    # 工会经费 3,000：100,000×2% = 2,000 → 调增 1,000
+    await _post("cap-union", {
+        "id": "cap-union", "direction": "expense", "amount": "3000.00",
+        "title": "拨缴工会经费", "category": "工会经费", "occurDate": "2026-07-02",
+        "sourceType": "manual", "billingStatus": "has_invoice",
+        "invoiceType": "增值税电子普通发票", "invoiceNumber": "25312000000091002",
+        "voucherLines": {
+            "debit": [{"accountCode": "5602", "accountName": "管理费用", "amount": "3000.00"}],
+            "credit": [{"accountCode": "1002", "accountName": "银行存款", "amount": "3000.00"}],
+        },
+    })
+    # 职工教育经费 4,500：100,000×2.5% = 2,500 → 调增 2,000
+    await _post("cap-edu", {
+        "id": "cap-edu", "direction": "expense", "amount": "4500.00",
+        "title": "员工技能培训费", "category": "职工教育经费", "occurDate": "2026-07-03",
+        "sourceType": "manual", "billingStatus": "has_invoice",
+        "invoiceType": "增值税电子普通发票", "invoiceNumber": "25312000000091003",
+        "voucherLines": {
+            "debit": [{"accountCode": "5602", "accountName": "管理费用", "amount": "4500.00"}],
+            "credit": [{"accountCode": "1002", "accountName": "银行存款", "amount": "4500.00"}],
+        },
+    })
+    # 公益捐赠 50,000：扣除前应纳税所得额 = 103000 + 50000 + 7000 + 20000 - 60000 = 120,000
+    # 30% 限额 = 36,000 → 调增 14,000
+    await _post("cap-don", {
+        "id": "cap-don", "direction": "expense", "amount": "50000.00",
+        "title": "红十字会公益捐赠", "category": "捐赠支出", "occurDate": "2026-08-01",
+        "sourceType": "manual", "billingStatus": "has_invoice",
+        "invoiceType": "增值税电子普通发票", "invoiceNumber": "25312000000091004",
+        "voucherLines": {
+            "debit": [{"accountCode": "5711", "accountName": "营业外支出", "amount": "50000.00"}],
+            "credit": [{"accountCode": "1002", "accountName": "银行存款", "amount": "50000.00"}],
+        },
+    })
+
+    card = await svc.build_annual_settlement_assist(
+        "u-iit", "c-iit-payroll-cap", 2026,
+        owner_salary=Decimal("20000"),
+    )
+    adj = card["adjustments"]
+    assert adj["salaryBase"] == Decimal("100000.00")
+    assert adj["welfareExcess"] == Decimal("4000.00")
+    assert adj["unionExcess"] == Decimal("1000.00")
+    assert adj["educationExcess"] == Decimal("2000.00")
+    assert adj["donationExcess"] == Decimal("14000.00")
+    # 合计调增 = 业主工资 20,000 + 4,000 + 1,000 + 2,000 + 14,000 = 41,000
+    assert adj["total"] == Decimal("41000.00")
+    assert card["taxableIncome"] == Decimal("84000.00")
+    assert any("职工福利费超限额调增 4000.00" in n for n in card["notes"])
+    assert any("工会经费超限额调增 1000.00" in n for n in card["notes"])
+    assert any("职工教育经费超限额调增 2000.00" in n for n in card["notes"])
+    assert any("公益性捐赠超限额调增 14000.00" in n for n in card["notes"])
 
 
 def test_c_table_hint_present():

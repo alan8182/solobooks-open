@@ -467,7 +467,7 @@ onMounted(load)
       <NCard :bordered="false" class="summary-card">
         <span class="summary-label">老板个人垫付待还</span>
         <span class="summary-value income">{{ formatMoney(Math.abs(bossClosing)) }}</span>
-        <span class="summary-sub">公户资金充裕时，可随时公转私免税归还</span>
+        <span class="summary-sub">凭真实合规垫资凭据核销后，可按往来还款归还</span>
       </NCard>
 
       <NCard :bordered="false" class="summary-card">
@@ -557,7 +557,7 @@ onMounted(load)
           {{ formatMoney(other.reimbursed) }} 元，如发票待付款、往来款），未计入本表，与总账科目余额表的差额即为这部分。
         </template>
         <template v-else>非垫付业务（发票待付款、往来款等）不计入本表。</template>
-        期末未报为负数表示已报销冲销金额超过垫付总额，需核对是否有重复报销。
+        期末未报为负数表示已报销冲销金额超过垫付总额，需核对是否有重复报销。本台账基于账面已入账凭证汇总，不构成税务合规担保；资金归还与税前扣除请保留真实合法凭据，并以主管税务机关口径为准。
       </p>
     </NCard>
 
@@ -600,7 +600,7 @@ onMounted(load)
           <div class="drawer-tip-box">
             <i class="ri-information-line"></i>
             <span v-if="selectedPerson.kind === 'boss'">
-              属于公司真实经营支出，由老板个人先行垫付。公户资金充裕时，可随时通过公对私转账归还个人，属于往来款返还不涉及个税。
+              属于公司真实经营支出，由老板个人先行垫付。凭真实合法的垫资凭据核销后，经公对私转账归还属于往来款清偿；具体税务认定请留存完整业务证据，并以主管税务机关口径为准。
             </span>
             <span v-else>
               由员工个人因公先行垫付，员工凭发票报销后通过银行打款或现金冲销，结清欠款。

@@ -6,7 +6,8 @@
 //
 // 用法：先 npm run build，再 npm run prerender。页面清单见 ./public-pages.mjs。
 // 浏览器查找顺序：环境变量 PUPPETEER_EXECUTABLE_PATH → puppeteer 缓存 headless-shell
-// → Edge → Chrome。headless-shell 优先于系统浏览器：D-019（Edge 自动升级后新进程
+// → 系统浏览器（macOS：Chromium / Chrome / Edge；Windows：Edge / Chrome）。
+// headless-shell 优先于系统浏览器：D-019（Edge 自动升级后新进程
 // 委托给运行中的现有会话即退出，Puppeteer 拿不到调试端口），headless-shell 是
 // 独立二进制，不受系统浏览器升级/会话状态影响。
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
@@ -73,6 +74,10 @@ function findBrowser() {
   const candidates = [
     process.env.PUPPETEER_EXECUTABLE_PATH,
     findCachedHeadlessShell(),
+    // macOS 系统浏览器：不装 headless-shell 时也能直接预渲染（本仓库在 macOS 上部署）
+    '/Applications/Chromium.app/Contents/MacOS/Chromium',
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
     'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
     'C:/Program Files/Google/Chrome/Application/chrome.exe',
   ].filter(Boolean)

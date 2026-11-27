@@ -6,21 +6,30 @@ import {
 } from 'naive-ui'
 import * as XLSX from 'xlsx'
 import { parseInvoiceRows, importInvoices } from '@/api/invoice'
+import { relinkInvoiceAttachments, uploadInvoiceAttachments } from '@/api/invoices'
+import type { InvoiceImportRow } from '@/api/invoices'
 import { getRdExpenseTypes, getRdProjects } from '@/api/rd'
 import type { RdExpenseTypeOption, RdProject } from '@/api/types'
 import { usePayeeEmployees } from '@/composables/usePayeeEmployees'
 import {
   INVOICE_PAYER_OPTIONS,
   hasUnnamedEmployeePayer,
-  initialInvoicePayer,
+  invoiceCategoryPayload,
+  invoiceFileRejection,
+  invoicePreviewRow,
   invoiceRowPayer,
   type InvoicePayerState,
 } from '@/utils/invoiceImport'
 import type { PayerKind } from '@/utils/fundsChannel'
 import { formatMoney } from '@/utils/format'
+import { summarizeUploadResults } from '@/utils/invoiceAttachments'
 import { SoloDrawer } from '@/components/ui'
 import FileDropzone from '@/components/business/FileDropzone.vue'
+import GuideTrigger from '@/components/business/GuideTrigger.vue'
+import GuideEntryLink from '@/components/business/GuideEntryLink.vue'
 import MailInboxCard from '@/components/business/MailInboxCard.vue'
+import OpeningGateAlert from '@/components/business/OpeningGateAlert.vue'
+import { useAuthStore } from '@/stores/auth'
 
 const props = defineProps<{
   show: boolean
@@ -32,6 +41,14 @@ const emit = defineEmits<{
 }>()
 
 const message = useMessage()
+const authStore = (() => {
+  try {
+    return useAuthStore()
+  } catch {
+    return null
+  }
+})()
+const openingBlocked = computed(() => Boolean(authStore?.openingBalanceRequired))
 
 type Step = 'upload' | 'mapping' | 'preview'
 const step = ref<Step>('upload')
@@ -144,6 +161,12 @@ function handleInboxImport({ kind, file }: { kind: string; file: File }) {
     message.warning('这份附件不是发票表格，请在月度结账向导里导入')
     return
   }
+  // 数电票原件（电子凭证会计数据标准）：XML/ZIP 走原件归档通道
+  const ext = (file.name.split('.').pop() || '').toLowerCase()
+  if (ext === 'xml' || ext === 'zip' || ext === 'ofd') {
+    handleXmlFile(file)
+    return
+  }
   handleFile(file)
 }
 
@@ -160,7 +183,15 @@ function handleFile(file: File) {
         message.warning('Excel 文件为空')
         return
       }
-      excelColumns.value = Object.keys(json[0] as any)
+      const columns = Object.keys(json[0] as any)
+      // 银行流水/资金明细不能走发票导入：模糊映射会把余额当金额。
+      // 这里允许用户手动映射，所以只拦明确像流水的文件。
+      const rejection = invoiceFileRejection(columns, { allowManualMapping: true })
+      if (rejection) {
+        message.error(rejection)
+        return
+      }
+      excelColumns.value = columns
       excelRows.value = json as any[]
 
       const map: Record<string, string> = {}
@@ -231,20 +262,55 @@ async function proceedToPreview() {
     return out
   })
 
+  await enterPreview(mapped)
+}
+
+function deletePreviewRow(index: number) {
+  classifiedRows.value.splice(index, 1)
+  if (classifiedRows.value.length === 0) {
+    message.warning('预览列表已空，已返回上传步骤')
+    step.value = 'upload'
+  }
+}
+
+/** 数电票 XML/ZIP：先归档原件（后端解析+判重+按发票号挂接），再把未匹配行的
+ * 导入行送进预览——确认权属于用户，归档与入账解耦。 */
+async function handleXmlFile(file: File) {
   loading.value = true
   try {
-    const result = await parseInvoiceRows(mapped)
-    classifiedRows.value = result.valid.map((r: any) => ({
-      ...r,
-      _direction: r.direction || 'expense',
-      _category: r.category || '其他支出',
-      _payer: initialInvoicePayer(r.payer),
-    }))
+    const results = await uploadInvoiceAttachments([file])
+    const summary = summarizeUploadResults(results)
+    if (summary) message.info(summary)
+    const importRows = results.flatMap(result => result.importRows || [])
+    if (importRows.length === 0) {
+      // 全部 matched/duplicate/rejected：没有需要入账的行，留在上传步并提示
+      const allMatched = results.every(result => result.outcome === 'matched' || result.outcome === 'duplicate')
+      if (allMatched && results.length > 0) {
+        message.success('原件已挂接到台账对应发票，无需重复入账')
+      }
+      return
+    }
+    await enterPreview(importRows)
+  } catch {
+    message.error('上传原件失败，请稍后重试')
+  } finally {
+    loading.value = false
+  }
+}
+
+/** 导入行 → 后端校验 → 进预览步（Excel 管线与 XML 管线共用） */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- 预览行是动态键（Excel 映射行与 XML 导入行共用）
+async function enterPreview(rows: any[]) {
+  loading.value = true
+  try {
+    const result = await parseInvoiceRows(rows)
+    classifiedRows.value = result.valid.map((r: any) => invoicePreviewRow(r))
     if (result.errors.length > 0) {
       message.warning(`${result.errors.length} 行数据无效已跳过`)
     }
     if (result.valid.length === 0) {
-      message.error('没有有效发票数据')
+      const reason = Array.isArray(result.errors) ? result.errors[0]?.reason : ''
+      message.error(reason || '没有有效发票数据')
       return
     }
     step.value = 'preview'
@@ -255,13 +321,16 @@ async function proceedToPreview() {
   }
 }
 
-function deletePreviewRow(index: number) {
-  classifiedRows.value.splice(index, 1)
-  if (classifiedRows.value.length === 0) {
-    message.warning('预览列表已空，已返回上传步骤')
-    step.value = 'upload'
+/** 供台账页「未匹配原件 → 生成凭证草稿」直达预览（走同一校验管线） */
+async function openWithRows(rows: InvoiceImportRow[]) {
+  if (props.show) {
+    reset()
   }
+  emit('update:show', true)
+  await enterPreview(rows)
 }
+
+defineExpose({ openWithRows })
 
 function setRowPayer(row: any, kind: PayerKind) {
   row._payer = {
@@ -316,12 +385,21 @@ const previewColumns = computed(() => [
   {
     title: '分类',
     key: '_category',
-    width: 130,
-    render: (row: any) => h(NInput, {
-      value: row._category,
-      'onUpdate:value': (v: string) => { row._category = v },
-      size: 'tiny',
-    }),
+    width: 150,
+    render: (row: any) => h('div', { class: 'category-cell' }, [
+      h(NInput, {
+        value: row._category,
+        'onUpdate:value': (v: string) => {
+          row._category = v
+          // 用户自己改过分类就是明确决定，导入时必须原样提交
+          row._categorySource = 'explicit'
+          // 用户自己改过分类就不再保留「按品名建议」的说明，避免提示与实际值不一致
+          row._categoryHint = ''
+        },
+        size: 'tiny',
+      }),
+      row._categoryHint ? h('div', { class: 'category-hint' }, row._categoryHint) : null,
+    ]),
   },
   {
     title: '付款方',
@@ -403,7 +481,9 @@ async function handleImport() {
     const rows = validImportableRows.value.map(r => ({
       ...r,
       direction: r._direction,
-      category: r._category,
+      // 兜底分类不提交：交给后端按品名规则/LLM 补分类，避免把「其他支出」
+      // 当成用户确认值写进凭证。
+      ...invoiceCategoryPayload(r),
       // 默认公司账户（沿用原行为），选了垫付才让后端把 2241 挂到垫付人
       payer: invoiceRowPayer(r._direction, r._payer),
       rdProjectId: r._rdProjectId,
@@ -411,7 +491,7 @@ async function handleImport() {
       rdOriginalAmount: r.amount,
       rdAllocationMethod: 'direct',
     }))
-    const result = await importInvoices(rows, false)
+    const result = await importInvoices(rows, true)
     if (result.imported > 0) {
       let successText = duplicatesCount.value > 0
         ? `成功导入 ${result.imported} 张发票，已自动剔除 ${duplicatesCount.value} 张重复发票`
@@ -421,6 +501,15 @@ async function handleImport() {
         successText += `；已自动冲抵 ${offsets.length} 笔历史往来暂付款（${offsets.map((o: any) => `¥${o.amount}`).join('、')}）`
       }
       message.success(successText)
+      // 未匹配原件按发票号幂等回挂（本次导入可能正好补上了它们的发票）
+      try {
+        const relink = await relinkInvoiceAttachments()
+        if (relink.relinked > 0) {
+          message.success(`已自动挂接 ${relink.relinked} 份此前未匹配的发票原件`)
+        }
+      } catch {
+        // 回挂失败不影响导入结果；台账页可手动「重新匹配」
+      }
       emit('success')
       emit('update:show', false)
     } else {
@@ -448,15 +537,26 @@ async function handleImport() {
     <div class="import-container">
       <!-- Step 1: Upload -->
       <div v-if="step === 'upload'" class="step-upload">
-        <MailInboxCard collapsible :kinds="['invoice']" @import="handleInboxImport" @error="message.error($event)" />
-        <FileDropzone
-          accept=".xlsx,.xls"
-          title="选择或拖拽税务局发票 Excel 文件"
-          subtitle="支持全电发票导出文件（.xlsx / .xls），自动识别进销项与税额"
-          :loading="loading"
-          @file="handleFile"
-          @error="message.error($event)"
-        />
+        <OpeningGateAlert v-if="openingBlocked" />
+        <template v-else>
+          <MailInboxCard collapsible :kinds="['invoice']" @import="handleInboxImport" @error="message.error($event)" />
+          <FileDropzone
+            accept=".xml,.zip"
+            title="数电票原件：XML 或打包 ZIP"
+            subtitle="电子税务局「发票批量下载」的原件（推荐）：自动解析、按发票号挂接台账，未匹配的先暂存待生成草稿"
+            :loading="loading"
+            @file="handleXmlFile"
+            @error="message.error($event)"
+          />
+          <FileDropzone
+            accept=".xlsx,.xls"
+            title="选择或拖拽税务局发票 Excel 文件"
+            subtitle="支持全电发票导出文件（.xlsx / .xls），自动识别进销项与税额"
+            :loading="loading"
+            @file="handleFile"
+            @error="message.error($event)"
+          />
+        </template>
         <div class="upload-tip">
           <h4>💡 导入说明</h4>
           <ul>
@@ -464,6 +564,11 @@ async function handleImport() {
             <li>系统会自动通过购买方和销售方识别进项（支出）与销项（收入）。</li>
             <li>系统自动根据发票号码进行防重拦截，已录入发票不会重复写入。</li>
           </ul>
+          <p class="upload-tip-guide">
+            还没导出过发票？
+            <GuideTrigger guide="invoice-list" label="看电子税务局导出步骤" />
+            <GuideEntryLink guide="invoice-list" />
+          </p>
         </div>
       </div>
 
@@ -545,6 +650,10 @@ async function handleImport() {
             :max-height="480"
           />
         </NSpin>
+        <p class="step-sub import-payment-hint">
+          付款方「公司账户（未付款）」= 先挂应付，银行实际付款后在流水页确认配对；
+          「老板/员工垫付」= 计入公司欠个人款，报销流水配对时再冲减。
+        </p>
       </div>
     </div>
   </SoloDrawer>
@@ -573,6 +682,10 @@ async function handleImport() {
   font-size: 13px;
   color: var(--solo-text-muted, #6b7280);
 }
+.import-payment-hint {
+  margin-top: 10px;
+  line-height: 1.7;
+}
 .dup-text {
   color: var(--solo-warning, #f59e0b);
 }
@@ -580,6 +693,16 @@ async function handleImport() {
   display: flex;
   flex-direction: column;
   gap: 2px;
+}
+.category-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.category-hint {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--solo-text-muted, #6b7280);
 }
 .payer-na {
   color: var(--solo-text-muted, #9ca3af);
@@ -603,6 +726,11 @@ async function handleImport() {
   font-size: 12px;
   color: var(--solo-text-muted, #4b5563);
   line-height: 1.8;
+}
+.upload-tip-guide {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--solo-text-muted, #4b5563);
 }
 .mapping-table-wrap {
   max-height: 480px;

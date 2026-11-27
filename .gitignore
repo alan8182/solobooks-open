@@ -17,6 +17,7 @@ backend/data/*.db-*
 backend/data/tax_exports/
 backend/data/backups/
 backend/data/migration_reports/
+backend/data/wechat_sim_notify_key.pem
 backend/data/legacy_tables/
 !backend/data/chart_of_accounts.json
 
@@ -79,11 +80,14 @@ opc_llm记账工具_prd_v_2.md
 .codegraph/
 
 # 本地运行产物
+backend/solobooks.db
 backend/data/*.db.*
 backend/data/*.stale*
 backend/uvicorn.log
 # 归档导出（用户数据，不入库）
 backend/data/archives/
+# 发票电子原件（用户数据，不入库）
+backend/data/attachments/
 # 本地测试校验器与构建产物
 backend/pytest_tmp/
 web/dist-verify/

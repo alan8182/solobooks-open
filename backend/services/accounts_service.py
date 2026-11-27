@@ -12,6 +12,16 @@ from typing import Any, Dict, List, Optional
 from services.database import get_conn
 
 
+def _with_auxiliary_kinds(row: Dict[str, Any]) -> Dict[str, Any]:
+    from core.chart_policy import auxiliary_kinds_for_account
+
+    code = str(row.get("code") or "")
+    return {
+        **row,
+        "auxiliary_kinds": sorted(auxiliary_kinds_for_account(code)) if int(row.get("level") or 0) > 0 else [],
+    }
+
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -237,7 +247,7 @@ async def create_account(company_id: str, code: str, name: str, parent_code: Opt
         await conn.commit()
         cursor = await conn.execute("SELECT * FROM chart_accounts WHERE id = ?", (cid,))
         row = await cursor.fetchone()
-        return dict(row) if row else None
+        return _with_auxiliary_kinds(dict(row)) if row else None
     finally:
         await conn.close()
 
@@ -266,7 +276,7 @@ async def update_account(company_id: str, code: str, updates: Dict[str, Any]) ->
             "SELECT * FROM chart_accounts WHERE company_id = ? AND code = ?", (company_id, code)
         )
         row = await cursor.fetchone()
-        return dict(row) if row else None
+        return _with_auxiliary_kinds(dict(row)) if row else None
     finally:
         await conn.close()
 
@@ -334,7 +344,7 @@ async def ensure_sub_account(company_id: str, parent_code: str, name: str) -> Op
         )
         existing = await cursor.fetchone()
         if existing:
-            return dict(existing)
+            return _with_auxiliary_kinds(dict(existing))
 
         cursor = await conn.execute(
             "SELECT code FROM chart_accounts WHERE company_id = ? AND parent_code = ?",
@@ -369,6 +379,6 @@ async def ensure_sub_account(company_id: str, parent_code: str, name: str) -> Op
         await conn.commit()
         cursor = await conn.execute("SELECT * FROM chart_accounts WHERE id = ?", (cid,))
         row = await cursor.fetchone()
-        return dict(row) if row else None
+        return _with_auxiliary_kinds(dict(row)) if row else None
     finally:
         await conn.close()

@@ -89,3 +89,43 @@ def test_chart_accounts_is_active_uses_boolean_literal():
     source = Path(__file__).resolve().parents[1].joinpath("services", "search_service.py").read_text(encoding="utf-8")
     assert "is_active = 1" not in source, "chart_accounts 查询禁止用整数字面量比较 boolean 列"
     assert "is_active = TRUE" in source
+
+
+def test_alipay_summary_guards_avoid_dialect_traps():
+    """支付宝汇总守卫查询的两条方言红线（2026-11-20 本地 PG 实测）：
+
+    1. `COALESCE(json_extract(...), 0)` 翻译后是 COALESCE(text, integer)，
+       PG 直接报 DatatypeMismatchError → 用户点「生成账单汇总凭证」就 500。
+    2. `is_monthly_summary = 1` 在 PG 上是 text 'true' = '1'，永远不命中，
+       重叠拦截静默失效 → 同一段账单可以重复入账。
+    两处都已改为 IS NULL / IS NOT NULL 存在性判断，这里锁死不许回退。
+    """
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[1].joinpath(
+        "services", "alipay_bill_service.py").read_text(encoding="utf-8")
+    assert "COALESCE(json_extract" not in source, \
+        "json_extract 结果不能进 COALESCE 与整数字面量混用（PG text/integer 不兼容）"
+    assert "is_monthly_summary') = 1" not in source and "isMonthlySummary') = 1" not in source, \
+        "JSON 布尔禁止用 = 1 比较：SQLite 取出 1、PG 取出 'true'，PG 上永不命中"
+
+
+def test_alipay_summary_guard_queries_translate_cleanly():
+    """存在性判断翻译到 PG 后必须仍是合法谓词（jsonb_extract_path_text IS [NOT] NULL）。"""
+    pg = _translate_postgres(
+        "SELECT 1 FROM entries WHERE company_id = ? "
+        "AND json_extract(payload, '$.source') = ? "
+        "AND json_extract(payload, '$.is_monthly_summary') IS NULL LIMIT 1"
+    )
+    assert "jsonb_extract_path_text(payload::jsonb, 'is_monthly_summary') IS NULL" in pg
+    _assert_dialect_safe(pg)
+
+    pg2 = _translate_postgres(
+        "SELECT payload FROM entries WHERE company_id = ? "
+        "AND json_extract(payload, '$.source') = ? "
+        "AND (json_extract(payload, '$.is_monthly_summary') IS NOT NULL "
+        "OR json_extract(payload, '$.isMonthlySummary') IS NOT NULL)"
+    )
+    assert "jsonb_extract_path_text(payload::jsonb, 'is_monthly_summary') IS NOT NULL" in pg2
+    assert "jsonb_extract_path_text(payload::jsonb, 'isMonthlySummary') IS NOT NULL" in pg2
+    _assert_dialect_safe(pg2)

@@ -15,6 +15,7 @@ RUN sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.li
     apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    fonts-wqy-zenhei \
     && rm -rf /var/lib/apt/lists/*
 
 # 默认清华源：服务器在国内，官方 pypi 直连极慢（2026-10-21 曾因下载

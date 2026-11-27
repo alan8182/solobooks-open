@@ -5,6 +5,7 @@
 
 import apiClient from './client'
 import type { VoucherGenerateResponse } from './types'
+import type { BalanceDirection } from '@/utils/ledgerFormat'
 
 export function generateVoucher(entryIds: string[]): Promise<VoucherGenerateResponse> {
   return apiClient.post('/api/ledger/voucher', { entryIds })
@@ -19,6 +20,7 @@ export interface LedgerAccountOption {
   isLeaf: boolean
   quantityEnabled: boolean
   unit: string | null
+  auxiliaryKinds?: string[]
 }
 
 /**
@@ -294,6 +296,8 @@ export interface LedgerPagination {
   sections: LedgerPageSection[]
   totalPages: number
   pageSize: Record<string, number>
+  /** 目录每页条目数，与后端 ledger_book_service.TOC_ROWS_PER_PAGE 同步 */
+  tocRowsPerPage?: number
 }
 
 export interface LedgerBook {
@@ -342,6 +346,11 @@ export interface LedgerBookSnapshotSummary {
   anchor: Record<string, unknown>
   generatedBy: string | null
   generatedAt: string | null
+  /** 签发时落盘的 PDF 归档件（历史册可能为 false，下载时只读现渲染） */
+  hasPdf?: boolean
+  pdfSha256?: string | null
+  pdfSizeBytes?: number | null
+  pdfGeneratedAt?: string | null
   voidReason: string | null
   voidedBy: string | null
   voidedAt: string | null
@@ -402,4 +411,197 @@ export interface LedgerSnapshotDiff {
 
 export function diffLedgerBookSnapshots(id: string, against: string): Promise<LedgerSnapshotDiff> {
   return apiClient.get(`/api/ledger/book/snapshots/${id}/diff`, { params: { against } })
+}
+
+export function downloadLedgerBookPdf(params: {
+  month?: string
+  year?: number
+  scope?: BookScope
+  showZeroRows?: boolean
+  preferIssued?: boolean
+}): Promise<Blob> {
+  return apiClient.get('/api/ledger/book/pdf', {
+    params: {
+      ...(params.month ? { month: params.month } : {}),
+      ...(params.year ? { year: params.year } : {}),
+      scope: params.scope || 'month',
+      show_zero_rows: params.showZeroRows ? 1 : 0,
+      prefer_issued: params.preferIssued ? 1 : 0,
+    },
+    responseType: 'blob',
+    timeout: 120000,
+  }) as unknown as Promise<Blob>
+}
+
+export function downloadLedgerBookSnapshotPdf(snapshotId: string): Promise<Blob> {
+  return apiClient.get(`/api/ledger/book/snapshots/${snapshotId}/pdf`, {
+    responseType: 'blob',
+    timeout: 120000,
+  }) as unknown as Promise<Blob>
+}
+
+/* ────────────────────────── 核算项目三表 ────────────────────────── */
+
+export type AuxiliaryLedgerKind = 'partner' | 'department' | 'project' | 'employee'
+export type CombinationDim = 'account' | AuxiliaryLedgerKind
+export type CombinationMetric = 'net' | 'debit' | 'credit' | 'closing'
+
+export interface AuxiliaryBalanceRow {
+  itemId: string
+  itemCode: string
+  itemName: string
+  isActive: boolean
+  unassigned: boolean
+  opening: string
+  openingAbs: string
+  openingDirection: BalanceDirection
+  debit: string
+  credit: string
+  ytdDebit: string
+  ytdCredit: string
+  closing: string
+  closingAbs: string
+  closingDirection: BalanceDirection
+}
+
+export interface AuxiliaryBalancesResponse {
+  kind: AuxiliaryLedgerKind
+  kindLabel: string
+  accountCode: string | null
+  month: string
+  items: AuxiliaryBalanceRow[]
+  unassigned: AuxiliaryBalanceRow | null
+  totalOpening: string
+  totalOpeningAbs: string
+  totalOpeningDirection: BalanceDirection
+  totalDebit: string
+  totalCredit: string
+  ytdTotalDebit: string
+  ytdTotalCredit: string
+  totalClosing: string
+  totalClosingAbs: string
+  totalClosingDirection: BalanceDirection
+}
+
+export interface AuxiliarySubLedgerLine {
+  entryId: string
+  voucherRef: string | null
+  date: string
+  period: string
+  summary: string
+  accountCode: string
+  accountName: string
+  counterparties: LedgerCounterparty[]
+  auxiliary: {
+    partnerName?: string
+    departmentName?: string
+    projectName?: string
+    employeeName?: string
+  }
+  debit: string
+  credit: string
+  balance: string
+  balanceAbs: string
+  balanceDirection: BalanceDirection
+  backfill: boolean
+  isReversal: boolean
+  isReversed: boolean
+}
+
+export interface AuxiliarySubLedgerResponse {
+  kind: AuxiliaryLedgerKind
+  kindLabel: string
+  itemId: string
+  itemCode: string
+  itemName: string
+  unassigned: boolean
+  accountCode: string | null
+  month: string
+  opening: string
+  openingAbs: string
+  openingDirection: BalanceDirection
+  lines: AuxiliarySubLedgerLine[]
+  periodDebit: string
+  periodCredit: string
+  ytdDebit: string
+  ytdCredit: string
+  closing: string
+  closingAbs: string
+  closingDirection: BalanceDirection
+}
+
+export interface AuxiliaryCombinationHeader {
+  id: string
+  code: string
+  name: string
+  unassigned: boolean
+}
+
+export interface AuxiliaryCombinationRow extends AuxiliaryCombinationHeader {
+  cells: Record<string, string>
+  rowTotal: string
+}
+
+export interface AuxiliaryCombinationResponse {
+  rowDim: CombinationDim
+  rowDimLabel: string
+  colDim: CombinationDim
+  colDimLabel: string
+  metric: CombinationMetric
+  accountCode: string | null
+  month: string
+  columns: AuxiliaryCombinationHeader[]
+  rows: AuxiliaryCombinationRow[]
+  colTotals: Record<string, string>
+  grandTotal: string
+}
+
+export function getAuxiliaryBalances(params: {
+  kind: AuxiliaryLedgerKind
+  month: string
+  accountCode?: string | null
+  includeZero?: boolean
+}): Promise<AuxiliaryBalancesResponse> {
+  return apiClient.get('/api/ledger/auxiliary-balances', {
+    params: {
+      kind: params.kind,
+      month: params.month,
+      ...(params.accountCode ? { account_code: params.accountCode } : {}),
+      ...(params.includeZero ? { include_zero: true } : {}),
+    },
+  })
+}
+
+export function getAuxiliarySubLedger(params: {
+  kind: AuxiliaryLedgerKind
+  itemId: string
+  month: string
+  accountCode?: string | null
+}): Promise<AuxiliarySubLedgerResponse> {
+  return apiClient.get('/api/ledger/auxiliary-sub-ledger', {
+    params: {
+      kind: params.kind,
+      item_id: params.itemId,
+      month: params.month,
+      ...(params.accountCode ? { account_code: params.accountCode } : {}),
+    },
+  })
+}
+
+export function getAuxiliaryCombination(params: {
+  rowDim: CombinationDim
+  colDim: CombinationDim
+  month: string
+  metric?: CombinationMetric
+  accountCode?: string | null
+}): Promise<AuxiliaryCombinationResponse> {
+  return apiClient.get('/api/ledger/auxiliary-combination', {
+    params: {
+      row_dim: params.rowDim,
+      col_dim: params.colDim,
+      month: params.month,
+      metric: params.metric || 'net',
+      ...(params.accountCode ? { account_code: params.accountCode } : {}),
+    },
+  })
 }

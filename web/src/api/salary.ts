@@ -11,6 +11,8 @@ export interface Employee {
   department: string
   base_salary: number
   social_security_base: number
+  /** 独立公积金缴费基数；未填/null 表示跟随社保基数，0 表示停缴公积金 */
+  housing_fund_base?: number | null
   /** 业主/投资者标记：经营所得 B 表业主工资调增的自动识别来源 */
   is_owner?: number | boolean
   /** 入职日期（YYYY-MM-DD）：工资表只从入职当月起计入该员工 */
@@ -42,6 +44,21 @@ export interface SalaryRecord {
   total_cost: number
 }
 
+export interface CarryForwardMeta {
+  hasPreviousSheet: boolean
+  sourceMonth: string | null
+  isIdenticalToPrevious: boolean
+  prevHeadcount?: number
+  prevTotalGross?: string
+  prevTotalNet?: string
+  prevTotalCost?: string
+  clearedBonusTotal?: string
+  clearedDeductionTotal?: string
+  headcountDiff?: number
+  taxDiff?: string
+  changeReasons: string[]
+}
+
 export interface SalarySheet {
   id: string
   company_id: string
@@ -65,6 +82,7 @@ export interface SalarySheet {
   /** 个人/单位公积金部分（从合并列里拆出来，用于展示「社保 X + 公积金 Y」） */
   personal_housing_fund_total?: number
   company_housing_fund_total?: number
+  carryForward?: CarryForwardMeta | null
   records: SalaryRecord[]
 }
 
@@ -123,8 +141,15 @@ export function addEmployee(data: Employee): Promise<Employee> {
   return apiClient.post<Employee>('/api/salary/employees', data)
 }
 
-export function updateEmployee(id: string, data: Partial<Employee>): Promise<Employee> {
-  return apiClient.put<Employee>(`/api/salary/employees/${id}`, data)
+export function updateEmployee(
+  id: string,
+  data: Partial<Employee>,
+  opts?: { month?: string; recalculate?: boolean },
+): Promise<Employee> {
+  const params = opts?.recalculate && opts?.month
+    ? { month: opts.month, recalculate: true }
+    : undefined
+  return apiClient.put<Employee>(`/api/salary/employees/${id}`, data, { params })
 }
 
 export function deleteEmployee(id: string): Promise<{ success: boolean }> {
@@ -135,12 +160,34 @@ export function getSalarySheet(month: string): Promise<SalarySheet> {
   return apiClient.get<SalarySheet>(`/api/salary/sheets/${month}`)
 }
 
+export function syncSalarySheetFromPrevious(month: string): Promise<SalarySheet> {
+  return apiClient.post<SalarySheet>(`/api/salary/sheets/${month}/sync-previous`)
+}
+
 export function updateSalaryRecords(month: string, records: Partial<SalaryRecord>[]): Promise<SalarySheet> {
   return apiClient.put<SalarySheet>(`/api/salary/sheets/${month}/records`, { records })
 }
 
 export function accrueSalarySheet(month: string): Promise<SalarySheet> {
   return apiClient.post<SalarySheet>(`/api/salary/sheets/${month}/accrue`)
+}
+
+export interface UnaccrueSalarySheetResult extends SalarySheet {
+  reversalVoucherId?: string | null
+  reversedVoucherIds?: string[]
+  unmatchedStatementCount?: number
+  alreadyDraft?: boolean
+}
+
+export function unaccrueSalarySheet(
+  month: string,
+  reason: string,
+  includePayments = false,
+): Promise<UnaccrueSalarySheetResult> {
+  return apiClient.post<UnaccrueSalarySheetResult>(`/api/salary/sheets/${month}/unaccrue`, {
+    reason,
+    includePayments,
+  })
 }
 
 export function getSalaryPaymentSuggestions(): Promise<{ total: number; suggestions: SalaryPaymentSuggestion[] }> {

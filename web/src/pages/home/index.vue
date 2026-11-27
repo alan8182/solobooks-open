@@ -1,12 +1,18 @@
 <!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { usePageRefresh } from '@/composables/usePageRefresh'
-import { computed, ref } from 'vue'
+import { computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { NButton } from 'naive-ui'
 import { SoloButton } from '@/components/ui'
 import { useAuthStore } from '@/stores/auth'
 import { useEntryStore } from '@/stores/entry'
+import {
+  DEMO_TOUR_STEPS,
+  resolveChecklistDisplay,
+  useGuideStateStore,
+  type DemoTourStep,
+} from '@/stores/guideState'
 import { useWorkspaceViewStore } from '@/stores/workspaceView'
 import { useTaskInbox } from '@/composables/useTaskInbox'
 import { useSetupReadiness } from '@/composables/useSetupReadiness'
@@ -20,17 +26,11 @@ const router = useRouter()
 const authStore = useAuthStore()
 const viewStore = useWorkspaceViewStore()
 const entryStore = useEntryStore()
+const guideStore = useGuideStateStore()
 // 两个看板各自持有数据，切回首页时要一起重拉，否则问候语是新的、待办还是两小时前的
 const { tasks, loading, partialFailure, reload: reloadTaskInbox } = useTaskInbox()
 const { readiness, loading: readinessLoading, reload: reloadReadiness } = useSetupReadiness()
 const closingStatus = useClosingStatus()
-const quickPrompt = ref('')
-
-function handleQuickSubmit() {
-  const text = quickPrompt.value.trim()
-  if (!text) return
-  router.push({ path: '/copilot', query: { q: text, autoSend: '1' } })
-}
 
 const proLinks = [
   { path: '/vouchers', label: '记账凭证', icon: 'ri-file-list-3-line' },
@@ -70,10 +70,28 @@ const bossActions = computed(() => [
   },
 ])
 
-const isDemoCurrent = computed(() => {
-  const current = authStore.companies.find((c) => c.company_id === authStore.currentCompanyId)
-  return current?.isDemo === true
-})
+const currentCompany = computed(
+  () => authStore.companies.find((c) => c.company_id === authStore.currentCompanyId) ?? null,
+)
+const isDemoCurrent = computed(() => currentCompany.value?.isDemo === true)
+const prioritizeChecklist = computed(
+  () =>
+    resolveChecklistDisplay(
+      guideStore.state,
+      readiness.value,
+      currentCompany.value?.created_at,
+      isDemoCurrent.value,
+    ) === 'expanded',
+)
+const visitedDemoSteps = computed(() => new Set(guideStore.state.demoTourVisited))
+const demoTourDoneCount = computed(
+  () => DEMO_TOUR_STEPS.filter((step) => visitedDemoSteps.value.has(step.key)).length,
+)
+
+function openDemoTourStep(step: DemoTourStep) {
+  guideStore.markDemoTourStep(step.key)
+  router.push(step.path)
+}
 
 const formattedDate = computed(() => {
   return new Date().toLocaleDateString('zh-CN', {
@@ -105,7 +123,6 @@ usePageRefresh(() => Promise.all([reloadTaskInbox(), reloadReadiness(), entrySto
   <div class="home-workbench">
     <header class="workbench-header">
       <div class="header-main">
-        <span class="workbench-kicker">{{ viewStore.isBoss ? '老板工作台' : '会计工作台' }}</span>
         <span class="date-label">{{ formattedDate }}</span>
         <h1 class="greeting-title">
           {{ greetingText }}，{{ authStore.user?.nickname || '主理人' }}
@@ -118,38 +135,23 @@ usePageRefresh(() => Promise.all([reloadTaskInbox(), reloadReadiness(), entrySto
       </div>
 
       <NButton
-        v-if="!viewStore.isBoss"
         type="primary"
-        size="large"
+        :secondary="viewStore.isBoss"
+        :size="viewStore.isBoss ? 'medium' : 'large'"
         class="primary-action"
         @click="openCopilot"
       >
         <template #icon><i class="ri-chat-3-line" /></template>
-        录入凭证 / 问 AI 财务官
+        {{ viewStore.isBoss ? '问 AI 财务官' : '录入凭证 / 问 AI 财务官' }}
       </NButton>
     </header>
 
-    <div v-if="viewStore.isBoss" class="boss-quick-bar">
-      <div class="quick-input-container">
-        <i class="ri-chat-3-line quick-icon" />
-        <input
-          v-model="quickPrompt"
-          type="text"
-          class="quick-input-field"
-          placeholder="交代一句话记账，例如：“收到技术咨询费 12000” 或 “这个月的流水已上传，帮我自动对账入账”..."
-          @keydown.enter="handleQuickSubmit"
-        />
-        <button
-          type="button"
-          class="quick-send-btn"
-          :disabled="!quickPrompt.trim()"
-          @click="handleQuickSubmit"
-        >
-          <span>记一笔</span>
-          <i class="ri-arrow-right-line" />
-        </button>
-      </div>
-    </div>
+    <!-- 真实账套尚未就绪时提权到首页第一眼位置，避免老板面对满屏 0 数据发懵 -->
+    <SetupChecklist
+      v-if="prioritizeChecklist"
+      :readiness="readiness"
+      :loading="readinessLoading"
+    />
 
     <div v-if="viewStore.isBoss" class="boss-action-grid" aria-label="老板记账入口">
       <button
@@ -193,28 +195,57 @@ usePageRefresh(() => Promise.all([reloadTaskInbox(), reloadReadiness(), entrySto
 
     <!-- 演示账套的样本数据会让清单全绿，但那不是用户自己的进度 -->
     <div v-if="isDemoCurrent" class="demo-onboarding-tip">
-      <div class="demo-tip-header">
-        <div class="demo-badge">
-          <i class="ri-flask-line" aria-hidden="true" />
-          <span>演示沙盒</span>
+      <div class="demo-tip-top">
+        <div class="demo-tip-header">
+          <div class="demo-badge">
+            <i class="ri-flask-line" aria-hidden="true" />
+            <span>演示沙盒</span>
+          </div>
+          <span class="demo-onboarding-copy">
+            当前正在体验<strong>演示账套</strong>（含 3 个月经营样本与待办），可自由试记与查看。体验满意后，随时开启你的专属企业账套（已有代账也无需先转出，可先导 1 个月流水平行试记对比）。
+          </span>
         </div>
-        <span class="demo-onboarding-copy">
-          当前正在体验<strong>演示账套</strong>（含 3 个月经营样本与待办），可自由试记与查看。体验满意后，随时开启你的专属企业账套。
-        </span>
+        <div class="demo-tip-actions">
+          <SoloButton size="small" variant="ghost" @click="router.push('/guide')">
+            上手指南
+          </SoloButton>
+          <SoloButton size="small" variant="primary" @click="router.push('/mine/companies?create=new')">
+            <i class="ri-add-line" aria-hidden="true" />
+            建立我的企业账套
+          </SoloButton>
+        </div>
       </div>
-      <div class="demo-tip-actions">
-        <SoloButton size="small" variant="ghost" @click="router.push('/guide')">
-          上手指南
-        </SoloButton>
-        <SoloButton size="small" variant="primary" @click="router.push('/mine/companies?create=new')">
-          <i class="ri-add-line" aria-hidden="true" />
-          建立我的企业账套
-        </SoloButton>
+
+      <div class="demo-tour-bar">
+        <span class="demo-tour-label">
+          3 分钟体验路线 · 已体验 {{ demoTourDoneCount }}/{{ DEMO_TOUR_STEPS.length }}
+        </span>
+        <div class="demo-tour-pills">
+          <button
+            v-for="step in DEMO_TOUR_STEPS"
+            :key="step.key"
+            type="button"
+            class="demo-tour-pill"
+            :class="{ 'is-visited': visitedDemoSteps.has(step.key) }"
+            :title="step.hint"
+            @click="openDemoTourStep(step)"
+          >
+            <i
+              :class="visitedDemoSteps.has(step.key) ? 'ri-check-line' : step.icon"
+              aria-hidden="true"
+            />
+            <span>{{ step.label }}</span>
+          </button>
+        </div>
       </div>
     </div>
 
-    <!-- 上手清单：只在「没配完 + 新手期」出现，就绪后自己折叠成一行 -->
-    <SetupChecklist :readiness="readiness" :loading="readinessLoading" />
+    <!-- 上手清单：未就绪展开时已在顶部提权展示；折叠/就绪一行版放在这里 -->
+    <SetupChecklist
+      v-if="!prioritizeChecklist"
+      :readiness="readiness"
+      :loading="readinessLoading"
+    />
 
     <div class="dashboard-grid">
       <TaskInbox
@@ -238,10 +269,9 @@ usePageRefresh(() => Promise.all([reloadTaskInbox(), reloadReadiness(), entrySto
 
 .demo-onboarding-tip {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 12px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
   padding: 12px 16px;
   border: 1px solid var(--solo-border);
   border-radius: var(--solo-radius-lg);
@@ -249,6 +279,14 @@ usePageRefresh(() => Promise.all([reloadTaskInbox(), reloadReadiness(), entrySto
   color: var(--solo-text-secondary);
   font-size: 13px;
   line-height: 1.6;
+}
+
+.demo-tip-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
 }
 
 .demo-tip-header {
@@ -289,10 +327,69 @@ usePageRefresh(() => Promise.all([reloadTaskInbox(), reloadReadiness(), entrySto
   white-space: nowrap;
 }
 
+.demo-tour-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--solo-border-light);
+}
+
+.demo-tour-label {
+  color: var(--solo-text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.demo-tour-pills {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.demo-tour-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 11px;
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius-control);
+  background: var(--solo-bg-card);
+  color: var(--solo-text-primary);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color 160ms ease-out, color 160ms ease-out, background-color 160ms ease-out;
+}
+
+.demo-tour-pill:hover {
+  border-color: var(--solo-primary);
+  color: var(--solo-primary);
+}
+
+.demo-tour-pill:focus-visible {
+  outline: 2px solid var(--solo-primary);
+  outline-offset: 1px;
+}
+
+.demo-tour-pill.is-visited {
+  border-color: var(--solo-income);
+  background: var(--solo-income-bg);
+  color: var(--solo-income);
+}
+
 @media (max-width: 640px) {
-  .demo-onboarding-tip {
+  .demo-tip-top {
     align-items: flex-start;
-    flex-wrap: wrap;
+  }
+
+  .demo-tour-bar {
+    flex-direction: column;
+    align-items: flex-start;
   }
 }
 
@@ -302,15 +399,6 @@ usePageRefresh(() => Promise.all([reloadTaskInbox(), reloadReadiness(), entrySto
   align-items: flex-start;
   gap: 20px;
   padding: 4px 0 2px;
-}
-
-.workbench-kicker {
-  display: block;
-  margin-bottom: 4px;
-  color: var(--solo-primary);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 1.2px;
 }
 
 .date-label {
@@ -339,71 +427,6 @@ usePageRefresh(() => Promise.all([reloadTaskInbox(), reloadReadiness(), entrySto
   flex-shrink: 0;
   border-radius: 8px;
   font-weight: 650;
-}
-
-.boss-quick-bar {
-  width: 100%;
-}
-
-.quick-input-container {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  background: var(--solo-bg-card, #ffffff);
-  border: 1.5px solid var(--solo-border, #dde3ea);
-  border-radius: var(--solo-radius-xl, 12px);
-  padding: 8px 14px 8px 18px;
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.03);
-  transition: border-color 0.2s ease, box-shadow 0.2s ease;
-}
-
-.quick-input-container:focus-within {
-  border-color: var(--solo-primary, #1747b0);
-  box-shadow: 0 0 0 3px rgba(23, 71, 176, 0.12);
-}
-
-.quick-icon {
-  font-size: 20px;
-  color: var(--solo-primary, #1747b0);
-  flex-shrink: 0;
-}
-
-.quick-input-field {
-  flex: 1;
-  border: 0;
-  outline: none;
-  font-size: 14px;
-  color: var(--solo-text-primary, #182230);
-  background: transparent;
-  padding: 6px 0;
-}
-
-.quick-input-field::placeholder {
-  color: var(--solo-text-muted, #636e7c);
-}
-
-.quick-send-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 8px 16px;
-  background: var(--solo-primary, #1747b0);
-  color: #ffffff;
-  border: 0;
-  border-radius: 8px;
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: background-color 0.16s ease;
-}
-
-.quick-send-btn:hover:not(:disabled) {
-  background: var(--solo-primary-hover, #2b66e2);
-}
-
-.quick-send-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
 }
 
 .boss-action-grid {

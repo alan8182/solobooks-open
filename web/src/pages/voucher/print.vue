@@ -1,11 +1,12 @@
 <!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { NButton, useMessage } from 'naive-ui'
 import { useEntryStore } from '@/stores/entry'
 import { useAuthStore } from '@/stores/auth'
 import { getRdProjects } from '@/api/rd'
+import { getAttachmentCountsByEntries } from '@/api/voucherBook'
 import { getCurrentMonth } from '@/utils/format'
 import VoucherSheet from '@/components/business/VoucherSheet.vue'
 import { SoloEmpty, SoloMonthPicker } from '@/components/ui'
@@ -19,6 +20,8 @@ const authStore = useAuthStore()
 const loading = ref(true)
 const month = ref(String(route.query.month || getCurrentMonth()))
 const rdProjectLabels = ref<Record<string, string>>({})
+/** 附单据数（真实附件聚合，与凭证册同源） */
+const attachmentCounts = ref<Record<string, number>>({})
 const selectedIds = computed(() =>
   String(route.query.ids || '')
     .split(',')
@@ -44,6 +47,23 @@ const entries = computed(() => {
 const totalAmount = computed(() =>
   entries.value.reduce((sum, entry) => sum + Number(entry.amount || 0), 0),
 )
+
+async function loadAttachmentCounts() {
+  const ids = entries.value.map((entry) => entry.id)
+  if (ids.length === 0) {
+    attachmentCounts.value = {}
+    return
+  }
+  try {
+    const { counts } = await getAttachmentCountsByEntries(ids)
+    attachmentCounts.value = counts || {}
+  } catch {
+    // 附单据数补齐失败不阻断打印，只是少了「附单据 X 张」
+    attachmentCounts.value = {}
+  }
+}
+
+watch(() => entries.value.map((entry) => entry.id).join(','), loadAttachmentCounts)
 
 async function load() {
   loading.value = true
@@ -106,6 +126,7 @@ onMounted(load)
         :company-name="companyName"
         :rd-project-labels="rdProjectLabels"
         :page-break="index < entries.length - 1"
+        :attachment-count="attachmentCounts[entry.id] ?? 0"
       />
     </div>
   </div>

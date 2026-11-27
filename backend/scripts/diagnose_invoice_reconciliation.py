@@ -100,6 +100,8 @@ async def _statement_conflicts(conn, company_id: str) -> list[dict]:
 
 
 async def _dangling_reconciled(conn, company_id: str) -> list[dict]:
+    # payload 序列化格式不统一（有空格/紧凑两种），不能靠 LIKE 精确匹配 json 片段；
+    # 先捞含 billingStatus 的行，再在 Python 里解析判断。
     rows = (
         await conn.execute(
             text(
@@ -107,7 +109,7 @@ async def _dangling_reconciled(conn, company_id: str) -> list[dict]:
                 SELECT e.id, e.payload AS payload
                 FROM entries e
                 WHERE e.company_id = :company
-                  AND e.payload LIKE '%"billingStatus": "reconciled"%'
+                  AND e.payload LIKE '%billingStatus%'
                 ORDER BY e.updated_at
                 """
             ),
@@ -137,9 +139,15 @@ async def _dangling_reconciled(conn, company_id: str) -> list[dict]:
     conflicts = []
     for row in rows:
         entry_id = str(row[0])
+        payload = _payload(row[1])
+        if payload.get("billingStatus") != "reconciled":
+            continue
         if entry_id in matched:
             continue
-        payload = _payload(row[1])
+        # 垫付报销的正常形态：银行流水匹配的是报销付款凭证
+        # ``reim-<statement>-<发票凭证id>``，发票凭证自身的 2241 已被该付款凭证冲平。
+        if any(matched_id.startswith("reim-") and matched_id.endswith(f"-{entry_id}") for matched_id in matched):
+            continue
         conflicts.append(
             {
                 "id": entry_id,

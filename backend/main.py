@@ -87,6 +87,10 @@ from routers.bank import router as bank_router
 from routers.search import router as search_router
 from routers.invoice import router as invoice_router
 from routers.invoices import router as invoices_router
+from routers.invoice_attachments import router as invoice_attachments_router
+from routers.invoice_prior_payment import router as invoice_prior_payment_router
+from routers.voucher_book import router as voucher_book_router
+from routers.voucher_attachments import router as voucher_attachments_router
 from routers.auxiliary import router as auxiliary_router
 from routers.legacy_import import router as legacy_import_router
 from routers.backup import router as backup_router
@@ -95,6 +99,7 @@ from routers.private_expense import router as private_expense_router
 from routers.salary import router as salary_router
 from routers.tax_report import router as tax_report_router
 from routers.wechat_bill import router as wechat_bill_router
+from routers.platform_bill import router as platform_bill_router
 from routers.accounting import router as accounting_router
 from routers.rd import router as rd_router
 from routers.aggregation import router as aggregation_router
@@ -112,6 +117,7 @@ from routers.health_scan import router as health_scan_router
 from routers.mailbox import router as mailbox_router
 from routers.billing import owner_router as billing_owner_router
 from routers.billing import public_router as billing_public_router
+from routers.billing import public_wechat_router as billing_wechat_public_router
 
 app.include_router(record_router)
 app.include_router(copilot_router)
@@ -129,6 +135,10 @@ app.include_router(bank_router)
 app.include_router(search_router)
 app.include_router(invoice_router)
 app.include_router(invoices_router)
+app.include_router(invoice_attachments_router)
+app.include_router(invoice_prior_payment_router)
+app.include_router(voucher_book_router)
+app.include_router(voucher_attachments_router)
 app.include_router(auxiliary_router)
 app.include_router(legacy_import_router)
 app.include_router(backup_router)
@@ -137,6 +147,7 @@ app.include_router(private_expense_router)
 app.include_router(salary_router)
 app.include_router(tax_report_router)
 app.include_router(wechat_bill_router)
+app.include_router(platform_bill_router)
 app.include_router(accounting_router)
 app.include_router(rd_router)
 app.include_router(aggregation_router)
@@ -153,9 +164,11 @@ app.include_router(audit_share_owner_router)
 app.include_router(audit_share_public_router)
 app.include_router(health_scan_router)
 app.include_router(mailbox_router)
-# 平台自营收款：公开回调路由（/api/billing/alipay/*）也必须注册在 MCP 兜底 mount 之前
+# 平台自营收款：公开回调路由（/api/billing/alipay/* 与 /api/billing/wechat/*）
+# 也必须注册在 MCP 兜底 mount 之前
 app.include_router(billing_owner_router)
 app.include_router(billing_public_router)
+app.include_router(billing_wechat_public_router)
 
 
 @app.middleware("http")

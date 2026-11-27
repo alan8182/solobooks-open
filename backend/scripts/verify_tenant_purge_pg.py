@@ -12,9 +12,13 @@ PG 上验证。
   1) 正常业务路径仍然禁止删除已过账凭证 / 审计事件；
   2) 清理事务（purge_company）能删干净。
 
-用法（连接串必须是「应用角色」，即 uvicorn 使用的那个）：
+用法（DATABASE_URL 是应用角色，TENANT_PURGE_DATABASE_URL 是数据库属主）：
     DATABASE_URL="postgresql+asyncpg://solobooks_app:***@127.0.0.1:55432/solobooks" \\
+    TENANT_PURGE_DATABASE_URL="postgresql+asyncpg://solobooks_owner:***@127.0.0.1:55432/solobooks" \\
         venv/Scripts/python.exe scripts/verify_tenant_purge_pg.py
+
+迁移 e7c1a4d9f2b8 后，应用角色即使自己设置 GUC 也会被触发器拒绝；
+清理只能由属主连接执行（services/company_delete_service 的专用会话）。
 
 脚本只操作它自己创建的临时主体（company_id 前缀 c_purge_probe_），
 不触碰任何既有数据；退出码 0 表示全部断言通过。
@@ -212,6 +216,14 @@ async def main() -> int:
     if not database_url().startswith("postgresql"):
         print("ERROR: 该脚本必须在 PostgreSQL 上运行（当前 DATABASE_URL 非 PG）。")
         return 2
+    from config import TENANT_PURGE_DATABASE_URL
+
+    if not TENANT_PURGE_DATABASE_URL:
+        print(
+            "ERROR: 未配置 TENANT_PURGE_DATABASE_URL（数据库属主连接）。\n"
+            "       迁移 e7c1a4d9f2b8 后清理不再由应用角色执行，缺省即失败关闭。"
+        )
+        return 2
 
     report = Report()
     probe = await _seed_probe()
@@ -224,14 +236,21 @@ async def main() -> int:
                 text(
                     "SELECT count(*) FROM pg_proc WHERE proname IN "
                     "('prevent_posted_journal_mutation', 'prevent_audit_mutation') "
-                    "AND prosrc LIKE '%solobooks.allow_tenant_purge%'"
+                    "AND prosrc LIKE '%solobooks.allow_tenant_purge%' "
+                    "AND prosrc LIKE '%pg_get_userbyid%'"
                 )
             )
             guarded = int(has_guard.scalar() or 0)
         if guarded >= 2:
-            report.ok("迁移 c1d3e5f7a9b2 已生效", f"{guarded} 个触发器函数含 GUC 判断")
+            report.ok(
+                "迁移 e7c1a4d9f2b8 已生效",
+                f"{guarded} 个触发器函数同时校验 GUC 与数据库属主",
+            )
         else:
-            report.fail("迁移 c1d3e5f7a9b2 已生效", f"仅 {guarded} 个函数带豁免判断")
+            report.fail(
+                "迁移 e7c1a4d9f2b8 已生效",
+                f"仅 {guarded} 个函数同时带 GUC 与属主判断",
+            )
 
         _ = "solobooks.allow_tenant_purge"
         await _expect_blocked(
@@ -263,7 +282,7 @@ async def main() -> int:
             "ENTRY_POSTED_IMMUTABLE",
         )
 
-        # 清理事务：purge_company 内部自己 set_config，应能删干净
+        # 清理事务：purge_company 用专用属主连接 + 事务级 GUC，应能删干净
         try:
             result = await company_delete_service.purge_company(
                 probe["owner_id"], company_id, probe["company_name"]

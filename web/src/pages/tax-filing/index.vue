@@ -1,6 +1,7 @@
 <!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
 import { usePageRefresh } from '@/composables/usePageRefresh'
+import { useVatFilingGuideMode } from '@/composables/useVatFilingGuideMode'
 import { accountingErrorText } from '@/utils/errors'
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -11,19 +12,25 @@ import apiClient from '@/api/client'
 import { useAuthStore } from '@/stores/auth'
 import { useWorkspaceViewStore } from '@/stores/workspaceView'
 import BossTaxCheatSheet from '@/components/business/BossTaxCheatSheet.vue'
+import CitTaxOpeningModal from '@/components/business/CitTaxOpeningModal.vue'
 import GuideTrigger from '@/components/business/GuideTrigger.vue'
 import { SoloSkeleton } from '@/components/ui'
 import {
   FILING_CARD_ORDER,
+  VAT_DECLARATION_DEMO_URL,
+  buildVatFilingGuide,
   calculateDeadlineSummary,
   calculateExemptionGauge,
   formatCopyAmount,
   generateTaxCopilotInsight,
   periodToQuarter,
   quarterLabel,
+  recommendVatFilingMode,
   resolveNextPendingCard,
   summarizeOtherTaxes,
   type FilingCardKey,
+  type VatFilingGuideData,
+  type VatFilingMode,
 } from '@/utils/taxFiling'
 
 const route = useRoute()
@@ -68,6 +75,18 @@ interface CrossDiff {
   difference: number
   hint: string
 }
+interface CarryforwardLedgerRow {
+  code: string
+  kind: string
+  label: string
+  openingBalance: number
+  expiredAmount: number
+  currentAmount: number
+  currentCap: number
+  deductedFromPrior: number
+  currentExcess: number
+  closingBalance: number
+}
 interface Package {
   period: string
   periodType: string
@@ -79,6 +98,14 @@ interface Package {
     isBelowThreshold?: boolean
     totalVatPayable?: number
     surchargeTotal?: number
+    goodsLaborSales?: number
+    serviceSales?: number
+    vatReduction?: number
+    invoicedSales?: number
+    uninvoicedSales?: number
+    uninvoicedPositiveSales?: number
+    uninvoicedNegativeSales?: number
+    negativeSales?: number
     filingFields: FilingField[]
     warnings: string[]
     blockingIssues: string[]
@@ -88,6 +115,12 @@ interface Package {
     revenue?: number
     totalProfit?: number
     preferentialTax?: number
+    priorYearLoss?: number
+    prepaidCitTax?: number
+    taxOpeningApplied?: boolean
+    autoAdjustmentTotal?: number
+    autoDecreaseTotal?: number
+    carryforwardLedger?: CarryforwardLedgerRow[]
     note?: string
     fields?: { line: string; label: string; amount: number }[]
     deadline: DeadlineInfo
@@ -211,6 +244,10 @@ const pkg = ref<Package | null>(null)
 const taxIdMissing = ref(false)
 const filingBusy = ref('')
 const hideZeroFields = ref(true)
+const citCalibrationVisible = ref(false)
+const filingFiscalYear = computed(
+  () => Number(String(period.value || '').slice(0, 4)) || new Date().getFullYear(),
+)
 
 // 当前激活的可切换卡片：第 1 张为「报前核对与总览」，后 4 张为独立申报事项卡片
 // 支持通过 route.query.card（如 ?card=vat 或 ?card=cit）直接锚定对应卡片
@@ -318,7 +355,21 @@ function handleBossMarkFiled(deadlineId: string | null) {
 interface IitAnnualCard {
   applicable: boolean
   profitTotal?: number
-  adjustments?: { total: number; ownerSalary: number; ownerSalarySource: string; undocumentedExpenses: number }
+  adjustments?: {
+    total: number
+    ownerSalary: number
+    ownerSalarySource: string
+    undocumentedExpenses: number
+    entertainmentExcess?: number
+    advertisingExcess?: number
+    welfareExcess?: number
+    unionExcess?: number
+    educationExcess?: number
+    donationExcess?: number
+    salaryBase?: number
+    finesAndPenalties?: number
+    items?: Array<{ code: string; label: string; amount: number; basis: string }>
+  }
   deductions?: { total: number; statutory: number }
   taxableIncome?: number
   tax?: number
@@ -452,11 +503,6 @@ const exemptionGauge = computed(() => {
   )
 })
 
-const copilotInsight = computed(() => {
-  if (!pkg.value) return null
-  return generateTaxCopilotInsight(pkg.value)
-})
-
 const vatFieldsBySection = computed(() => {
   const sections = new Map<string, FilingField[]>()
   for (const f of pkg.value?.vat.filingFields ?? []) {
@@ -467,84 +513,55 @@ const vatFieldsBySection = computed(() => {
   return [...sections.entries()]
 })
 
-// 电子税务局填报路径指引：按本期数据动态生成分步抄报步骤与防错提示
-interface GuideAmountRow { label: string; amount: number; copyLabel: string }
-interface GuideStep { title: string; detail: string; amounts?: GuideAmountRow[] }
+// 电子税务局填报路径指引：按本期数据动态生成分步抄报步骤与防错提示。
+// 新版税局会按业务复杂度自动匹配「确认式 / 填表式」入口，前端无法预判，
+// 由用户按页面实际形态切换；有未开票收入时默认推荐填表式。
+const { mode: savedVatGuideMode, setMode: persistVatGuideMode } = useVatFilingGuideMode()
 
-const vatFilingGuide = computed(() => {
-  const pkgData = pkg.value
-  const vat = pkgData?.vat
-  if (!pkgData || !vat) return null
-  const fieldAmount = (code: string) => vat.filingFields.find(f => f.code === code)?.amount ?? 0
-  const totalSales = vat.totalSales ?? 0
-  const steps: GuideStep[] = []
-  const warnings: string[] = []
+const vatGuideData = computed<VatFilingGuideData>(() => ({
+  periodType: pkg.value?.periodType,
+  totalSales: pkg.value?.vat.totalSales ?? 0,
+  goodsLaborSales: pkg.value?.vat.goodsLaborSales ?? 0,
+  serviceSales: pkg.value?.vat.serviceSales ?? 0,
+  isBelowThreshold: pkg.value?.vat.isBelowThreshold ?? true,
+  vatPayable: pkg.value?.summary.vatPayable ?? pkg.value?.vat.totalVatPayable ?? 0,
+  vatReduction: pkg.value?.vat.vatReduction ?? 0,
+  surchargeTotal: pkg.value?.vat.surchargeTotal ?? 0,
+  uninvoicedPositiveSales: pkg.value?.vat.uninvoicedPositiveSales ?? 0,
+  uninvoicedNegativeSales: pkg.value?.vat.uninvoicedNegativeSales ?? 0,
+  invoiceTotal: pkg.value?.crossCheck.invoiceTotal,
+}))
 
-  if (totalSales === 0) {
-    steps.push(
-      { title: '无需填报销售额', detail: '本期账载销售额为 0，申报页各销售额入口保持 0 即可。' },
-      { title: '直接「下一步」完成零申报', detail: '核对「本期应补（退）税额」为 ¥0.00 后，点「下一步」提交申报。' },
-    )
-    return { steps, warnings }
-  }
+const recommendedVatGuideMode = computed(() => recommendVatFilingMode(vatGuideData.value))
+const vatFilingMode = computed<VatFilingMode>(() => savedVatGuideMode.value ?? recommendedVatGuideMode.value)
 
-  if (vat.isBelowThreshold) {
-    const dialogRows: GuideAmountRow[] = []
-    const goodsExempt = fieldAmount('simple.goods.exempt')
-    const serviceExempt = fieldAmount('simple.services.exempt')
-    if (goodsExempt > 0) dialogRows.push({ label: '「货物及劳务」弹窗 · 1%征收率行', amount: goodsExempt, copyLabel: '本期销售额·货物及劳务' })
-    if (serviceExempt > 0) dialogRows.push({ label: '「服务、不动产和无形资产」弹窗 · 1%征收率行', amount: serviceExempt, copyLabel: '本期销售额·服务、不动产和无形资产' })
-    steps.push(
-      {
-        title: '「本期销售情况」→ 点各销售额入口右侧编辑',
-        detail: `在弹窗「1%征收率」行填入下方金额（免税销售额含税=不含税，直接填账载金额），其余行保持 0；「免税」行只读不用管——${pkg.value?.periodType === 'month' ? '本月未超 10 万' : '本季未超 30 万'}时系统会自动归集为「免税销售额」。`,
-        amounts: dialogRows,
-      },
-      {
-        title: '「预览表单」核对归集结果',
-        detail: '主表第 9/10 栏「免税销售额」应等于你填的金额（本年累计自动累加），第 1 栏「应征增值税不含税销售额」应保持 0.00。',
-      },
-      {
-        title: '核对税额并申报',
-        detail: `「本期应补（退）税额」应为 ¥${money(pkgData.summary.vatPayable)}，确认后点「下一步」完成申报；附加税费同步为 0，无需处理。`,
-      },
-    )
-    warnings.push(
-      '若预览表单中金额落在第 1 栏「应征增值税不含税销售额」（应税行）而非第 9/10 栏，点右上角「我要填表」进报表，直接改第 10 栏「其中：小微企业免税销售额」（第 9 栏自动合计，第 19/20 栏免税额自动带出）。',
-    )
-    if (pkgData.crossCheck.invoiceTotal === 0) {
-      warnings.push('本期发票开具为 ¥0.00，税局「自动归集发票」预填会是 0.00——这不是数据没同步，按上述步骤手动填报即可，否则会漏报销售收入。')
-    }
-    return { steps, warnings }
-  }
+function setVatFilingMode(next: VatFilingMode) {
+  persistVatGuideMode(next)
+}
 
-  // 超免税额度：引导式弹窗按 1% 征收率填报（系统已价税分离）
-  const goodsRate1 = fieldAmount('simple.goods.rate_1')
-  const serviceRate1 = fieldAmount('simple.services.rate_1')
-  if (goodsRate1 > 0) {
-    steps.push({
-      title: '「本期销售情况」→ 点「货物及劳务销售额」右侧编辑',
-      detail: '在弹窗「1%征收率」行填入下方金额（不含税，已按 1% 换算）；3%/5% 及其中项保持 0。',
-      amounts: [{ label: '1%征收率行', amount: goodsRate1, copyLabel: '1%征收率·货物及劳务' }],
-    })
-  }
-  if (serviceRate1 > 0) {
-    steps.push({
-      title: '→ 点「服务、不动产和无形资产销售额」右侧编辑',
-      detail: '在弹窗「1%征收率」行填入下方金额（不含税，已按 1% 换算）；其余行保持 0。',
-      amounts: [{ label: '1%征收率行', amount: serviceRate1, copyLabel: '1%征收率·服务、不动产和无形资产' }],
-    })
-  }
-  steps.push({
-    title: '核对税额并申报扣款',
-    detail: `弹窗确定后「本期应补（退）税额」应为 ¥${money(pkgData.summary.vatPayable)}，点「下一步」完成申报并及时缴款；附加税费随征自动计算。`,
-  })
-  return { steps, warnings }
+// 税情简报的路径建议跟随实际入口形态，避免手卡让用户切到填表式、简报又指回确认式
+const copilotInsight = computed(() => {
+  if (!pkg.value) return null
+  return generateTaxCopilotInsight(pkg.value, vatFilingMode.value)
 })
 
-// 完整栏次表：给非零行标注电子税局里的实际填写位置
+const vatFilingGuide = computed(() => {
+  if (!pkg.value) return null
+  return buildVatFilingGuide(vatGuideData.value, vatFilingMode.value)
+})
+
+// 完整栏次表：给非零行标注电子税局里的实际填写位置（按入口形态切换）
 function fieldLocationHint(f: FilingField): string {
-  if (f.section === '税费试算' || f.section === '附加税费') return '系统自动试算，无需填写'
+  if (f.section === '税费试算') return '系统自动试算，无需填写'
+  if (vatFilingMode.value === 'form') {
+    if (f.section === '附加税费') return '附列资料（三）附加税费情况表 · 系统自动带出'
+    if (f.label === '免税销售额') {
+      const col = f.code.includes('goods') ? '货物及劳务' : '服务、不动产和无形资产'
+      return `主表第 10 栏「小微企业免税销售额」· ${col}`
+    }
+    return `附列资料（一）· ${f.label}行（未开票收入先填附1）`
+  }
+  if (f.section === '附加税费') return '系统自动试算，无需填写'
   if (f.label === '免税销售额') {
     const col = f.code.includes('goods') ? '货物及劳务' : '服务、不动产和无形资产'
     return `「本期销售情况」弹窗·1%征收率行 → 自动归集主表第 9/10 栏 · ${col}`
@@ -569,6 +586,16 @@ const otherTaxesSummary = computed(() => {
 // 折叠开关：增值税与所得税完整栏次
 const showFullVatTable = ref(false)
 const showFullCitTable = ref(false)
+const citCarryforwardRows = computed(() =>
+  (pkg.value?.cit?.carryforwardLedger || []).filter(
+    (row) =>
+      row.openingBalance > 0
+      || row.deductedFromPrior > 0
+      || row.currentExcess > 0
+      || row.closingBalance > 0
+      || row.expiredAmount > 0,
+  ),
+)
 
 const totalEstimatedTax = computed(() => {
   if (!pkg.value) return 0
@@ -771,18 +798,14 @@ usePageRefresh(load)
       </div>
     </div>
 
-    <!-- 税费种认定入口：让用户知道本期「该报哪些税」是按税局认定表来的，而不是系统猜的 -->
-    <div class="taxreg-bar">
-      <span class="taxreg-bar__dot" :class="{ 'taxreg-bar__dot--on': pkg?.taxRegistrations?.synced }" />
+    <!-- 税费种认定入口：未同步时提醒用户去同步，已维护后不再占位显示 -->
+    <div v-if="pkg && !pkg.taxRegistrations?.synced" class="taxreg-bar">
+      <span class="taxreg-bar__dot" />
       <span class="taxreg-bar__text">
-        <template v-if="pkg?.taxRegistrations?.synced">
-          已按税费种认定表生成征期：{{ pkg.taxRegistrations.count }} 项认定，覆盖
-          {{ pkg.taxRegistrations.groups.length }} 张申报表
-        </template>
-        <template v-else>尚未同步税费种认定表，当前按内置税种清单生成征期</template>
+        尚未同步税费种认定表，当前按内置税种清单生成征期
       </span>
       <NButton size="tiny" text type="primary" @click="router.push('/tax-registration')">
-        {{ pkg?.taxRegistrations?.synced ? '维护认定' : '去同步认定' }}
+        去同步认定
       </NButton>
     </div>
 
@@ -828,10 +851,12 @@ usePageRefresh(load)
           :period="period"
           :loading="loading"
           :exporting="exporting"
+          :vat-mode="vatFilingMode"
           @switch-mode="viewStore.setMode('accounting')"
           @refresh="load"
           @mark-filed="handleBossMarkFiled"
           @export-xls="exportFinancialXls"
+          @calibrate-cit="citCalibrationVisible = true"
         />
 
         <template v-else>
@@ -1132,7 +1157,31 @@ usePageRefresh(load)
               <div class="handcard-header">
                 <i class="ri-file-list-3-line handcard-icon" aria-hidden="true"></i>
                 <span class="handcard-title">电子税务局快速抄报手卡</span>
+                <div class="handcard-mode-switch" role="group" aria-label="申报表单形态">
+                  <button
+                    type="button"
+                    :class="{ 'is-active': vatFilingMode === 'confirm' }"
+                    @click="setVatFilingMode('confirm')"
+                  >
+                    确认式
+                  </button>
+                  <button
+                    type="button"
+                    :class="{ 'is-active': vatFilingMode === 'form' }"
+                    @click="setVatFilingMode('form')"
+                  >
+                    填表式
+                  </button>
+                </div>
               </div>
+              <p class="handcard-mode-hint">
+                <template v-if="vatFilingMode === 'confirm'">
+                  进入申报页看到「本期销售情况」入口 → 按确认式抄报；若左侧是「报表列表」，切到填表式。
+                </template>
+                <template v-else>
+                  进入申报页左侧能打开「报表列表 / 附列资料」 → 按填表式抄报；只有「本期销售情况」入口的，切回确认式。
+                </template>
+              </p>
               <div class="guide-steps">
                 <div v-for="(step, idx) in vatFilingGuide.steps" :key="idx" class="guide-step">
                   <span class="guide-step-num">{{ idx + 1 }}</span>
@@ -1156,6 +1205,18 @@ usePageRefresh(load)
                   <i class="ri-error-warning-line" aria-hidden="true"></i>
                   <span>{{ w }}</span>
                 </div>
+              </div>
+              <div class="handcard-demo-row">
+                <a
+                  class="handcard-demo-link"
+                  :href="VAT_DECLARATION_DEMO_URL"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <i class="ri-play-circle-line" aria-hidden="true"></i>
+                  看新版税局操作演示（浙江版，第三方）
+                </a>
+                <span class="handcard-demo-note">界面以税局实际为准</span>
               </div>
             </div>
 
@@ -1371,7 +1432,17 @@ usePageRefresh(load)
                     <div class="item-amount-val">¥ {{ money(iitAnnual.profitTotal) }}</div>
                   </div>
                   <div class="handcard-item">
-                    <div class="handcard-item-top"><span class="item-label">纳税调增（业主工资+无票）</span></div>
+                    <div class="handcard-item-top">
+                      <span class="item-label">纳税调增（业主工资/限额/无票）</span>
+                      <NTooltip v-if="iitAnnual.adjustments?.items?.length" trigger="hover">
+                        <template #trigger>
+                          <i class="ri-information-line sub-info-icon" />
+                        </template>
+                        <div v-for="item in iitAnnual.adjustments.items" :key="item.code">
+                          {{ item.label }}：+¥{{ money(item.amount) }}
+                        </div>
+                      </NTooltip>
+                    </div>
                     <div class="item-amount-val">+¥ {{ money(iitAnnual.adjustments?.total) }}</div>
                   </div>
                   <div class="handcard-item">
@@ -1515,6 +1586,53 @@ usePageRefresh(load)
                   </div>
                 </div>
               </div>
+            </div>
+
+            <div class="cit-calibration-bar">
+              <span v-if="(pkg.cit.priorYearLoss || 0) > 0 || (pkg.cit.prepaidCitTax || 0) > 0">
+                已按校准基数扣减：以前年度亏损 ¥{{ money(pkg.cit.priorYearLoss) }} · 本年已预缴 ¥{{ money(pkg.cit.prepaidCitTax) }}
+              </span>
+              <span v-else>
+                去电子税务局申报时，第 24 行「以前年度亏损」与第 30 行「本年已预缴」会自动带出；如需同步校准此处的预估税额：
+              </span>
+              <NButton size="tiny" secondary type="primary" @click="citCalibrationVisible = true">
+                {{ (pkg.cit.priorYearLoss || 0) > 0 || (pkg.cit.prepaidCitTax || 0) > 0 ? '修改校准基数' : '校准亏损 / 已预缴' }}
+              </NButton>
+            </div>
+
+            <!-- 跨年结转台账（仅当存在结转余额或本年新增/抵减时展示） -->
+            <div v-if="citCarryforwardRows.length > 0" class="cit-carryforward-card">
+              <div class="cit-cf-head">
+                <span class="cit-cf-title">跨年结转台账（广宣费 / 职工教育经费 / 公益捐赠）</span>
+                <span v-if="(pkg.cit.autoDecreaseTotal || 0) > 0" class="cit-cf-badge">
+                  本年抵减调减 -¥{{ money(pkg.cit.autoDecreaseTotal) }}
+                </span>
+              </div>
+              <table class="cit-cf-table">
+                <thead>
+                  <tr>
+                    <th>项目</th>
+                    <th>年初结转</th>
+                    <th>本年抵减（调减）</th>
+                    <th>本年新增（调增）</th>
+                    <th>年末滚存</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="row in citCarryforwardRows" :key="row.code">
+                    <td>
+                      {{ row.label }}
+                      <span v-if="row.expiredAmount > 0" class="cit-cf-expired">
+                        （超 3 年过期作废 ¥{{ money(row.expiredAmount) }}）
+                      </span>
+                    </td>
+                    <td>¥{{ money(row.openingBalance) }}</td>
+                    <td>{{ row.deductedFromPrior > 0 ? `-¥${money(row.deductedFromPrior)}` : '—' }}</td>
+                    <td>{{ row.currentExcess > 0 ? `+¥${money(row.currentExcess)}` : '—' }}</td>
+                    <td><strong>¥{{ money(row.closingBalance) }}</strong></td>
+                  </tr>
+                </tbody>
+              </table>
             </div>
 
             <!-- 可折叠的全部 A200000 栏次 -->
@@ -1737,6 +1855,11 @@ usePageRefresh(load)
                         <div v-if="item.hint" :style="{ marginTop: item.guide ? '4px' : '0', opacity: 0.8 }">{{ item.hint }}</div>
                       </div>
                     </NTooltip>
+                    <GuideTrigger
+                      v-if="item.taxKind === 'social_insurance' && item.status === 'pending'"
+                      guide="social-insurance"
+                      label="社保怎么申报？"
+                    />
                     <span class="other-deadline" v-if="item.dueDate">{{ deadlineText(item) }}</span>
                   </div>
                   <NButton
@@ -1804,6 +1927,12 @@ usePageRefresh(load)
     </NSpin>
 
 
+
+    <CitTaxOpeningModal
+      v-model:show="citCalibrationVisible"
+      :fiscal-year="filingFiscalYear"
+      @saved="load"
+    />
   </div>
 </template>
 
@@ -1898,9 +2027,6 @@ usePageRefresh(load)
   height: 6px;
   border-radius: 50%;
   background: var(--solo-text-muted);
-}
-.taxreg-bar__dot--on {
-  background: var(--solo-income);
 }
 .taxreg-bar__text {
   flex: 1;
@@ -2346,14 +2472,67 @@ usePageRefresh(load)
 }
 .handcard-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
+  row-gap: 8px;
   margin-bottom: 12px;
 }
 .handcard-title {
   font-size: 14px;
   font-weight: 600;
   color: var(--solo-text-primary, #182230);
+}
+.handcard-mode-switch {
+  margin-left: auto;
+  display: inline-flex;
+  padding: 2px;
+  background: var(--solo-bg-card, #fff);
+  border: 1px solid var(--solo-border, #edf0f4);
+  border-radius: 6px;
+}
+.handcard-mode-switch button {
+  padding: 3px 10px;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: var(--solo-text-secondary, #586474);
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+.handcard-mode-switch button.is-active {
+  background: var(--solo-primary, #1747b0);
+  color: #fff;
+  font-weight: 600;
+}
+.handcard-mode-hint {
+  margin: -4px 0 10px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--solo-text-muted, #636e7c);
+}
+.handcard-demo-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  margin-top: 10px;
+}
+.handcard-demo-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--solo-primary, #1747b0);
+  text-decoration: none;
+}
+.handcard-demo-link:hover {
+  text-decoration: underline;
+}
+.handcard-demo-note {
+  font-size: 11px;
+  color: var(--solo-text-muted, #636e7c);
 }
 .handcard-tip {
   font-size: 12px;

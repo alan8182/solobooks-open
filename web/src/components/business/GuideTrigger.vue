@@ -15,7 +15,7 @@ const props = withDefaults(
   defineProps<{
     guide: GuideId
     label?: string
-    /** 次要说明，跟在链接后面，例如「含 3 张截图」 */
+    /** 次要说明，跟在链接后面；没有就不传，别给链接堆噪音 */
     hint?: string
   }>(),
   { label: '怎么做？', hint: '' },

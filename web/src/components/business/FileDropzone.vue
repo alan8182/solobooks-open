@@ -14,6 +14,7 @@ const props = withDefaults(
     disabled?: boolean
     maxSizeMb?: number
     dropTitle?: string
+    multiple?: boolean
   }>(),
   {
     subtitle: '',
@@ -24,11 +25,13 @@ const props = withDefaults(
     disabled: false,
     maxSizeMb: 20,
     dropTitle: '松开即可上传',
+    multiple: false,
   },
 )
 
 const emit = defineEmits<{
   file: [file: File]
+  files: [files: File[]]
   error: [message: string]
 }>()
 
@@ -68,10 +71,33 @@ function acceptFile(file: File) {
   emit('file', file)
 }
 
+function handleFileList(fileList: FileList | File[] | null | undefined) {
+  const items = Array.from(fileList || [])
+  if (items.length === 0) return
+
+  if (!props.multiple) {
+    if (items.length > 1) emit('error', '一次只能上传一个文件，已使用第一个')
+    acceptFile(items[0])
+    return
+  }
+
+  const valid: File[] = []
+  for (const file of items) {
+    const error = validate(file)
+    if (error) {
+      emit('error', `${file.name}：${error}`)
+      continue
+    }
+    valid.push(file)
+  }
+  if (valid.length > 0) {
+    emit('files', valid)
+  }
+}
+
 function onChange(event: Event) {
   const input = event.target as HTMLInputElement
-  const file = input.files?.[0]
-  if (file) acceptFile(file)
+  handleFileList(input.files)
   input.value = ''
 }
 
@@ -100,10 +126,7 @@ function onDrop(event: DragEvent) {
   event.preventDefault()
   dragDepth.value = 0
   isDragging.value = false
-  const files = event.dataTransfer?.files
-  if (!files || files.length === 0) return
-  if (files.length > 1) emit('error', '一次只能上传一个文件，已使用第一个')
-  acceptFile(files[0])
+  handleFileList(event.dataTransfer?.files)
 }
 
 // 拖到区域外时阻止浏览器把文件当作页面打开，避免丢失当前向导状态
@@ -155,6 +178,7 @@ defineExpose({ openPicker })
       type="file"
       class="dropzone-input"
       :accept="accept"
+      :multiple="multiple"
       @change="onChange"
     />
   </div>

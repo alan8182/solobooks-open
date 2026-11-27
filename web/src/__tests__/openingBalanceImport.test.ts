@@ -17,7 +17,21 @@ import {
   describeExpectedPeriod,
   checkOpeningPeriod,
   buildOpeningTemplateWorkbook,
+  isPartnerAccountCode,
+  partnerFromAccountName,
 } from '@/utils/openingBalanceImport'
+
+describe('往来科目前缀与后端 chart_policy 同口径', () => {
+  it('3001 实收资本按股东挂往来，期初「实收资本-何静谷」能切出股东名', () => {
+    expect(isPartnerAccountCode('3001')).toBe(true)
+    expect(partnerFromAccountName('实收资本-何静谷')).toBe('何静谷')
+    // 费用类科目不能被当成往来：切名本身不判科目，由 isPartnerAccountCode 把关
+    expect(isPartnerAccountCode('5602')).toBe(false)
+    expect(isPartnerAccountCode('2202')).toBe(true)
+    expect(partnerFromAccountName('应付账款-杭州白鹭文化传媒有限公司'))
+      .toBe('杭州白鹭文化传媒有限公司')
+  })
+})
 
 describe('opening balance Excel import and matching', () => {
   const mockExistingAccounts = [
@@ -1027,5 +1041,49 @@ describe('年初余额快照', () => {
     expect(payable.map(i => i.partner_name).sort()).toEqual(['乙公司', '甲公司'])
     // 合计行 15,000 + 客商行 15,000 若都算就是 30,000
     expect(payable.reduce((s, i) => s + i.credit_balance, 0)).toBeCloseTo(15000, 2)
+  })
+})
+
+describe('同族末级精确同名匹配（3位子码 vs 2位子码）', () => {
+  it('auto-matches unique same-family leaf names like 2221001005 销项税额 without doubling parent', () => {
+    const accounts = [
+      { account_code: '222100101', account_name: '进项税额' },
+      { account_code: '222100105', account_name: '销项税额' },
+      { account_code: '2221021', account_name: '待转销项税额' },
+      { account_code: '2221026', account_name: '应交增值税（小规模纳税人专用）' },
+    ]
+    const rows = [
+      { '科目编码': '2221', '科目名称': '应交税费', '期末余额贷方': '1,302.88' },
+      { '科目编码': '2221001', '科目名称': '应交税费-应交增值税', '期末余额借方': '922.31' },
+      { '科目编码': '2221001005', '科目名称': '应交税费-应交增值税-销项税额', '期末余额借方': '922.31' },
+      { '科目编码': '2221026', '科目名称': '应交税费-应交增值税（小规模纳税人专用）', '期末余额贷方': '2,225.19' },
+    ]
+
+    const result = parseOpeningRows(rows, accounts)
+    const vatOutput = result.items.find(i => i.account_code === '222100105')
+    expect(vatOutput?.debit_balance).toBe(922.31)
+    expect(result.items.find(i => i.account_code === '2221021')?.debit_balance).toBe(0)
+    expect(result.unmatchedCount).toBe(0)
+    // 2221 与 2221001 应全部让位给下级明细，不重复计入
+    expect(result.totalDebit).toBe(922.31)
+    expect(result.totalCredit).toBe(2225.19)
+  })
+
+  it('keeps generic leaf names and semantically ambiguous names in unmatchedRows for user confirmation', () => {
+    const accounts = [
+      { account_code: '221101', account_name: '应付职工薪酬-工资' },
+      { account_code: '221102', account_name: '应付职工薪酬-单位社保' },
+      { account_code: '5301', account_name: '营业外收入' },
+      { account_code: '5301002', account_name: '营业外收入-政府补助' },
+    ]
+    const rows = [
+      { '科目编码': '2211002', '科目名称': '应付职工薪酬-职工社保费', '期末余额贷方': '2,620.00' },
+      { '科目编码': '5301012', '科目名称': '营业外收入-其他', '本年累计发生额贷方': '500.00' },
+    ]
+
+    const result = parseOpeningRows(rows, accounts)
+    const codes = (result.unmatchedRows || []).map(r => r.originalCode)
+    expect(codes).toContain('2211002')
+    expect(codes).toContain('5301012')
   })
 })

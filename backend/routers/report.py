@@ -33,8 +33,10 @@ from models.schemas import (
 from core.errors import AccountingError
 from services.llm import chat_text_json, chat_text
 from services.ocr import HEALTH_SCORE_V3_PROMPT
+from services.attachment_storage_service import attachment_counts_by_entries
 from services.diagnosis_prompts import CFO_DIAGNOSIS_PROMPT
 from services.tax_rules import compute_vat, lookup_tax, sanitize_risk_tags
+from services.platform_bill_common import SETTLEMENT_SOURCES
 from db.session import get_db_session
 from services.accounting_core_service import (
     VAT_REVENUE_ACCOUNT_CODES,
@@ -276,27 +278,27 @@ def _quarter_key(month_num: int) -> str:
 
 def _classify_statement_account(code: str, name: str, category: str) -> Optional[tuple[str, str]]:
     text = f"{code} {name} {category}"
-    if code in ("5001", "5051") or "主营业务收入" in text or "其他业务收入" in text:
+    if code.startswith(("5001", "5051")) or "主营业务收入" in text or "其他业务收入" in text:
         return "operating_revenue", "income"
-    if code == "5301" or "营业外收入" in text:
+    if code.startswith("5301") or "营业外收入" in text:
         return "nonoperating_income", "income"
     if "投资收益" in text:
         return "investment_income", "income"
     if code.startswith(("5401", "5402")) or "主营业务成本" in text or "生产成本" in text or "人力成本" in text:
         return "operating_cost", "expense"
-    if code == "5403" or "税金及附加" in text:
+    if code.startswith("5403") or "税金及附加" in text:
         return "tax_surcharges", "expense"
     if code.startswith("5601") or "销售费用" in text or "推广费" in text:
         return "selling_expenses", "expense"
-    if code == "4301002" or code.startswith("4301002"):
+    if code.startswith("4301002"):
         return None  # 研发支出-资本化是资产（开发支出），不进利润表
     if code.startswith(("5602", "4301")) or "管理费用" in text or "研发支出" in text:
         return "admin_expenses", "expense"
     if code.startswith("5603") or "财务费用" in text or "银行及金融手续费" in text or "利息" in text:
         return "finance_expenses", "expense"
-    if code == "5711" or "营业外支出" in text:
+    if code.startswith("5711") or "营业外支出" in text:
         return "nonoperating_expense", "expense"
-    if code == "5801" or "所得税费用" in text:
+    if code.startswith("5801") or "所得税费用" in text:
         return "income_tax_expense", "expense"
     return None
 
@@ -316,7 +318,7 @@ def _fallback_statement_bucket(entry: dict) -> Optional[tuple[str, str, Decimal]
         return bucket, nature, amount
 
     if direction == "income":
-        if "营业外收入" in category:
+        if category in ("营业外收入", "非流动资产处置净收益", "政府补助", "捐赠收益", "盘盈收益"):
             return "nonoperating_income", "income", amount
         if "投资收益" in category:
             return "investment_income", "income", amount
@@ -330,11 +332,15 @@ def _fallback_statement_bucket(entry: dict) -> Optional[tuple[str, str, Decimal]
             return None
         if category in ("生产成本", "人力成本"):
             return "operating_cost", "expense", amount
-        if category in ("推广费", "广告费", "业务宣传费"):
+        if category in ("推广费", "广告费", "业务宣传费", "展览费", "商品维修费", "装卸费", "包装费", "保险费"):
             return "selling_expenses", "expense", amount
-        if category in ("银行及金融手续费", "利息费用"):
+        if category in ("银行及金融手续费", "利息费用", "汇兑损益", "现金折扣"):
             return "finance_expenses", "expense", amount
-        if category in ("营业外支出", "坏账损失", "税收滞纳金"):
+        if category in (
+            "营业外支出", "坏账损失", "税收滞纳金", "罚款支出", "捐赠支出", "赞助支出",
+            "非流动资产处置净损失", "盘亏损失", "存货毁损报废损失",
+            "长期债券投资损失", "长期股权投资损失", "自然灾害损失",
+        ):
             return "nonoperating_expense", "expense", amount
         if category == "所得税费用":
             return "income_tax_expense", "expense", amount
@@ -394,7 +400,7 @@ def _add_statement_details(values: dict[str, Decimal], bucket: str, amount: Deci
 
 def _income_statement_entry_values(entry: dict) -> dict[str, Decimal]:
     values = _empty_income_statement_values()
-    if entry.get("source") == "wechat_settlement" or entry.get("isClosingTransfer"):
+    if entry.get("source") in SETTLEMENT_SOURCES or entry.get("isClosingTransfer"):
         return values
     # 冲销期初凭证的冲销凭证与期初同进同出，一并排除（期初重设后不排除会把
     # 启用前损益反向冲一遍）
@@ -792,8 +798,12 @@ async def cit_assist(
     non_operating_expense = d2(profit.get("non_operating_expense", 0))
     total_profit = d2(profit.get("total_profit", 0))
 
-    # 纳税调增的确定性计算：招待费 60%/5‰、广宣费 15%、罚款滞纳金、无票支出。
+    # 纳税调增/结转抵减的确定性计算：招待费 60%/5‰、广宣费 15%、三项经费 14%/2%/8%、公益捐赠 12%、罚款滞纳金、无票支出。
     # 这是 A105000 的简化口径，结果作为第 19-24 行的系统测算默认值，用户可修改。
+    from services.cit_carryforward_service import compute_carryforward_ledger
+    from services.cit_tax_opening import apply_tax_opening, get_tax_opening_memo
+
+    tax_memo = await get_tax_opening_memo(ctx.company_id, session=session)
     if session is not None:
         all_entries = await posted_entries_for_reports(session, ctx.company_id)
         year_entries = [
@@ -802,23 +812,37 @@ async def cit_assist(
             and statement.period.fiscal_year_start.isoformat() <= occurred <= statement.period.end.isoformat()
         ]
     else:
+        all_entries = []
         year_entries = []
+    ledger = compute_carryforward_ledger(
+        all_entries,
+        statement.period.fiscal_year_start.year,
+        profit,
+        entity_type="ltd",
+        opening_memo=tax_memo,
+        target_period_end=statement.period.end,
+    )
     adjustments = build_cit_adjustments(
-        year_entries, profit, statement.period.fiscal_year_start, statement.period.end,
+        year_entries,
+        profit,
+        statement.period.fiscal_year_start,
+        statement.period.end,
+        carryforward_ledger=ledger,
     )
     auto_adjustment_total = d2(adjustments["totalIncrease"])
+    auto_decrease_total = d2(adjustments["totalDecrease"])
+    net_adjustment = d2(adjustments["netAdjustment"])
 
     profit_before_loss = d2(
-        total_profit + auto_adjustment_total + req.specificBusinessIncome - req.nonTaxableIncome
+        total_profit + net_adjustment + req.specificBusinessIncome - req.nonTaxableIncome
         - req.acceleratedDepreciationReduction - req.exemptDeduction
         - req.incomeExemption
     )
-    from services.cit_tax_opening import apply_tax_opening, get_tax_opening_memo
 
     # 未传第 24/30 行时回退期初税务备忘（仅其所属纳税年度生效）
     opening = apply_tax_opening(
         profit_before_loss,
-        await get_tax_opening_memo(ctx.company_id, session=session),
+        tax_memo,
         statement.period.fiscal_year_start.year,
     )
     prior_loss = req.priorYearLoss if req.priorYearLoss is not None else opening["lossDeducted"]
@@ -965,8 +989,102 @@ async def cit_assist(
         companyTaxProfileComplete=company_tax_profile_complete,
         beginnerReady=beginner_ready,
         autoAdjustmentTotal=auto_adjustment_total,
+        autoDecreaseTotal=auto_decrease_total,
         autoAdjustments=adjustments["items"],
+        carryforwardLedger=adjustments["carryforwardLedger"],
     )
+
+
+_INTERNAL_CLOSING_KEYWORDS = (
+    "期末损益结转",
+    "损益结转",
+    "结转损益",
+    "结转本年利润",
+    "免征增值税",
+    "结转未交增值税",
+    "计提增值税",
+    "计提附加税",
+    "计提所得税",
+    "计提折旧",
+    "累计折旧",
+    "无形资产摊销",
+    "待摊费用摊销",
+    "计提工资",
+    "计提社保",
+    "计提公积金",
+)
+
+_NO_INVOICE_BANK_KEYWORDS = (
+    "利息收入",
+    "银行结息",
+    "银行手续费",
+    "账户管理费",
+    "微额验证",
+    "打款验证",
+    "微信支付结算",
+    "支付宝结算",
+    "微信支付提现",
+    "支付宝提现",
+    "内部转账",
+    "资金划转",
+    "往来退款",
+    "往来暂付",
+    "往来款",
+    "股东垫付报销",
+    "报销垫付款",
+    "归还股东垫付",
+    "股东借款",
+    "股东投入",
+    "注册资本",
+    "实收资本",
+    "社保",
+    "公积金",
+    "缴税",
+    "税款",
+    "发放工资",
+    "工资发放",
+)
+
+
+def _classify_archive_compliance(
+    entry: dict,
+    attachment_count: int,
+    amt: Decimal,
+) -> tuple[str, str, str]:
+    """判定单条凭证的归档合规状态与明确说明，返回 (compliance, compliance_status, reason)。"""
+    entry_id = str(entry.get("id") or "")
+    category = str(entry.get("category") or "")
+    title = str(entry.get("title") or "")
+    billing = str(entry.get("billingStatus") or "no_document")
+    invoice_no = str(entry.get("invoiceNumber") or "").strip()
+    direction = str(entry.get("direction") or "")
+    combined = f"{category} {title}"
+
+    # 1. 内部结转 / 税费折旧计提：自制记账凭证，无需外部单据
+    if entry_id.startswith("closing-pnl-") or any(k in combined for k in _INTERNAL_CLOSING_KEYWORDS):
+        return "无需外部单据", "compliant", "内部结转凭证，无需外部单据"
+
+    # 2. 已有发票号 / 明确有发票或收据 / 已挂载真实附件原件
+    if invoice_no:
+        detail = f"已有发票（已附 {attachment_count} 份原件）" if attachment_count > 0 else "已有发票记录"
+        return "合规", "compliant", detail
+    if attachment_count > 0:
+        return "合规", "compliant", f"已附 {attachment_count} 份原件"
+    if billing in ("has_invoice", "has_receipt"):
+        return "合规", "compliant", "已有发票/收据"
+
+    # 3. 银行原生业务 / 内部资金划转 / 还款往来 / 社保税款工资（凭银行流水或回单归档，不要求发票）
+    if any(k in combined for k in _NO_INVOICE_BANK_KEYWORDS):
+        return "合规", "compliant", "银行流水/回单即凭证，无需发票"
+
+    # 4. 收入类（如平台月度汇总、未开票零售收入）：不存在成本费用税前扣除缺票风险
+    if direction == "income" or "收入" in category or "月度汇总" in title:
+        return "合规", "compliant", "收入按银行流水/平台账单申报，无需进项发票"
+
+    # 5. 真正缺票/缺凭据的成本费用支出：明确告知缺什么
+    if abs(amt) > Decimal("500"):
+        return "待补", "missing", "缺合规发票（超 500 元无票支出需纳税调增，请补传发票或原件）"
+    return "待补", "missing", "缺发票或收款凭据/支付截图（500 元以下可凭收据与付款截图入账）"
 
 
 @router.post("/report/archive-checklist", response_model=ArchiveChecklistResponse)
@@ -984,20 +1102,25 @@ async def archive_checklist(
     total_amount = Decimal("0")
 
     entries = _filter_month(await _authoritative_entries(session, ctx), req.month)
+    # 附单据数来自真实附件（发票→active 附件），不再用 billingStatus 推导假数（A3）
+    attachment_counts = await attachment_counts_by_entries(
+        ctx.company_id, [str(e.get("id")) for e in entries if e.get("id")]
+    )
     for e in entries:
         billing = e.get("billingStatus", "no_document")
         amt = Decimal(str(e.get("amount") or 0))
         total_amount += abs(amt)
 
-        # unknown 和 no_document 都属于待补
-        if billing in ("has_invoice", "has_receipt"):
-            compliance = "合规"
-            compliance_status = "compliant"
+        voucher_no = e.get("voucher_no") or e.get("voucherNo") or e.get("voucherRef")
+        attachment_count = attachment_counts.get(str(e.get("id")), 0) if e.get("id") else 0
+
+        compliance, compliance_status, missing_reason = _classify_archive_compliance(
+            e, attachment_count, amt
+        )
+        if compliance_status == "compliant":
             compliant += 1
             compliant_amount += abs(amt)
         else:
-            compliance = "待补"
-            compliance_status = "missing"
             missing += 1
             missing_amount += abs(amt)
 
@@ -1007,9 +1130,6 @@ async def archive_checklist(
             risk = tags[0] if isinstance(tags, list) else str(tags)
             if compliance_status == "compliant" and risk:
                 compliance_status = "questionable"
-
-        voucher_no = e.get("voucher_no") or e.get("voucherNo") or e.get("voucherRef")
-        attachment_count = 1 if billing in ("has_invoice", "has_receipt") else 0
 
         items.append(ArchiveItem(
             id=str(e.get("id")) if e.get("id") else None,
@@ -1026,6 +1146,7 @@ async def archive_checklist(
             complianceStatus=compliance_status,
             riskTag=risk,
             attachmentCount=attachment_count,
+            missingReason=missing_reason,
             note=e.get("explanation", ""),
         ))
 

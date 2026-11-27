@@ -5,9 +5,11 @@
 
 import { beforeEach, describe, expect, it } from 'vitest'
 import {
+  detectPrepaidCitHint,
   loadTaxOpeningMemory,
   saveTaxOpeningMemory,
   taxOpeningMemoryStorageKey,
+  type TaxOpeningMemory,
 } from '@/utils/taxOpeningMemory'
 
 const memory = {
@@ -45,6 +47,15 @@ describe('tax opening memory storage helpers', () => {
     expect(loadTaxOpeningMemory('c1', 2026)).toBeNull()
     saveTaxOpeningMemory('c1', 2026, memory)
     expect(loadTaxOpeningMemory('c1', 2026)).toEqual(memory)
+
+    const withCarryforward: TaxOpeningMemory = {
+      ...memory,
+      carryforwardAdvertising: 15000,
+      carryforwardEducation: 3200,
+      carryforwardDonations: [{ year: 2024, amount: 5000 }],
+    }
+    saveTaxOpeningMemory('c1', 2026, withCarryforward)
+    expect(loadTaxOpeningMemory('c1', 2026)).toEqual(withCarryforward)
   })
 
   it('normalizes malformed values instead of crashing', () => {
@@ -69,5 +80,35 @@ describe('tax opening memory storage helpers', () => {
     expect(loadTaxOpeningMemory('c1', 2026)).toBeNull()
     // 旧键留作孤儿，不被读取也不被消费
     expect(localStorage.getItem('solo_tax_opening_memory_2026')).not.toBeNull()
+  })
+})
+
+describe('detectPrepaidCitHint', () => {
+  it('detects 2221006 YTD debit even when the quarter balance ended at 0 (skipped_zero)', () => {
+    const hint = detectPrepaidCitHint([
+      { original_code: '2221', original_name: '应交税费', ytd_debit: 6745.52, status: 'skipped_rollup' },
+      { original_code: '2221006', original_name: '应交税费-应交企业所得税', ytd_debit: 209.21, status: 'skipped_zero' },
+      { original_code: '2221008', original_name: '应交税费-应交城市维护建设税', ytd_debit: 112.41, status: 'matched' },
+    ])
+    expect(hint).toEqual({
+      amount: 209.21,
+      sourceLabel: '原表 2221006 应交企业所得税（本年累计借方）',
+    })
+  })
+
+  it('ignores non-CIT taxes, rollup/total rows, and zero/null YTD debits', () => {
+    expect(
+      detectPrepaidCitHint([
+        { original_code: '2221', original_name: '应交税费', ytd_debit: 500, status: 'skipped_total' },
+        { original_code: '2221006', original_name: '应交税费-应交企业所得税', ytd_debit: 500, status: 'skipped_rollup' },
+        { original_code: '2221026', original_name: '应交增值税（小规模纳税人专用）', ytd_debit: 300, status: 'matched' },
+      ]),
+    ).toBeNull()
+
+    expect(
+      detectPrepaidCitHint([
+        { original_code: '2221006', original_name: '应交税费-应交企业所得税', ytd_debit: null, status: 'skipped_zero' },
+      ]),
+    ).toBeNull()
   })
 })

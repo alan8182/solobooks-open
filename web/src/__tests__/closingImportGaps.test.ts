@@ -18,7 +18,7 @@ describe('deriveMissingClosingImports', () => {
   it('returns all three categories when nothing was imported', () => {
     const gaps = deriveMissingClosingImports({ invoiceCount: 0, wechatBillCount: 0, bankStatementCount: 0 })
     expect(gaps.map((gap) => gap.key)).toEqual(['invoice', 'wechat', 'bank'])
-    expect(gaps.map((gap) => gap.label)).toEqual(['发票', '微信账单', '银行流水'])
+    expect(gaps.map((gap) => gap.label)).toEqual(['发票', '平台账单', '银行流水'])
   })
 
   it('returns only the missing categories in fixed order', () => {
@@ -43,7 +43,7 @@ describe('deriveMissingClosingImports', () => {
 describe('formatMissingImportLabels', () => {
   it('joins labels with the enumeration comma', () => {
     const gaps = deriveMissingClosingImports({ invoiceCount: 0, wechatBillCount: 0, bankStatementCount: 0 })
-    expect(formatMissingImportLabels(gaps)).toBe('发票、微信账单、银行流水')
+    expect(formatMissingImportLabels(gaps)).toBe('发票、平台账单、银行流水')
   })
 
   it('returns an empty string when nothing is missing', () => {

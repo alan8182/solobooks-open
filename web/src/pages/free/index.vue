@@ -14,7 +14,7 @@ const freePaths = [
     badge: '0 元 · 免部署',
     title: '云端免费试用版',
     desc: '注册即用，功能与标准版一致。适合先拿真实账目跑一遍，再决定要不要升级。',
-    points: ['每月 10 万 AI Token', '最多 3 个企业账套', 'Web 与移动端云同步'],
+    points: ['首月 20 万 AI Token（新人可 ¥1 扩容至 100 万，次月起 10 万/月）', '最多 3 个企业账套', 'Web 与移动端云同步'],
     action: '免费开启云端体验',
     primary: true,
   },
@@ -32,7 +32,7 @@ const compareRows = [
   ['费用', '0 元', '0 元（软件许可）', '598 元 / 年'],
   ['部署方式', '免部署，注册即用', '自备服务器 + Docker', '免部署，注册即用'],
   ['企业账套', '最多 3 个', '不限（受服务器资源限制）', '最多 3 个'],
-  ['AI 额度', '每月 10 万 Token', '自备模型 API Key，按模型商价格计费', '每年 500 万 Token'],
+  ['AI 额度', '首月 20 万 Token（新人可 ¥1 扩容至 100 万，次月起 10 万/月）', '自备模型 API Key，按模型商价格计费', '每年 1000 万 Token'],
   ['数据位置', '云端', '你自己的服务器', '云端'],
   ['适合谁', '想先试用、不想折腾', '重数据自主、有技术能力', '要省心与 1 对 1 服务'],
 ]
@@ -98,7 +98,7 @@ function openSelfHost() {
             <button class="btn-primary" @click="router.push('/login')">免费开启云端体验</button>
             <button class="btn-ghost" @click="openSelfHost">查看自托管部署</button>
           </div>
-          <p class="hero-note">云端免费版每月 10 万 Token、最多 3 个账套；自托管版本主体内部记账永久免费。</p>
+          <p class="hero-note">云端免费版新用户首月 20 万 Token（新人可 ¥1 扩容至 100 万，次月起每月 10 万）、最多 3 个账套；自托管版本主体内部记账永久免费。</p>
         </div>
       </section>
 
@@ -207,6 +207,7 @@ function openSelfHost() {
 
     <footer class="site-footer">
       <div class="footer-inner">
+        <p class="footer-tagline">不做糊涂账，合规用梭罗。</p>
         <div class="footer-links">
           <a href="/">官网首页</a>
           <a href="/learn">学习中心</a>
@@ -706,6 +707,14 @@ tbody tr:last-child td {
   padding: 26px 24px 34px;
   color: var(--solo-text-muted);
   font-size: 13px;
+}
+
+.footer-tagline {
+  margin: 0 0 12px;
+  color: var(--solo-text-primary);
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: -0.2px;
 }
 
 .footer-links {

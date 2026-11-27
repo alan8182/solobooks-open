@@ -295,12 +295,12 @@ def test_admin_patch_user_plan_and_clears_quota_cache(client, monkeypatch):
         assert body["user"]["planAnchorAt"] == "2026-11-13"
         assert body["user"]["quotaBonusTokens"] == 50000
 
-        # 4. 缓存已立即清空，用户端立刻拿到新套餐与年付 500 万额度
+        # 4. 缓存已立即清空，用户端立刻拿到新套餐与年付 1000 万额度
         me_after = client.get("/api/usage/me", headers={"Authorization": f"Bearer {u_headers}"})
         assert me_after.status_code == 200
         assert me_after.json()["quota"]["planCode"] == "standard"
         assert me_after.json()["quota"]["periodType"] == "annual"
-        assert me_after.json()["quota"]["limitTokens"] == 5_000_000
+        assert me_after.json()["quota"]["limitTokens"] == 10_000_000
         assert me_after.json()["quota"]["maxCompanies"] == 3
         assert me_after.json()["quota"]["bonusTokens"] == 50000
 

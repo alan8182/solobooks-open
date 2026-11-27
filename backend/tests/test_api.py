@@ -525,6 +525,60 @@ class TestAuthoritativeAccountingApi:
         }, headers=auth_headers)
         assert ok2.status_code == 200, ok2.text
         assert ok2.json()["status"] == "created"
+        # 不得复用已冲销的 bank-<流水id> 凭证：save_entry 对已存在凭证只返回不报错，
+        # 复用会把冲销凭证重新挂回流水并谎报 created（2026-11-23 事故）。
+        rebooked_id = ok2.json()["entryId"]
+        assert rebooked_id != entry_id
+        rebooked = next(
+            e for e in client.get('/api/record/entries', headers=auth_headers).json()["entries"]
+            if e["id"] == rebooked_id
+        )
+        assert rebooked["voucherStatus"] != "reversed"
+        after_rebook = client.get('/api/bank/statements?statement_id=reversed-journey',
+                                  headers=auth_headers).json()["items"][0]
+        assert after_rebook["matched_entry_id"] == rebooked_id
+        assert entry_id not in (after_rebook.get("matched_entry_ids") or [])
+
+    def test_batch_confirm_skips_reversed_bank_voucher(self, client, auth_headers):
+        """批量确认高置信度流水不得把已冲销的 bank-<流水id> 凭证重新挂账。
+
+        2026-11-23：用户冲销银行入账并解除关联后，批量确认再次复用同一 id 的
+        冲销凭证，流水重新指向 reversed 凭证（A3 悬空引用）。
+        """
+        bank = client.post('/api/bank/import-json', json={"statement_id": "batch-reversed-guard", "rows": [{
+            "transaction_date": "2033-03-08",
+            "description": "财付通支付科技有限公司 | 附言: 提现",
+            "amount": 19.82,
+        }]}, headers=auth_headers)
+        assert bank.status_code == 200, bank.text
+        statement = client.get('/api/bank/statements?statement_id=batch-reversed-guard',
+                               headers=auth_headers).json()["items"][0]
+
+        first = client.post('/api/bank/batch-confirm-rules', json={
+            "statement_ids": [statement["id"]],
+        }, headers=auth_headers)
+        assert first.status_code == 200, first.text
+        assert first.json()["confirmedCount"] == 1
+        entry_id = f"bank-{statement['id']}"
+
+        unlink = client.post('/api/bank/confirm-suggestion', json={
+            "statement_id": statement["id"], "type": "match",
+            "matched_entry_id": "", "matched_entry_ids": [],
+        }, headers=auth_headers)
+        assert unlink.status_code == 200, unlink.text
+        reverse = client.post(f'/api/record/entries/{entry_id}/reverse',
+                              json={"reason": "批量确认冲销回归"}, headers=auth_headers)
+        assert reverse.status_code == 200, reverse.text
+
+        second = client.post('/api/bank/batch-confirm-rules', json={
+            "statement_ids": [statement["id"]],
+        }, headers=auth_headers)
+        assert second.status_code == 200, second.text
+        assert second.json()["confirmedCount"] == 0, second.text
+        after = client.get('/api/bank/statements?statement_id=batch-reversed-guard',
+                           headers=auth_headers).json()["items"][0]
+        assert not after.get("matched_entry_id")
+        assert not (after.get("matched_entry_ids") or [])
 
 
 class TestInvoice:
@@ -573,6 +627,38 @@ class TestInvoice:
         # Row 2: Buyer is 杭州惠保信 -> expense
         assert valid[2]["direction"] == "expense"
         assert valid[2]["seller_name"] == "杭州市拱墅区同泡大餐饮店"
+
+    def test_invoice_parse_rejects_bank_statement_rows(self, client, auth_headers):
+        """银行流水被误传进发票导入时，按行拦下而不是当成发票入账。
+
+        2026-11 用户把杭州银行流水上传到结账向导的「导入发票」，前端模糊映射
+        把「账户余额」当成金额，后端只校验"有号码或有金额"，于是批量生成了
+        16 条无号码、无开票日期的草稿发票。真实发票至少要有号码或开票日期。
+        """
+        rows = [
+            {"amount": 99361.17},
+            {"amount": 20000.00},
+            {"amount": 0.01},
+        ]
+        resp = client.post("/api/invoice/parse", json={"rows": rows}, headers=auth_headers)
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["valid_count"] == 0
+        assert len(data["errors"]) == 3
+        assert "银行流水" in data["errors"][0]["reason"]
+
+    def test_invoice_import_rejects_rows_without_invoice_identity(self, client, auth_headers):
+        """直接打导入接口也必须被拦：调用方无法绕过 parse 的发票要素校验。"""
+        resp = client.post(
+            "/api/invoice/import",
+            json={"rows": [{"amount": 99361.17}], "classify": False},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["imported"] == 0
+        assert data["entries"] == []
+        assert "银行流水" in data["errors"][0]["reason"]
 
     @pytest.mark.asyncio
     async def test_invoice_import_sales_row_without_category_normalizes_to_income(self, monkeypatch):
@@ -884,6 +970,7 @@ class TestBankReconciliation:
         )
         await keeper.commit()
         yield uri
+        bank_service._schema_ready = False
         await keeper.close()
 
     async def _insert_entry(self, company_id, payload):
@@ -1138,7 +1225,8 @@ class TestBankReconciliation:
         assert report["balance_reconciliation"]["book_bank_balance"] == 10
 
     @pytest.mark.asyncio
-    async def test_business_context_can_override_technical_service_to_r_and_d(self, temp_bank_db):
+    async def test_business_context_can_override_technical_service_to_r_and_d(self, temp_bank_db, monkeypatch):
+        from services import llm
         from services.bank_service import classify_single_statement, import_statements_json
 
         company_id = "c-bank-context"
@@ -1150,11 +1238,114 @@ class TestBankReconciliation:
         }], "bank-batch-rd")
         stmt = await self._statement_row("bank-batch-rd")
 
+        calls = []
+
+        def fake_llm(system_prompt, user_message, fallback, **kwargs):
+            calls.append(user_message)
+            return {
+                "direction": "expense",
+                "category": "研发支出-费用化支出",
+                "accountCode": "4301",
+                "accountName": "研发支出-费用化支出",
+                "title": "研发技术服务费",
+                "confidence": 0.94,
+                "reason": "用户补充说明该技术服务费用于研发项目",
+            }
+
+        monkeypatch.setattr(llm, "safe_chat_text_json", fake_llm)
         result = await classify_single_statement(company_id, stmt["id"], "这笔技术服务费用于研发项目")
 
+        assert len(calls) == 1
+        assert "用户补充说明：这笔技术服务费用于研发项目" in calls[0]
         assert result["category"] == "研发支出-费用化支出"
         assert result["accountCode"] == "4301"
         assert "研发" in result["reason"]
+
+        # LLM 不可用触发 fallback 时，仍能按补充说明兜底为研发支出
+        monkeypatch.setattr(
+            llm,
+            "safe_chat_text_json",
+            lambda system_prompt, user_message, fallback, **kwargs: fallback,
+        )
+        fallback_result = await classify_single_statement(company_id, stmt["id"], "这笔技术服务费用于研发项目")
+        assert fallback_result["category"] == "研发支出-费用化支出"
+        assert fallback_result["accountCode"] == "4301"
+
+    @pytest.mark.asyncio
+    async def test_classify_single_statement_business_context_invokes_llm_on_payroll_description(
+        self, temp_bank_db, monkeypatch
+    ):
+        """有用户补充说明时一律走 LLM（含税费社保流水），不走本地快规则提前截胡。"""
+        from services import llm
+        from services.bank_service import classify_single_statement, import_statements_json
+
+        company_id = "c-bank-tax-ss-context"
+        await import_statements_json(company_id, [{
+            "transaction_date": "2026-10-15",
+            "description": "税费社保 (对方: 金库杭州市余杭区支库)",
+            "amount": -200,
+            "balance": 8000,
+        }], "bank-batch-tax-ss")
+        stmt = await self._statement_row("bank-batch-tax-ss")
+
+        llm_calls = []
+
+        def fake_safe_chat_text_json(system_prompt, user_message, fallback, **kwargs):
+            llm_calls.append(user_message)
+            if "罚" in user_message:
+                return {
+                    "direction": "expense",
+                    "category": "罚款支出",
+                    "accountCode": "5711011",
+                    "accountName": "营业外支出-罚款支出",
+                    "title": "未及时申报个税罚款",
+                    "confidence": 0.96,
+                    "reason": "用户说明属于未及时申报个税产生的税务罚款，计入营业外支出-罚款支出",
+                }
+            return {
+                "direction": "expense",
+                "category": "税费支出",
+                "title": "增值税税款缴纳",
+                "confidence": 0.92,
+                "reason": "用户补充说明明确为正常税款缴纳",
+            }
+
+        monkeypatch.setattr(llm, "safe_chat_text_json", fake_safe_chat_text_json)
+
+        # 1. 无业务说明：「税费社保」只是财税库行通道词，不能判社保，
+        #    先给税费缴纳模糊组交用户拍板，同样不耗 LLM
+        default_res = await classify_single_statement(company_id, stmt["id"], "")
+        assert default_res["category"] == "税费缴纳"
+        assert default_res["accountCode"] == "2221026"
+        assert default_res["requiresConfirmation"] is True
+        assert len(llm_calls) == 0
+
+        # 2. 补充个税逾期申报罚款说明：一律调用 LLM，返回罚款支出（5711011）
+        penalty_res = await classify_single_statement(
+            company_id, stmt["id"], "这笔是未及时申报个税被税务局罚了200元"
+        )
+        assert len(llm_calls) == 1
+        assert "用户补充说明：这笔是未及时申报个税被税务局罚了200元" in llm_calls[0]
+        assert penalty_res["category"] == "罚款支出"
+        assert penalty_res["accountCode"] == "5711011"
+        assert penalty_res["accountName"] == "营业外支出-罚款支出"
+        assert "罚款" in penalty_res["reason"]
+
+        # 3. 补充一般缴税说明：同样调用 LLM 判断，并把「税费支出」归一为「税费缴纳」
+        tax_res = await classify_single_statement(company_id, stmt["id"], "这是本月缴纳的增值税税款")
+        assert len(llm_calls) == 2
+        assert "用户补充说明：这是本月缴纳的增值税税款" in llm_calls[1]
+        assert tax_res["category"] == "税费缴纳"
+        assert tax_res["accountCode"] == "2221026"
+
+        # 4. LLM 异常退回 fallback 时，滞纳金 → 5711010、罚款 → 5711011
+        monkeypatch.setattr(llm, "safe_chat_text_json", lambda s, u, fallback, **kw: fallback)
+        late_fee_fb = await classify_single_statement(company_id, stmt["id"], "补缴增值税滞纳金")
+        assert late_fee_fb["category"] == "税收滞纳金"
+        assert late_fee_fb["accountCode"] == "5711010"
+        fine_fb = await classify_single_statement(company_id, stmt["id"], "未及时申报个税罚款")
+        assert fine_fb["category"] == "罚款支出"
+        assert fine_fb["accountCode"] == "5711011"
 
     @pytest.mark.asyncio
     async def test_ai_suggest_corrects_invalid_fallback_direction_for_income_statement(self, temp_bank_db, monkeypatch):
@@ -2120,6 +2311,64 @@ class TestBankReconciliation:
                                  "credit": [{"accountCode": credit, "amount": value}]},
             })
 
+    async def _insert_alipay_order(self, company_id, order_no, amount=5, fee=0.05, occur_date="2026-07-14"):
+        for suffix, direction, value, debit, credit in [
+            ("income", "income", amount, "1012002", "5001"),
+            ("fee", "expense", fee, "5603002", "1012002"),
+        ]:
+            await self._insert_entry(company_id, {
+                "id": f"{order_no}-{suffix}", "source": "alipay_bill", "platform_order_no": order_no,
+                "title": suffix, "category": "主营业务收入" if direction == "income" else "银行及金融手续费",
+                "direction": direction, "amount": value, "occurDate": occur_date,
+                "voucherLines": {"debit": [{"accountCode": debit, "amount": value}],
+                                 "credit": [{"accountCode": credit, "amount": value}]},
+            })
+
+    @pytest.mark.asyncio
+    async def test_bank_new_entry_attaches_statement_counterparty_to_3001(self, temp_bank_db):
+        """银行流水确认生成实收资本时，必须把「(对方: 何静谷)」挂成股东辅助核算。
+
+        回归的是：3001 不在往来白名单、银行分录也不带对手方，导致实收资本只有
+        一个总数，看不出每个股东实缴多少。
+        """
+        from deps.auth import AuthContext
+        from routers.bank import ConfirmSuggestionRequest, confirm_suggestion
+        from services.bank_service import import_statements_json
+        from sqlalchemy import select
+        from db.models import JournalLine, Partner
+        from db.session import session_scope
+
+        company_id = "c-bank-counterparty-3001"
+        await import_statements_json(company_id, [{
+            "transaction_date": "2026-05-20",
+            "description": "汇兑 | 附言: 何静谷实缴出资款 (对方: 何静谷)",
+            "amount": 20000,
+        }], "bank-counterparty-3001")
+        stmt = await self._statement_row("bank-counterparty-3001")
+        ctx = AuthContext(user_id="u-bank-test", company_id=company_id)
+
+        await confirm_suggestion(ConfirmSuggestionRequest(
+            statement_id=stmt["id"], type="new",
+            new_entry={
+                "title": "何静谷实缴出资款", "amount": 20000, "direction": "owner_transfer",
+                "category": "股东投入", "occurDate": "2026-05-20",
+            },
+        ), ctx)
+
+        async with session_scope() as session:
+            lines = (
+                await session.execute(
+                    select(JournalLine).where(JournalLine.journal_entry_id == f"bank-{stmt['id']}")
+                )
+            ).scalars().all()
+            partners = (
+                await session.execute(select(Partner).where(Partner.company_id == company_id))
+            ).scalars().all()
+        by_code = {line.account_code: line for line in lines}
+        assert by_code["3001"].auxiliary["partner_name"] == "何静谷"
+        shareholder = next(p for p in partners if p.id == by_code["3001"].auxiliary["partner_id"])
+        assert shareholder.type == "person"
+
     @pytest.mark.asyncio
     async def test_wechat_settlement_suggests_group_without_llm_or_writes(self, temp_bank_db, monkeypatch):
         from services.bank_service import ai_suggest_matches, import_statements_json
@@ -2144,6 +2393,58 @@ class TestBankReconciliation:
         assert len(suggestions[0]["matchedEntries"]) == 2
         assert (await self._statement_row("wx-suggest"))["matched_entry_id"] is None
         assert "billingStatus" not in await self._entry_payload("wx-order-income")
+
+    @pytest.mark.asyncio
+    async def test_alipay_settlement_suggests_group_without_llm_or_writes(self, temp_bank_db, monkeypatch):
+        """支付宝提现到账要与支付宝账单原收入/手续费合并核销，不能当成新收入。"""
+        from services.bank_service import ai_suggest_matches, import_statements_json
+        from services import llm
+
+        company_id = "c-ali-group-suggestion"
+        await self._insert_alipay_order(company_id, "ali-order")
+        await import_statements_json(company_id, [{
+            "transaction_date": "2026-07-15",
+            "description": "入账 | 支付宝（中国）网络技术有限公司",
+            "amount": 4.95,
+        }], "ali-suggest")
+
+        def unexpected_llm(*args, **kwargs):
+            raise AssertionError("A known Alipay settlement must not be classified as new revenue")
+        monkeypatch.setattr(llm, "safe_chat_text_json", unexpected_llm)
+        suggestions = await ai_suggest_matches(company_id)
+        assert len(suggestions) == 1
+        assert suggestions[0]["type"] == "match"
+        assert suggestions[0]["rule"] == "alipay_detail_match"
+        assert set(suggestions[0]["matchedEntryIds"]) == {"ali-order-income", "ali-order-fee"}
+        assert (await self._statement_row("ali-suggest"))["matched_entry_id"] is None
+        assert "billingStatus" not in await self._entry_payload("ali-order-income")
+
+    @pytest.mark.asyncio
+    async def test_alipay_settlement_rejects_duplicate_new_entry(self, temp_bank_db):
+        """同一条支付宝到账已有平台账目时，按普通收入再记一笔必须被拦下。"""
+        from fastapi import HTTPException
+        from deps.auth import AuthContext
+        from routers.bank import ConfirmSuggestionRequest, confirm_suggestion
+        from services.bank_service import import_statements_json
+
+        company_id = "c-ali-duplicate-guard"
+        await self._insert_alipay_order(company_id, "ali-original")
+        await import_statements_json(company_id, [{
+            "transaction_date": "2026-07-15",
+            "description": "支付宝（中国）网络技术有限公司",
+            "amount": 4.95,
+        }], "ali-guard")
+        stmt = await self._statement_row("ali-guard")
+        ctx = AuthContext(user_id="u-bank-test", company_id=company_id)
+        with pytest.raises(HTTPException) as exc:
+            await confirm_suggestion(ConfirmSuggestionRequest(
+                statement_id=stmt["id"], type="new",
+                new_entry={"title": "银行入账", "amount": 4.95, "direction": "income",
+                           "category": "主营业务收入", "occurDate": "2026-07-15"},
+            ), ctx)
+        assert exc.value.status_code == 409
+        assert exc.value.detail["code"] == "EXISTING_WECHAT_ENTRIES"
+        assert set(exc.value.detail["candidateEntryGroups"][0]) == {"ali-original-income", "ali-original-fee"}
 
     @pytest.mark.asyncio
     async def test_wechat_settlement_rejects_duplicate_new_entry_then_matches_originals(self, temp_bank_db):

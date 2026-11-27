@@ -57,6 +57,7 @@ describe('sidebar navigation structure', () => {
       '/mine/salary',
       '/private-expenses',
       '/aggregation',
+      '/tools',
     ])
     expect(settings?.children?.map((item) => item.path)).toEqual([
       // 税费种认定：税局口径的配置
@@ -99,6 +100,48 @@ describe('sidebar navigation structure', () => {
     expect(router.resolve('/rd-expenses').meta.workspace).toEqual(['accounting'])
   })
 
+  it('keeps every non-primary entry reachable from the boss view 更多 menu', () => {
+    // 老板视图主航只由 bossGroup 决定；其余入口全部由 Sidebar 收进「更多」
+    const primary = NAV_ITEMS.filter(
+      (item) => item.bossGroup && ['每月', '每天', '复盘'].includes(item.bossGroup),
+    )
+    expect(primary.map((item) => item.path)).toEqual([
+      '/',
+      '/copilot',
+      '/todos',
+      '/bank',
+      '/closing-wizard',
+      '/tax-filing',
+      '/reports',
+    ])
+
+    // 设置、专项核算、凭证与账簿、账本与发票都在「更多」的数据源里
+    const secondaryPaths = NAV_ITEMS
+      .filter((item) => !item.bossGroup || item.bossGroup === '设置')
+      .flatMap((item) => item.path ? [item.path] : (item.children ?? []).map((child) => child.path))
+    expect(secondaryPaths).toEqual(expect.arrayContaining([
+      '/ledger',
+      '/invoices',
+      '/vouchers',
+      '/ledger/books',
+      '/ledger/book',
+      '/reports/archive',
+      '/assets',
+      '/rd-expenses',
+      '/mine/salary',
+      '/private-expenses',
+      '/aggregation',
+      '/tax-registration',
+      '/mine/audit-share',
+      '/mine/accounts',
+      '/mine/contacts',
+      '/mine/opening',
+      '/mine/backup',
+      '/mine/mcp',
+      '/mine',
+    ]))
+  })
+
   it('keeps shared boss and accounting routes available in both views', () => {
     expect(router.resolve('/').meta.workspace).toBeUndefined()
     expect(router.resolve('/ledger').meta.workspace).toBeUndefined()
@@ -111,6 +154,8 @@ describe('sidebar navigation structure', () => {
     expect(router.resolve('/bank').meta.workspace).toBeUndefined()
     expect(router.resolve('/private-expenses').meta.workspace).toBeUndefined()
     expect(router.resolve('/mine/audit-share').meta.workspace).toBeUndefined()
+    // 备份与归档收进老板「更多」，路由不能再拦成会计专属
+    expect(router.resolve('/mine/backup').meta.workspace).toBeUndefined()
   })
 
   it('exposes /bank as 资金流水 in boss view and maintains exactly 7 primary items in boss view (salary folded into closing-wizard)', () => {
@@ -213,6 +258,34 @@ describe('auth redirect guard rules', () => {
   it('leaves public routes alone in both states', () => {
     expect(resolveAuthRedirect(publicRoute, null)).toBeNull()
     expect(resolveAuthRedirect(publicRoute, 'token')).toBeNull()
+  })
+
+  it('lets the login page handle wechat callback states even when a local token exists', () => {
+    // 微信整页回退会带 wechat_pending 落回 /login：本机若残留旧登录态，
+    // 守卫不能把用户直接送回工作台，否则 pending cookie 对应的绑定流程会被吞掉。
+    expect(
+      resolveAuthRedirect(
+        { path: '/login', query: { wechat_pending: '1', redirect: '/bank' }, meta: {} },
+        'token',
+      ),
+    ).toBeNull()
+    expect(
+      resolveAuthRedirect({ path: '/login', query: { wechat_error: 'state_invalid' }, meta: {} }, 'token'),
+    ).toBeNull()
+    // 不带微信状态参数时仍按原规则回跳
+    expect(
+      resolveAuthRedirect({ path: '/login', query: { redirect: '/bank' }, meta: {} }, 'token'),
+    ).toBe('/bank')
+  })
+
+  it('exposes the wechat web callback as a top-level public route', () => {
+    // 主路径必须与后端 config.WECHAT_WEB_FRONTEND_CALLBACK_PATH 一致
+    const callback = routes.find((route) => route.path === '/wechat-login-callback')
+    expect(callback?.meta?.requiresAuth).toBe(false)
+    expect(callback?.alias).toContain('/auth/wechat/callback')
+    // 必须挂在顶层：不能被 AppLayout 的 :pathMatch(.*)* 当成 404
+    expect(router.resolve('/wechat-login-callback').name).toBe('WechatWebCallback')
+    expect(router.resolve('/auth/wechat/callback').name).toBe('WechatWebCallback')
   })
 })
 

@@ -9,6 +9,7 @@
 import { computed } from 'vue'
 import { formatDate, formatMoney, amountToChineseCapital } from '@/utils/format'
 import { generateVoucherLines, normalizeVoucherLines } from '@/utils/accounting'
+import { formatAuxiliaryLineText } from '@/utils/auxiliary'
 
 const props = withDefaults(
   defineProps<{
@@ -17,8 +18,12 @@ const props = withDefaults(
     rdProjectLabels?: Record<string, string>
     showBlankRows?: boolean
     pageBreak?: boolean
+    /** 附单据张数（真实附件聚合；未传时不渲染，保持旧调用方不变） */
+    attachmentCount?: number | null
+    /** 仿真凭证册模式：启用印刷墨色、完整空白行与签字底线 */
+    bookMode?: boolean
   }>(),
-  { companyName: '', rdProjectLabels: () => ({}), showBlankRows: true, pageBreak: false },
+  { companyName: '', rdProjectLabels: () => ({}), showBlankRows: true, pageBreak: false, attachmentCount: null, bookMode: false },
 )
 
 const RD_TYPE_LABELS: Record<string, string> = {
@@ -67,19 +72,18 @@ function plainMoney(value: number) {
 }
 
 function auxiliaryText(line: any): string {
-  const auxiliary = line?.auxiliary || {}
-  const parts = [auxiliary.partner_name, auxiliary.department_name, auxiliary.project_name].filter(Boolean)
-  return parts.join(' / ')
+  return formatAuxiliaryLineText(line?.auxiliary)
 }
 </script>
 
 <template>
-  <div class="voucher-sheet" :class="{ 'page-break': pageBreak }">
+  <div class="voucher-sheet" :class="{ 'page-break': pageBreak, 'is-book': bookMode }">
     <div class="voucher-company">{{ companyName }}</div>
     <div class="voucher-title-wrap">
       <span class="voucher-title">记 账 凭 证</span>
     </div>
     <div class="voucher-meta">
+      <span v-if="attachmentCount !== null" class="meta-attachments">附单据 {{ attachmentCount }} 张</span>
       <span class="meta-date">{{ dateCN }}</span>
       <span class="meta-ref">记字第{{ voucherSeq }}号</span>
     </div>
@@ -135,11 +139,8 @@ function auxiliaryText(line: any): string {
     </table>
 
     <div class="voucher-sign">
-      <span class="sign-item">财务主管</span>
       <span class="sign-item">复核 {{ entry.reviewedByName || '' }}</span>
       <span class="sign-item">记账 {{ entry.postedByName || '' }}</span>
-      <span class="sign-item">出纳</span>
-      <span class="sign-item">经办</span>
       <span class="sign-item">制单 {{ entry.createdByName || '' }}</span>
     </div>
 
@@ -179,13 +180,23 @@ function auxiliaryText(line: any): string {
   margin: 6px 0 14px;
 }
 .voucher-title {
+  position: relative;
   display: inline-block;
   font-size: 22px;
   font-weight: 700;
   letter-spacing: 10px;
   margin-right: -10px;
-  padding: 0 2px 6px;
-  border-bottom: 3px solid var(--solo-text-primary);
+  padding: 0 6px 5px;
+  border-bottom: 1.5px solid var(--solo-text-primary);
+}
+.voucher-title::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -5px;
+  height: 1px;
+  background: currentColor;
 }
 .voucher-meta {
   display: grid;
@@ -194,6 +205,7 @@ function auxiliaryText(line: any): string {
   margin-bottom: 14px;
   font-size: 13px;
 }
+.meta-attachments { grid-column: 1; color: var(--solo-text-primary); }
 .meta-date { grid-column: 2; color: var(--solo-text-primary); }
 .meta-ref { grid-column: 3; text-align: right; font-weight: 500; }
 .voucher-table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -207,10 +219,10 @@ function auxiliaryText(line: any): string {
   font-size: 13px;
 }
 .voucher-table td { padding: 10px 12px; text-align: left; vertical-align: top; }
-.col-summary { width: 22%; }
-.col-account { width: 42%; }
-.col-amount { width: 18%; }
-.amount { text-align: right; font-variant-numeric: tabular-nums; }
+.col-summary { width: 34%; }
+.col-account { width: 32%; }
+.col-amount { width: 17%; }
+.voucher-table td.amount { text-align: right; font-variant-numeric: tabular-nums; }
 .qty-hint { font-size: 11px; color: var(--solo-text-muted, #636e7c); line-height: 1.4; }
 .total-capital, .total { font-weight: 700; }
 .aux-hint { margin-top: 2px; font-size: 11px; color: #4b5563; }
@@ -246,6 +258,82 @@ function auxiliaryText(line: any): string {
 .risk-tags { display: flex; gap: 6px; margin-top: 16px; }
 .risk-tag { font-size: 11px; color: var(--solo-expense); background: #fef2f2; padding: 2px 8px; border-radius: 4px; }
 
+/* ── 仿真册专用印刷排版：传统凭证蓝墨框线 + 固定空白行 + 签章底线 ── */
+.voucher-sheet.is-book {
+  width: 100%;
+  background: transparent;
+  box-shadow: none;
+  border-radius: 0;
+  padding: 0;
+}
+.voucher-sheet.is-book .voucher-company {
+  color: var(--solo-doc-ink);
+  letter-spacing: 0.8px;
+}
+.voucher-sheet.is-book .voucher-title-wrap {
+  margin: 4px 0 10px;
+}
+.voucher-sheet.is-book .voucher-title {
+  color: var(--solo-doc-ink);
+  border-bottom-color: var(--solo-doc-ink);
+}
+.voucher-sheet.is-book .voucher-meta {
+  margin-bottom: 10px;
+  color: var(--solo-doc-ink);
+}
+.voucher-sheet.is-book .meta-attachments,
+.voucher-sheet.is-book .meta-date {
+  color: var(--solo-doc-ink);
+}
+.voucher-sheet.is-book .voucher-table {
+  width: 100%;
+  table-layout: fixed;
+  border: 1.5px solid var(--solo-doc-ink);
+}
+.voucher-sheet.is-book .voucher-table th,
+.voucher-sheet.is-book .voucher-table td {
+  border-color: rgba(44, 62, 85, 0.42);
+  overflow-wrap: anywhere;
+}
+.voucher-sheet.is-book .voucher-table th {
+  padding: 8px 10px;
+  background: rgba(44, 62, 85, 0.045);
+  color: var(--solo-doc-ink);
+  letter-spacing: 1px;
+}
+.voucher-sheet.is-book .voucher-table tbody td {
+  padding: 7px 10px;
+  height: 34px;
+}
+.voucher-sheet.is-book .voucher-table tfoot td {
+  padding: 8px 10px;
+  border-top: 3px double var(--solo-doc-ink);
+  background: rgba(44, 62, 85, 0.025);
+}
+.voucher-sheet.is-book .blank-row {
+  display: table-row;
+}
+.voucher-sheet.is-book .voucher-sign {
+  margin-top: 18px;
+  gap: 12px;
+  font-size: 12.5px;
+  color: var(--solo-doc-ink);
+}
+.voucher-sheet.is-book .sign-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  flex: 1;
+  white-space: nowrap;
+}
+.voucher-sheet.is-book .sign-item::after {
+  content: '';
+  flex: 1;
+  min-width: 22px;
+  border-bottom: 1px solid rgba(44, 62, 85, 0.45);
+  transform: translateY(-2px);
+}
+
 @media print {
   .voucher-sheet {
     box-shadow: none;
@@ -253,7 +341,7 @@ function auxiliaryText(line: any): string {
     border-radius: 0;
     break-inside: avoid;
   }
-  .voucher-title { border-bottom-color: #000; }
+  .voucher-title { color: #000; border-bottom-color: #000; }
   .voucher-table th,
   .voucher-table td { border-color: #000; }
   .vat-exempt-tag { display: none !important; }

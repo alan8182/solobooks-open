@@ -210,31 +210,48 @@ def annual_due_date(fiscal_year: int) -> date:
 
 
 async def _annual_expense_scan(
-    company_id: str, fiscal_year: int
-) -> tuple[Decimal, list[dict[str, Any]], Decimal]:
-    """年度费用扫描：返回（无票支出合计, 无票明细, 人力成本合计）。
+    company_id: str,
+    fiscal_year: int,
+    profit_ytd: dict[str, Any] | None = None,
+    *,
+    entity_type: str = "individual_business",
+    exclude_salary: Decimal = ZERO,
+    pre_deductions: Decimal = ZERO,
+) -> dict[str, Any]:
+    """年度费用扫描：复用 CIT 确定性调增引擎，并统计全年人力成本发放基数。
 
-    无票支出判定复用 CIT 底稿同一套缺凭证逻辑，口径同源不二次发明；
-    人力成本按 sourceType 精确筛选：工资模块四张凭证（salary_accrual /
-    salary_pay / salary_social / salary_iit）的 category 都是"人力成本"，
-    只有 sourceType="salary_pay" 才是真正的工资发放额。若按 category 累加，
-    计提与缴纳凭证会被重复计入，基数成倍虚高。
-    手工录入的"人力成本"凭证（无 sourceType 或 sourceType=manual）
-    仍按原口径计入。
+    无票支出、招待费 60%/5‰ 限额、广宣费 15% 限额、三项经费（14%/2%/2.5%）、
+    公益性捐赠（30%）、罚款滞纳金统一复用 ``build_cit_adjustments``
+    （《个体工商户个人所得税计税办法》第 27 条及财税〔2019〕99 号），
+    不二次发明规则；人力成本按 sourceType 精确筛选：工资模块四张凭证
+    （salary_accrual / salary_pay / salary_social / salary_iit）的 category
+    都是"人力成本"，只有 sourceType="salary_pay" 才是真正的工资发放额。
+    手工录入的"人力成本"凭证（无 sourceType 或 sourceType=manual）仍按原口径计入。
     """
     from db.session import session_scope
     from services.accounting_core_service import posted_entries_for_reports
-    from services.cit_adjustment_service import _entry_amount, _entry_text, _in_period, _missing_document
+    from services.cit_adjustment_service import (
+        _entry_amount,
+        _entry_text,
+        _in_period,
+        build_cit_adjustments,
+    )
+    from services.cit_carryforward_service import compute_carryforward_ledger
+    from services.cit_tax_opening import get_tax_opening_memo
 
+    period_start = f"{fiscal_year}-01-01"
+    period_end = f"{fiscal_year}-12-31"
     async with session_scope() as session:
         entries = await posted_entries_for_reports(session, company_id)
-    undocumented = ZERO
-    detail: list[dict[str, Any]] = []
+
+    year_entries = [
+        entry for entry in entries
+        if _in_period(entry, period_start, period_end)
+    ]
+
     salary_paid = ZERO
-    for entry in entries:
+    for entry in year_entries:
         if entry.get("direction") != "expense":
-            continue
-        if not _in_period(entry, f"{fiscal_year}-01-01", f"{fiscal_year}-12-31"):
             continue
         amount = _entry_amount(entry)
         if amount <= ZERO:
@@ -244,15 +261,40 @@ async def _annual_expense_scan(
             salary_paid += amount
         elif source_type in ("", "manual") and _entry_text(entry, "category") == "人力成本":
             salary_paid += amount
-        if _missing_document(entry):
-            undocumented += amount
-            detail.append({
-                "entryId": str(entry.get("id") or ""),
-                "title": str(entry.get("title") or ""),
-                "occurDate": str(entry.get("occurDate") or "")[:10],
-                "amount": amount,
-            })
-    return money(undocumented), detail, money(salary_paid)
+
+    tax_memo = await get_tax_opening_memo(company_id)
+    ledger = compute_carryforward_ledger(
+        entries,
+        fiscal_year,
+        profit_ytd or {},
+        entity_type=entity_type,
+        opening_memo=tax_memo,
+        target_exclude_salary=exclude_salary,
+        target_period_end=period_end,
+    )
+    cit_adjustments = build_cit_adjustments(
+        year_entries,
+        profit_ytd or {},
+        period_start,
+        period_end,
+        entity_type=entity_type,
+        exclude_salary=exclude_salary,
+        pre_deductions=pre_deductions,
+        carryforward_ledger=ledger,
+    )
+    undocumented_item = next(
+        (item for item in cit_adjustments.get("items") or [] if item.get("code") == "A105000-30"),
+        None,
+    )
+    undocumented = money(undocumented_item["amount"]) if undocumented_item else ZERO
+    undocumented_detail = list(undocumented_item.get("detail") or []) if undocumented_item else []
+
+    return {
+        "undocumented": undocumented,
+        "undocumentedDetail": undocumented_detail,
+        "salaryPaid": money(salary_paid),
+        "citAdjustments": cit_adjustments,
+    }
 
 
 # C 表：两处以上取得经营所得需合并申报（系统无外部数据源，仅提示）
@@ -276,8 +318,9 @@ async def build_annual_settlement_assist(
 ) -> dict[str, Any]:
     """经营所得 B 表汇算清缴作业包（年度口径）。
 
-    应纳税所得额 = 利润总额 + 纳税调增（业主工资不得扣除、无票支出）− 扣除
-    （减除费用 6 万/年、专项扣除、专项附加扣除、其他）。
+    应纳税所得额 = 利润总额 + 纳税调增（业主工资不得扣除、招待费 60%/5‰ 超限额、
+    广宣费 15% 超限额、三项经费 14%/2%/2.5% 超限额、公益性捐赠 30% 超限额、
+    罚款滞纳金、无票支出）− 扣除（减除费用 6 万/年、专项扣除、专项附加扣除、其他）。
 
     业主工资来源（自动优先、手工兜底）：
     - ``owner_salary`` 显式传入 → 手工确认口径（ownerSalarySource=manual）；
@@ -296,15 +339,12 @@ async def build_annual_settlement_assist(
     revenue = money(statement.profit_ytd.get("revenue") or ZERO)
     profit_total = money(statement.profit_ytd.get("total_profit") or ZERO)
 
-    undocumented, undocumented_detail, salary_paid = await _annual_expense_scan(company_id, fiscal_year)
-
     owner_salary_source = "manual"
     if owner_salary is None:
         owner_salary_source = "auto"
         owner_salary = await _auto_owner_salary(company_id, fiscal_year)
     owner_salary = money(max(Decimal("0"), owner_salary or ZERO))
 
-    addbacks = owner_salary + undocumented
     statutory = money(Decimal("60000") if statutory_deduction is None else max(Decimal("0"), statutory_deduction))
     deductions = money(
         statutory
@@ -312,6 +352,36 @@ async def build_annual_settlement_assist(
         + max(Decimal("0"), special_additional_deductions or ZERO)
         + max(Decimal("0"), other_deductions or ZERO)
     )
+
+    scan = await _annual_expense_scan(
+        company_id,
+        fiscal_year,
+        statement.profit_ytd,
+        entity_type=entity_type,
+        exclude_salary=owner_salary,
+        pre_deductions=deductions,
+    )
+    undocumented = money(scan.get("undocumented") or ZERO)
+    undocumented_detail = list(scan.get("undocumentedDetail") or [])
+    salary_paid = money(scan.get("salaryPaid") or ZERO)
+    cit_adjustments = scan.get("citAdjustments") or {}
+    adj_items = list(cit_adjustments.get("items") or [])
+    adj_by_code = {item.get("code"): money(item.get("amount") or ZERO) for item in adj_items}
+    entertainment_excess = adj_by_code.get("A105000-14", ZERO)
+    advertising_excess = adj_by_code.get("A105000-16", ZERO)
+    welfare_excess = adj_by_code.get("A105000-02", ZERO)
+    union_excess = adj_by_code.get("A105000-03", ZERO)
+    education_excess = adj_by_code.get("A105000-04", ZERO)
+    donation_excess = adj_by_code.get("A105000-17", ZERO)
+    fines_and_penalties = adj_by_code.get("A105000-19", ZERO)
+    salary_base = money(cit_adjustments.get("salaryBase") or ZERO)
+    carryforward_decrease = money(cit_adjustments.get("totalDecrease") or ZERO)
+    carryforward_ledger = list(cit_adjustments.get("carryforwardLedger") or [])
+
+    net_adj = cit_adjustments.get("netAdjustment")
+    if net_adj is None:
+        net_adj = cit_adjustments.get("totalIncrease") or ZERO
+    addbacks = money(owner_salary + money(net_adj))
 
     taxable = max(Decimal("0"), money(profit_total + addbacks - deductions))
     result = tax_payable(taxable, entity_type, date(fiscal_year, 12, 31))
@@ -330,9 +400,43 @@ async def build_annual_settlement_assist(
             "已默认扣除减除费用 6 万/年；若业主已在工资薪金综合所得中扣除过 6 万，"
             "本表不得重复扣除，请把减除费用改为 0。"
         )
+    if entertainment_excess > ZERO:
+        notes.append(
+            f"业务招待费超限额调增 {entertainment_excess} 元（按发生额 60% 与销售收入 5‰ 孰低扣除）。"
+        )
+    if advertising_excess > ZERO:
+        notes.append(
+            f"广告费和业务宣传费超限额调增 {advertising_excess} 元（超过销售收入 15% 部分可结转以后年度扣除）。"
+        )
+    if welfare_excess > ZERO:
+        notes.append(
+            f"职工福利费超限额调增 {welfare_excess} 元（按从业人员工资薪金总额 {salary_base} 元的 14% 限额扣除；"
+            "业主本人相关费用可按当地上年度社平工资 3 倍为基数核算，请以电子税务局申报为准）。"
+        )
+    if union_excess > ZERO:
+        notes.append(
+            f"工会经费超限额调增 {union_excess} 元（按从业人员工资薪金总额 {salary_base} 元的 2% 限额扣除）。"
+        )
+    if education_excess > ZERO:
+        notes.append(
+            f"职工教育经费超限额调增 {education_excess} 元（个体户/个独按从业人员工资薪金总额 {salary_base} 元的 2.5% 扣除，超额可结转以后年度）。"
+        )
+    if donation_excess > ZERO:
+        notes.append(
+            f"公益性捐赠超限额调增 {donation_excess} 元（按扣除捐赠前应纳税所得额 30% 限额扣除；"
+            "仅限公益捐赠票据且不得与综合所得重复扣除，直接捐赠须全额调增）。"
+        )
+    if fines_and_penalties > ZERO:
+        notes.append(
+            f"罚款、滞纳金 {fines_and_penalties} 元不得税前扣除，已全额调增。"
+        )
     if undocumented > ZERO:
         notes.append(
             f"年度无票支出 {undocumented} 元已全额调增，取得合规凭证后可调减。"
+        )
+    if carryforward_decrease > ZERO:
+        notes.append(
+            f"本年已自动抵减以前年度跨年结转费用 {carryforward_decrease} 元（含广宣费/职工教育经费结转，已计入纳税调减）。"
         )
     if profit_total < ZERO:
         notes.append(
@@ -362,6 +466,17 @@ async def build_annual_settlement_assist(
             "ownerSalarySource": owner_salary_source,
             "undocumentedExpenses": undocumented,
             "undocumentedDetail": undocumented_detail,
+            "entertainmentExcess": entertainment_excess,
+            "advertisingExcess": advertising_excess,
+            "welfareExcess": welfare_excess,
+            "unionExcess": union_excess,
+            "educationExcess": education_excess,
+            "donationExcess": donation_excess,
+            "salaryBase": salary_base,
+            "finesAndPenalties": fines_and_penalties,
+            "carryforwardDecrease": carryforward_decrease,
+            "carryforwardLedger": carryforward_ledger,
+            "items": adj_items,
             "total": addbacks,
         },
         "deductions": {

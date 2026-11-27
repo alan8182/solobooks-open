@@ -143,12 +143,14 @@ class ConfirmRequest(BaseModel):
     payer: Optional[str] = "company_account"
     companyId: Optional[str] = None
     company_id: Optional[str] = None
-    # 辅助核算（P0 WP2）：只带 id，name 由服务端按主数据回填，不信客户端文案。
+    # 辅助核算（P0 WP2 + 职员扩展）：只带 id，name 由服务端按主数据回填，不信客户端文案。
     # 挂到哪些科目由 core.chart_policy.auxiliary_kinds_for_account 决定。
     partner_id: Optional[str] = None
     partnerId: Optional[str] = None
     department_id: Optional[str] = None
     departmentId: Optional[str] = None
+    employee_id: Optional[str] = None
+    employeeId: Optional[str] = None
     # 数量金额式（P1 WP-D）：confirm 时由服务端挂到勾选了数量核算的科目行上；
     # 数量×单价与金额的一致性在 _normalize_voucher_lines 校验（容差 1 分）。
     quantity: Optional[Decimal] = None
@@ -319,10 +321,12 @@ class PeriodReopenRequest(BaseModel):
 
 
 class StepUpRequest(BaseModel):
-    action: Literal["reopen_period", "confirm_legacy_migration", "adjust_opening_balance"]
+    action: Literal["reopen_period", "confirm_legacy_migration", "adjust_opening_balance", "delete_company"]
     phone: str
     code: str
     bizId: Optional[str] = None
+    # delete_company 的目标主体（必须在当前账号名下）；其他动作固定用当前主体。
+    companyId: Optional[str] = None
 
 
 class StepUpResponse(BaseModel):
@@ -405,6 +409,34 @@ class WechatBindRequest(BaseModel):
     """登录后绑定微信请求。"""
 
     code: str
+
+
+class WechatWebAuthorizeResponse(BaseModel):
+    """网站应用扫码登录：返回 open.weixin.qq.com 扫码页 URL。"""
+
+    authorize_url: str
+    expires_in: int
+
+
+class WechatWebBindPhoneRequest(BaseModel):
+    """网站微信登录首次绑定手机号（ticket 在 HttpOnly cookie 中）。"""
+
+    phone: str
+    code: str
+    biz_id: Optional[str] = None
+    bizId: Optional[str] = None
+
+
+class WechatWebExchangeResponse(BaseModel):
+    """exchange 的联合响应：login ticket 直接发 JWT，bind ticket 要求绑手机。"""
+
+    phone_required: bool = False
+    access_token: Optional[str] = None
+    token_type: Optional[str] = None
+    user_id: Optional[str] = None
+    company_id: Optional[str] = None
+    expires_in: Optional[str] = None
+    has_password: bool = False
 
 
 class PasswordLoginRequest(BaseModel):
@@ -638,9 +670,11 @@ class CitAssistResponse(BaseModel):
     # 现行口径：仅「是否限制/禁止行业」已确认；从业人数自动派生
     companyTaxProfileComplete: bool
     beginnerReady: bool
-    # 纳税调增（系统测算默认值，可修改）：招待费 60%/5‰、广宣费 15%、罚款滞纳金、无票支出
+    # 纳税调增（系统测算默认值，可修改）：招待费 60%/5‰、广宣费 15%、三项经费、公益捐赠、罚款滞纳金、无票支出
     autoAdjustmentTotal: Decimal = Decimal("0.00")
+    autoDecreaseTotal: Decimal = Decimal("0.00")
     autoAdjustments: List["CitAdjustmentItem"] = []
+    carryforwardLedger: List[dict] = []
 
 
 class CitAdjustmentItem(BaseModel):
@@ -669,6 +703,7 @@ class ArchiveItem(BaseModel):
     complianceStatus: Optional[str] = None
     riskTag: Optional[str] = None
     attachmentCount: int = 0
+    missingReason: Optional[str] = None
     note: Optional[str] = None
 
 class ArchiveChecklistResponse(BaseModel):
@@ -1074,6 +1109,7 @@ class AccountNode(BaseModel):
     is_active: bool
     quantity_enabled: bool = False
     unit: Optional[str] = None
+    auxiliary_kinds: List[str] = []
     created_at: str
     updated_at: str
     children: List["AccountNode"] = []
@@ -1764,3 +1800,4 @@ class DemoBookDeleteResponse(BaseModel):
     deleted: bool
     companyId: str
     nextCompanyId: Optional[str] = None
+    accessToken: Optional[str] = None

@@ -8,7 +8,7 @@ import {
 } from 'naive-ui'
 import { useEntryStore } from '@/stores/entry'
 import {
-  getPeriodCloseChecks, batchPostEntries,
+  getPeriodCloseChecks,
   getPendingAccruals, createAccrual, reverseAccrual, settleAccrual,
   type AccrualRecord,
 } from '@/api/accounting'
@@ -17,7 +17,6 @@ import { getCategories } from '@/api/category'
 import { formatMoney } from '@/utils/format'
 import { sortByDayDesc } from '@/utils/entryGrouping'
 import { SoloDrawer, SoloEmpty, SoloFieldHelp, SoloMonthPicker } from '@/components/ui'
-import { RESCUE_RULES } from '@/utils/rescueRules'
 import { usePageRefresh } from '@/composables/usePageRefresh'
 import { useTabGuard } from '@/composables/useTabGuard'
 
@@ -28,7 +27,6 @@ const dialog = useDialog()
 const entryStore = useEntryStore()
 
 const loading = ref(true)
-const batchPosting = ref(false)
 const targetMonth = computed(() => typeof route.query.month === 'string' && /^\d{4}-(0[1-9]|1[0-2])$/.test(route.query.month) ? route.query.month : '')
 // 月份筛选存 URL 查询参数（可分享、可回退）。原生 type=month 在 Firefox 没有选择面板、
 // Chrome 上面板也难点中，统一用 naive-ui 月份选择器；清空即查看全部月份。
@@ -50,15 +48,15 @@ const scopedEntries = computed(() => entryStore.activeEntries.filter(e => {
   if (period) return period === targetMonth.value
   return String(e.occurDate || '').startsWith(targetMonth.value)
 }))
-const reasonLabels: Record<string, string> = { pending_post: '待过账', pending_review: '待复核', missing_source: '缺少有效来源', missing_rule: '缺少记账规则' }
+const reasonLabels: Record<string, string> = { pending_post: '待关账封存', pending_review: '待复核', missing_source: '缺少有效来源', missing_rule: '缺少记账规则' }
 function statusLabel(status: string | undefined) {
-  return ({ draft: '待过账', pending_review: '待复核', posted: '已过账', reversed: '已冲销' } as Record<string, string>)[status || ''] || '状态待核实'
+  return ({ draft: '待关账封存', pending_review: '待复核', posted: '已过账', reversed: '已冲销' } as Record<string, string>)[status || ''] || '状态待核实'
 }
 function statusTagType(status: string | undefined) {
   return ({ draft: 'warning', pending_review: 'info', posted: 'success', reversed: 'default' } as Record<string, 'warning' | 'info' | 'success' | 'default'>)[status || ''] || 'warning'
 }
 
-/** 已过账 / 已冲销（且有凭证号）的行不可再勾选过账 */
+/** 已过账 / 已冲销（且有凭证号）的行已封存 */
 function isPosted(entry: Pick<Entry, 'voucherStatus' | 'voucherRef'>) {
   return ['posted', 'reversed'].includes(entry.voucherStatus || '') && !!entry.voucherRef
 }
@@ -71,7 +69,7 @@ const statusFilter = ref('')
 const keyword = ref('')
 const statusOptions = [
   { label: '全部状态', value: '' },
-  { label: '待过账', value: 'draft' },
+  { label: '待关账封存', value: 'draft' },
   { label: '待复核', value: 'pending_review' },
   { label: '已过账', value: 'posted' },
   { label: '已冲销', value: 'reversed' },
@@ -94,13 +92,12 @@ const filteredRows = computed(() => {
 
 const pendingRows = computed(() => filteredRows.value.filter(e => !isPosted(e)))
 
-// ── 勾选与批量过账：只有未过账行可勾选 ──────────────────────────────
-const checkedRowKeys = ref<Array<string | number>>([])
-
-watch(scopedEntries, () => {
-  const validIds = new Set(scopedEntries.value.map(e => e.id))
-  checkedRowKeys.value = checkedRowKeys.value.filter(id => validIds.has(String(id)))
-})
+function goClosingWizard() {
+  void router.push({
+    path: '/closing-wizard',
+    query: targetMonth.value ? { month: targetMonth.value } : undefined,
+  })
+}
 
 function handleRowClick(row: Entry) {
   if (isPosted(row)) {
@@ -111,7 +108,6 @@ function handleRowClick(row: Entry) {
 }
 
 const columns = computed<DataTableColumns<Entry>>(() => [
-  { type: 'selection', disabled: (row) => isPosted(row) },
   {
     title: '日期',
     key: 'occurDate',
@@ -200,74 +196,6 @@ function openEntry(entryId: string) {
     router.push({ path: `/ledger/${entryId}`, query: { from: String(route.query.from) } })
   } else {
     router.push(`/ledger/${entryId}`)
-  }
-}
-
-function promptBatchPost(mode: 'selected' | 'all') {
-  const ids = mode === 'selected' ? checkedRowKeys.value.map(String) : pendingRows.value.map(e => e.id)
-  if (!ids.length) return
-
-  const targetCount = ids.length
-  dialog.info({
-    title: `确认批量过账 (${targetCount} 笔)`,
-    content: `将批量过账选中的 ${targetCount} 笔凭证并生成正式凭证号。过账后凭证将纳入正式财务报表核算；如遇需他人复核或借贷不平衡单据，系统将自动跳过并保留为草稿。是否继续？`,
-    positiveText: '确认批量过账',
-    negativeText: '取消',
-    onPositiveClick: async () => {
-      await executeBatchPost(ids)
-    },
-  })
-}
-
-async function executeBatchPost(ids: string[]) {
-  if (batchPosting.value) return
-  batchPosting.value = true
-  try {
-    const res = await batchPostEntries({ entryIds: ids })
-    if (res.postedCount > 0 && res.failedCount === 0) {
-      message.success(`🎉 已成功批量过账 ${res.postedCount} 笔凭证`)
-    } else if (res.postedCount > 0 && res.failedCount > 0) {
-      message.warning(`已过账 ${res.postedCount} 笔凭证；${res.failedCount} 笔因需复核或异常未过账，已保留为草稿`)
-      // 第二通道：批量失败不进 catch，但每条都带 code —— 同样能给出「去处理」的出路
-      const box = dialog.warning({
-        title: '部分凭证未过账说明',
-        content: () => {
-          return h('div', { style: 'max-height: 240px; overflow-y: auto;' }, [
-            h('p', { style: 'margin-bottom: 8px;' }, `以下 ${res.failedCount} 笔凭证未过账，请核对原因：`),
-            h('ul', { style: 'padding-left: 20px; font-size: 13px;' }, res.failedEntries.map(f => {
-              const rule = RESCUE_RULES[f.code]
-              const target = rule ? rule.actions({})[0] : null
-              return h('li', { style: 'margin-bottom: 4px;' }, [
-                h('span', `${f.title}：${f.reason}`),
-                target?.path
-                  ? h('button', {
-                      style: {
-                        marginLeft: '8px', padding: '2px 8px',
-                        border: '1px solid var(--solo-border)',
-                        borderRadius: '6px', background: 'var(--solo-bg-card)',
-                        color: 'var(--solo-primary)', fontSize: '12px', cursor: 'pointer',
-                      },
-                      onClick: () => {
-                        box.destroy()
-                        router.push(target.path as string)
-                      },
-                    }, target.label)
-                  : null,
-              ])
-            })),
-          ])
-        },
-        positiveText: '知道了',
-      })
-    } else if (res.failedCount > 0) {
-      message.error(`批量过账未完成，${res.failedCount} 笔凭证未通过核验`)
-    }
-    checkedRowKeys.value = []
-    await loadEntries()
-  } catch (err: any) {
-    message.error(err?.response?.data?.detail || '批量过账请求失败，请稍后重试')
-  } finally {
-    batchPosting.value = false
   }
 }
 
@@ -450,6 +378,10 @@ onMounted(() => {
           <template #icon><i class="ri-printer-line" /></template>
           打印本月凭证
         </NButton>
+        <NButton size="small" secondary @click="router.push({ path: '/vouchers/book', query: { month: targetMonth } })">
+          <template #icon><i class="ri-booklet-line" /></template>
+          装订凭证册
+        </NButton>
         <NButton size="small" secondary @click="openAccrualForm">
           <template #icon><i class="ri-file-add-line" /></template>
           暂估入账
@@ -467,7 +399,7 @@ onMounted(() => {
     </div>
 
     <NSpin :show="loading">
-      <p class="page-hint">按记账期间筛选，支持排序、搜索与批量过账。点击行查看来源和分录；已对账不代表已过账。</p>
+      <p class="page-hint">按记账期间筛选，支持排序与搜索。未关账期间账目保持草稿可随时修改，月度关账时统一生成正式凭证号封存。</p>
 
       <div v-if="pendingAccruals.length" class="section mb-4 accrual-section">
         <div class="section-label">
@@ -506,7 +438,7 @@ onMounted(() => {
         </NCard>
       </div>
 
-      <!-- 凭证列表：状态筛选 + 关键词搜索 + 排序 + 批量过账 -->
+      <!-- 凭证列表：状态筛选 + 关键词搜索 + 排序 -->
       <div class="section">
         <div class="table-toolbar">
           <NSelect v-model:value="statusFilter" :options="statusOptions" size="small" style="width: 128px;" />
@@ -514,31 +446,18 @@ onMounted(() => {
             <template #prefix><i class="ri-search-line toolbar-search-icon" /></template>
           </NInput>
           <div class="batch-actions">
-            <span v-if="checkedRowKeys.length > 0" class="selected-badge">已勾选 {{ checkedRowKeys.length }} 笔</span>
             <NButton
-              v-if="checkedRowKeys.length > 0"
-              size="small"
-              type="primary"
-              :loading="batchPosting"
-              @click="promptBatchPost('selected')"
-            >
-              批量过账所选 ({{ checkedRowKeys.length }})
-            </NButton>
-            <NButton
-              v-else
+              v-if="pendingRows.length > 0"
               size="small"
               type="primary"
               ghost
-              :loading="batchPosting"
-              :disabled="pendingRows.length === 0"
-              @click="promptBatchPost('all')"
+              @click="goClosingWizard"
             >
-              一键过账全部 ({{ pendingRows.length }})
+              前往月度结账 ({{ pendingRows.length }} 笔待封存)
             </NButton>
           </div>
         </div>
         <NDataTable
-          v-model:checked-row-keys="checkedRowKeys"
           size="small"
           :bordered="false"
           :columns="columns"

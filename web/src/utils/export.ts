@@ -261,3 +261,6 @@ export function exportLedgerBookToExcel(book: LedgerBook) {
 export function saveWorkbook(workbook: XLSX.WorkBook, filename: string) {
   XLSX.writeFile(workbook, filename)
 }
+
+/** 统一的 Blob 文件下载出口：实现已下沉到轻量模块，这里保留旧导出路径。 */
+export { saveBlobFile } from './download'

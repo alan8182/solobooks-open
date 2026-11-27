@@ -12,12 +12,9 @@ import {
   NCollapseItem,
   NDivider,
   NDropdown,
-  NGrid,
-  NGridItem,
   NInput,
   NModal,
   NSelect,
-  NSpace,
   NSpin,
   NStep,
   NSteps,
@@ -28,13 +25,22 @@ import {
   useMessage,
 } from 'naive-ui'
 import { formatMoney } from '@/utils/format'
+import { SETTLEMENT_TYPE_LABELS, settlementTypeLabel } from '@/utils/settlementType'
 import GuideTrigger from '@/components/business/GuideTrigger.vue'
+import GuideEntryLink from '@/components/business/GuideEntryLink.vue'
 import {
   amountClassForDirection,
   invoiceDisplayAmount,
   formatDispositionTag,
   invoiceRowStatus,
   formatDispositionExplanation,
+  isSettledAsOfMonth,
+  formatAccountPreviewLabel,
+  formatMatchAccountLabel,
+  formatMatchCategoryBasis,
+  formatMatchExplanation,
+  categoryPlainHint,
+  parseBankStatementDisplay,
 } from '@/utils/closingWizard'
 import {
   deriveMissingClosingImports,
@@ -46,11 +52,32 @@ import { useDeleteConfirm } from '@/composables/useDeleteConfirm'
 import apiClient from '@/api/client'
 import { useBackfillConfirm } from '@/composables/backfillConfirm'
 import { useAuthStore } from '@/stores/auth'
-import { getClosingReadiness, canBatchPostDrafts, deriveClosingTasks, summarizeFiveChecks, countOtherPendingReadiness, type ClosingNotice, type ClosingNoticeRecord, type ClosingReadinessItem, type ClosingTaskAction } from '@/utils/closingReadiness'
+import {
+  getClosingReadiness,
+  canBatchPostDrafts,
+  deriveClosingTasks,
+  summarizeFiveChecks,
+  countOtherPendingReadiness,
+  formatClosingNoticeTitle,
+  hasClosingNoticeActions,
+  noticeAlertType,
+  noticeExportScope,
+  type ClosingNotice,
+  type ClosingNoticeRecord,
+  type ClosingReadinessItem,
+  type ClosingTaskAction,
+} from '@/utils/closingReadiness'
 import { getFilingObligations, type FilingObligation, type FilingObligations } from '@/api/accounting'
+import {
+  BANK_RECEIPT_ACCEPT,
+  relinkBankReceipts,
+  uploadBankReceipts,
+  type BankReceiptUploadResult,
+} from '@/api/attachments'
 import { loadAccountMapping } from '@/utils/accounting'
 import ReopenPeriodDialog from './ReopenPeriodDialog.vue'
 import AskAiPanel from './AskAiPanel.vue'
+import PayrollCheckCard from './components/PayrollCheckCard.vue'
 import { usePayrollFlow } from './composables/usePayrollFlow'
 import { useClosingImports } from './composables/useClosingImports'
 import { useClosingFlow } from './composables/useClosingFlow'
@@ -58,6 +85,8 @@ import { useBatchPost } from './composables/useBatchPost'
 import { useReconciliationWorkspace } from './composables/useReconciliationWorkspace'
 import FileDropzone from '@/components/business/FileDropzone.vue'
 import MailInboxCard from '@/components/business/MailInboxCard.vue'
+import MultiInvoiceMatchModal from '@/components/business/MultiInvoiceMatchModal.vue'
+import OpeningGateAlert from '@/components/business/OpeningGateAlert.vue'
 import { SoloDrawer, SoloEmpty } from '@/components/ui'
 
 // 「重新上传/重新导入」按钮复用拖拽区的文件选择器
@@ -94,6 +123,7 @@ const goCreateRdProject = () => {
 }
 const entryStore = useEntryStore()
 const authStore = useAuthStore()
+const openingBlocked = computed(() => Boolean(authStore?.openingBalanceRequired))
 const { confirmDelete } = useDeleteConfirm()
 const currentCompany = computed(
   () => authStore.companies?.find((company) => company.company_id === authStore.currentCompanyId) ?? null,
@@ -218,6 +248,38 @@ const isQuarterEndMonth = computed(() => {
   return ['03', '06', '09', '12'].includes(monthStr)
 })
 
+const nextClosingMonth = computed(() => {
+  const match = String(targetMonth.value || '').match(/^(\d{4})-(\d{2})$/)
+  if (!match) return ''
+  const nextDate = new Date(Number(match[1]), Number(match[2]), 1)
+  const nextKey = `${nextDate.getFullYear()}-${String(nextDate.getMonth() + 1).padStart(2, '0')}`
+  const currentKey = `${currentYear}-${String(currentMonth + 1).padStart(2, '0')}`
+  return nextKey <= currentKey ? nextKey : ''
+})
+
+function goNextClosingMonth() {
+  if (!nextClosingMonth.value) return
+  targetMonth.value = nextClosingMonth.value
+  currentStep.value = 1
+  router.replace({ query: { month: nextClosingMonth.value, step: '1' } })
+  void loadAllData()
+}
+
+function formatCeremonyTodo(item: { title?: string; desc?: string }) {
+  const rawTitle = String(item.title || '')
+  const rawDesc = String(item.desc || '')
+  if (!/^逾期未申报\s*-\s*/.test(rawTitle)) {
+    return { overdueBadge: '', title: rawTitle, desc: rawDesc }
+  }
+  const overdueMatch = rawDesc.match(/已?(逾期\s*\d+\s*天)/)
+  const overdueBadge = overdueMatch ? overdueMatch[1].replace(/\s+/g, ' ').trim() : '逾期'
+  const title = rawTitle.replace(/^逾期未申报\s*-\s*/, '').trim()
+  const firstClause = (rawDesc.split('。')[0] || '')
+    .replace(/[（(]已?逾期[^)）]*[)）]/g, '')
+    .trim()
+  return { overdueBadge, title, desc: firstClause }
+}
+
 // Real Unmatched Data lists
 // ponytail: explicit detection of zero-transaction periods to prevent false "ready to close" reports
 const confirmZeroActivity = ref(false)
@@ -268,31 +330,19 @@ function apiErrorMessage(err: any, fallback: string) {
   return fallback
 }
 
-// 工资 6 连发流程（状态/请求/口径已拆入 composables/usePayrollFlow）
+// 工资计提核对状态（状态/请求/口径已拆入 composables/usePayrollFlow；发放与扣缴随银行流水自动核销）
 const {
   payrollAccrued,
-  payrollPaid,
   payrollPendingReview,
-  payrollSsPaid,
-  payrollHfPaid,
-  payrollTaxPaid,
   employees,
   showSalaryTable,
-  payrollPaymentSuggestions,
-  applyingSalaryStatementId,
-  payrollHasSocial,
-  payrollHasTax,
   hasBlockingPayroll,
   totalNetSalary,
   totalCompanyCost,
+  payrollAllSettled,
+  payrollCarryForward,
   loadSalarySheet,
-  loadPayrollPaymentSuggestions,
-  handleApplySalaryPayment,
   handleAccruePayroll,
-  handlePayPayroll,
-  handlePaySocial,
-  handlePayHousingFund,
-  handlePayTax,
 } = usePayrollFlow({
   month: targetMonth,
   loading,
@@ -300,8 +350,9 @@ const {
   reloadAll: loadAllData,
 })
 
-// 三类导入流程（微信/发票/银行，状态与请求已拆入 composables/useClosingImports）
+// 三类导入流程（平台账单/发票/银行，状态与请求已拆入 composables/useClosingImports）
 const {
+  platformBillPlatform,
   wechatBillRows,
   wechatBillSummary,
   wechatBillImported,
@@ -315,6 +366,7 @@ const {
   removeWechatRow,
   confirmWechatBillImport,
   processInvoiceFile,
+  processInvoiceFiles,
   handleDeleteInvoice,
   toggleArchiveMode,
   bankUploadResult,
@@ -326,12 +378,28 @@ const {
   reloadAll: loadAllData,
 })
 
+const showBankImportDetailModal = ref(false)
+watch(bankUploadResult, (res) => {
+  if (!res) {
+    showBankImportDetailModal.value = false
+  } else if (res.errors > 0 || res.skipped > 0) {
+    showBankImportDetailModal.value = true
+  }
+})
+
+const platformBillLabel = computed(() => {
+  if (platformBillPlatform.value === 'alipay') return '支付宝'
+  if (platformBillPlatform.value === 'wechat') return '微信支付'
+  return '平台账单'
+})
+
 // 邮件收件箱「导入」：附件构造 File 后路由到对应解析向导（与手动上传同一条链路，
 // 解析预览后仍由用户确认入账；重复防线在业务层去重）
 const INBOX_IMPORT_ROUTES: Record<string, (file: File) => unknown> = {
   invoice: processInvoiceFile,
   bank: processBankFile,
   wechat_bill: processWechatBillFile,
+  alipay_bill: processWechatBillFile,
 }
 function handleInboxImport({ kind, file }: { kind: string; file: File }) {
   const route = INBOX_IMPORT_ROUTES[kind]
@@ -342,19 +410,17 @@ function handleInboxImport({ kind, file }: { kind: string; file: File }) {
 const {
   showVoucherModal,
   voucherModalLoading,
-  voucherPostingLoading,
-  batchPostingLoading,
   batchPostConfirmVisible,
   batchPostWalkthrough,
   batchPostWalkthroughTotal,
+  walkthroughIndex,
   currentVoucherEntry,
   batchPostEntries,
   openVoucherModal,
-  handleModalPostEntry,
   openBatchPostConfirm,
   startWalkthrough,
+  advanceWalkthrough,
   startWalkthroughFromConfirm,
-  confirmBatchPost,
   modalVoucherLines,
   modalDebitTotal,
   modalCreditTotal,
@@ -378,6 +444,7 @@ const {
   selectedBank,
   matchedPairs,
   persistedMatchedPairs,
+  aiSuggestionsLoading,
   filterUnmatchedData,
   loadAiSuggestions,
   loadReconciliationHealth,
@@ -412,6 +479,7 @@ const {
   manualForm,
   manualSubmitting,
   manualAiLoading,
+  manualAdvancedOpen,
   manualSuggestionMeta,
   showPairCategoryDialog,
   pairCategoryTarget,
@@ -421,12 +489,14 @@ const {
   editVoucherForm,
   editVoucherSaving,
   editVoucherTargetEntry,
+  editVoucherBatchSiblings,
+  editVoucherApplyToSiblings,
   cleanStatementTitle,
   suggestionAccountPreview,
   rowCategoryChoice,
   ambiguityGroupOf,
   effectiveSuggestion,
-  altAccountText,
+  findRefundPairPartner,
   askAiVisible,
   askAiStmt,
   askAiPrompt,
@@ -437,17 +507,31 @@ const {
   openPairCategoryDialog,
   handlePairCategorySave,
   openEditVoucher,
+  setEditVoucherSettlement,
+  editableMatchedEntryOf,
   saveEditVoucher,
   refreshManualAiSuggestion,
+  handleManualCategoryChange,
   handleManualClassify,
-  highConfidenceStatements,
   statementTierFilter,
   selectedStatementIds,
   rememberRuleOnConfirm,
+  lastConfirmedAction,
+  undoingLastConfirm,
+  undoLastConfirmed,
+  dismissLastConfirmed,
+  getPayrollSettlement,
+  advancePayableOf,
+  advancePayableSourceText,
+  invoiceReimbursementOf,
+  fallbackMatchedEntriesOf,
+  matchedFallbackCategoryOf,
+  handleAdvanceAsNewExpense,
   isSelectableForBatch,
   isNeedsAttentionStatement,
   suggestionBadgeLabel,
   selectableBatchStatements,
+  readyStatements,
   attentionStatements,
   filteredUnmatchedStatements,
   toggleStatementSelection,
@@ -458,6 +542,7 @@ const {
   batchConfirming,
   handleBatchConfirmRules,
   quickSubmittingId,
+  handlePayrollSettlementAction,
   handleAcceptSuggested,
   handleQuickSelectCategory,
   findMatchingInvoiceForStatement,
@@ -485,6 +570,7 @@ const {
   effectiveRdProjectOptions,
   editVoucherBusinessContext,
   editVoucherAiLoading,
+  editVoucherAiSuggestion,
   editVoucherPreview,
   refreshEditVoucherAi,
   loadEditVoucherPreview,
@@ -494,14 +580,27 @@ const {
   dispositionResettingId,
   employeePayerOptions,
   pendingEntryList,
+  bankMatchedPendingEntriesCount,
   entryIsOutflow,
   confirmedExceptionEntries,
+  unreimbursedAdvanceEntries,
+  loadAdvanceBalances,
   bossLedgerSummary,
   pendingInvoiceList,
   unpaidInvoiceCount,
   handleMatchInvoiceDirect,
+  getMultiMatchCandidatesForStatement,
+  confirmMultiMatch,
   bossExpenseOptions,
   bossIncomeOptions,
+  priorPaidCandidatesLoading,
+  priorPaidLinkingId,
+  expandedPriorPaidEntryId,
+  loadPriorPaymentCandidates,
+  priorPaidSuggestionOf,
+  priorPaidListFor,
+  priorPaidCandidateTitle,
+  linkToPriorPayment,
 } = useReconciliationWorkspace({
   month: targetMonth,
   currentStep,
@@ -516,15 +615,118 @@ const {
   apiErrorMessage,
 })
 
+function liveMatchedEntryOf(stmt: any): any | undefined {
+  const sug = getAiSuggestion(stmt?.id)
+  if (!sug || sug.type !== 'match') return undefined
+  const id = String(sug.matchedEntryId || sug.matchedEntryIds?.[0] || '')
+  return id ? entryStore.activeEntries.find((item: any) => String(item.id) === id) : undefined
+}
+
+function matchExplanationOf(stmt: any): string {
+  const sug = getAiSuggestion(stmt?.id)
+  if (!sug || sug.type !== 'match') return ''
+  return formatMatchExplanation(sug, liveMatchedEntryOf(stmt))
+}
+
+function matchAccountLabelOf(stmt: any): string {
+  const sug = getAiSuggestion(stmt?.id)
+  if (!sug || sug.type !== 'match') return ''
+  return formatMatchAccountLabel(sug, liveMatchedEntryOf(stmt))
+}
+
+function matchCategoryBasisOf(stmt: any): string {
+  const sug = getAiSuggestion(stmt?.id)
+  if (!sug || sug.type !== 'match') return ''
+  return formatMatchCategoryBasis(sug, liveMatchedEntryOf(stmt))
+}
+
+const showMultiMatchModal = ref(false)
+const multiMatchTargetStmt = ref<any | null>(null)
+const multiMatchInitialIds = ref<string[]>([])
+const multiMatchSubmitting = ref(false)
+const multiMatchCandidates = computed(() =>
+  multiMatchTargetStmt.value ? getMultiMatchCandidatesForStatement(multiMatchTargetStmt.value) : [],
+)
+
+function openMultiMatchModal(stmt: any, initialIds: string[] = []) {
+  multiMatchTargetStmt.value = stmt
+  multiMatchInitialIds.value = [...initialIds]
+  showMultiMatchModal.value = true
+}
+
+async function handleConfirmMultiMatch(entryIds: string[]) {
+  if (!multiMatchTargetStmt.value || !entryIds.length || multiMatchSubmitting.value) return
+  multiMatchSubmitting.value = true
+  try {
+    const ok = await confirmMultiMatch(multiMatchTargetStmt.value, entryIds)
+    if (ok) {
+      showMultiMatchModal.value = false
+    }
+  } finally {
+    multiMatchSubmitting.value = false
+  }
+}
+
+const monthSalesInvoiceCount = computed(() =>
+  monthInvoiceRows.value.filter((inv) => inv.direction === 'income').length,
+)
+const monthPurchaseInvoiceCount = computed(() =>
+  monthInvoiceRows.value.filter((inv) => inv.direction === 'expense').length,
+)
+const invoiceContinueUploadLabel = computed(() => {
+  if (monthSalesInvoiceCount.value > 0 && monthPurchaseInvoiceCount.value === 0) {
+    return '+ 上传收票表（进项）'
+  }
+  if (monthPurchaseInvoiceCount.value > 0 && monthSalesInvoiceCount.value === 0) {
+    return '+ 上传开票表（销项）'
+  }
+  return '+ 继续上传发票'
+})
+const invoiceDropzoneTitle = computed(() => {
+  if (monthInvoiceRows.value.length === 0) {
+    return '点击或拖拽开票表 / 收票表上传'
+  }
+  if (monthSalesInvoiceCount.value > 0 && monthPurchaseInvoiceCount.value === 0) {
+    return '继续拖拽或点击上传「收票表（进项发票）」'
+  }
+  if (monthPurchaseInvoiceCount.value > 0 && monthSalesInvoiceCount.value === 0) {
+    return '继续拖拽或点击上传「开票表（销项发票）」'
+  }
+  return '继续拖拽或点击追加上传发票 Excel'
+})
+
 // 「修改凭证」弹窗：从待确认卡片进入时带出第一步选的付款人；
 // 已过账凭证只能红冲重记，标题与自定义分录在弹窗里锁住。
 const editVoucherIsPosted = computed(() => {
   const entry = editVoucherTargetEntry.value
   return String(entry?.voucherStatus || entry?.status || '') === 'posted'
 })
-const editVoucherDispositionLabel = computed(() => {
-  const id = String(editVoucherTargetEntry.value?.id || '')
-  return id ? String(dispositionChoice.value[id]?.label || '') : ''
+// 弹窗里当前付款来源的白话说明：与第二步卡片同一套语义，改了立刻可见
+const editVoucherIsOutflowEntry = computed(() =>
+  !editVoucherTargetEntry.value || entryIsOutflow(editVoucherTargetEntry.value),
+)
+const editVoucherPayerSummary = computed(() => {
+  const form = editVoucherForm.value
+  const outflow = editVoucherIsOutflowEntry.value
+  if (form.paymentStatus === 'unpaid') {
+    return outflow ? '还没付款（计入应付供应商挂账）' : '客户未付款（计入客户应收欠款）'
+  }
+  const payer = String(form.payer || '')
+  if (!payer) return ''
+  if (payer === 'boss_personal') {
+    return outflow ? '老板个人垫付（计入公司欠老板款，可免税转回私卡）' : '老板私户代收（计入老板暂存公款）'
+  }
+  if (payer.startsWith('employee_personal')) {
+    const name = payer.split(':')[1]
+    return name ? `员工垫付（计入公司欠${name}报销款）` : '员工垫付（计入员工待报销款）'
+  }
+  if (payer === 'platform_balance') return '在平台未提现（计入平台待提现余额）'
+  return outflow ? '公司账户付款（从公司账户直接支付）' : '公司账户收款'
+})
+const editVoucherPayerNeedsReimbursement = computed(() => {
+  const form = editVoucherForm.value
+  if (form.paymentStatus === 'unpaid' || editVoucherIsOutflowEntry.value === false) return false
+  return form.payer === 'boss_personal' || String(form.payer || '').startsWith('employee_personal')
 })
 
 // 第 1 步「单据未上传」提示：三类单据统一按本月口径判定（银行流水不再是账套全量），
@@ -544,7 +746,7 @@ const importGapWarningText = computed(() => {
   const wechatCount = wechatBillRecordsSummary.value.total || wechatBillRecords.value.length
   const imported: string[] = []
   if (monthInvoiceRows.value.length > 0) imported.push(`发票 ${monthInvoiceRows.value.length} 张`)
-  if (wechatCount > 0) imported.push(`微信账单 ${wechatCount} 笔`)
+  if (wechatCount > 0) imported.push(`平台账单 ${wechatCount} 笔`)
   if (monthStatements.value.length > 0) imported.push(`银行流水 ${monthStatements.value.length} 笔`)
   const importedPart = imported.length > 0 ? `已导入：${imported.join(' · ')}；` : ''
   return `${importedPart}还未上传：${formatMissingImportLabels(missingImportGaps.value)} —— 上传后系统才能自动记账与对账`
@@ -559,8 +761,67 @@ function importCardTagType(
   return showImportGapWarning.value ? 'warning' : 'default'
 }
 
+// ── 银行电子回单 & 标准对账单上传 ──
+const bankReceiptInputRef = ref<HTMLInputElement | null>(null)
+const bankReceiptUploading = ref(false)
+const bankReceiptRelinking = ref(false)
+const bankReceiptResult = ref<BankReceiptUploadResult | null>(null)
+
+function triggerBankReceiptUpload() {
+  bankReceiptInputRef.value?.click()
+}
+
+async function handleBankReceiptFiles(event: Event) {
+  const input = event.target as HTMLInputElement | null
+  const files = input?.files ? Array.from(input.files) : []
+  if (input) input.value = ''
+  if (!files.length) return
+  bankReceiptUploading.value = true
+  try {
+    const res = await uploadBankReceipts(files, true)
+    bankReceiptResult.value = res
+    const { receiptTotal, matchedCount, parkedCount, statementPdfCount, duplicateCount } = res.summary
+    const parts: string[] = []
+    if (receiptTotal > 0) parts.push(`拆出回单 ${receiptTotal} 笔（已挂流水 ${matchedCount}，待挂 ${parkedCount}）`)
+    if (statementPdfCount > 0) parts.push(`对账单 PDF ${statementPdfCount} 份`)
+    if (duplicateCount > 0) parts.push(`重复跳过 ${duplicateCount} 份`)
+    message.success(parts.length ? parts.join(' · ') : '回单文件处理完成')
+  } catch (err) {
+    message.error((err as { response?: { data?: { detail?: string } } })?.response?.data?.detail || '上传银行回单失败')
+  } finally {
+    bankReceiptUploading.value = false
+  }
+}
+
+async function handleRelinkBankReceipts() {
+  bankReceiptRelinking.value = true
+  try {
+    const res = await relinkBankReceipts()
+    if (bankReceiptResult.value) {
+      bankReceiptResult.value = {
+        ...bankReceiptResult.value,
+        summary: {
+          ...bankReceiptResult.value.summary,
+          matchedCount: bankReceiptResult.value.summary.matchedCount + res.relinked,
+          parkedCount: Math.max(0, bankReceiptResult.value.summary.parkedCount - res.relinked),
+        },
+      }
+    }
+    message.success(res.relinked > 0 ? `已自动挂接 ${res.relinked} 笔银行回单到流水` : '当前没有可新挂接的待匹配回单')
+  } catch {
+    message.error('重新匹配回单失败')
+  } finally {
+    bankReceiptRelinking.value = false
+  }
+}
+
 const readinessItems = computed(() => getClosingReadiness(periodCloseChecks.value))
 const closingTasks = computed(() => deriveClosingTasks(periodCloseChecks.value))
+const step2AllDone = computed(() =>
+  unmatchedStatements.value.length === 0
+  && pendingEntryList.value.length === 0
+  && !hasBlockingPayroll.value,
+)
 
 // 五项核对常显条：把结账检查里最核心的五项从折叠明细提到顶部，
 // 关账前一眼看到「账证 / 账账 / 账实 / 账表 / 申报」是否都通过。
@@ -578,11 +839,10 @@ const mainFilingObligations = computed<FilingObligation[]>(() =>
   (filingInfo.value?.obligations || []).filter(item => MAIN_FILING_KINDS.has(item.taxKind)),
 )
 
-function filingDueLabel(item: FilingObligation): string {
-  const text = String(item.dueDate || '').slice(5)
-  if (!text) return ''
-  const [month, day] = text.split('-')
-  return `${Number(month)} 月 ${Number(day)} 日前`
+function openBetaContactModal() {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('solo:open-beta-contact'))
+  }
 }
 
 function goFilingPackage(item?: FilingObligation) {
@@ -605,15 +865,17 @@ const currentBossLedgerDetail = computed(() => {
   if (!activeBossLedgerType.value) return null
   if (activeBossLedgerType.value === 'customer_owes') {
     const list = confirmedExceptionEntries.value.filter(
-      (e) => e.paymentStatus === 'unpaid' && e.direction === 'income',
+      (e) => e.paymentStatus === 'unpaid' && e.direction === 'income' && !isSettledAsOfMonth(e, targetMonth.value),
     )
     return {
       type: 'customer_owes' as const,
       title: '客户欠款明细（应收账款）',
+      amountLabel: '本月汇总金额',
       amount: bossLedgerSummary.value.customerOwes,
       count: bossLedgerSummary.value.customerCount,
       bossOnly: 0,
       empOnly: 0,
+      advanceBreakdown: null,
       tip: '本月销项发票或应收业务中，客户尚未完成公户支付的款项。等公户收到回款流水时，系统将自动对账核销。',
       targetRoute: '/invoices',
       targetQuery: { direction: 'income', month: targetMonth.value },
@@ -623,15 +885,17 @@ const currentBossLedgerDetail = computed(() => {
   }
   if (activeBossLedgerType.value === 'supplier_owes') {
     const list = confirmedExceptionEntries.value.filter(
-      (e) => e.paymentStatus === 'unpaid' && e.direction === 'expense',
+      (e) => e.paymentStatus === 'unpaid' && e.direction === 'expense' && !isSettledAsOfMonth(e, targetMonth.value),
     )
     return {
       type: 'supplier_owes' as const,
       title: '待付供应商款明细（应付挂账）',
+      amountLabel: '本月汇总金额',
       amount: bossLedgerSummary.value.companyOwesSupplier,
       count: bossLedgerSummary.value.supplierCount,
       bossOnly: 0,
       empOnly: 0,
+      advanceBreakdown: null,
       tip: '本月进项发票或应付业务中，公司尚未付款挂账的款项。后续从公司银行公户付款打款时，系统将自动核销。',
       targetRoute: '/invoices',
       targetQuery: { direction: 'expense', month: targetMonth.value },
@@ -640,20 +904,27 @@ const currentBossLedgerDetail = computed(() => {
     }
   }
   if (activeBossLedgerType.value === 'boss_and_emp') {
-    const list = confirmedExceptionEntries.value.filter(
-      (e) => e.direction === 'expense' && (e.payer === 'boss_personal' || String(e.payer || '').startsWith('employee_personal')),
-    )
+    const list = unreimbursedAdvanceEntries.value
+    const summary = bossLedgerSummary.value
     return {
       type: 'boss_and_emp' as const,
       title: '公司欠老板/员工垫付款明细',
-      amount: bossLedgerSummary.value.companyOwesBossAndEmp,
+      amountLabel: summary.fromAdvanceLedger ? `截至 ${targetMonth.value} 待报销余额` : '本月待报销金额',
+      amount: summary.companyOwesBossAndEmp,
       count: list.length,
-      bossOnly: bossLedgerSummary.value.bossOnly,
-      empOnly: bossLedgerSummary.value.empOnly,
-      tip: '属于公司真实经营支出，但实际由老板或员工个人先行垫付。公户资金充裕时，可随时通过公对私转账归还个人，属于往来款返还不涉及个税。',
-      targetRoute: '/private-expenses',
-      targetQuery: undefined,
-      targetLabel: '前往老板私账登记还款 ↗',
+      bossOnly: summary.bossOnly,
+      empOnly: summary.empOnly,
+      advanceBreakdown: summary.fromAdvanceLedger
+        ? {
+            opening: summary.advanceOpening,
+            occurred: summary.advanceMonthOccurred,
+            reimbursed: summary.advanceMonthReimbursed,
+          }
+        : null,
+      tip: '以下为截至本期末尚未报销的垫付单据。公户资金充裕时，可通过公对私转账归还个人并在对账中核销，属于往来款返还不涉及个税。',
+      targetRoute: '/reports/advance-balances',
+      targetQuery: { month: targetMonth.value } as Record<string, string>,
+      targetLabel: '查看垫付未报销汇总 ↗',
       entries: list,
     }
   }
@@ -663,14 +934,6 @@ const currentBossLedgerDetail = computed(() => {
 function handleGoToTarget(routePath: string, query?: Record<string, string>) {
   showBossLedgerDrawer.value = false
   router.push({ path: routePath, query })
-}
-
-function noticeTitle(notice: ClosingNotice): string {
-  // 启用前的数据是「流水 N 条 + 工资表 N 份」，混算成「N 笔」会串味；
-  // 具体构成由 message 说明，标题只报事项名。
-  if (notice.code === 'PRE_BOOK_START_ACTIVITY') return notice.name
-  const amount = notice.amount ? ` · ¥${notice.amount}` : ''
-  return `${notice.name}（${notice.count} 笔${amount}）`
 }
 
 function noticeRecordTitle(record: ClosingNoticeRecord): string {
@@ -683,6 +946,7 @@ function noticeRecordMeta(record: ClosingNoticeRecord): string {
   }
   if (record.originalPeriod) return `原期间 ${record.originalPeriod}`
   if (record.businessPeriod) return `所属 ${record.businessPeriod}`
+  if (record.reason) return String(record.reason)
   return ''
 }
 
@@ -690,13 +954,9 @@ function noticeRecordAmount(record: ClosingNoticeRecord): string {
   return String(record.amount ?? record.vatAmount ?? '')
 }
 
-const NOTICE_EXPORT_SCOPE: Record<string, string> = {
-  CROSS_PERIOD_PENDING: 'cross-period',
-  VAT_PERIOD_MISMATCH: 'vat-period',
-}
-
 async function exportBackfillNotice(notice: ClosingNotice) {
-  const scope = NOTICE_EXPORT_SCOPE[notice.code] || 'backfill'
+  const scope = noticeExportScope(notice)
+  if (!scope) return
   try {
     const blob = (await apiClient.get('/api/periods/backfills/export', {
       params: { scope, month: targetMonth.value },
@@ -764,6 +1024,10 @@ async function runTaskAction(action: ClosingTaskAction) {
     showBankBalanceDetail.value = true
     return
   }
+  if (action.kind === 'import-bill') {
+    currentStep.value = 1
+    return
+  }
   if (action.kind === 'vouchers') {
     const voucherCheck = periodCloseChecks.value?.checks?.find((c: any) => c.code === 'VOUCHER_TO_SOURCE')
     const firstEntryId = voucherCheck?.records?.[0]?.entryId
@@ -780,6 +1044,13 @@ async function runTaskAction(action: ClosingTaskAction) {
 function scrollIntoBank(statementId: string) {
   void nextTick(() => {
     document.querySelector(`[data-statement-id="${statementId}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  })
+}
+
+function scrollToPendingEntry(entryId: string) {
+  if (!entryId) return
+  void nextTick(() => {
+    document.querySelector(`[data-pending-entry-id="${entryId}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
   })
 }
 function handleReadinessAction(item: ClosingReadinessItem) {
@@ -811,13 +1082,28 @@ const bankBalanceRecon = computed(() => {
 })
 const canBatchPostAndClose = computed(() => canBatchPostDrafts(periodCloseChecks.value))
 
+function handleClickCloseMonth() {
+  if (!isZeroRecordMonth.value && batchPostEntries.value.length > 0) {
+    openBatchPostConfirm()
+    return
+  }
+  void runClosing()
+}
+
+async function confirmReviewAndClose() {
+  batchPostConfirmVisible.value = false
+  await runClosing()
+}
+
 // 结账域（状态/请求已拆入 composables/useClosingFlow；阻断判定由各域传入）
 const {
   closed,
   closingLoading,
+  reportLoading,
   monthlyIncome,
   monthlyExpense,
   netProfit,
+  monthlyInterestIncome,
   cfoDiagnosis,
   diagnosisLoading,
   closingVoucherRefs,
@@ -875,10 +1161,11 @@ async function loadAllData() {
       initialPeriodResolved = true
     }
 
-    // 月份确定后再读取当期结账检查与申报信息，保证首屏内容和选择月份一致。
+    // 月份确定后再读取当期结账检查、申报信息与 2241 垫付台账，保证首屏内容和选择月份一致。
     const [periodChecks, obligations] = await Promise.all([
       apiClient.get(`/api/periods/${targetMonth.value}/close-checks`),
       getFilingObligations(targetMonth.value).catch(() => null),
+      loadAdvanceBalances(),
     ])
     filingInfo.value = (obligations as unknown as FilingObligations | null) ?? null
     periodCloseChecks.value = periodChecks as any
@@ -922,7 +1209,6 @@ async function loadAllData() {
   // 5. 辅助与 AI 接口转为后台异步并行加载，防止慢接口超时阻断整个 UI 正常渲染
   loadReconciliationHealth()
   loadSalarySheet()
-  loadPayrollPaymentSuggestions()
   loadWechatBillRecords()
   
   if (closed.value) {
@@ -930,6 +1216,8 @@ async function loadAllData() {
     fetchClosingTodos()
   }
   loadAiSuggestions()
+  // 先付款后收票检测：发票在当月公户找不到扣款时，跨期找已入账的付款凭证
+  loadPriorPaymentCandidates()
 }
 
 
@@ -952,6 +1240,12 @@ function readinessStatusIcon(status: string) {
     incomplete: 'ri-time-line',
     not_required: 'ri-subtract-line',
   }[status] || 'ri-time-line'
+}
+
+function fiveCheckStatusLabel(item: { status: string; waitingForPosting?: boolean }) {
+  if (isZeroRecordMonth.value) return '本月无记录'
+  if (item.waitingForPosting) return '待过账后核验'
+  return readinessStatusLabel(item.status)
 }
 
 function goLedgerDetail(entryId: string) {
@@ -1065,29 +1359,19 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
             </NTag>
             <NTooltip trigger="hover" placement="bottom" :style="{ maxWidth: '320px' }">
               <template #trigger>
-                <button
-                  type="button"
-                  class="closing-ai-badge-btn"
+                <NButton
+                  type="primary"
+                  secondary
+                  size="small"
                   aria-label="打开 AI 财务官检查本月结账"
                   @click="openClosingCopilot"
                 >
-                  <i class="ri-sparkling-2-line" aria-hidden="true" />
-                  <span>AI 财务官</span>
-                </button>
+                  <template #icon><i class="ri-chat-3-line" aria-hidden="true" /></template>
+                  问 AI 财务官
+                </NButton>
               </template>
               检查本月结账、解释差异并创建待确认修复草稿；最终锁账仍由你在此页确认。
             </NTooltip>
-          </div>
-          <div v-if="mainFilingObligations.length" class="closing-filing-inline">
-            <i class="ri-calendar-check-line" aria-hidden="true" />
-            <span class="filing-inline-title">本期申报</span>
-            <span class="filing-inline-text">
-              {{ mainFilingObligations.map(item => `${item.name}${filingDueLabel(item) ? `（${filingDueLabel(item)}）` : ''}`).join(' · ') }}
-            </span>
-            <button type="button" class="filing-inline-link" @click="goFilingPackage(mainFilingObligations[0])">
-              查看申报底稿
-              <i class="ri-arrow-right-s-line" aria-hidden="true" />
-            </button>
           </div>
         </div>
       </div>
@@ -1095,7 +1379,7 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
 
     <!-- 一套月结向导同时服务老板与会计：默认大白话，专业明细折叠可展开 -->
     <!-- Steps Card (未结账时持续展示步骤导引) -->
-    <NCard v-if="!closed" :bordered="false" class="report-card steps-card mb-3" style="padding: 6px 14px;">
+    <NCard v-if="!closed" :bordered="false" class="report-card steps-card mb-3">
       <NSteps :current="currentStep" size="small" @update:current="(val: number) => goStep(val)">
         <NStep title="导入单据" description="发票、流水、账单" style="cursor: pointer;" @click="goStep(1)" />
         <NStep title="确认收支" description="系统已自动记账，逐笔确认例外" style="cursor: pointer;" @click="goStep(2)" />
@@ -1107,16 +1391,20 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
     <div v-if="!closed && currentStep === 1" class="step-status-bar mb-3" :class="{ 'step-status-bar--warning': showImportGapWarning }">
       <div class="step-status-main">
         <i class="step-status-icon" :class="showImportGapWarning ? 'ri-error-warning-line' : 'ri-folder-shared-line'" />
-        <span class="step-status-label">{{ showImportGapWarning ? '本月单据未齐' : '本月已导入' }}</span>
+        <span class="step-status-label">{{ showImportGapWarning ? '本月单据未齐' : (monthStatements.length || pendingInvoiceList.length || wechatBillRows.length) ? '本月已导入' : '第一步' }}</span>
         <span class="step-status-text">
           <template v-if="showImportGapWarning">{{ importGapWarningText }}</template>
+          <template v-else-if="monthStatements.length || pendingInvoiceList.length || wechatBillRows.length">
+            银行流水 {{ monthStatements.length }} 笔 · 待确认发票 {{ pendingInvoiceList.length }} 张{{ unpaidInvoiceCount > 0 ? `（另有 ${unpaidInvoiceCount} 张已确认去向）` : '' }} · 平台账单 {{ wechatBillRecordsSummary.total || wechatBillRecords.length }} 笔
+          </template>
           <template v-else>
-            银行流水 {{ monthStatements.length }} 笔 · 待确认发票 {{ pendingInvoiceList.length }} 张{{ unpaidInvoiceCount > 0 ? `（另有 ${unpaidInvoiceCount} 张已确认去向）` : '' }} · 微信账单 {{ wechatBillRecordsSummary.total || wechatBillRecords.length }} 笔
+            上传本月发票与银行流水后进入下一步
           </template>
         </span>
       </div>
       <div class="step-status-actions">
         <button
+          v-if="!openingBlocked"
           type="button"
           class="step-status-inbox-btn"
           :class="{ 'is-active': showMailInbox }"
@@ -1135,8 +1423,10 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
 
     <!-- Step 1 Layout: 资料归集与导入 (发票 · 网银流水 · 平台账单) -->
     <div v-if="currentStep === 1">
+      <OpeningGateAlert v-if="openingBlocked" class="mb-3" />
       <NSpin :show="loading">
         <MailInboxCard
+          v-if="!openingBlocked"
           collapsible
           hide-trigger
           v-model:expanded="showMailInbox"
@@ -1144,37 +1434,57 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
           @error="onFileError"
         />
         <div class="step1-import-grid">
-        <NCard :bordered="false" class="report-card" :class="{ 'step1-card-expanded': unmatchedInvoices.length > 0 }">
+        <NCard :bordered="false" class="report-card" :class="{ 'step1-card-expanded': monthInvoiceRows.length > 0 }">
           <div class="step-import-head">
             <h3 class="report-section-title"><span class="step-import-num">1</span>导入发票</h3>
             <div class="step-import-meta">
               <NTag size="small" :type="importCardTagType(monthInvoiceRows.length > 0, unmatchedInvoices.length > 0 ? 'info' : 'default')" :bordered="false">
                 {{ monthInvoiceRows.length === 0
-                  ? '还没导入'
-                  : unmatchedInvoices.length > 0
-                    ? `本月待核对 ${unmatchedInvoices.length} 张 · 共 ${monthInvoiceRows.length} 张`
-                    : `本月已核对 ${monthInvoiceRows.length} 张` }}
+                  ? '未导入'
+                  : `销项 ${monthSalesInvoiceCount} · 进项 ${monthPurchaseInvoiceCount}${unmatchedInvoices.length > 0 ? `（待核对 ${unmatchedInvoices.length}）` : ''}` }}
               </NTag>
-              <NButton v-if="monthInvoiceRows.length > 0" size="tiny" quaternary type="primary" @click="invoiceDropzone?.openPicker()">重新上传</NButton>
+            </div>
+          </div>
+          <p class="report-subtitle">
+            税局进项 / 销项 Excel
+            <GuideTrigger guide="invoice-list" label="发票在哪下载？" />
+            <GuideEntryLink guide="invoice-list" />
+          </p>
+
+          <div v-if="openingBlocked" class="opening-locked-slot">
+            <i class="ri-lock-line" aria-hidden="true" />
+            <span>完成期初建账后开放上传</span>
+          </div>
+          <FileDropzone
+            v-else
+            ref="invoiceDropzone"
+            accept=".xlsx,.xls,.csv"
+            multiple
+            icon="ri-file-excel-2-line"
+            :title="invoiceDropzoneTitle"
+            :loading="loading"
+            :style="monthInvoiceRows.length > 0 ? 'margin-bottom: 10px;' : undefined"
+            @files="processInvoiceFiles"
+            @error="onFileError"
+          />
+
+          <div class="step1-card-footer">
+            <div class="step1-card-footer-left">
+              <NButton
+                v-if="monthInvoiceRows.length > 0 && !openingBlocked"
+                size="tiny"
+                secondary
+                type="primary"
+                @click="invoiceDropzone?.openPicker()"
+              >
+                {{ invoiceContinueUploadLabel }}
+              </NButton>
               <NButton v-if="monthInvoiceRows.length > 0" text size="tiny" @click="showInvoiceDetails = !showInvoiceDetails">
                 {{ showInvoiceDetails ? '收起明细' : '展开明细' }}
               </NButton>
-              <NButton text size="tiny" @click="router.push('/invoices')">去整页管理</NButton>
             </div>
+            <NButton text size="tiny" @click="router.push('/invoices')">去整页管理</NButton>
           </div>
-          <p class="report-subtitle">税局导出的进项/销项发票 Excel，自动拆分税率并生成发票明细。</p>
-
-          <FileDropzone
-            v-show="monthInvoiceRows.length === 0"
-            ref="invoiceDropzone"
-            accept=".xlsx,.xls,.csv"
-            icon="ri-file-excel-2-line"
-            title="点击或拖拽发票 Excel 上传"
-            subtitle="上传后自动写入系统发票库"
-            :loading="loading"
-            @file="processInvoiceFile"
-            @error="onFileError"
-          />
   
           <div v-if="monthInvoiceRows.length > 0" class="report-table-wrapper" style="max-height: 320px; overflow-y: auto;">
             <table class="report-table">
@@ -1256,7 +1566,7 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
              只判前者会导致「已导入 15 笔」的常驻状态依然收起，表格挤在 1/3 卡片里。 -->
         <NCard :bordered="false" class="report-card" :class="{ 'step1-card-expanded': wechatBillRows.length > 0 || wechatBillRecords.length > 0 }">
           <div class="step-import-head">
-            <h3 class="report-section-title"><span class="step-import-num">2</span>导入微信/平台账单</h3>
+            <h3 class="report-section-title"><span class="step-import-num">2</span>导入平台账单</h3>
             <div class="step-import-meta">
               <NTag
                 size="small"
@@ -1265,27 +1575,40 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
               >
                 {{ (wechatBillRecordsSummary.total || wechatBillRows.length) > 0
                   ? `已导入 ${wechatBillRecordsSummary.total || wechatBillRows.length} 笔`
-                  : '还没导入' }}
+                  : '未导入' }}
               </NTag>
             </div>
           </div>
           <p class="report-subtitle">
-            微信商户后台导出的当月账单 CSV，自动识别每笔手续费。
-            <GuideTrigger guide="wechat-bill" label="账单怎么导出？" />
+            微信 / 支付宝商家账单 CSV
+            <span class="report-subtitle-guides">
+              <GuideTrigger guide="wechat-bill" label="微信账单怎么导出？" />
+              <GuideTrigger guide="alipay-bill" label="支付宝账单怎么导出？" />
+            </span>
           </p>
 
+          <!-- 有预览时收起上传区；导入完成后重新露出，同月可继续导入另一平台账单 -->
+          <div v-if="openingBlocked" class="opening-locked-slot">
+            <i class="ri-lock-line" aria-hidden="true" />
+            <span>完成期初建账后开放上传</span>
+          </div>
           <FileDropzone
-            v-show="!wechatBillImported && wechatBillRows.length === 0"
+            v-else
+            v-show="wechatBillRows.length === 0"
             ref="wechatDropzone"
             accept=".csv"
-            icon="ri-wechat-pay-line"
-            icon-color="#07c160"
-            title="点击或拖拽微信账单 CSV 上传"
-            subtitle="从微信「账单中心」按月导出"
+            icon="ri-file-chart-line"
+            icon-color="var(--primary-color)"
+            title="点击或拖拽微信/支付宝账单 CSV 上传"
             :loading="loading"
             @file="processWechatBillFile"
             @error="onFileError"
           />
+
+          <div v-if="wechatBillRows.length === 0" class="step1-card-footer">
+            <span class="step1-optional-hint">可选 · 无商家账单可跳过</span>
+            <NButton text size="tiny" @click="openBetaContactModal">其他平台？联系反馈</NButton>
+          </div>
 
           <!-- Preview and Import Configuration -->
           <div v-if="wechatBillRows.length > 0">
@@ -1293,14 +1616,15 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
             <div style="background: var(--card-background-hover); border-radius: 8px; padding: 14px 16px; margin-bottom: 12px; border: 1px solid var(--border-color);">
               <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
                 <span style="font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 6px;">
-                  <i class="ri-file-chart-line" style="color: var(--primary-color);" /> 月度汇总核对（共 {{ wechatBillSummary.总交易单数 || wechatBillRows.length }} 笔）
+                  <i class="ri-file-chart-line" style="color: var(--primary-color);" /> 账单汇总核对（共 {{ wechatBillSummary.总交易单数 || wechatBillRows.length }} 笔）
+                  <NTag size="tiny" :bordered="false" type="info">{{ platformBillLabel }}</NTag>
                 </span>
                 <!-- 记账模式切换 -->
                 <div style="display: flex; align-items: center; gap: 12px;">
                   <span style="font-size: 13px; color: var(--text-secondary);">记账方式：</span>
                   <label style="font-size: 13px; cursor: pointer; display: flex; align-items: center; gap: 4px;">
                     <input type="radio" value="summary" v-model="wechatImportMode" />
-                    <strong>月度汇总记账</strong>（推荐·生成1张凭证）
+                    <strong>按账单期间汇总</strong>（推荐·生成1张凭证）
                   </label>
                   <label style="font-size: 13px; cursor: pointer; display: flex; align-items: center; gap: 4px; color: var(--text-secondary);">
                     <input type="radio" value="detail" v-model="wechatImportMode" />
@@ -1368,7 +1692,7 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
             <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 12px;">
               <span style="font-size: 13px; color: var(--text-secondary);">
                 <template v-if="wechatImportMode === 'summary'">
-                  当前模式：将按月度对账结果生成 <strong>1 张综合记账凭证</strong>（自动轧平收入、退款与手续费，收入按征收率价税分离计提增值税）
+                  当前模式：将按账单期间汇总生成 <strong>1 张综合记账凭证</strong>（自动轧平收入、退款与手续费，收入按征收率价税分离计提增值税）
                 </template>
                 <template v-else-if="wechatBillRows.some(r => r.is_duplicate)">
                   逐笔明细模式：将导入 {{ wechatBillRows.filter(r => !r.is_duplicate).length }} 条新记录 · 自动过滤 {{ wechatBillRows.filter(r => r.is_duplicate).length }} 条已存在记录
@@ -1386,19 +1710,41 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
                   :loading="wechatBillImporting"
                   :disabled="wechatBillImporting || (wechatImportMode === 'detail' && wechatBillRows.filter(r => !r.is_duplicate).length === 0)"
                 >
-                  {{ wechatImportMode === 'summary' ? '生成月度汇总凭证' : '确认逐笔导入' }}
+                  {{ wechatImportMode === 'summary' ? '生成账单汇总凭证' : '确认逐笔导入' }}
                 </NButton>
               </div>
             </div>
           </div>
 
-          <!-- Imported success state -->
-          <div v-if="wechatBillImported" style="text-align: center; padding: 24px 0;">
-            <i class="ri-checkbox-circle-fill" :style="{ fontSize: '32px', color: wechatBillFailures.length > 0 ? '#a05c10' : '#07c160' }"></i>
-            <p style="margin-top: 8px; color: var(--text-secondary);">
-              {{ wechatBillFailures.length > 0 ? `导入完成，${wechatBillFailures.reduce((n, f) => n + f.count, 0)} 条交易未能入账（原因见下）` : '微信账单已导入，收款与手续费已自动分录' }}
-            </p>
-            <NButton size="small" ghost style="margin-top: 8px;" @click="() => { wechatBillImported = false; wechatBillFailures = []; wechatDropzone?.openPicker() }">重新导入</NButton>
+          <!-- Imported success compact bar (avoids duplicating the upload dropzone above) -->
+          <div
+            v-if="wechatBillImported"
+            class="bank-upload-summary-bar mb-4"
+            :class="{ 'is-warn': wechatBillFailures.length > 0 }"
+          >
+            <div class="bank-upload-summary-left">
+              <i
+                :class="wechatBillFailures.length > 0 ? 'ri-error-warning-line' : 'ri-checkbox-circle-line'"
+                class="bank-upload-summary-icon"
+                aria-hidden="true"
+              />
+              <span class="bank-upload-summary-title">
+                {{ wechatBillFailures.length > 0 ? `导入完成，${wechatBillFailures.reduce((n, f) => n + f.count, 0)} 条交易未能入账（原因见下）` : `${platformBillLabel}账单已导入，收款、退款与手续费已自动分录` }}
+              </span>
+              <span class="bank-upload-summary-stats">
+                如需导入另一平台账单请直接在上方上传，同平台重复上传自动判重
+              </span>
+            </div>
+            <div class="bank-upload-summary-actions">
+              <NButton
+                size="tiny"
+                quaternary
+                aria-label="关闭导入提示"
+                @click="() => { wechatBillImported = false; wechatBillFailures = [] }"
+              >
+                <i class="ri-close-line" aria-hidden="true" />
+              </NButton>
+            </div>
           </div>
 
           <!-- Import failure details: aggregated by cause; start-date issues link to the company editor -->
@@ -1447,10 +1793,15 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
                 <tbody>
                   <tr v-for="rec in wechatBillRecords" :key="rec.orderNo">
                     <td class="date-cell">{{ rec.date }}</td>
-                    <td>{{ rec.title }}</td>
+                    <td>
+                      <NTag size="tiny" :type="rec.platform === 'alipay' ? 'info' : 'success'" :bordered="false" style="margin-right: 6px;">
+                        {{ rec.platform === 'alipay' ? '支付宝' : '微信' }}
+                      </NTag>
+                      {{ rec.title }}
+                    </td>
                     <td style="text-align: center;">
                       <NTag :type="rec.status === 'SUCCESS' ? 'success' : rec.status === 'SUMMARY' ? 'info' : 'warning'" size="small" :bordered="false">
-                        {{ rec.status === 'SUCCESS' ? '收款' : rec.status === 'SUMMARY' ? '月度汇总' : '退款' }}
+                        {{ rec.status === 'SUCCESS' ? '收款' : rec.status === 'SUMMARY' ? '账单汇总' : '退款' }}
                       </NTag>
                     </td>
                     <td class="amount-cell" style="text-align: right;" :style="rec.orderAmount < 0 ? 'color: var(--solo-expense)' : ''">{{ formatMoney(rec.orderAmount) }}</td>
@@ -1464,74 +1815,142 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
         </NCard>
 
         <!-- 网银流水 -->
-        <NCard :bordered="false" class="report-card" :class="{ 'step1-card-expanded': bankUploadResult || unmatchedStatements.length > 0 }">
+        <NCard :bordered="false" class="report-card" :class="{ 'step1-card-expanded': unmatchedStatements.length > 0 }">
           <div class="step-import-head">
             <h3 class="report-section-title"><span class="step-import-num">3</span>导入银行流水</h3>
             <div class="step-import-meta">
               <NTag size="small" :type="importCardTagType(monthStatements.length > 0, 'success')" :bordered="false">
-                {{ monthStatements.length > 0 ? `已导入 ${monthStatements.length} 笔` : '还没导入' }}
+                {{ monthStatements.length > 0 ? `已导入 ${monthStatements.length} 笔` : '未导入' }}
               </NTag>
-              <NButton text size="tiny" @click="router.push('/bank')">去整页管理</NButton>
             </div>
           </div>
           <p class="report-subtitle">
-            网银导出的本月流水单，自动认领收支并匹配已有记账。
+            网银导出的本月流水单
             <GuideTrigger guide="bank-statement" label="流水怎么下载？" />
           </p>
 
+          <div v-if="openingBlocked" class="opening-locked-slot">
+            <i class="ri-lock-line" aria-hidden="true" />
+            <span>完成期初建账后开放上传</span>
+          </div>
           <FileDropzone
+            v-else
             accept=".xlsx,.xls,.csv"
             icon="ri-download-cloud-2-line"
             title="点击或拖拽网银流水上传"
-            subtitle="支持工行、招行、建行等 Excel/CSV"
             :loading="loading"
             @file="processBankFile"
             @error="onFileError"
           />
+
+          <div class="step1-card-footer">
+            <div class="step1-card-footer-left">
+              <input
+                ref="bankReceiptInputRef"
+                type="file"
+                :accept="BANK_RECEIPT_ACCEPT"
+                multiple
+                hidden
+                @change="handleBankReceiptFiles"
+              />
+              <NButton
+                v-if="!openingBlocked"
+                size="tiny"
+                secondary
+                :loading="bankReceiptUploading"
+                @click="triggerBankReceiptUpload"
+              >
+                上传银行回单 (ZIP/PDF)
+              </NButton>
+            </div>
+            <NButton text size="tiny" @click="router.push('/bank')">去整页管理</NButton>
+          </div>
   
-          <!-- Upload Feedback Panel -->
-          <div v-if="bankUploadResult" class="mb-4" style="background: rgba(99, 102, 241, 0.02); border: 1px solid var(--solo-border); border-radius: var(--solo-radius); padding: 16px;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-              <span style="font-weight: bold; color: var(--solo-text-primary); font-size: 14px;">
-                <i class="ri-checkbox-circle-line" style="color: var(--solo-income); margin-right: 4px;"></i>
-                本次文件解析与导入成功
+          <!-- Upload Feedback Compact Bar (details in modal to avoid duplicate tables on page) -->
+          <div
+            v-if="bankUploadResult"
+            class="bank-upload-summary-bar mb-4"
+            :class="{ 'is-warn': bankUploadResult.errors > 0 || bankUploadResult.skipped > 0 }"
+          >
+            <div class="bank-upload-summary-left">
+              <i
+                :class="bankUploadResult.errors > 0 || bankUploadResult.skipped > 0 ? 'ri-error-warning-line' : 'ri-checkbox-circle-line'"
+                class="bank-upload-summary-icon"
+                aria-hidden="true"
+              />
+              <span class="bank-upload-summary-title">
+                {{ bankUploadResult.errors > 0 || bankUploadResult.skipped > 0 ? '本次文件解析完成（含异常）' : '本次文件解析与导入成功' }}
               </span>
-              <span style="font-size: 12px; color: var(--solo-text-muted);">
-                已导入: <span style="color: var(--solo-income); font-weight: bold;">{{ bankUploadResult.imported }}</span> 条 |
-                失败: <span style="color: var(--solo-expense); font-weight: bold;">{{ bankUploadResult.errors }}</span> 条<template v-if="bankUploadResult.skipped > 0"> |
-                跳过: <span style="color: #A05C10; font-weight: bold;">{{ bankUploadResult.skipped }}</span> 条（无有效交易日期）</template>
+              <span class="bank-upload-summary-stats">
+                已导入 <strong class="stat-income">{{ bankUploadResult.imported }}</strong> 条 ·
+                失败 <strong class="stat-expense">{{ bankUploadResult.errors }}</strong> 条<template v-if="bankUploadResult.skipped > 0"> ·
+                跳过 <strong class="stat-warn">{{ bankUploadResult.skipped }}</strong> 条（无有效交易日期）</template>
               </span>
             </div>
-            
-            <div class="report-table-wrapper" style="max-height: 250px; overflow-y: auto;">
-              <table class="report-table">
-                <thead>
-                  <tr>
-                    <th style="width: 110px;">交易日期</th>
-                    <th>交易内容 (类型/摘要/对方)</th>
-                    <th style="text-align: right; width: 110px;">发生额</th>
-                    <th style="text-align: right; width: 110px;">账户余额</th>
-                    <th style="text-align: center; width: 115px;">对账状态</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr v-for="(row, idx) in bankUploadResult.rows" :key="idx">
-                    <td>{{ (row.transaction_date || '').slice(0, 10) || '-' }}</td>
-                    <td>{{ row.description || '-' }}</td>
-                    <td class="amount-cell" :class="safeFloat(row.amount) >= 0 ? 'income' : 'expense'">
-                      {{ formatMoney(safeFloat(row.amount)) }}
-                    </td>
-                    <td style="text-align: right; color: var(--solo-text-secondary);">
-                      {{ formatMoney(safeFloat(row.balance)) }}
-                    </td>
-                    <td style="text-align: center;">
-                      <NTag size="small" :type="isItemAutoMatched(row) ? 'success' : 'warning'">
-                        {{ isItemAutoMatched(row) ? '已确认对账' : '待手动对账' }}
-                      </NTag>
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
+            <div class="bank-upload-summary-actions">
+              <NButton
+                v-if="bankUploadResult.rows?.length > 0"
+                size="tiny"
+                quaternary
+                type="primary"
+                @click="showBankImportDetailModal = true"
+              >
+                查看本次明细（{{ bankUploadResult.rows.length }}）
+              </NButton>
+              <NButton
+                size="tiny"
+                quaternary
+                aria-label="关闭导入提示"
+                @click="bankUploadResult = null"
+              >
+                <i class="ri-close-line" aria-hidden="true" />
+              </NButton>
+            </div>
+          </div>
+
+          <div
+            v-if="bankReceiptResult"
+            class="bank-upload-summary-bar mb-4"
+            :class="{ 'is-warn': bankReceiptResult.summary.parkedCount > 0 || bankReceiptResult.summary.rejectedCount > 0 }"
+          >
+            <div class="bank-upload-summary-left">
+              <i
+                :class="bankReceiptResult.summary.parkedCount > 0 ? 'ri-error-warning-line' : 'ri-checkbox-circle-line'"
+                class="bank-upload-summary-icon"
+                aria-hidden="true"
+              />
+              <span class="bank-upload-summary-title">银行回单与对账单归档</span>
+              <span class="bank-upload-summary-stats">
+                回单 <strong class="stat-income">{{ bankReceiptResult.summary.receiptTotal }}</strong> 笔（已挂流水
+                {{ bankReceiptResult.summary.matchedCount }} · 待挂
+                <strong :class="{ 'stat-warn': bankReceiptResult.summary.parkedCount > 0 }">{{ bankReceiptResult.summary.parkedCount }}</strong>）
+                <template v-if="bankReceiptResult.summary.statementPdfCount > 0">
+                  · 标准对账单 {{ bankReceiptResult.summary.statementPdfCount }} 份
+                </template>
+                <template v-if="bankReceiptResult.summary.duplicateCount > 0">
+                  · 重复跳过 {{ bankReceiptResult.summary.duplicateCount }}
+                </template>
+              </span>
+            </div>
+            <div class="bank-upload-summary-actions">
+              <NButton
+                v-if="bankReceiptResult.summary.parkedCount > 0"
+                size="tiny"
+                quaternary
+                type="primary"
+                :loading="bankReceiptRelinking"
+                @click="handleRelinkBankReceipts"
+              >
+                重新匹配流水
+              </NButton>
+              <NButton
+                size="tiny"
+                quaternary
+                aria-label="关闭回单提示"
+                @click="bankReceiptResult = null"
+              >
+                <i class="ri-close-line" aria-hidden="true" />
+              </NButton>
             </div>
           </div>
   
@@ -1575,199 +1994,52 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
 
     <!-- Step 2 Layout: 流水认领与薪酬 (员工薪酬核对 · 智能流水认领与配平) -->
     <div v-if="currentStep === 2">
-      <!-- 2.1 员工薪酬核对卡片 (紧凑折叠式，适合不同规模企业) -->
-      <NCard :bordered="false" class="report-card mb-4" style="padding: 16px 20px;">
-        <div style="display: flex; justify-content: space-between; align-items: center;">
-          <div style="display: flex; align-items: center; gap: 10px;">
-            <i class="ri-user-star-line" style="font-size: 20px; color: var(--solo-primary);"></i>
-            <div>
-              <span style="font-weight: 600; font-size: 15px; color: var(--solo-text-primary);">员工薪酬与社保发放</span>
-              <span v-if="employees.length === 0" style="font-size: 12px; color: var(--solo-text-muted); margin-left: 10px;">
-                💡 本月无在职员工薪酬数据（轻资产/一人企业模式无需计提薪酬）
-              </span>
-              <span v-else style="font-size: 12px; color: var(--solo-text-muted); margin-left: 10px;">
-                应发 {{ employees.length }} 人 · 实发薪酬 {{ formatMoney(totalNetSalary) }} · 企业人工总成本 {{ formatMoney(totalCompanyCost) }}
-              </span>
-            </div>
-          </div>
-          <div style="display: flex; align-items: center; gap: 8px;">
-            <NButton size="tiny" secondary @click="router.push({ path: '/mine/salary', query: targetMonth ? { month: targetMonth } : {} })">
-              <template #icon><i class="ri-edit-line" /></template>
-              去修改
-            </NButton>
-            <template v-if="employees.length > 0">
-              <NButton size="tiny" secondary @click="showSalaryTable = !showSalaryTable">
-                {{ showSalaryTable ? '收起明细' : '查看明细' }}
-                <template #icon><i :class="showSalaryTable ? 'ri-arrow-up-s-line' : 'ri-arrow-down-s-line'" /></template>
-              </NButton>
-              <NTag v-if="payrollPaid" size="small" type="success" :bordered="false">✓ 薪酬已发放</NTag>
-              <NTag v-else-if="payrollAccrued" size="small" type="info" :bordered="false">已计提待发放</NTag>
-              <NTag v-else size="small" type="warning" :bordered="false">待计提记账</NTag>
-            </template>
-          </div>
-        </div>
-
-        <template v-if="employees.length > 0">
-          <NGrid :cols="3" :x-gap="16" class="mt-3 mb-3">
-            <NGridItem>
-              <div class="report-card" style="padding: 12px; background: rgba(99, 102, 241, 0.02); text-align: center;">
-                <div style="font-size: 12px; color: var(--solo-text-muted);">本月应发人数</div>
-                <div style="font-size: 18px; font-weight: bold; color: var(--solo-text-primary); margin-top: 2px;">{{ employees.length }} 人</div>
-              </div>
-            </NGridItem>
-            <NGridItem>
-              <div class="report-card" style="padding: 12px; background: rgba(99, 102, 241, 0.02); text-align: center;">
-                <div style="font-size: 12px; color: var(--solo-text-muted);">本月实发薪酬</div>
-                <div style="font-size: 18px; font-weight: bold; color: var(--solo-income); margin-top: 2px;">{{ formatMoney(totalNetSalary) }}</div>
-              </div>
-            </NGridItem>
-            <NGridItem>
-              <div class="report-card" style="padding: 12px; background: rgba(99, 102, 241, 0.02); text-align: center;">
-                <div style="font-size: 12px; color: var(--solo-text-muted);">企业总人工成本</div>
-                <div style="font-size: 18px; font-weight: bold; color: var(--solo-expense); margin-top: 2px;">{{ formatMoney(totalCompanyCost) }}</div>
-              </div>
-            </NGridItem>
-          </NGrid>
-
-          <!-- 展开后的员工薪酬明细 -->
-          <div v-show="showSalaryTable" class="report-table-wrapper mb-3" style="max-height: 260px; overflow-y: auto;">
-            <table class="report-table">
-              <thead>
-                <tr>
-                  <th>姓名</th>
-                  <th>部门</th>
-                  <th>基本工资</th>
-                  <th>绩效/奖金</th>
-                  <th>五险一金单位缴存</th>
-                  <th style="text-align: right;">实发工资</th>
-                  <th style="text-align: right;">企业总成本</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="emp in employees" :key="emp.name">
-                  <td>{{ emp.name }}</td>
-                  <td>{{ emp.dept }}</td>
-                  <td>{{ formatMoney(emp.base) }}</td>
-                  <td>{{ formatMoney(emp.bonus) }}</td>
-                  <td>{{ formatMoney(emp.social) }}</td>
-                  <td class="amount-cell income">{{ formatMoney(emp.net) }}</td>
-                  <td class="amount-cell expense">{{ formatMoney(emp.cost) }}</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-
-          <NAlert
-            v-if="payrollPaymentSuggestions.length"
-            type="info"
-            :show-icon="false"
-            style="margin-bottom: 12px;"
-          >
-            <div style="font-weight: 600; margin-bottom: 6px;">银行流水发现待发工资</div>
-            <div
-              v-for="item in payrollPaymentSuggestions"
-              :key="item.statement.id"
-              style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 6px;"
-            >
-              <span>{{ item.month }} 工资 · 实发 ¥{{ item.netSalary }}</span>
-              <span style="color: var(--solo-text-muted); font-size: 12px;">{{ item.statement.date }} {{ item.statement.description }}</span>
-              <NTag size="tiny" :type="item.confidence === 'high' ? 'success' : 'warning'" :bordered="false">
-                {{ item.confidence === 'high' ? '高置信' : '请确认' }}
-              </NTag>
-              <NButton
-                size="tiny"
-                type="primary"
-                :loading="applyingSalaryStatementId === item.statement.id"
-                @click="handleApplySalaryPayment(item)"
-              >
-                确认发放并核销
-              </NButton>
-            </div>
-          </NAlert>
-
-          <NAlert
-            v-if="payrollPendingReview"
-            type="warning"
-            :show-icon="false"
-            style="margin-bottom: 12px;"
-          >
-            工资计提凭证正在等待审核（复核模式下需他人过账）。审核通过后此处会自动更新为「已计提」，届时才能继续发放与缴纳。
-          </NAlert>
-
-          <NSpace justify="end">
-            <NButton size="small" type="warning" :disabled="payrollAccrued || payrollPendingReview" @click="handleAccruePayroll">
-              {{ payrollAccrued ? '✓ 已经计提记账' : (payrollPendingReview ? '计提凭证待审核' : '一键计提记账') }}
-            </NButton>
-            <NButton size="small" type="primary" :disabled="!payrollAccrued || payrollPaid || payrollPendingReview" @click="handlePayPayroll">
-              {{ payrollPaid ? '✓ 已经确认发放' : '确认发放记账' }}
-            </NButton>
-            <NButton
-              v-if="payrollHasSocial && !payrollPendingReview"
-              size="small"
-              type="info"
-              :disabled="!payrollAccrued || payrollSsPaid"
-              @click="handlePaySocial"
-            >
-              {{ payrollSsPaid ? '✓ 社保已缴纳' : '确认缴纳社保' }}
-            </NButton>
-            <NButton
-              v-if="payrollHasSocial && !payrollPendingReview"
-              size="small"
-              type="info"
-              :disabled="!payrollAccrued || payrollHfPaid"
-              @click="handlePayHousingFund"
-            >
-              {{ payrollHfPaid ? '✓ 公积金已缴纳' : '确认缴纳公积金' }}
-            </NButton>
-            <NButton
-              v-if="payrollHasTax && !payrollPendingReview"
-              size="small"
-              type="info"
-              :disabled="!payrollAccrued || payrollTaxPaid"
-              @click="handlePayTax"
-            >
-              {{ payrollTaxPaid ? '✓ 个税已缴纳' : '确认缴纳个税' }}
-            </NButton>
-          </NSpace>
-        </template>
-      </NCard>
+      <!-- 2.1 员工薪酬核对卡片（按是否阻断本月关账 3 态自适应） -->
+      <PayrollCheckCard
+        :month="targetMonth"
+        :employees="employees"
+        v-model:show-salary-table="showSalaryTable"
+        :payroll-accrued="payrollAccrued"
+        :payroll-pending-review="payrollPendingReview"
+        :total-net-salary="totalNetSalary"
+        :total-company-cost="totalCompanyCost"
+        :payroll-all-settled="payrollAllSettled"
+        :carry-forward="payrollCarryForward"
+        @go-edit="router.push({ path: '/mine/salary', query: targetMonth ? { month: targetMonth } : {} })"
+        @accrue="handleAccruePayroll"
+      />
 
       <!-- 2.2 智能流水认领与配平工作台 -->
       <NCard :bordered="false" class="report-card mb-4" style="padding: 16px 20px;">
         <div class="page-header" style="margin-bottom: 12px !important;">
           <div class="header-left">
             <h3 class="report-section-title" style="margin: 0;"><i class="ri-bank-card-line" style="color: var(--solo-primary);"></i> 第二步：银行流水智能对账与配平</h3>
-            <p class="report-subtitle">系统已自动比对银行对账单与记账单据，请复核推荐的入账科目并确认。</p>
+            <p class="report-subtitle">把每一笔进出账说清楚来龙去脉，报表才经得起银行授信与投资人尽调。系统有把握的可一键确认，标「需要你拍板」的请花 10 秒点选用途。</p>
           </div>
           <div class="header-right">
-            <NTag size="small" type="info" :bordered="false">流水对账核销</NTag>
+            <NTag size="small" type="info" :bordered="false">票流一致 · 尽调就绪</NTag>
           </div>
         </div>
 
-        <!-- Progress and Hero Action Bar -->
+        <!-- Two-in-One Compact Top Action & Filter Bar -->
         <div class="feed-summary-hero">
-          <div class="feed-hero-left">
-            <div class="feed-hero-stat-circle">
-              <div class="stat-number">{{ reconciliationStats.total ? `${reconciliationStats.rate}%` : '—' }}</div>
-              <div class="stat-label">对账完成率</div>
+          <div class="feed-hero-top">
+            <div class="feed-hero-progress">
+              <span class="hero-progress-ratio">
+                已入账 <strong>{{ reconciliationStats.total ? `${reconciliationStats.matched}/${reconciliationStats.total}` : '—' }}</strong>
+              </span>
+              <div class="hero-progress-track">
+                <div
+                  class="hero-progress-fill"
+                  :style="{ width: `${reconciliationStats.total ? Math.min(100, Math.max(0, reconciliationStats.rate || 0)) : 0}%` }"
+                ></div>
+              </div>
+              <span class="hero-progress-sep">·</span>
+              <span class="hero-progress-pending">待处理银行流水 ({{ unmatchedStatements.length }})</span>
+              <span v-if="reconciliationStats.linkedUnposted?.length > 0" class="hero-unposted-warn">
+                <i class="ri-error-warning-line"></i> {{ reconciliationStats.linkedUnposted.length }} 笔待过账
+              </span>
             </div>
-            <div class="feed-hero-metrics">
-              <div class="metric-pill">本月共 <strong>{{ reconciliationStats.total }}</strong> 笔流水</div>
-              <div class="metric-pill success" v-if="highConfidenceStatements.length > 0">
-                <i class="ri-flashlight-line"></i> 系统已自动配平 <strong>{{ highConfidenceStatements.length }}</strong> 笔
-              </div>
-              <div class="metric-pill warning" v-if="unmatchedStatements.length - highConfidenceStatements.length > 0">
-                待确认用途 <strong>{{ unmatchedStatements.length - highConfidenceStatements.length }}</strong> 笔
-              </div>
-              <div class="metric-pill" v-if="unmatchedStatements.length === 0 && reconciliationStats.total > 0">
-                <i class="ri-check-line" style="color: var(--solo-income);"></i> 本月流水已全部完成
-              </div>
-              <div class="metric-pill warning" v-if="reconciliationStats.linkedUnposted?.length > 0">
-                <i class="ri-error-warning-line"></i> <strong>{{ reconciliationStats.linkedUnposted.length }}</strong> 笔核销凭证尚未过账，锁账前需过账
-              </div>
-            </div>
-          </div>
-          <div class="feed-hero-right">
             <NButton
               v-if="batchTargetStatements.length > 0"
               type="primary"
@@ -1777,10 +2049,67 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
               @click="handleBatchConfirmRules"
             >
               <template #icon><i class="ri-check-double-line" /></template>
-              批量确认已识别流水 ({{ batchTargetStatements.length }} 笔)
+              确认已勾选的已识别流水 ({{ batchTargetStatements.length }} 笔)
             </NButton>
-            <div v-else-if="unmatchedStatements.length === 0 && reconciliationStats.total > 0" style="display: flex; align-items: center; gap: 6px; color: var(--solo-income); font-weight: 600;">
-              <i class="ri-checkbox-circle-fill" style="font-size: 20px;"></i> 全部流水已认领平衡
+            <div v-else-if="unmatchedStatements.length === 0" class="feed-hero-done-wrap">
+              <span v-if="reconciliationStats.total > 0" class="feed-hero-done-badge">
+                <i class="ri-checkbox-circle-fill" /> 全部流水已认领平衡
+              </span>
+              <NButton v-if="step2AllDone" type="primary" size="small" @click="nextStep">
+                前往关账检查
+                <template #icon><i class="ri-arrow-right-line" /></template>
+              </NButton>
+            </div>
+          </div>
+
+          <div v-if="unmatchedStatements.length > 0" class="feed-hero-bottom">
+            <div class="tier-filter-pills">
+              <button
+                type="button"
+                class="tier-pill"
+                :class="{ active: statementTierFilter === 'all' }"
+                @click="statementTierFilter = 'all'"
+              >
+                全部 ({{ unmatchedStatements.length }})
+              </button>
+              <button
+                type="button"
+                class="tier-pill"
+                :class="{ active: statementTierFilter === 'ready' }"
+                @click="statementTierFilter = 'ready'"
+              >
+                系统有把握 ({{ readyStatements.length }})
+              </button>
+              <button
+                v-if="attentionStatements.length > 0"
+                type="button"
+                class="tier-pill attention"
+                :class="{ active: statementTierFilter === 'attention' }"
+                @click="statementTierFilter = 'attention'"
+              >
+                需要你拍板 · 疑义待定 ({{ attentionStatements.length }})
+              </button>
+            </div>
+            <div class="feed-hero-controls">
+              <NCheckbox
+                v-if="selectableBatchStatements.length > 0"
+                size="small"
+                :checked="allSelectableChecked"
+                :indeterminate="someSelectableChecked"
+                @update:checked="toggleSelectAllStatements"
+              >
+                <span style="font-size: 12px; color: var(--solo-text-secondary);">全选 ({{ selectableBatchStatements.length }})</span>
+              </NCheckbox>
+              <NTooltip trigger="hover" placement="top" :style="{ maxWidth: '320px' }">
+                <template #trigger>
+                  <span>
+                    <NCheckbox v-model:checked="rememberRuleOnConfirm" size="small">
+                      <span style="font-size: 12px; color: var(--solo-text-secondary);">记住此规则</span>
+                    </NCheckbox>
+                  </span>
+                </template>
+                勾选后，确认或调整某笔流水的入账科目时，系统会自动记住该对方户名或摘要特征；后续导入同类流水将直接按 98% 记忆规则自动归类。
+              </NTooltip>
             </div>
           </div>
         </div>
@@ -1834,14 +2163,14 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
           <!-- 卡片 3: 公司欠老板/员工（可免税报销提取） -->
           <div
             class="boss-ledger-card"
-            :class="{ clickable: bossLedgerSummary.companyOwesBossAndEmp > 0 }"
-            @click="bossLedgerSummary.companyOwesBossAndEmp > 0 && openBossLedgerDetail('boss_and_emp')"
+            :class="{ clickable: bossLedgerSummary.companyOwesBossAndEmp > 0 || bossLedgerSummary.advanceMonthReimbursed > 0 }"
+            @click="(bossLedgerSummary.companyOwesBossAndEmp > 0 || bossLedgerSummary.advanceMonthReimbursed > 0) && openBossLedgerDetail('boss_and_emp')"
           >
             <div class="boss-ledger-card-header">
               <span class="boss-ledger-card-title">
                 <i class="ri-user-heart-line" style="color: var(--solo-primary);"></i> 公司欠老板/员工（可免税报销提取）
               </span>
-              <span v-if="bossLedgerSummary.companyOwesBossAndEmp > 0" class="boss-ledger-card-link">
+              <span v-if="bossLedgerSummary.companyOwesBossAndEmp > 0 || bossLedgerSummary.advanceMonthReimbursed > 0" class="boss-ledger-card-link">
                 查看明细 <i class="ri-arrow-right-s-line"></i>
               </span>
             </div>
@@ -1850,21 +2179,593 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
             </div>
             <div class="boss-ledger-card-meta">
               <template v-if="bossLedgerSummary.companyOwesBossAndEmp > 0">
-                老板垫付 {{ formatMoney(bossLedgerSummary.bossOnly) }} · 员工垫付 {{ formatMoney(bossLedgerSummary.empOnly) }}（公户有钱可随时转回私卡）
+                老板垫付 {{ formatMoney(bossLedgerSummary.bossOnly) }} · 员工垫付 {{ formatMoney(bossLedgerSummary.empOnly) }}<template v-if="bossLedgerSummary.advanceMonthReimbursed > 0">（本月已报销 {{ formatMoney(bossLedgerSummary.advanceMonthReimbursed) }}，余款可随时转回私卡）</template><template v-else>（公户有钱可随时转回私卡）</template>
+              </template>
+              <template v-else-if="bossLedgerSummary.advanceMonthReimbursed > 0">
+                本月已报销 {{ formatMoney(bossLedgerSummary.advanceMonthReimbursed) }}，垫付款已结清
               </template>
               <template v-else>本月无个人垫付报销款</template>
             </div>
           </div>
         </div>
 
-        <!-- 待确认的发票与日常收支：仅列公户没找到流水的发票和日常收支手工账，排除工资/手续费/股东投入等纯会计分录 -->
+        <!-- 最近一次确认的就地撤销条 -->
+        <div v-if="lastConfirmedAction" class="recent-confirm-undo-bar">
+          <div class="recent-confirm-undo-text">
+            <i class="ri-checkbox-circle-fill" style="color: var(--solo-income); font-size: 15px;"></i>
+            <span>已确认 {{ lastConfirmedAction.label }}</span>
+          </div>
+          <div class="recent-confirm-undo-actions">
+            <NButton
+              size="tiny"
+              type="primary"
+              secondary
+              :loading="undoingLastConfirm"
+              @click="undoLastConfirmed"
+            >
+              撤销此次确认
+            </NButton>
+            <button
+              type="button"
+              class="recent-confirm-dismiss"
+              aria-label="关闭提示"
+              @click="dismissLastConfirmed"
+            >
+              <i class="ri-close-line"></i>
+            </button>
+          </div>
+        </div>
+
+        <!-- Empty state -->
+        <div v-if="unmatchedStatements.length === 0" class="feed-empty-box">
+          <i class="ri-shield-check-line feed-empty-icon"></i>
+          <div style="font-size: 15px; font-weight: 600; color: var(--solo-text-primary); margin-top: 8px;">
+            本月所有银行流水已处理完成
+          </div>
+          <div style="font-size: 12px; color: var(--solo-text-muted); margin-top: 4px;">
+            <template v-if="step2AllDone">
+              资金进出已 100% 对应入账，可直接进入下一步进行关账合规检查。
+            </template>
+            <template v-else-if="hasBlockingPayroll">
+              流水已清空，请先完成上方员工薪酬计提后即可进入下一步。
+            </template>
+            <template v-else>
+              流水已清空，请先确认下方 {{ pendingEntryList.length }} 笔待确认单据的资金去向。
+            </template>
+          </div>
+          <NButton
+            v-if="step2AllDone"
+            type="primary"
+            size="medium"
+            style="margin-top: 14px;"
+            @click="nextStep"
+          >
+            下一步：前往关账检查
+            <template #icon><i class="ri-arrow-right-line" /></template>
+          </NButton>
+        </div>
+
+        <!-- Statement Cards List (Compact Reconcile Feed) -->
+        <div v-else class="feed-card-list">
+          <template v-for="(stmt, idx) in filteredUnmatchedStatements" :key="stmt.id">
+            <div
+              v-if="statementTierFilter === 'all' && !isNeedsAttentionStatement(stmt) && idx === 0"
+              class="feed-group-divider ready"
+            >
+              <span><i class="ri-check-double-line"></i> 系统有把握（{{ readyStatements.length }} 笔）</span>
+              <span class="feed-group-sub">分类明确，可勾选后批量确认或逐笔认可</span>
+            </div>
+            <div
+              v-else-if="statementTierFilter === 'all' && isNeedsAttentionStatement(stmt) && (idx === 0 || !isNeedsAttentionStatement(filteredUnmatchedStatements[idx - 1]))"
+              class="feed-group-divider attention"
+            >
+              <span><i class="ri-question-answer-line"></i> 需要你拍板（{{ attentionStatements.length }} 笔）</span>
+              <span class="feed-group-sub">存在多种可能用途或需复核，请点选用途后逐笔确认</span>
+            </div>
+            <div
+              :data-statement-id="stmt.id"
+              class="feed-card reconcile-row"
+              :class="{
+                'high-conf': (getAiSuggestion(stmt.id)?.confidence || 0) >= 0.95 && !isNeedsAttentionStatement(stmt) && !ambiguityGroupOf(stmt).length,
+                'needs-attention': isNeedsAttentionStatement(stmt),
+              }"
+            >
+            <!-- 事实区：批量勾选 + 方向Tag + 对手方/事由 + 通道/日期/金额 -->
+            <div class="reconcile-cell-fact">
+              <div class="fact-lead">
+                <NCheckbox
+                  size="small"
+                  :checked="selectedStatementIds.includes(stmt.id)"
+                  :disabled="!isSelectableForBatch(stmt)"
+                  @update:checked="(val: boolean) => toggleStatementSelection(stmt.id, val)"
+                />
+                <NTag
+                  size="small"
+                  :type="stmt.amount >= 0 ? 'success' : 'error'"
+                  :bordered="false"
+                  style="font-weight: 600; flex-shrink: 0;"
+                >
+                  {{ stmt.amount >= 0 ? '收款' : '付款' }}
+                </NTag>
+                <span class="fact-desc" :title="stmt.description">
+                  <template v-if="parseBankStatementDisplay(stmt.description).counterparty">
+                    <span class="fact-party">{{ parseBankStatementDisplay(stmt.description).counterparty }}</span>
+                    <template v-if="parseBankStatementDisplay(stmt.description).summary">
+                      <span class="fact-sep">·</span>
+                      <span class="fact-summary">{{ parseBankStatementDisplay(stmt.description).summary }}</span>
+                    </template>
+                  </template>
+                  <template v-else>{{ parseBankStatementDisplay(stmt.description).summary || stmt.description }}</template>
+                </span>
+              </div>
+              <div class="fact-meta">
+                <span v-if="parseBankStatementDisplay(stmt.description).channel" class="fact-channel">
+                  {{ parseBankStatementDisplay(stmt.description).channel }}
+                </span>
+                <span class="fact-date">{{ stmt.transaction_date ? stmt.transaction_date.slice(0, 10) : '未指定日期' }}</span>
+                <div class="fact-amount" :class="stmt.amount >= 0 ? 'income' : 'expense'">
+                  {{ stmt.amount >= 0 ? '+' : '' }}{{ formatMoney(stmt.amount) }}
+                </div>
+              </div>
+            </div>
+
+            <!-- 第二行：方案与核算依据 + 操作调整 -->
+            <div class="reconcile-row-detail">
+              <div class="reconcile-cell-plan">
+              <!-- Case 1: 匹配记账单据（支持 1:1 单票与 1:N 多票/多垫付合并核销） -->
+              <div v-if="getAiSuggestion(stmt.id)?.type === 'match'" class="plan-badge match">
+                <i class="ri-link-m" aria-hidden="true" style="font-size: 14px; color: var(--solo-primary);"></i>
+                <template v-if="(getAiSuggestion(stmt.id)?.matchedEntryIds?.length || 0) > 1">
+                  <span class="plan-label">合并核销 {{ getAiSuggestion(stmt.id)?.matchedEntryIds?.length }} 笔单据：</span>
+                  <span class="multi-match-chips">
+                    <NButton
+                      v-for="(item, idx) in (getAiSuggestion(stmt.id)?.matchedEntries || []).slice(0, 3)"
+                      :key="item.id || idx"
+                      text
+                      size="tiny"
+                      type="primary"
+                      class="feed-rec-link"
+                      @click="openVoucherModal(item.id)"
+                    >
+                      <strong>{{ item.title || item.id }}</strong>
+                    </NButton>
+                    <span
+                      v-if="(getAiSuggestion(stmt.id)?.matchedEntryIds?.length || 0) > 3"
+                      class="multi-match-more"
+                    >
+                      等 {{ getAiSuggestion(stmt.id)?.matchedEntryIds?.length }} 笔
+                    </span>
+                  </span>
+                </template>
+                <template v-else>
+                  <span class="plan-label">匹配单据：</span>
+                  <NButton
+                    text
+                    size="tiny"
+                    type="primary"
+                    class="feed-rec-link"
+                    @click="openVoucherModal(getAiSuggestion(stmt.id)?.matchedEntryId || getAiSuggestion(stmt.id)?.matchedEntryIds?.[0])"
+                  >
+                    <strong>{{ getAiSuggestion(stmt.id)?.matchedEntry?.title || getAiSuggestion(stmt.id)?.reason }}</strong>
+                  </NButton>
+                  <span v-if="matchAccountLabelOf(stmt)" class="plan-account-preview">
+                    <i class="ri-arrow-right-line" style="font-size: 11px;"></i>
+                    {{ matchAccountLabelOf(stmt) }}
+                  </span>
+                </template>
+                <span v-if="matchedFallbackCategoryOf(stmt)" class="plan-evidence-pill attention">
+                  <i class="ri-alert-line" style="font-size: 11px;"></i>
+                  <span>{{ suggestionBadgeLabel(stmt) }}</span>
+                </span>
+                <NTooltip
+                  v-if="getAiSuggestion(stmt.id)?.reason || matchCategoryBasisOf(stmt)"
+                  trigger="hover"
+                  placement="top"
+                  :style="{ maxWidth: '380px' }"
+                >
+                  <template #trigger>
+                    <span class="plan-reason-hint" aria-label="科目与匹配依据">
+                      <i class="ri-information-line"></i>
+                    </span>
+                  </template>
+                  <div style="font-size: 12px; line-height: 1.5; color: rgba(255, 255, 255, 0.82);">
+                    <template v-if="matchCategoryBasisOf(stmt)">
+                      <div style="font-weight: 600; margin-bottom: 3px; color: var(--solo-bg-blue-soft);">科目归类依据</div>
+                      <div>{{ matchCategoryBasisOf(stmt) }}</div>
+                    </template>
+                    <template v-if="getAiSuggestion(stmt.id)?.reason">
+                      <div
+                        style="font-weight: 600; margin-bottom: 3px; color: var(--solo-bg-blue-soft);"
+                        :style="matchCategoryBasisOf(stmt) ? { marginTop: '6px' } : undefined"
+                      >
+                        流水匹配依据
+                      </div>
+                      <div>{{ getAiSuggestion(stmt.id)?.reason }}</div>
+                    </template>
+                  </div>
+                </NTooltip>
+              </div>
+
+              <!-- Case 2: 匹配未关联发票 -->
+              <div v-else-if="findMatchingInvoiceForStatement(stmt)" class="plan-badge match">
+                <i class="ri-file-list-3-line" style="font-size: 14px; color: var(--solo-primary);"></i>
+                <span class="plan-label">吻合发票：</span>
+                <strong class="ellipsis" :title="findMatchingInvoiceForStatement(stmt)?.title" style="max-width: 180px;">
+                  {{ findMatchingInvoiceForStatement(stmt)?.title }}
+                </strong>
+                <span style="font-size: 11px; color: var(--solo-text-muted);">({{ formatMoney(findMatchingInvoiceForStatement(stmt)?.amount || 0) }})</span>
+              </div>
+
+              <!-- Case 3a: 多义项候选（白话在前 + 去重轻视觉科目在后 + 选中项一句白话后果说明） -->
+              <div
+                v-else-if="getAiSuggestion(stmt.id)?.suggestedEntry?.category && ambiguityGroupOf(stmt).length"
+                class="plan-ambiguity-stack"
+              >
+                <div class="plan-alternatives">
+                  <span class="plan-label">请确认用途：</span>
+                  <button
+                    v-for="altCat in ambiguityGroupOf(stmt)"
+                    :key="altCat"
+                    type="button"
+                    class="plan-alt-chip"
+                    :class="{ selected: effectiveSuggestion(stmt)?.suggestedEntry?.category === altCat }"
+                    :title="categoryPlainHint(altCat) || undefined"
+                    @click="rowCategoryChoice[stmt.id] = altCat"
+                  >
+                    <i
+                      v-if="effectiveSuggestion(stmt)?.suggestedEntry?.category === altCat"
+                      class="ri-check-line"
+                      style="font-size: 11px;"
+                    ></i>
+                    <span>{{ altCat }}</span>
+                    <span
+                      v-if="formatAccountPreviewLabel(altCat, suggestionAccountPreview(stmt, altCat))"
+                      class="plan-alt-account"
+                    >{{ formatAccountPreviewLabel(altCat, suggestionAccountPreview(stmt, altCat)) }}</span>
+                  </button>
+                  <button type="button" class="plan-ask-ai" @click="openAskAi(stmt)">
+                    <i class="ri-chat-sm-2-line" style="font-size: 12px;"></i> 问 AI
+                  </button>
+                  <NTooltip trigger="hover" placement="top" :style="{ maxWidth: '360px' }">
+                    <template #trigger>
+                      <span class="plan-reason-hint" aria-label="记账依据分析">
+                        <i class="ri-information-line"></i>
+                      </span>
+                    </template>
+                    <div style="font-size: 12px; line-height: 1.5; color: rgba(255, 255, 255, 0.82);">
+                      <div style="font-weight: 600; margin-bottom: 3px; color: var(--solo-bg-blue-soft);">
+                        记账依据分析 · {{ suggestionBadgeLabel(stmt) }}
+                      </div>
+                      <div>{{ getAiSuggestion(stmt.id)?.reason || '系统根据往来特征与账目特征智能匹配' }}</div>
+                    </div>
+                  </NTooltip>
+                </div>
+                <div
+                  v-if="getPayrollSettlement(stmt)?.reason || categoryPlainHint(effectiveSuggestion(stmt)?.suggestedEntry?.category)"
+                  class="plan-plain-hint"
+                >
+                  {{ getPayrollSettlement(stmt)?.reason || categoryPlainHint(effectiveSuggestion(stmt)?.suggestedEntry?.category) }}
+                </div>
+              </div>
+
+              <!-- Case 3b: 单义建议分类（带 Tooltip 解释） -->
+              <div
+                v-else-if="getAiSuggestion(stmt.id)?.suggestedEntry?.category"
+                class="plan-badge"
+                :class="isFallbackSuggestion(stmt) ? 'fallback' : 'standard'"
+              >
+                <span class="plan-label">{{ isFallbackSuggestion(stmt) ? '系统兜底分类：' : '建议分类：' }}</span>
+                <strong class="plan-category">{{ effectiveSuggestion(stmt)?.suggestedEntry?.category }}</strong>
+                <span
+                  v-if="formatAccountPreviewLabel(effectiveSuggestion(stmt)?.suggestedEntry?.category, suggestionAccountPreview(stmt))"
+                  class="plan-account-preview"
+                >
+                  <i class="ri-arrow-right-line" style="font-size: 11px;"></i>
+                  {{ formatAccountPreviewLabel(effectiveSuggestion(stmt)?.suggestedEntry?.category, suggestionAccountPreview(stmt)) }}
+                </span>
+
+                <NTooltip trigger="hover" placement="top" :style="{ maxWidth: '360px' }">
+                  <template #trigger>
+                    <span
+                      class="plan-evidence-pill"
+                      :class="
+                        isFallbackSuggestion(stmt)
+                          || ['opening_balance_missing', 'salary_module_required'].includes(getPayrollSettlement(stmt)?.mode)
+                          ? 'attention'
+                          : getAiSuggestion(stmt.id)?.rule === 'company_memory_rule'
+                            ? 'memory-rule'
+                            : 'verified'
+                      "
+                    >
+                      <i
+                        :class="
+                          isFallbackSuggestion(stmt)
+                            || ['opening_balance_missing', 'salary_module_required'].includes(getPayrollSettlement(stmt)?.mode)
+                            ? 'ri-alert-line'
+                            : getAiSuggestion(stmt.id)?.rule === 'company_memory_rule'
+                              ? 'ri-bookmark-3-line'
+                              : 'ri-shield-check-line'
+                        "
+                        style="font-size: 11px;"
+                      ></i>
+                      <span>{{ suggestionBadgeLabel(stmt) }}</span>
+                    </span>
+                  </template>
+                  <div style="font-size: 12px; line-height: 1.5; color: rgba(255, 255, 255, 0.82);">
+                    <div style="font-weight: 600; margin-bottom: 3px; color: var(--solo-bg-blue-soft);">记账依据分析</div>
+                    <div>{{ getAiSuggestion(stmt.id)?.reason || '系统根据往来特征与账目特征智能匹配' }}</div>
+                  </div>
+                </NTooltip>
+              </div>
+
+              <!-- Case 4: 无推荐分类（区分分析加载中与需人工/AI协助） -->
+              <div v-else class="plan-alternatives">
+                <div class="plan-badge none">
+                  <i :class="aiSuggestionsLoading ? 'ri-loader-4-line' : 'ri-question-line'" style="font-size: 13px;"></i>
+                  <span class="plan-label">{{ aiSuggestionsLoading ? 'AI 正在分析推荐分类...' : '待指定核算科目' }}</span>
+                </div>
+                <button v-if="!aiSuggestionsLoading" type="button" class="plan-ask-ai" @click="openAskAi(stmt)">
+                  <i class="ri-chat-sm-2-line" style="font-size: 12px;"></i> 问 AI
+                </button>
+              </div>
+              <!-- 匹配单据的一句话来源与确认后果说明（避免只有「确认配对」按钮显得突兀） -->
+              <div
+                v-if="getAiSuggestion(stmt.id)?.type === 'match' && !invoiceReimbursementOf(stmt) && matchExplanationOf(stmt)"
+                class="plan-plain-hint"
+                style="margin-top: 4px;"
+              >
+                {{ matchExplanationOf(stmt) }}
+              </div>
+              <!-- 垫付报销：不替老板断言「可冲减」，只把欠款来源说清并问一句白话 -->
+              <div v-if="advancePayableOf(stmt)" class="plan-advance-payable">
+                <i class="ri-question-line" aria-hidden="true"></i>
+                <span>
+                  {{ advancePayableOf(stmt).kind === 'opening' ? '建账时你欠' : '账上还欠' }}
+                  「{{ advancePayableOf(stmt).accountName }} · {{ advancePayableOf(stmt).counterparty }}」
+                  <strong>¥{{ advancePayableOf(stmt).available }}</strong>
+                  <template v-if="advancePayableSourceText(stmt)">（{{ advancePayableSourceText(stmt) }}）</template>。
+                  这笔是还他的垫付款吗？
+                </span>
+              </div>
+              <!-- 发票疑似个人垫付报销：引导先在下方「待确认单据」按统一流程确认垫付人与分类 -->
+              <div v-if="invoiceReimbursementOf(stmt)" class="plan-advance-payable is-warn">
+                <i class="ri-error-warning-line" aria-hidden="true"></i>
+                <span>
+                  付款对象是 <strong>{{ invoiceReimbursementOf(stmt).counterparty || '个人' }}</strong>，发票销方是 <strong>{{ invoiceReimbursementOf(stmt).sellerName }}</strong>——请先在下方「待确认单据」确认垫付人与用途分类，再回来一键配对。
+                </span>
+              </div>
+              <!-- 流水对方与发票销方不一致的兜底提醒 -->
+              <div
+                v-else-if="getAiSuggestion(stmt.id)?.type === 'match' && getAiSuggestion(stmt.id)?.counterpartyMismatch"
+                class="plan-advance-payable is-warn"
+              >
+                <i class="ri-error-warning-line" aria-hidden="true"></i>
+                <span>流水对方与发票{{ Number(stmt.amount || 0) > 0 ? '购方' : '销方' }}不一致，请核对后再确认配对。</span>
+              </div>
+              <!-- 对公发票仍归在兜底科目（其他支出）时的提醒：确认配对前先通过「修改单据」改具体科目 -->
+              <div
+                v-else-if="matchedFallbackCategoryOf(stmt)"
+                class="plan-advance-payable is-warn"
+              >
+                <i class="ri-error-warning-line" aria-hidden="true"></i>
+                <span v-if="(getAiSuggestion(stmt.id)?.matchedEntryIds?.length || 0) > 1">
+                  合并单据中有 {{ fallbackMatchedEntriesOf(stmt).length || (getAiSuggestion(stmt.id)?.matchedEntryIds?.length || 0) }} 笔仍归在兜底科目「其他支出」，请先点「修改待定单据」确认具体用途科目，再确认配对。
+                </span>
+                <span v-else>这张发票目前归在兜底科目「其他支出」，建议先点「修改单据」确认具体用途科目，再确认配对。</span>
+              </div>
+              </div>
+
+              <!-- 操作与调整区（左次右主：次级修改在左，主确认按钮固定最右对齐） -->
+              <div class="reconcile-cell-action">
+                <!-- 非配对场景次级入口：关联多票（有可用单据时）/ 改分类 -->
+                <NButton
+                  v-if="!hasExistingEntrySuggestion(stmt) && getMultiMatchCandidatesForStatement(stmt).length >= 1"
+                  size="small"
+                  tertiary
+                  class="reconcile-multi-btn"
+                  :disabled="quickSubmittingId === stmt.id"
+                  @click="openMultiMatchModal(stmt)"
+                >
+                  <template #icon><i class="ri-stack-line" aria-hidden="true" /></template>
+                  关联多票
+                </NButton>
+                <NButton
+                  v-if="advancePayableOf(stmt)"
+                  size="small"
+                  tertiary
+                  class="reconcile-new-expense-btn"
+                  :disabled="quickSubmittingId === stmt.id"
+                  @click="handleAdvanceAsNewExpense(stmt)"
+                >
+                  <template #icon><i class="ri-add-line" /></template>
+                  不是，新支出
+                </NButton>
+                <NButton
+                  v-if="!hasExistingEntrySuggestion(stmt)"
+                  size="small"
+                  tertiary
+                  class="reconcile-modify-btn"
+                  :disabled="quickSubmittingId === stmt.id"
+                  @click="openManualClassify(stmt, effectiveSuggestion(stmt)?.suggestedEntry)"
+                >
+                  <template #icon><i class="ri-edit-line" /></template>
+                  改分类<span class="sr-only">详细记账</span>
+                </NButton>
+                <!-- 已配对指向有效凭证（草稿可直接改；已过账可红冲重记）：确认前允许调整 -->
+                <NButton
+                  v-if="editableMatchedEntryOf(stmt)"
+                  size="small"
+                  tertiary
+                  class="reconcile-modify-btn"
+                  :disabled="quickSubmittingId === stmt.id"
+                  @click="openPendingEntryEdit(editableMatchedEntryOf(stmt))"
+                >
+                  <template #icon><i class="ri-edit-line" /></template>
+                  修改单据
+                </NButton>
+                <NButton
+                  v-else-if="fallbackMatchedEntriesOf(stmt).length > 0"
+                  size="small"
+                  tertiary
+                  class="reconcile-modify-btn"
+                  :disabled="quickSubmittingId === stmt.id"
+                  @click="openPendingEntryEdit(fallbackMatchedEntriesOf(stmt)[0], fallbackMatchedEntriesOf(stmt).slice(1))"
+                >
+                  <template #icon><i class="ri-edit-line" /></template>
+                  修改待定单据
+                </NButton>
+                <NButton
+                  v-if="hasExistingEntrySuggestion(stmt) && !invoiceReimbursementOf(stmt)"
+                  size="small"
+                  tertiary
+                  class="reconcile-modify-btn"
+                  :disabled="quickSubmittingId === stmt.id"
+                  @click="openManualClassify(stmt, null, { bypassMatch: true })"
+                >
+                  <template #icon><i class="ri-price-tag-3-line" /></template>
+                  不配对，改分类
+                </NButton>
+                <NButton
+                  v-if="getAiSuggestion(stmt.id)?.type === 'match' && (getAiSuggestion(stmt.id)?.matchedEntryIds?.length || 0) <= 1 && getMultiMatchCandidatesForStatement(stmt).length > 1"
+                  size="small"
+                  quaternary
+                  class="reconcile-detail-btn"
+                  @click="openMultiMatchModal(stmt, getAiSuggestion(stmt.id)?.matchedEntryIds || (getAiSuggestion(stmt.id)?.matchedEntryId ? [getAiSuggestion(stmt.id).matchedEntryId] : []))"
+                >
+                  <template #icon><i class="ri-arrow-left-right-line" /></template>
+                  换单据
+                </NButton>
+
+                <!-- 已匹配多张发票：这里是唯一能调整合并清单的入口。
+                     单笔匹配不再给「核对已有账目」：匹配单据标题本身可点开凭证弹窗，
+                     旧按钮只弹一句无落点的提示。 -->
+                <NButton
+                  v-if="(getAiSuggestion(stmt.id)?.matchedEntryIds?.length || 0) > 1"
+                  size="small"
+                  quaternary
+                  class="reconcile-detail-btn"
+                  @click="openMultiMatchModal(stmt, getAiSuggestion(stmt.id)?.matchedEntryIds || [])"
+                >
+                  <template #icon><i class="ri-link-m" /></template>
+                  调整多票勾选
+                </NButton>
+                <NButton
+                  v-if="matchUndoableEntries(stmt).length"
+                  size="small"
+                  quaternary
+                  type="error"
+                  @click="undoMatchEntry(stmt)"
+                >
+                  撤销原入账
+                </NButton>
+
+                <!-- 次级入口：确属公户直付而非个人报销时的退路 -->
+                <NButton
+                  v-if="getAiSuggestion(stmt.id)?.type === 'match' && invoiceReimbursementOf(stmt)"
+                  size="small"
+                  tertiary
+                  class="reconcile-modify-btn"
+                  :loading="quickSubmittingId === stmt.id"
+                  @click="handleAcceptSuggested(stmt)"
+                >
+                  按公户直付
+                </NButton>
+
+                <!-- 主确认按钮：固定最右侧对齐 -->
+                <NButton
+                  v-if="getAiSuggestion(stmt.id)?.type === 'match' && invoiceReimbursementOf(stmt)"
+                  size="small"
+                  type="primary"
+                  class="reconcile-primary-btn"
+                  @click="scrollToPendingEntry(invoiceReimbursementOf(stmt).entryId)"
+                >
+                  <template #icon><i class="ri-arrow-down-line" /></template>
+                  去下方确认发票
+                </NButton>
+                <NButton
+                  v-else-if="getAiSuggestion(stmt.id)?.type === 'match'"
+                  size="small"
+                  type="primary"
+                  secondary
+                  class="reconcile-primary-btn"
+                  :loading="quickSubmittingId === stmt.id"
+                  @click="handleAcceptSuggested(stmt)"
+                >
+                  确认配对
+                </NButton>
+                <NButton
+                  v-else-if="findMatchingInvoiceForStatement(stmt)"
+                  size="small"
+                  type="primary"
+                  secondary
+                  class="reconcile-primary-btn"
+                  :loading="quickSubmittingId === stmt.id"
+                  @click="handleMatchInvoiceDirect(stmt, findMatchingInvoiceForStatement(stmt)!)"
+                >
+                  关联发票
+                </NButton>
+                <NButton
+                  v-else-if="getPayrollSettlement(stmt)"
+                  size="small"
+                  :type="['salary_sheet', 'opening_balance'].includes(getPayrollSettlement(stmt).mode) ? 'primary' : 'warning'"
+                  :secondary="!['salary_sheet', 'opening_balance'].includes(getPayrollSettlement(stmt).mode)"
+                  class="reconcile-primary-btn"
+                  :loading="quickSubmittingId === stmt.id"
+                  @click="handlePayrollSettlementAction(stmt)"
+                >
+                  <template #icon>
+                    <i :class="['salary_sheet', 'opening_balance'].includes(getPayrollSettlement(stmt).mode) ? 'ri-check-line' : 'ri-arrow-right-up-line'" />
+                  </template>
+                  <template v-if="getPayrollSettlement(stmt).mode === 'salary_sheet'">
+                    核销 {{ getPayrollSettlement(stmt).month }} {{ getPayrollSettlement(stmt).label }}
+                  </template>
+                  <template v-else-if="getPayrollSettlement(stmt).mode === 'opening_balance'">
+                    冲销期初应付（{{ getPayrollSettlement(stmt).allocations?.length > 1 ? getPayrollSettlement(stmt).allocations.map((a: any) => a.accountCode).join('+') : getPayrollSettlement(stmt).accountCode }}）
+                  </template>
+                  <template v-else-if="getPayrollSettlement(stmt).mode === 'opening_balance_missing'">
+                    去期初设置补录
+                  </template>
+                  <template v-else>
+                    去工资表核对
+                  </template>
+                </NButton>
+                <NButton
+                  v-else-if="getAiSuggestion(stmt.id)?.suggestedEntry?.category"
+                  size="small"
+                  type="primary"
+                  class="reconcile-primary-btn"
+                  :loading="quickSubmittingId === stmt.id"
+                  @click="handleAcceptSuggested(stmt)"
+                >
+                  <template #icon><i class="ri-check-line" /></template>
+                  {{ advancePayableOf(stmt) ? '是，还他垫付款' : findRefundPairPartner(stmt) ? '一并冲抵入账' : isFallbackSuggestion(stmt) ? '按此入账' : '认可入账' }}
+                </NButton>
+              </div>
+            </div>
+            </div>
+          </template>
+        </div>
+
+        <!-- 当全月单据均已被上方银行流水认领时的简短状态说明，避免误以为单据凭空消失 -->
+        <div
+          v-if="pendingEntryList.length === 0 && bankMatchedPendingEntriesCount > 0 && unmatchedStatements.length > 0"
+          class="matched-pending-hint"
+        >
+          <i class="ri-links-line" aria-hidden="true"></i>
+          <span>另有 {{ bankMatchedPendingEntriesCount }} 笔发票/单据已在上方银行流水中自动匹配，确认流水即可一并核销。</span>
+        </div>
+
+        <!-- 待确认的发票与日常收支：仅列在上方公户流水尚未对上的孤儿单据，兜底确认垫付/挂账去向 -->
         <template v-if="pendingEntryList.length > 0">
-          <div class="feed-section-header">
+          <div class="feed-section-header" style="margin-top: 20px;">
             <div style="font-weight: 600; font-size: 14px; color: var(--solo-text-primary); display: flex; align-items: center; gap: 6px;">
               <i class="ri-file-list-3-line" style="color: var(--solo-primary);"></i>
               <span>待确认款项的单据 ({{ pendingEntryList.length }})</span>
             </div>
-            <span style="font-size: 12px; color: var(--solo-text-muted);">以下发票或日常收支在本月公户未找到对应流水，点一下确认实际收付情况即可自动入账</span>
+            <span style="font-size: 12px; color: var(--solo-text-muted);">
+              以下发票或日常收支在本月公户未找到对应流水，点一下确认实际收付情况即可自动入账
+              <template v-if="bankMatchedPendingEntriesCount > 0"> · 另有 {{ bankMatchedPendingEntriesCount }} 笔已在上方流水中自动匹配</template>
+            </span>
           </div>
           <NAlert v-if="monthStatements.length === 0" type="warning" :bordered="false" style="margin-bottom: 12px;">
             本月还没有导入公户流水，请先确认是否漏导银行流水；若确定是通过个人垫付或尚未收付款，请直接点选下方胶囊按钮。
@@ -1874,177 +2775,222 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
             <div
               v-for="entry in pendingEntryList"
               :key="entry.id"
+              :data-pending-entry-id="entry.id"
               class="pending-entry-card"
-              :class="{ 'pending-entry-card--expanded': expandedDispositionEntryId === entry.id }"
+              :class="{
+                'pending-entry-card--expanded': expandedDispositionEntryId === entry.id || expandedPriorPaidEntryId === entry.id,
+                'pending-entry-card--suggested': !!findStatementCandidateForEntry(entry) || !!priorPaidSuggestionOf(entry),
+              }"
             >
-              <div class="pending-entry-main">
-                <div class="pending-entry-title">
-                  <NTag v-if="entry.source === 'invoice_import' || entry.invoiceNumber" size="small" :bordered="false" :type="entry.direction === 'income' ? 'success' : 'warning'">
-                    {{ entry.direction === 'income' ? '销项发票' : '进项发票' }}
-                  </NTag>
-                  <NTag v-else size="small" :bordered="false" type="info">
-                    {{ entry.direction === 'income' ? '日常收入' : '日常支出' }}
-                  </NTag>
-                  <span class="pending-entry-date">{{ entry.date }}</span>
-                  <strong>{{ entry.title }}</strong>
+              <div class="pending-entry-header">
+                <div class="pending-entry-main">
+                  <div class="pending-entry-title">
+                    <NTag v-if="entry.source === 'invoice_import' || entry.invoiceNumber" size="small" :bordered="false" :type="entry.direction === 'income' ? 'success' : 'warning'">
+                      {{ entry.direction === 'income' ? '销项发票' : '进项发票' }}
+                    </NTag>
+                    <NTag v-else size="small" :bordered="false" type="info">
+                      {{ entry.direction === 'income' ? '日常收入' : '日常支出' }}
+                    </NTag>
+                    <strong>{{ entry.title }}</strong>
+                    <span class="pending-entry-date">{{ entry.date }}</span>
+                    <span class="pending-entry-category">用途分类：{{ entry.category || '日常经营' }}</span>
+                  </div>
                 </div>
-                <div class="pending-entry-meta">
-                  <span>用途分类：{{ entry.category || '日常经营' }}</span>
-                  <span v-if="findStatementCandidateForEntry(entry)" class="pending-entry-hint">
-                    {{ statementCandidateText(findStatementCandidateForEntry(entry)) }}
-                  </span>
-                  <span v-else class="pending-entry-hint muted">
-                    {{ entry.direction === 'income' ? '公户未查到该笔收款，请确认款项去向：' : '公户未查到该笔扣款，请确认谁付的钱：' }}
-                  </span>
+                <div class="pending-entry-amount" :class="entryIsOutflow(entry) ? 'expense' : 'income'">
+                  {{ entryIsOutflow(entry) ? '-' : '+' }}{{ formatMoney(Math.abs(Number(entry.amount) || 0)) }}
                 </div>
               </div>
-              <div class="pending-entry-amount" :class="entryIsOutflow(entry) ? 'expense' : 'income'">
-                {{ entryIsOutflow(entry) ? '-' : '+' }}{{ formatMoney(Math.abs(Number(entry.amount) || 0)) }}
-              </div>
-              <div class="pending-entry-actions">
+
+              <!-- 疑似对应当月银行流水：整行浅蓝建议条 + 唯一实心蓝主按钮，避免挤压标题与动作区 -->
+              <div v-if="findStatementCandidateForEntry(entry)" class="statement-match-suggestion">
+                <i class="ri-links-line" aria-hidden="true"></i>
+                <span class="pending-entry-hint">
+                  {{ statementCandidateText(findStatementCandidateForEntry(entry)) }}
+                </span>
                 <NButton
-                  v-if="findStatementCandidateForEntry(entry)"
                   size="tiny"
                   round
                   type="primary"
-                  secondary
+                  :loading="quickSubmittingId === findStatementCandidateForEntry(entry)?.statement?.id"
                   @click="handleEntryPaid(entry)"
                 >关联疑似流水</NButton>
+              </div>
 
-                <!-- 手改分录入口：标题/分类/科目都可改，发票挂账草稿重算时保持贷 2241 挂账 -->
-                <NButton size="tiny" round type="primary" @click="openPendingEntryEdit(entry)">修改</NButton>
+              <!-- 先付款后收票：检测到前期已入账的付款凭证，整行建议挂接（本月不重复入账） -->
+              <div v-if="priorPaidSuggestionOf(entry)" class="prior-paid-suggestion">
+                <i class="ri-links-line" aria-hidden="true"></i>
+                <span>
+                  检测到该款项已于 {{ priorPaidSuggestionOf(entry)?.occurredOn?.slice(0, 10) }}
+                  入账「{{ priorPaidSuggestionOf(entry)?.summary }}」
+                </span>
+                <NButton
+                  size="tiny"
+                  round
+                  type="primary"
+                  :loading="priorPaidLinkingId === entry.id"
+                  @click="linkToPriorPayment(entry, priorPaidSuggestionOf(entry)!)"
+                >挂接到该凭证（不重复入账）</NButton>
+              </div>
 
-                <!-- 第一步：只确认「谁付的钱」，不落库；第二步在下方原地展开确认科目 -->
-                <template v-if="entry.direction === 'expense'">
-                  <NButton
-                    size="tiny"
-                    round
-                    secondary
-                    :class="{ 'disposition-chip--active': dispositionChoice[entry.id]?.payer === 'boss_personal' }"
-                    @click="beginDisposition(entry, { payer: 'boss_personal', label: '老板个人垫付（计入公司欠老板款，可免税转回私卡）' })"
-                  >老板垫付</NButton>
-                  <NDropdown
-                    trigger="click"
-                    :options="employeePayerOptions"
-                    @select="(key: string) => beginDisposition(entry, { payer: key, label: key.includes(':') ? `员工垫付（计入公司欠${key.split(':')[1]}报销款）` : '员工垫付（计入员工待报销款）' })"
-                  >
+              <div v-if="expandedDispositionEntryId !== entry.id" class="pending-entry-footer">
+                <div class="pending-entry-actions">
+                  <span class="pending-entry-hint muted">
+                    {{
+                      findStatementCandidateForEntry(entry) || priorPaidSuggestionOf(entry)
+                        ? '不是这笔？选其他去向：'
+                        : (entry.direction === 'income' ? '公户未查到该笔收款，请确认款项去向：' : '公户未查到该笔扣款，请确认谁付的钱：')
+                    }}
+                  </span>
+
+                  <!-- 第一步：只确认「谁付的钱」，不落库；第二步在下方原地展开确认科目 -->
+                  <template v-if="entry.direction === 'expense'">
                     <NButton
                       size="tiny"
                       round
                       secondary
-                      :class="{ 'disposition-chip--active': !!dispositionChoice[entry.id]?.payer?.startsWith('employee_personal') }"
+                      :class="{ 'disposition-chip--active': dispositionChoice[entry.id]?.payer === 'boss_personal' }"
+                      @click="beginDisposition(entry, { payer: 'boss_personal', label: '老板个人垫付（计入公司欠老板款，可免税转回私卡）' })"
+                    >老板垫付</NButton>
+                    <NDropdown
+                      trigger="click"
+                      :options="employeePayerOptions"
+                      @select="(key: string) => beginDisposition(entry, { payer: key, label: key.includes(':') ? `员工垫付（计入公司欠${key.split(':')[1]}报销款）` : '员工垫付（计入员工待报销款）' })"
                     >
-                      员工垫付 <i class="ri-arrow-down-s-line" style="font-size: 11px; margin-left: 2px;"></i>
-                    </NButton>
-                  </NDropdown>
-                  <NButton
-                    size="tiny"
-                    round
-                    secondary
-                    :class="{ 'disposition-chip--active': dispositionChoice[entry.id]?.paymentStatus === 'unpaid' }"
-                    @click="beginDisposition(entry, { paymentStatus: 'unpaid', label: '还没付款（计入应付供应商挂账）' })"
-                  >还没付款</NButton>
-                  <NButton
-                    size="tiny"
-                    round
-                    quaternary
-                    :class="{ 'disposition-chip--active': dispositionChoice[entry.id]?.payer === 'prepaid_deduct' }"
-                    @click="beginDisposition(entry, { payer: 'prepaid_deduct', label: '预存扣款（冲减前期预付余额）' })"
-                  >预存扣款</NButton>
-                </template>
+                      <NButton
+                        size="tiny"
+                        round
+                        secondary
+                        :class="{ 'disposition-chip--active': !!dispositionChoice[entry.id]?.payer?.startsWith('employee_personal') }"
+                      >
+                        员工垫付 <i class="ri-arrow-down-s-line" style="font-size: 11px; margin-left: 2px;"></i>
+                      </NButton>
+                    </NDropdown>
+                    <NButton
+                      size="tiny"
+                      round
+                      secondary
+                      :class="{ 'disposition-chip--active': dispositionChoice[entry.id]?.paymentStatus === 'unpaid' }"
+                      @click="beginDisposition(entry, { paymentStatus: 'unpaid', label: '还没付款（计入应付供应商挂账）' })"
+                    >还没付款</NButton>
+                    <NButton
+                      size="tiny"
+                      round
+                      secondary
+                      :class="{ 'disposition-chip--active': dispositionChoice[entry.id]?.payer === 'prepaid_deduct' }"
+                      @click="beginDisposition(entry, { payer: 'prepaid_deduct', label: '预存扣款（冲减前期预付余额）' })"
+                    >预存扣款</NButton>
+                    <!-- 发票专用的第 5 选项：钱在前期已付并已入账，把票挂回原凭证而不是再记一笔 -->
+                    <NButton
+                      v-if="entry.source === 'invoice_import' || entry.invoiceNumber"
+                      size="tiny"
+                      round
+                      secondary
+                      :loading="priorPaidCandidatesLoading"
+                      :class="{ 'disposition-chip--active': expandedPriorPaidEntryId === entry.id }"
+                      @click="expandedPriorPaidEntryId = expandedPriorPaidEntryId === entry.id ? null : entry.id"
+                    >前期已付款<i class="ri-arrow-down-s-line" style="font-size: 11px; margin-left: 2px;"></i></NButton>
+                  </template>
 
-                <!-- 收入（销项发票 / 日常收入手工账）胶囊选项 -->
-                <template v-else>
-                  <NButton
-                    size="tiny"
-                    round
-                    secondary
-                    :class="{ 'disposition-chip--active': dispositionChoice[entry.id]?.paymentStatus === 'unpaid' }"
-                    @click="beginDisposition(entry, { paymentStatus: 'unpaid', label: '客户未付款（计入客户应收欠款）' })"
-                  >客户未付款</NButton>
-                  <NButton
-                    size="tiny"
-                    round
-                    secondary
-                    :class="{ 'disposition-chip--active': dispositionChoice[entry.id]?.payer === 'boss_personal' }"
-                    @click="beginDisposition(entry, { payer: 'boss_personal', label: '老板私户代收（计入老板暂存公款）' })"
-                  >老板私户收</NButton>
-                  <NButton
-                    size="tiny"
-                    round
-                    secondary
-                    :class="{ 'disposition-chip--active': dispositionChoice[entry.id]?.payer === 'platform_balance' }"
-                    @click="beginDisposition(entry, { payer: 'platform_balance', label: '在平台未提现（计入平台待提现余额）' })"
-                  >在平台未提现</NButton>
-                  <NButton
-                    size="tiny"
-                    round
-                    quaternary
-                    :class="{ 'disposition-chip--active': dispositionChoice[entry.id]?.payer === 'advance_offset' }"
-                    @click="beginDisposition(entry, { payer: 'advance_offset', label: '冲前期预收（核销前期预收客户款）' })"
-                  >冲前期预收</NButton>
-                </template>
+                  <!-- 收入（销项发票 / 日常收入手工账）胶囊选项 -->
+                  <template v-else>
+                    <NButton
+                      size="tiny"
+                      round
+                      secondary
+                      :class="{ 'disposition-chip--active': dispositionChoice[entry.id]?.paymentStatus === 'unpaid' }"
+                      @click="beginDisposition(entry, { paymentStatus: 'unpaid', label: '客户未付款（计入客户应收欠款）' })"
+                    >客户未付款</NButton>
+                    <NButton
+                      size="tiny"
+                      round
+                      secondary
+                      :class="{ 'disposition-chip--active': dispositionChoice[entry.id]?.payer === 'boss_personal' }"
+                      @click="beginDisposition(entry, { payer: 'boss_personal', label: '老板私户代收（计入老板暂存公款）' })"
+                    >老板私户收</NButton>
+                    <NButton
+                      size="tiny"
+                      round
+                      secondary
+                      :class="{ 'disposition-chip--active': dispositionChoice[entry.id]?.payer === 'platform_balance' }"
+                      @click="beginDisposition(entry, { payer: 'platform_balance', label: '在平台未提现（计入平台待提现余额）' })"
+                    >在平台未提现</NButton>
+                    <NButton
+                      size="tiny"
+                      round
+                      secondary
+                      :class="{ 'disposition-chip--active': dispositionChoice[entry.id]?.payer === 'advance_offset' }"
+                      @click="beginDisposition(entry, { payer: 'advance_offset', label: '冲前期预收（核销前期预收客户款）' })"
+                    >冲前期预收</NButton>
+                  </template>
+                </div>
+
+                <!-- 手改分录入口降为轻量文字/幽灵按钮并右置，不再抢主 CTA 视觉权重 -->
+                <NButton size="tiny" quaternary class="pending-entry-edit-btn" @click="openPendingEntryEdit(entry)">
+                  <template #icon><i class="ri-edit-line" /></template>
+                  修改
+                </NButton>
               </div>
 
-              <!-- 第二步：像待处理银行流水一样，先看建议科目与借贷，再「认可入账」 -->
+              <!-- 前期已付款候选列表：弱匹配/多候选时展开逐条挑，空列表说明前期没有等额付款 -->
+              <div v-if="expandedPriorPaidEntryId === entry.id" class="prior-paid-panel">
+                <div v-if="priorPaidListFor(entry).length === 0" class="prior-paid-empty">
+                  未找到金额一致的前期已入账款项。若确定已在前期付款，请先检查前期流水是否已导入并入账；否则请选择上方付款方式。
+                </div>
+                <div
+                  v-for="candidate in priorPaidListFor(entry)"
+                  :key="candidate.entryId"
+                  class="prior-paid-item"
+                >
+                  <div class="prior-paid-item-main">
+                    <strong>{{ priorPaidCandidateTitle(candidate) }}</strong>
+                    <span class="prior-paid-item-desc">{{ candidate.statementDescription || candidate.summary }}</span>
+                  </div>
+                  <NButton
+                    size="tiny"
+                    round
+                    type="primary"
+                    secondary
+                    :loading="priorPaidLinkingId === entry.id"
+                    @click="linkToPriorPayment(entry, candidate)"
+                  >挂接</NButton>
+                </div>
+              </div>
+
+              <!-- 第二步：原地接管底部操作栏，合并去向、分类与单行分录预览 -->
               <div v-if="expandedDispositionEntryId === entry.id" class="pending-entry-plan">
                 <div class="pending-entry-plan-head">
-                  <span class="pending-entry-plan-title">
-                    第二步：这笔算什么{{ entry.direction === 'income' ? '收入' : '支出' }}
-                  </span>
-                  <NTag size="small" :bordered="false" type="info">
-                    {{ dispositionChoice[entry.id]?.label || '已选付款方式' }}
-                  </NTag>
-                  <NButton text size="tiny" @click="cancelDisposition(entry)">更改付款人</NButton>
-                </div>
-                <div class="pending-entry-plan-category">
-                  <span class="plan-label">建议分类</span>
-                  <strong>{{ dispositionPreview[entry.id]?.category || entry.category || '日常经营' }}</strong>
-                  <NTag
-                    v-if="dispositionPreview[entry.id]?.preview?.source === 'fallback'"
-                    size="tiny"
-                    :bordered="false"
-                    type="warning"
-                  >兜底科目，建议换分类</NTag>
-                  <NTag
-                    v-else-if="dispositionRecommendationReason(entry)"
-                    size="tiny"
-                    :bordered="false"
-                    type="success"
-                  >
-                    AI 建议：{{ dispositionRecommendationReason(entry) }}
-                  </NTag>
-                  <NTag v-else size="tiny" :bordered="false">当前分类</NTag>
-                  <span v-if="dispositionRecommendation[entry.id] === 'loading'" class="plan-muted">AI 正在看这张票…</span>
-                </div>
-                <div class="pending-entry-plan-lines">
-                  <NSpin v-if="dispositionPreview[entry.id]?.loading" size="small" />
-                  <template v-else-if="dispositionPreviewOf(entry)">
-                    <div
-                      v-for="line in dispositionPreviewDebitLines(entry)"
-                      :key="`d-${line.accountCode}`"
-                      class="plan-line"
+                  <div class="pending-entry-plan-payer">
+                    <span class="plan-label">已选去向</span>
+                    <NTag size="small" :bordered="false" type="info">
+                      {{ dispositionChoice[entry.id]?.label || '已选付款方式' }}
+                    </NTag>
+                    <NButton text size="tiny" type="primary" @click="cancelDisposition(entry)">更改付款人</NButton>
+                  </div>
+                  <div class="pending-entry-plan-category">
+                    <span class="plan-label">记入分类</span>
+                    <NSelect
+                      :value="dispositionCategorySelected[entry.id]"
+                      :options="dispositionCategorySelectGroups(entry)"
+                      placeholder="换分类"
+                      size="small"
+                      class="plan-category-select"
+                      :menu-props="CATEGORY_MENU_PROPS"
+                      @update:value="(value: string) => setDispositionCategory(entry, value)"
+                    />
+                    <NTag
+                      v-if="dispositionPreview[entry.id]?.preview?.source === 'fallback'"
+                      size="tiny"
+                      :bordered="false"
+                      type="warning"
+                    >兜底科目，建议换分类</NTag>
+                    <span
+                      v-else-if="dispositionRecommendationReason(entry)"
+                      class="plan-ai-reason"
                     >
-                      <span class="plan-side debit">借</span>
-                      <span class="plan-code">{{ line.accountCode }}</span>
-                      <span class="plan-name">{{ line.accountName }}</span>
-                      <span v-if="line.partnerName" class="plan-partner">往来：{{ line.partnerName }}</span>
-                      <span class="plan-amount">¥{{ line.amount }}</span>
-                    </div>
-                    <div
-                      v-for="line in dispositionPreviewCreditLines(entry)"
-                      :key="`c-${line.accountCode}`"
-                      class="plan-line"
-                    >
-                      <span class="plan-side credit">贷</span>
-                      <span class="plan-code">{{ line.accountCode }}</span>
-                      <span class="plan-name">{{ line.accountName }}</span>
-                      <span v-if="line.partnerName" class="plan-partner">往来：{{ line.partnerName }}</span>
-                      <span class="plan-amount">¥{{ line.amount }}</span>
-                    </div>
-                  </template>
-                  <div v-else class="plan-error">
-                    {{ dispositionPreview[entry.id]?.error || '暂时无法预览科目' }}
+                      <i class="ri-sparkling-line" aria-hidden="true" />
+                      AI 建议：{{ dispositionRecommendationReason(entry) }}
+                    </span>
+                    <span v-if="dispositionRecommendation[entry.id] === 'loading'" class="plan-muted">AI 正在看这张票…</span>
                   </div>
                 </div>
                 <div v-if="dispositionPreview[entry.id]?.preview?.willReverse" class="plan-note">
@@ -2056,23 +3002,63 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
                   class="plan-note warning"
                 >{{ warning.message }}</div>
                 <div class="pending-entry-plan-controls">
-                  <NSelect
-                    :value="dispositionCategorySelected[entry.id]"
-                    :options="dispositionCategorySelectGroups(entry)"
-                    placeholder="换分类"
-                    size="small"
-                    style="width: 220px;"
-                    :menu-props="CATEGORY_MENU_PROPS"
-                    @update:value="(value: string) => setDispositionCategory(entry, value)"
-                  />
-                  <NButton
-                    size="small"
-                    type="primary"
-                    :loading="dispositionSubmittingId === entry.id"
-                    :disabled="!!dispositionPreview[entry.id]?.loading"
-                    @click="acceptPendingDisposition(entry)"
-                  >认可入账</NButton>
-                  <NButton size="small" secondary @click="openPendingEntryEdit(entry)">详细记账</NButton>
+                  <div class="pending-entry-plan-lines">
+                    <NSpin v-if="dispositionPreview[entry.id]?.loading" size="small" />
+                    <template v-else-if="dispositionPreviewOf(entry)">
+                      <template v-if="dispositionPreviewDebitLines(entry).length === 1 && dispositionPreviewCreditLines(entry).length === 1">
+                        <span class="plan-line is-compact">
+                          <span class="plan-side debit">借</span>
+                          <span class="plan-code">{{ dispositionPreviewDebitLines(entry)[0].accountCode }}</span>
+                          <span class="plan-name">{{ dispositionPreviewDebitLines(entry)[0].accountName }}</span>
+                          <span v-if="dispositionPreviewDebitLines(entry)[0].partnerName" class="plan-partner">（往来：{{ dispositionPreviewDebitLines(entry)[0].partnerName }}）</span>
+                        </span>
+                        <i class="ri-arrow-right-line plan-line-arrow" aria-hidden="true" />
+                        <span class="plan-line is-compact">
+                          <span class="plan-side credit">贷</span>
+                          <span class="plan-code">{{ dispositionPreviewCreditLines(entry)[0].accountCode }}</span>
+                          <span class="plan-name">{{ dispositionPreviewCreditLines(entry)[0].accountName }}</span>
+                          <span v-if="dispositionPreviewCreditLines(entry)[0].partnerName" class="plan-partner">（往来：{{ dispositionPreviewCreditLines(entry)[0].partnerName }}）</span>
+                        </span>
+                      </template>
+                      <div v-else class="plan-lines-stack">
+                        <div
+                          v-for="line in dispositionPreviewDebitLines(entry)"
+                          :key="`d-${line.accountCode}`"
+                          class="plan-line"
+                        >
+                          <span class="plan-side debit">借</span>
+                          <span class="plan-code">{{ line.accountCode }}</span>
+                          <span class="plan-name">{{ line.accountName }}</span>
+                          <span v-if="line.partnerName" class="plan-partner">（往来：{{ line.partnerName }}）</span>
+                          <span class="plan-amount">{{ formatMoney(Number(line.amount) || 0) }}</span>
+                        </div>
+                        <div
+                          v-for="line in dispositionPreviewCreditLines(entry)"
+                          :key="`c-${line.accountCode}`"
+                          class="plan-line"
+                        >
+                          <span class="plan-side credit">贷</span>
+                          <span class="plan-code">{{ line.accountCode }}</span>
+                          <span class="plan-name">{{ line.accountName }}</span>
+                          <span v-if="line.partnerName" class="plan-partner">（往来：{{ line.partnerName }}）</span>
+                          <span class="plan-amount">{{ formatMoney(Number(line.amount) || 0) }}</span>
+                        </div>
+                      </div>
+                    </template>
+                    <div v-else class="plan-error">
+                      {{ dispositionPreview[entry.id]?.error || '暂时无法预览科目' }}
+                    </div>
+                  </div>
+                  <div class="pending-entry-plan-actions">
+                    <NButton size="small" secondary @click="openPendingEntryEdit(entry)">修改单据</NButton>
+                    <NButton
+                      size="small"
+                      type="primary"
+                      :loading="dispositionSubmittingId === entry.id"
+                      :disabled="!!dispositionPreview[entry.id]?.loading"
+                      @click="acceptPendingDisposition(entry)"
+                    >认可入账</NButton>
+                  </div>
                 </div>
                 <!-- 研发归集：账号内有覆盖本月的有效项目时常驻，选中分类即就地补明细 -->
                 <div
@@ -2118,7 +3104,7 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
                     />
                   </div>
                   <div class="pending-entry-rd-note">
-                    按凭证金额 100% 直接归集。多项目分摊请用「详细记账」拆分金额与分摊方法。
+                    按凭证金额 100% 直接归集。多项目分摊请用「修改单据」拆分金额与分摊方法。
                   </div>
                 </div>
               </div>
@@ -2127,27 +3113,37 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
         </template>
 
         <!-- 已确认去向的单据（展示大白话入账结果，消灭糊涂账） -->
-        <div v-if="confirmedExceptionEntries.length > 0" style="margin-bottom: 20px;">
+        <div v-if="confirmedExceptionEntries.length > 0" style="margin-top: 20px; margin-bottom: 4px;">
           <NCollapse>
             <NCollapseItem :title="`已确认入账去向的单据 (${confirmedExceptionEntries.length})`" name="confirmed_dispositions">
               <template #header-extra>
                 <span style="font-size: 12px; color: var(--solo-text-muted);">已自动归入对应往来账本；未过账记录可重新选择</span>
               </template>
               <div class="pending-entry-list" style="margin-top: 8px;">
-                <div v-for="entry in confirmedExceptionEntries" :key="entry.id" class="pending-entry-card" style="opacity: 0.92; background: var(--solo-card-bg, #fff);">
+                <div v-for="entry in confirmedExceptionEntries" :key="entry.id" class="pending-entry-card pending-entry-card--compact" style="opacity: 0.92;">
                   <div class="pending-entry-main">
                     <div class="pending-entry-title">
                       <NTag size="small" :bordered="false" type="info">{{ entry.source === 'invoice_import' ? '发票' : '账目' }}</NTag>
                       <span class="pending-entry-date">{{ entry.date }}</span>
                       <strong>{{ entry.title }}</strong>
                       <NTag size="small" type="success" :bordered="false" style="margin-left: 8px;">
-                        {{ formatDispositionTag(entry) }}
+                        {{ formatDispositionTag(entry) }}<template v-if="isSettledAsOfMonth(entry, targetMonth)"> · {{ entry.paymentStatus === 'unpaid' ? '已核销' : '已报销' }}</template>
                       </NTag>
                     </div>
                     <div class="pending-entry-meta">
                       <span>{{ entry.category || '日常经营' }}</span>
-                      <span style="color: var(--solo-primary); font-weight: 500;">
-                        · {{ formatDispositionExplanation(entry) }}
+                      <span
+                        :style="{
+                          color: isSettledAsOfMonth(entry, targetMonth) ? 'var(--solo-income)' : 'var(--solo-primary)',
+                          fontWeight: 500,
+                        }"
+                      >
+                        <template v-if="isSettledAsOfMonth(entry, targetMonth)">
+                          · 已于 {{ entry.paymentDate || targetMonth }} 核销结清
+                        </template>
+                        <template v-else>
+                          · {{ formatDispositionExplanation(entry) }}
+                        </template>
                       </span>
                     </div>
                   </div>
@@ -2172,299 +3168,12 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
           </NCollapse>
         </div>
 
-        <!-- Pending Statements Feed -->
-        <div class="feed-section-header" style="flex-wrap: wrap; gap: 10px;">
-          <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
-            <div style="font-weight: 600; font-size: 14px; color: var(--solo-text-primary); display: flex; align-items: center; gap: 6px;">
-              <i class="ri-time-line" style="color: var(--solo-primary);"></i>
-              <span>待处理银行流水 ({{ unmatchedStatements.length }})</span>
-            </div>
-            <div v-if="unmatchedStatements.length > 0" class="tier-filter-pills">
-              <button
-                type="button"
-                class="tier-pill"
-                :class="{ active: statementTierFilter === 'all' }"
-                @click="statementTierFilter = 'all'"
-              >
-                全部 ({{ unmatchedStatements.length }})
-              </button>
-              <button
-                type="button"
-                class="tier-pill"
-                :class="{ active: statementTierFilter === 'ready' }"
-                @click="statementTierFilter = 'ready'"
-              >
-                已识别 ({{ unmatchedStatements.length - attentionStatements.length }})
-              </button>
-              <button
-                v-if="attentionStatements.length > 0"
-                type="button"
-                class="tier-pill attention"
-                :class="{ active: statementTierFilter === 'attention' }"
-                @click="statementTierFilter = 'attention'"
-              >
-                疑义待定 ({{ attentionStatements.length }})
-              </button>
-            </div>
-          </div>
-          <div v-if="unmatchedStatements.length > 0" style="display: flex; align-items: center; gap: 14px; flex-wrap: wrap;">
-            <NCheckbox
-              v-if="selectableBatchStatements.length > 0"
-              size="small"
-              :checked="allSelectableChecked"
-              :indeterminate="someSelectableChecked"
-              @update:checked="toggleSelectAllStatements"
-            >
-              <span style="font-size: 12px; color: var(--solo-text-secondary);">全选可确认 ({{ selectableBatchStatements.length }})</span>
-            </NCheckbox>
-            <NTooltip trigger="hover" placement="top" :style="{ maxWidth: '320px' }">
-              <template #trigger>
-                <span>
-                  <NCheckbox v-model:checked="rememberRuleOnConfirm" size="small">
-                    <span style="font-size: 12px; color: var(--solo-text-secondary);">记住此规则（相同对方/摘要自动入账）</span>
-                  </NCheckbox>
-                </span>
-              </template>
-              勾选后，确认或调整某笔流水的入账科目时，系统会自动记住该对方户名或摘要特征；后续导入同类流水将直接按 98% 记忆规则自动归类。
-            </NTooltip>
-          </div>
-        </div>
-
-        <!-- Empty state -->
-        <div v-if="unmatchedStatements.length === 0" class="feed-empty-box">
-          <i class="ri-shield-check-line feed-empty-icon"></i>
-          <div style="font-size: 15px; font-weight: 600; color: var(--solo-text-primary); margin-top: 8px;">
-            本月所有银行流水已处理完成
-          </div>
-          <div style="font-size: 12px; color: var(--solo-text-muted); margin-top: 4px;">
-            资金进出已 100% 对应入账，可直接进入下一步进行关账合规检查。
-          </div>
-        </div>
-
-        <!-- Statement Cards List (Compact Reconcile Feed) -->
-        <div v-else class="feed-card-list">
-          <div
-            v-for="stmt in filteredUnmatchedStatements"
-            :key="stmt.id"
-            class="feed-card reconcile-row"
-            :class="{
-              'high-conf': (getAiSuggestion(stmt.id)?.confidence || 0) >= 0.95 && !isNeedsAttentionStatement(stmt),
-              'needs-attention': isNeedsAttentionStatement(stmt),
-            }"
-          >
-            <!-- 事实区：批量勾选 + 方向Tag + 日期 + 交易对方与附言 + 金额 -->
-            <div class="reconcile-cell-fact">
-              <div class="fact-lead">
-                <NCheckbox
-                  size="small"
-                  :checked="selectedStatementIds.includes(stmt.id)"
-                  :disabled="!isSelectableForBatch(stmt)"
-                  @update:checked="(val: boolean) => toggleStatementSelection(stmt.id, val)"
-                />
-                <NTag
-                  size="small"
-                  :type="stmt.amount >= 0 ? 'success' : 'error'"
-                  :bordered="false"
-                  style="font-weight: 600; flex-shrink: 0;"
-                >
-                  {{ stmt.amount >= 0 ? '收款' : '付款' }}
-                </NTag>
-                <span class="fact-date">{{ stmt.transaction_date ? stmt.transaction_date.slice(0, 10) : '未指定日期' }}</span>
-                <span class="fact-desc" :title="stmt.description">{{ stmt.description }}</span>
-              </div>
-              <div class="fact-amount" :class="stmt.amount >= 0 ? 'income' : 'expense'">
-                {{ stmt.amount >= 0 ? '+' : '' }}{{ formatMoney(stmt.amount) }}
-              </div>
-            </div>
-
-            <!-- 第二行：方案与核算依据 + 操作调整 -->
-            <div class="reconcile-row-detail">
-              <div class="reconcile-cell-plan">
-              <!-- Case 1: 匹配记账单据 -->
-              <div v-if="getAiSuggestion(stmt.id)?.type === 'match'" class="plan-badge match">
-                <i class="ri-link-m" style="font-size: 14px; color: var(--solo-primary);"></i>
-                <span class="plan-label">匹配单据：</span>
-                <NButton
-                  text
-                  size="tiny"
-                  type="primary"
-                  class="feed-rec-link"
-                  @click="openVoucherModal(getAiSuggestion(stmt.id)?.matchedEntryId || getAiSuggestion(stmt.id)?.matchedEntryIds?.[0])"
-                >
-                  <strong>{{ getAiSuggestion(stmt.id)?.matchedEntry?.title || getAiSuggestion(stmt.id)?.reason }}</strong>
-                </NButton>
-              </div>
-
-              <!-- Case 2: 匹配未关联发票 -->
-              <div v-else-if="findMatchingInvoiceForStatement(stmt)" class="plan-badge match">
-                <i class="ri-file-list-3-line" style="font-size: 14px; color: var(--solo-primary);"></i>
-                <span class="plan-label">吻合发票：</span>
-                <strong class="ellipsis" :title="findMatchingInvoiceForStatement(stmt)?.title" style="max-width: 180px;">
-                  {{ findMatchingInvoiceForStatement(stmt)?.title }}
-                </strong>
-                <span style="font-size: 11px; color: var(--solo-text-muted);">({{ formatMoney(findMatchingInvoiceForStatement(stmt)?.amount || 0) }})</span>
-              </div>
-
-              <!-- Case 3: 建议分类（带 Tooltip 解释） -->
-              <div
-                v-else-if="getAiSuggestion(stmt.id)?.suggestedEntry?.category"
-                class="plan-badge"
-                :class="isFallbackSuggestion(stmt) ? 'fallback' : 'standard'"
-              >
-                <span class="plan-label">{{ isFallbackSuggestion(stmt) ? '系统兜底分类：' : '建议分类：' }}</span>
-                <strong class="plan-category">{{ effectiveSuggestion(stmt)?.suggestedEntry?.category }}</strong>
-                <span v-if="suggestionAccountPreview(stmt)" class="plan-account-preview">
-                  <i class="ri-arrow-right-line" style="font-size: 11px;"></i>
-                  {{ suggestionAccountPreview(stmt)!.name }} {{ suggestionAccountPreview(stmt)!.code }}
-                </span>
-
-                <NTooltip trigger="hover" placement="top" :style="{ maxWidth: '360px' }">
-                  <template #trigger>
-                    <span
-                      class="plan-evidence-pill"
-                      :class="
-                        isFallbackSuggestion(stmt)
-                          ? 'attention'
-                          : getAiSuggestion(stmt.id)?.rule === 'company_memory_rule'
-                            ? 'memory-rule'
-                            : 'verified'
-                      "
-                    >
-                      <i
-                        :class="
-                          isFallbackSuggestion(stmt)
-                            ? 'ri-alert-line'
-                            : getAiSuggestion(stmt.id)?.rule === 'company_memory_rule'
-                              ? 'ri-bookmark-3-line'
-                              : 'ri-shield-check-line'
-                        "
-                        style="font-size: 11px;"
-                      ></i>
-                      <span>{{ suggestionBadgeLabel(stmt) }}</span>
-                    </span>
-                  </template>
-                  <div style="font-size: 12px; line-height: 1.5;">
-                    <div style="font-weight: 600; margin-bottom: 3px; color: var(--solo-primary);">记账依据分析</div>
-                    <div>{{ getAiSuggestion(stmt.id)?.reason || '系统根据往来特征与账目特征智能匹配' }}</div>
-                  </div>
-                </NTooltip>
-              </div>
-
-              <!-- Case 4: 无推荐分类 -->
-              <div v-else class="plan-badge none">
-                <i class="ri-question-line" style="font-size: 13px;"></i>
-                <span class="plan-label">待指定核算科目</span>
-              </div>
-
-              <!-- 模糊分类候选：正确科目取决于账外事实，展开候选由用户点选；问 AI 仅分析不代操作。
-                   必须放在 Case 链之后——中间插入 v-if 会截断 v-if/v-else 链，让「待指定核算科目」误显 -->
-              <div v-if="ambiguityGroupOf(stmt).length" class="plan-alternatives">
-                <button
-                  v-for="altCat in ambiguityGroupOf(stmt)"
-                  :key="altCat"
-                  type="button"
-                  class="plan-alt-chip"
-                  :class="{ selected: effectiveSuggestion(stmt)?.suggestedEntry?.category === altCat }"
-                  @click="rowCategoryChoice[stmt.id] = altCat"
-                >
-                  {{ altCat }}<span v-if="altAccountText(stmt, altCat)" class="plan-alt-account">{{ altAccountText(stmt, altCat) }}</span>
-                </button>
-                <button type="button" class="plan-ask-ai" @click="openAskAi(stmt)">
-                  <i class="ri-chat-sm-2-line" style="font-size: 12px;"></i> 问 AI
-                </button>
-              </div>
-              </div>
-
-              <!-- 操作与调整区 -->
-              <div class="reconcile-cell-action">
-                <!-- 快捷选择科目 -->
-                <template v-if="!hasExistingEntrySuggestion(stmt)">
-                  <NSelect
-                    size="small"
-                    class="reconcile-category-select"
-                    placeholder="换分类..."
-                    :options="stmt.amount >= 0 ? bossIncomeOptions : bossExpenseOptions"
-                    :disabled="quickSubmittingId === stmt.id"
-                    :menu-props="CATEGORY_MENU_PROPS"
-                    @update:value="(val: string) => handleQuickSelectCategory(stmt, val)"
-                  />
-                </template>
-
-                <!-- 主确认按钮 -->
-                <NButton
-                  v-if="getAiSuggestion(stmt.id)?.type === 'match'"
-                  size="small"
-                  type="primary"
-                  secondary
-                  :loading="quickSubmittingId === stmt.id"
-                  @click="handleAcceptSuggested(stmt)"
-                >
-                  确认配对
-                </NButton>
-                <NButton
-                  v-else-if="findMatchingInvoiceForStatement(stmt)"
-                  size="small"
-                  type="primary"
-                  secondary
-                  :loading="quickSubmittingId === stmt.id"
-                  @click="handleMatchInvoiceDirect(stmt, findMatchingInvoiceForStatement(stmt)!)"
-                >
-                  关联发票
-                </NButton>
-                <NButton
-                  v-else-if="getAiSuggestion(stmt.id)?.suggestedEntry?.category"
-                  size="small"
-                  type="primary"
-                  :loading="quickSubmittingId === stmt.id"
-                  @click="handleAcceptSuggested(stmt)"
-                >
-                  <template #icon><i class="ri-check-line" /></template>
-                  {{ isFallbackSuggestion(stmt) ? '按此入账' : '认可入账' }}
-                </NButton>
-
-                <!-- 详细记账：完整表单（改标题/研发明细/二级科目），非配对场景的次级入口 -->
-                <NButton
-                  v-if="!hasExistingEntrySuggestion(stmt)"
-                  size="small"
-                  quaternary
-                  class="reconcile-detail-btn"
-                  @click="openManualClassify(stmt, getAiSuggestion(stmt.id)?.suggestedEntry)"
-                >
-                  <template #icon><i class="ri-edit-line" /></template>
-                  详细记账
-                </NButton>
-
-                <!-- 已有账目待配对：唯一入口（此时下拉已隐藏） -->
-                <NButton
-                  v-if="hasExistingEntrySuggestion(stmt)"
-                  size="small"
-                  quaternary
-                  class="reconcile-detail-btn"
-                  @click="openManualClassify(stmt, getAiSuggestion(stmt.id)?.suggestedEntry)"
-                >
-                  <template #icon><i class="ri-link-m" /></template>
-                  核对已有账目
-                </NButton>
-                <NButton
-                  v-if="matchUndoableEntries(stmt).length"
-                  size="small"
-                  quaternary
-                  type="error"
-                  @click="undoMatchEntry(stmt)"
-                >
-                  撤销原入账
-                </NButton>
-              </div>
-            </div>
-          </div>
-        </div>
-
         <!-- Historical Unmatched (Collapsible) -->
         <div v-if="historicalUnmatchedStatements.length > 0" style="margin-top: 16px;">
           <NCollapse>
             <NCollapseItem :title="`历史月份遗留未认领流水 (${historicalUnmatchedStatements.length})`" name="history">
               <div class="feed-card-list">
-                <div v-for="stmt in historicalUnmatchedStatements" :key="stmt.id" class="feed-card reconcile-row" style="opacity: 0.92;">
+                <div v-for="stmt in historicalUnmatchedStatements" :key="stmt.id" :data-statement-id="stmt.id" class="feed-card reconcile-row" style="opacity: 0.92;">
                   <div class="reconcile-cell-fact">
                     <div class="fact-lead">
                       <NTag size="small" type="warning" :bordered="false" style="flex-shrink: 0;">历史遗留</NTag>
@@ -2539,16 +3248,20 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
               <div>
                 <p class="eyebrow">第三步：检查并锁账</p>
                 <h3>{{ targetMonth }} 关账检查</h3>
-                <p class="report-subtitle">系统自动核对凭证、银行流水与报表是否 100% 勾稽。每次规范封账，都在为公司积累经得起授信与融资尽调的数字资产。</p>
+                <p class="report-subtitle">自动核验凭证、银行流水与报表勾稽关系，确认无误后锁定本期账册。</p>
               </div>
               <div class="readiness-count" :class="{ ready: closingReady && !hasBlockingReconciliationRisk, zero: isZeroRecordMonth }">
                 <template v-if="isZeroRecordMonth">
-                  <strong style="color: var(--solo-text-muted);">0 笔</strong>
-                  <span>本月暂无业务记账</span>
+                  <i class="ri-calendar-close-line" />
+                  <span>0 笔 · 本月暂无业务记账</span>
+                </template>
+                <template v-else-if="closingTasks.length === 0">
+                  <i class="ri-checkbox-circle-fill" />
+                  <span>{{ canBatchPostAndClose ? `结账时将自动过账 ${closeDraftCount} 张` : '全部就绪，可以结账' }}</span>
                 </template>
                 <template v-else>
-                  <strong>{{ closingTasks.length === 0 ? '0' : closingTasks.length }}</strong>
-                  <span>{{ closingTasks.length === 0 ? (canBatchPostAndClose ? `结账时将批量过账 ${closeDraftCount} 张` : '全部就绪，可以结账') : '步待办后可结账' }}</span>
+                  <i class="ri-list-check-2" />
+                  <span>还差 <strong>{{ closingTasks.length }}</strong> 步可结账</span>
                 </template>
               </div>
             </div>
@@ -2565,13 +3278,13 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
                   v-for="item in fiveCheckItems"
                   :key="item.code"
                   class="five-check-chip"
-                  :class="item.status"
+                  :class="[item.status, { 'waiting-post': item.waitingForPosting }]"
                   :title="item.detail"
                 >
                   <span class="five-check-chip-icon"><i :class="readinessStatusIcon(item.status)" /></span>
                   <span class="five-check-chip-copy">
                     <strong>{{ item.label }}</strong>
-                    <small>{{ isZeroRecordMonth ? '本月无记录' : readinessStatusLabel(item.status) }}</small>
+                    <small>{{ fiveCheckStatusLabel(item) }}</small>
                   </span>
                 </div>
               </div>
@@ -2607,12 +3320,27 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
 
             <!-- 待办任务队列：同一根因聚合为一个任务，完成即少一步 -->
             <div v-if="!isZeroRecordMonth && closingTasks.length > 0" class="closing-task-list mb-4" aria-label="结账待办任务">
-              <div v-for="(task, taskIndex) in closingTasks" :key="task.id" class="closing-task-card" :class="task.severity">
-                <div class="task-index" :class="task.severity">{{ taskIndex + 1 }}</div>
+              <div
+                v-for="(task, taskIndex) in closingTasks"
+                :key="task.id"
+                class="closing-task-card"
+                :class="[task.severity, { 'is-post-task': task.id === 'post' }]"
+              >
+                <div class="task-index" :class="[task.severity, { 'is-post-task': task.id === 'post' }]">
+                  <i v-if="task.id === 'post' && closingTasks.length === 1" class="ri-file-check-line" />
+                  <template v-else>{{ taskIndex + 1 }}</template>
+                </div>
                 <div class="task-body">
                   <h4>{{ task.title }}</h4>
-                  <p v-if="task.detail">{{ task.detail }}</p>
-                  <small v-if="task.affects.length">这会影响：{{ task.affects.join(' · ') }}</small>
+                  <template v-if="task.id === 'post'">
+                    <p v-if="task.affects.length">
+                      过账后系统将自动完成账账、银行流水、财务报表等 {{ task.affects.length }} 项勾稽核验
+                    </p>
+                  </template>
+                  <template v-else>
+                    <p v-if="task.detail">{{ task.detail }}</p>
+                    <small v-if="task.affects.length">这会影响：{{ task.affects.join(' · ') }}</small>
+                  </template>
                   <NCollapse v-if="task.matchDetails?.length" class="task-details-collapse">
                     <NCollapseItem :title="`查看 ${task.matchDetails.length} 笔明细`" name="details">
                       <div v-for="detailItem in task.matchDetails" :key="detailItem.statementId" class="task-detail-row">
@@ -2625,17 +3353,6 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
                 </div>
                 <div class="task-actions">
                   <NButton
-                    v-if="task.id === 'post'"
-                    size="small"
-                    type="primary"
-                    secondary
-                    :loading="batchPostingLoading"
-                    @click="openBatchPostConfirm"
-                  >
-                    <template #icon><i class="ri-check-double-line" /></template>
-                    去批量过账
-                  </NButton>
-                  <NButton
                     v-for="action in task.actions"
                     :key="action.label"
                     size="small"
@@ -2643,19 +3360,19 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
                     @click="runTaskAction(action)"
                   >
                     {{ action.label }}
-                    <template #icon><i class="ri-arrow-right-line" /></template>
+                    <template v-if="action.kind !== 'walkthrough'" #icon><i class="ri-arrow-right-line" /></template>
                   </NButton>
                 </div>
               </div>
             </div>
 
-            <!-- 跨期与补记提示：不阻断结账，但必须让用户看见并知情 -->
-            <div v-if="closingNotices.length > 0" class="closing-notice-list mb-4" aria-label="跨期与补记提示">
+            <!-- 跨期、补记及免税预告提示：不阻断结账，但必须让用户看见并知情 -->
+            <div v-if="closingNotices.length > 0" class="closing-notice-list mb-4" aria-label="结账前提示">
               <NAlert
                 v-for="notice in closingNotices"
                 :key="notice.code"
-                type="warning"
-                :title="noticeTitle(notice)"
+                :type="noticeAlertType(notice)"
+                :title="formatClosingNoticeTitle(notice)"
                 class="closing-notice"
               >
                 <p class="notice-message">{{ notice.message }}</p>
@@ -2673,10 +3390,9 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
                     </div>
                   </NCollapseItem>
                 </NCollapse>
-                <div class="notice-actions">
-                  <!-- 启用前数据没有补记台账可导出（导出的会是空表，误导人） -->
+                <div v-if="hasClosingNoticeActions(notice)" class="notice-actions">
                   <NButton
-                    v-if="notice.code !== 'PRE_BOOK_START_ACTIVITY'"
+                    v-if="noticeExportScope(notice)"
                     size="tiny"
                     secondary
                     @click="exportBackfillNotice(notice)"
@@ -2702,6 +3418,15 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
                   >
                     去补记
                   </NButton>
+                  <NButton
+                    v-if="notice.code === 'SALARY_PAYABLE_OUTSTANDING'"
+                    size="tiny"
+                    secondary
+                    type="primary"
+                    @click="router.push({ path: '/mine/salary', query: notice.suggestedMonth ? { month: notice.suggestedMonth } : {} })"
+                  >
+                    去工资表
+                  </NButton>
                 </div>
               </NAlert>
             </div>
@@ -2709,6 +3434,9 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
             <!-- 全部核验明细（五项已在顶部常显，这里补充折旧、摊销、工资、关账顺序等准备项） -->
             <NCollapse class="readiness-detail-collapse mb-4">
               <NCollapseItem title="展开全部核验明细（含折旧、摊销、工资、关账顺序）" name="checks">
+                <template #header-extra>
+                  <span class="readiness-collapse-meta">共 {{ readinessItems.length }} 项核验</span>
+                </template>
             <div class="readiness-list" aria-label="结账准备清单">
               <div
                 v-for="item in readinessItems"
@@ -2755,7 +3483,7 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
                 :loading="closingLoading"
                 :disabled="!closingReady || hasBlockingReconciliationRisk"
                 style="padding: 0 36px; font-weight: 600;"
-                @click="runClosing()"
+                @click="handleClickCloseMonth()"
               >
                 <template #icon><i class="ri-lock-line" /></template>
                 <template v-if="hasBlockingPayroll">
@@ -2768,15 +3496,15 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
                   确认按【零业务/零申报】结账
                 </template>
                 <template v-else-if="closingReady && !hasBlockingReconciliationRisk">
-                  <template v-if="canBatchPostAndClose">确认过账 {{ closeDraftCount }} 张并结账</template>
+                  <template v-if="batchPostEntries.length > 0">核对账目并锁账（共 {{ batchPostEntries.length }} 笔）</template>
                   <template v-else>确认一键完成本月结账</template>
                 </template>
                 <template v-else>
-                  尚有阻断项待处理，暂无法结账
+                  请先完成上方 {{ closingTasks.length || 1 }} 项待办后再锁账
                 </template>
               </NButton>
               <p style="font-size: 12px; color: var(--solo-text-muted); margin-top: 8px;">
-                {{ canBatchPostAndClose ? `确认后将批量过账本月 ${closeDraftCount} 张待过账凭证，自动生成期末损益结转凭证后完成关账；如有凭证需复核或其他核验未通过，整次操作会回滚。` : isZeroRecordMonth ? '以零业务结账后，本期资产负债表与利润表将以零收支锁定归档' : '结账后本期账册将锁定归档，自动生成期末损益结转凭证（12 月含年度利润结转），并生成 AI 财务体检与经营诊断报告' }}
+                {{ isZeroRecordMonth ? '以零业务结账后，本期资产负债表与利润表将以零收支锁定归档' : '点击后先核对本月全部入账明细；确认无误后将自动为草稿凭证编号过账、生成期末损益结转并锁定本月账册。' }}
               </p>
             </div>
           </NSpin>
@@ -2785,23 +3513,19 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
 
       <!-- 5.2 已结账视图：成果交代 + 3 大后续动作看板 -->
       <div v-else class="ceremony-dashboard">
-        <!-- 结账成功大卡片：保留原版大气仪式感与大方块指标，做大做足成就感 -->
+        <!-- 结账成功大卡片：紧凑标题 + 核心三项经营指标 -->
         <NCard :bordered="false" class="report-card ceremony-hero-card mb-4">
-          <div class="checkmark-wrapper">
-            <i class="ri-checkbox-circle-fill" />
-          </div>
-
           <div class="ceremony-hero-content">
-            <div class="ceremony-achievement-pill">
-              <i class="ri-shield-star-line" />
-              <span>独立掌握财务 · 账目主权归于自己 · 尽调就绪</span>
+            <div class="ceremony-title-bar">
+              <div class="checkmark-wrapper" aria-hidden="true">
+                <i class="ri-thumb-up-fill" />
+              </div>
+              <h2 class="ceremony-title">{{ targetMonth }} 结账成功</h2>
             </div>
-            <h2 class="ceremony-title">{{ targetMonth }} 结账成功</h2>
             <p class="ceremony-desc">
-              不依赖代账中介，本月流水全清、发票全齐、账目全平。你的公司又积累了一个月可随时交付银行授信、审计与投资人尽调的标准数字资产。
+              本月流水全清、发票全齐、账目全平，账册已锁定归档。
             </p>
             <div class="ceremony-meta-tags">
-              <NTag size="small" type="success" :bordered="false">本期账册已锁定归档</NTag>
               <NTag size="small" :bordered="false">
                 损益结转凭证：{{ closingVoucherRefs.join('、') || '已自动结转' }}
               </NTag>
@@ -2817,21 +3541,24 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
             </div>
           </div>
 
-          <!-- 原样保留并放大的 3 列经营指标大方块（强化数据色彩） -->
+          <!-- 3 列经营指标：克制浅底，收入/净利润带语义色，成本费用用中性深色 -->
           <div class="metrics-row ceremony-metrics-row">
-            <div class="metric-box ceremony-metric-box is-income">
+            <div
+              class="metric-box ceremony-metric-box is-income"
+              :title="monthlyInterestIncome > 0 ? `含银行利息净收入 ${formatMoney(monthlyInterestIncome)}` : ''"
+            >
               <div class="metric-box-label">
                 <i class="ri-arrow-right-up-line" />
-                <span>{{ targetMonth }} 经营收入</span>
+                <span>{{ targetMonth }} 本月收入</span>
               </div>
               <span class="metric-box-val is-income">{{ formatMoney(monthlyIncome) }}</span>
             </div>
             <div class="metric-box ceremony-metric-box is-expense">
               <div class="metric-box-label">
                 <i class="ri-arrow-right-down-line" />
-                <span>{{ targetMonth }} 经营成本</span>
+                <span>{{ targetMonth }} 成本费用</span>
               </div>
-              <span class="metric-box-val is-expense">{{ formatMoney(monthlyExpense) }}</span>
+              <span class="metric-box-val">{{ formatMoney(monthlyExpense) }}</span>
             </div>
             <div class="metric-box ceremony-metric-box is-profit" :class="netProfit >= 0 ? 'is-positive' : 'is-negative'">
               <div class="metric-box-label">
@@ -2886,6 +3613,7 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
               <div class="action-card-buttons">
                 <NButton
                   type="primary"
+                  secondary
                   size="small"
                   :loading="diagnosisLoading"
                   @click="cfoDiagnosis ? (showDiagnosisModal = true) : generateDiagnosis()"
@@ -2893,9 +3621,9 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
                   <template #icon><i :class="cfoDiagnosis ? 'ri-eye-line' : 'ri-sparkling-line'" /></template>
                   {{ cfoDiagnosis ? '查看完整诊断' : '生成 AI 诊断' }}
                 </NButton>
-                <NButton size="small" quaternary @click="downloadReport">
+                <NButton size="small" text type="primary" :loading="reportLoading" @click="downloadReport">
                   <template #icon><i class="ri-download-2-line" /></template>
-                  导出 PDF 包
+                  导出账簿 PDF
                 </NButton>
               </div>
             </div>
@@ -2954,7 +3682,7 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
                 <div class="action-card-icon is-todo"><i class="ri-task-line" /></div>
                 <div>
                   <h4 class="action-card-title">结账后待办</h4>
-                  <span class="action-card-sub">经营闭环 · 往来跟踪</span>
+                  <span class="action-card-sub">全账套待处理 · 往来与申报</span>
                 </div>
               </div>
               <span class="closing-todo-count">{{ closingTodos.pendingCount }} 件待处理</span>
@@ -2969,8 +3697,13 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
                 >
                   <span class="closing-todo-dot" :class="item.level === 'high' ? 'is-high' : 'is-medium'" />
                   <div class="closing-todo-copy">
-                    <strong>{{ item.title }}</strong>
-                    <span v-if="item.desc">{{ item.desc }}</span>
+                    <div class="closing-todo-title-line">
+                      <span v-if="formatCeremonyTodo(item).overdueBadge" class="closing-todo-overdue">
+                        {{ formatCeremonyTodo(item).overdueBadge }}
+                      </span>
+                      <strong>{{ formatCeremonyTodo(item).title }}</strong>
+                    </div>
+                    <span v-if="formatCeremonyTodo(item).desc">{{ formatCeremonyTodo(item).desc }}</span>
                   </div>
                   <span class="closing-todo-cta">{{ item.routeLabel }} <i class="ri-arrow-right-s-line" /></span>
                 </li>
@@ -3017,7 +3750,11 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
         <div class="ceremony-footer-bar">
           <div class="ceremony-footer-links">
             <button type="button" class="footer-link-btn" @click="router.push(`/ledger/book?month=${targetMonth}`)">
-              <i class="ri-book-2-line" /> 导出电子账簿（总账/明细账）
+              <i class="ri-book-2-line" /> 打开电子账簿（总账/明细账）
+            </button>
+            <span class="footer-link-divider">·</span>
+            <button type="button" class="footer-link-btn" @click="router.push(`/vouchers/book?month=${targetMonth}`)">
+              <i class="ri-booklet-line" /> 装订凭证册
             </button>
             <span class="footer-link-divider">·</span>
             <button type="button" class="footer-link-btn" @click="router.push('/mine/audit-share')">
@@ -3028,22 +3765,23 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
               <i class="ri-lock-unlock-line" /> 反结账本期
             </button>
           </div>
-          <NButton type="primary" size="medium" @click="router.push('/')">
-            返回首页工作台
+          <NButton v-if="nextClosingMonth" secondary type="primary" size="small" @click="goNextClosingMonth">
+            继续结账 {{ nextClosingMonth }}
+            <template #icon><i class="ri-arrow-right-line" /></template>
           </NButton>
         </div>
       </div>
     </div>
 
-    <!-- Step Navigation Buttons (第一步的下一步入口在步骤条汇总行，避免重复) -->
-    <div v-if="!closed && currentStep > 1" class="no-print" style="display: flex; justify-content: space-between; align-items: center; margin-top: 12px;">
+    <!-- Step Navigation Buttons (第一步与第二步完成态的下一步入口在卡片内/汇总行，避免重复及右下角遮挡) -->
+    <div v-if="!closed && currentStep > 1" class="step-nav-footer no-print">
       <NButton :disabled="currentStep === 1" @click="prevStep">
         <template #icon><i class="ri-arrow-left-line" /></template>
         上一步
       </NButton>
-      <div v-if="currentStep < 3" style="display: flex; gap: 8px;">
+      <div v-if="currentStep < 3 && !(currentStep === 2 && step2AllDone)" style="display: flex; gap: 8px;">
         <NButton type="primary" @click="nextStep">
-          {{ currentStep === 2 ? '下一步：前往关账检查' : '下一步：流水认领与薪酬' }}
+          下一步：前往关账检查
           <template #icon><i class="ri-arrow-right-line" /></template>
         </NButton>
       </div>
@@ -3063,88 +3801,69 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
         <div class="manual-dialog-header">
           <div class="manual-dialog-icon"><i class="ri-quill-pen-line"></i></div>
           <div>
-            <div class="manual-dialog-title">分类记账草稿</div>
-            <div class="manual-dialog-subtitle">AI 仅提供建议，确认后才会记账并对账</div>
+            <div class="manual-dialog-title">修改分类与记账明细</div>
+            <div class="manual-dialog-subtitle">可调整归属科目、补充业务说明或研发归集，确认后才会记账并对账</div>
           </div>
         </div>
 
-        <!-- Statement Info -->
-        <div class="manual-stmt-info">
-          <div class="manual-stmt-row">
-            <span class="manual-stmt-label"><i class="ri-calendar-line"></i> 交易日期</span>
-            <span class="manual-stmt-val">{{ manualTarget?.transaction_date?.slice(0, 10) }}</span>
-          </div>
-          <div class="manual-stmt-row">
-            <span class="manual-stmt-label"><i class="ri-bank-card-line"></i> 银行摘要</span>
-            <span class="manual-stmt-val" style="font-size: 12px; color: var(--solo-text-secondary);">{{ manualTarget?.description }}</span>
-          </div>
-          <div class="manual-stmt-row">
-            <span class="manual-stmt-label"><i class="ri-money-cny-circle-line"></i> 交易金额</span>
-            <span class="manual-stmt-val" :class="(manualTarget?.amount ?? 0) >= 0 ? 'income' : 'expense'" style="font-size: 16px; font-weight: 700;">
-              {{ formatMoney(manualTarget?.amount) }}
-            </span>
-          </div>
-        </div>
-
-        <NDivider style="margin: 12px 0;" />
-
-        <!-- Form -->
-        <div class="manual-form">
-          <div class="manual-form-item">
-            <label class="manual-form-label">记账标题 <span style="color: var(--solo-expense);">*</span></label>
-            <NInput
-              v-model:value="manualForm.title"
-              placeholder="请输入记账标题，如：5月工资代发、住房公积金缴纳"
-              maxlength="50"
-              show-count
-            />
-          </div>
-
-          <div class="manual-form-item">
-            <label class="manual-form-label">业务说明（选填）</label>
-            <NInput
-              v-model:value="manualForm.businessContext"
-              type="textarea"
-              placeholder="例如：这笔技术服务费用于研发项目"
-              :rows="2"
-              maxlength="200"
-            />
-            <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 6px;">
-              <span style="font-size: 11px; color: var(--solo-text-muted);">补充用途后，可让 AI 重新生成分类草稿</span>
-              <NButton size="tiny" secondary :loading="manualAiLoading" @click="refreshManualAiSuggestion">
-                根据说明更新 AI 建议
-              </NButton>
+        <!-- Layer 1: 紧凑流水横幅 -->
+        <div class="manual-stmt-banner">
+          <div class="manual-stmt-banner-main">
+            <div class="manual-stmt-banner-title">
+              <NTag
+                size="tiny"
+                :type="(manualTarget?.amount ?? 0) >= 0 ? 'success' : 'error'"
+                :bordered="false"
+                style="font-weight: 600; flex-shrink: 0;"
+              >
+                {{ (manualTarget?.amount ?? 0) >= 0 ? '收款' : '付款' }}
+              </NTag>
+              <span class="ellipsis" :title="manualTarget?.description">
+                <template v-if="parseBankStatementDisplay(manualTarget?.description).counterparty">
+                  <strong>{{ parseBankStatementDisplay(manualTarget?.description).counterparty }}</strong>
+                  <template v-if="parseBankStatementDisplay(manualTarget?.description).summary">
+                    · {{ parseBankStatementDisplay(manualTarget?.description).summary }}
+                  </template>
+                </template>
+                <template v-else>{{ parseBankStatementDisplay(manualTarget?.description).summary || manualTarget?.description }}</template>
+              </span>
+            </div>
+            <div class="manual-stmt-banner-meta">
+              {{ manualTarget?.transaction_date?.slice(0, 10) }}
+              <template v-if="parseBankStatementDisplay(manualTarget?.description).channel">
+                · {{ parseBankStatementDisplay(manualTarget?.description).channel }}
+              </template>
             </div>
           </div>
-
-          <div v-if="manualSuggestionMeta.reason" class="manual-account-preview">
-            <span>AI 理由：{{ manualSuggestionMeta.reason }}</span>
-            <span v-if="manualSuggestionMeta.confidence !== undefined" style="margin-left: 12px;">置信度：<b>{{ Math.round((manualSuggestionMeta.confidence || 0) * 100) }}%</b></span>
+          <div class="manual-stmt-banner-amount" :class="(manualTarget?.amount ?? 0) >= 0 ? 'income' : 'expense'">
+            {{ (manualTarget?.amount ?? 0) >= 0 ? '+' : '' }}{{ formatMoney(manualTarget?.amount) }}
           </div>
+        </div>
 
-          <div v-if="manualForm.suggestedSubAccount" class="manual-account-preview" style="margin-top: 12px;">
-            <NCheckbox v-model:checked="manualForm.useSuggestedSubAccount">
-              建议新建二级科目 <b>{{ manualForm.suggestedSubAccount.name }}</b>（父科目 {{ manualForm.suggestedSubAccount.parentCode }}）
-            </NCheckbox>
-          </div>
-
+        <!-- Layer 2: 核心决策区（账目分类 + 凭证摘要） -->
+        <div class="manual-form">
           <div class="manual-form-item">
             <label class="manual-form-label">账目分类 <span style="color: var(--solo-expense);">*</span></label>
             <NSelect
-              v-model:value="manualForm.categoryValue"
+              :value="manualForm.categoryValue"
               :options="CATEGORY_OPTIONS"
-              placeholder="请选择科目分类"
-              :render-label="(opt: any) => opt.disabled ? opt.label : `${opt.label}`"
+              placeholder="输入关键字搜索分类 / 科目名 / 代码"
+              filterable
+              :filter="filterCategory"
+              :render-label="renderCategoryLabel"
+              :virtual-scroll="false"
+              @update:value="handleManualCategoryChange"
             />
-            <!-- Direction & Account preview -->
-            <div v-if="manualForm.categoryValue && !manualForm.categoryValue.startsWith('__')" class="manual-account-preview">
-              <span>科目代码：<b>{{ manualForm.categoryValue.split('|')[2] }}</b></span>
-              <span style="margin-left: 12px;">科目名称：<b>{{ manualForm.categoryValue.split('|')[3] }}</b></span>
-              <span style="margin-left: 12px;">方向：
+            <div v-if="manualForm.categoryValue && !manualForm.categoryValue.startsWith('__')" class="manual-account-summary">
+              <div class="manual-account-summary-row">
+                <span>将记入：<b>{{ manualForm.categoryValue.split('|')[2] }} {{ manualForm.categoryValue.split('|')[3] }}</b></span>
                 <NTag size="tiny" :type="manualForm.categoryValue.startsWith('income') ? 'success' : manualForm.categoryValue.startsWith('expense') ? 'error' : 'warning'" :bordered="false">
                   {{ categoryValueNatureLabel(manualForm.categoryValue) }}
                 </NTag>
-              </span>
+              </div>
+              <div v-if="categoryPlainHint(manualForm.categoryValue.split('|')[1])" class="manual-account-plain-hint">
+                {{ categoryPlainHint(manualForm.categoryValue.split('|')[1]) }}
+              </div>
             </div>
           </div>
 
@@ -3165,25 +3884,73 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
             </div>
             <NInput
               v-model:value="manualForm.rdAllocationBasis"
-              style="margin-top: 10px;"
+              style="margin-top: 8px;"
               placeholder="分摊依据（直接归集可选，如合同或领料单编号）"
               maxlength="200"
             />
-            <NText depth="3" style="display: block; margin-top: 8px; font-size: 12px;">
+            <NText depth="3" style="display: block; margin-top: 6px; font-size: 12px;">
               找不到研发项目？
               <NButton text type="primary" size="tiny" @click="goCreateRdProject">去研发项目页新建</NButton>
             </NText>
           </div>
 
+          <div v-if="manualForm.suggestedSubAccount" class="manual-account-summary">
+            <NCheckbox v-model:checked="manualForm.useSuggestedSubAccount">
+              建议新建二级科目 <b>{{ manualForm.suggestedSubAccount.name }}</b>（父科目 {{ manualForm.suggestedSubAccount.parentCode }}）
+            </NCheckbox>
+          </div>
+
           <div class="manual-form-item">
-            <label class="manual-form-label">备注（选填）</label>
+            <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+              <label class="manual-form-label">业务说明（选填，不确定分类时可让 AI 重判）</label>
+              <NButton size="tiny" secondary :loading="manualAiLoading" @click="refreshManualAiSuggestion">
+                根据说明更新 AI 建议
+              </NButton>
+            </div>
             <NInput
-              v-model:value="manualForm.remark"
+              v-model:value="manualForm.businessContext"
               type="textarea"
-              placeholder="可填写其他备注，如合同编号、付款对象等"
-              :rows="2"
+              placeholder="例如：这笔款项是股东暂借给公司的周转资金"
+              :autosize="{ minRows: 1, maxRows: 3 }"
               maxlength="200"
             />
+            <div v-if="manualSuggestionMeta.reason" class="manual-account-summary">
+              <span>AI 分析：{{ manualSuggestionMeta.reason }}</span>
+            </div>
+          </div>
+
+          <div class="manual-form-item">
+            <label class="manual-form-label">凭证摘要（选填，默认按分类自动生成）</label>
+            <NInput
+              v-model:value="manualForm.title"
+              placeholder="不填则自动生成「对方 · 分类」作为凭证摘要"
+              maxlength="50"
+              show-count
+            />
+          </div>
+
+          <!-- Layer 3: 低频备注默认折叠 -->
+          <div class="manual-advanced-box">
+            <button
+              type="button"
+              class="manual-advanced-toggle"
+              @click="manualAdvancedOpen = !manualAdvancedOpen"
+            >
+              <i :class="manualAdvancedOpen ? 'ri-arrow-down-s-line' : 'ri-arrow-right-s-line'"></i>
+              <span>添加备注（选填）</span>
+            </button>
+            <div v-if="manualAdvancedOpen" class="manual-advanced-panel">
+              <div class="manual-form-item">
+                <label class="manual-form-label">备注</label>
+                <NInput
+                  v-model:value="manualForm.remark"
+                  type="textarea"
+                  placeholder="可填写合同编号、付款对象等"
+                  :rows="2"
+                  maxlength="200"
+                />
+              </div>
+            </div>
           </div>
         </div>
 
@@ -3193,7 +3960,7 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
           <NButton
             type="primary"
             :loading="manualSubmitting"
-            :disabled="!manualForm.title.trim() || !manualForm.categoryValue || manualForm.categoryValue.startsWith('__') || (isRdCategoryValue(manualForm.categoryValue) && (!manualForm.rdProjectId || !manualForm.rdExpenseType))"
+            :disabled="!manualForm.categoryValue || manualForm.categoryValue.startsWith('__') || (isRdCategoryValue(manualForm.categoryValue) && (!manualForm.rdProjectId || !manualForm.rdExpenseType))"
             @click="handleManualClassify"
           >
             <template #icon><i class="ri-check-line" /></template>
@@ -3325,14 +4092,92 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
         <div class="manual-dialog-header">
           <div class="manual-dialog-icon"><i class="ri-edit-line"></i></div>
           <div>
-            <div class="manual-dialog-title">详细记账</div>
+            <div class="manual-dialog-title">修改单据</div>
             <div class="manual-dialog-subtitle">{{ editVoucherTargetEntry?.title || currentVoucherEntry?.voucherRef || currentVoucherEntry?.title || '凭证' }}</div>
           </div>
         </div>
 
         <div class="manual-form">
-          <div v-if="editVoucherDispositionLabel" class="manual-account-preview" style="margin: 0 0 12px;">
-            <span>付款人：<b>{{ editVoucherDispositionLabel }}</b></span>
+          <div v-if="editVoucherPayerSummary" class="manual-account-preview" style="margin: 0 0 12px;">
+            <span>{{ editVoucherIsOutflowEntry ? '付款人：' : '收款去向：' }}<b>{{ editVoucherPayerSummary }}</b></span>
+          </div>
+          <!-- 未过账草稿：配对前先确认"这笔钱到底谁付的"，付款来源直接决定贷方科目 -->
+          <div v-if="!editVoucherIsPosted" class="manual-form-item">
+            <label class="manual-form-label">
+              {{ editVoucherTargetEntry && !entryIsOutflow(editVoucherTargetEntry) ? '这笔钱收到哪里？' : '这笔钱谁付的？' }}
+            </label>
+            <div class="edit-voucher-payer-chips">
+              <template v-if="!editVoucherTargetEntry || entryIsOutflow(editVoucherTargetEntry)">
+                <NButton
+                  size="tiny"
+                  round
+                  secondary
+                  :class="{ 'disposition-chip--active': editVoucherForm.payer === 'company_account' && !editVoucherForm.paymentStatus }"
+                  @click="setEditVoucherSettlement({ payer: 'company_account' })"
+                >公司账户付</NButton>
+                <NButton
+                  size="tiny"
+                  round
+                  secondary
+                  :class="{ 'disposition-chip--active': editVoucherForm.payer === 'boss_personal' }"
+                  @click="setEditVoucherSettlement({ payer: 'boss_personal' })"
+                >老板垫付</NButton>
+                <NDropdown
+                  trigger="click"
+                  :options="employeePayerOptions"
+                  @select="(key: string) => setEditVoucherSettlement({ payer: key })"
+                >
+                  <NButton
+                    size="tiny"
+                    round
+                    secondary
+                    :class="{ 'disposition-chip--active': editVoucherForm.payer.startsWith('employee_personal') }"
+                  >
+                    员工垫付 <i class="ri-arrow-down-s-line" style="font-size: 11px; margin-left: 2px;"></i>
+                  </NButton>
+                </NDropdown>
+                <NButton
+                  size="tiny"
+                  round
+                  secondary
+                  :class="{ 'disposition-chip--active': editVoucherForm.paymentStatus === 'unpaid' }"
+                  @click="setEditVoucherSettlement({ paymentStatus: 'unpaid' })"
+                >还没付款</NButton>
+              </template>
+              <template v-else>
+                <NButton
+                  size="tiny"
+                  round
+                  secondary
+                  :class="{ 'disposition-chip--active': editVoucherForm.payer === 'company_account' && !editVoucherForm.paymentStatus }"
+                  @click="setEditVoucherSettlement({ payer: 'company_account' })"
+                >公司账户收</NButton>
+                <NButton
+                  size="tiny"
+                  round
+                  secondary
+                  :class="{ 'disposition-chip--active': editVoucherForm.payer === 'boss_personal' }"
+                  @click="setEditVoucherSettlement({ payer: 'boss_personal' })"
+                >老板私户收</NButton>
+                <NButton
+                  size="tiny"
+                  round
+                  secondary
+                  :class="{ 'disposition-chip--active': editVoucherForm.payer === 'platform_balance' }"
+                  @click="setEditVoucherSettlement({ payer: 'platform_balance' })"
+                >在平台未提现</NButton>
+                <NButton
+                  size="tiny"
+                  round
+                  secondary
+                  :class="{ 'disposition-chip--active': editVoucherForm.paymentStatus === 'unpaid' }"
+                  @click="setEditVoucherSettlement({ paymentStatus: 'unpaid' })"
+                >客户未付款</NButton>
+              </template>
+            </div>
+            <NText v-if="editVoucherPayerNeedsReimbursement" depth="3" style="display: block; margin-top: 6px; font-size: 12px;">
+              确认配对这笔流水时会按「报销垫付款」入账，不会重复记支出。
+            </NText>
           </div>
           <div v-if="editVoucherIsPosted" class="plan-note" style="margin: 0 0 12px;">
             该凭证已过账：保存会红冲原凭证并按新科目重记；摘要与自定义分录不能改。
@@ -3367,6 +4212,14 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
               <template #icon><i class="ri-file-edit-line" /></template>
               让 AI 根据说明重新建议
             </NButton>
+            <div
+              v-if="editVoucherAiSuggestion?.category || editVoucherAiSuggestion?.reason"
+              class="manual-account-summary edit-voucher-ai-suggestion"
+              style="margin-top: 8px; line-height: 1.6;"
+            >
+              <div><strong>AI 建议：{{ editVoucherAiSuggestion.category }}</strong></div>
+              <div v-if="editVoucherAiSuggestion.reason" style="margin-top: 2px;">{{ editVoucherAiSuggestion.reason }}</div>
+            </div>
           </div>
           <div class="manual-form-item">
             <label class="manual-form-label">账目分类 <span style="color: var(--solo-expense);">*</span></label>
@@ -3398,39 +4251,49 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
             <label class="manual-form-label">将落账的分录</label>
             <div class="pending-entry-plan-lines" style="margin-top: 0;">
               <NSpin v-if="editVoucherPreview.loading" size="small" />
-              <template v-else-if="editVoucherPreview.preview">
+              <div v-else-if="editVoucherPreview.preview" class="plan-lines-stack">
                 <div
-                  v-for="line in editVoucherPreview.preview.debit"
-                  :key="`d-${line.accountCode}`"
+                  v-for="(line, idx) in editVoucherPreview.preview.debit"
+                  :key="`d-${line.accountCode}-${idx}`"
                   class="plan-line"
                 >
                   <span class="plan-side debit">借</span>
                   <span class="plan-code">{{ line.accountCode }}</span>
                   <span class="plan-name">{{ line.accountName }}</span>
                   <span v-if="line.partnerName" class="plan-partner">往来：{{ line.partnerName }}</span>
-                  <span class="plan-amount">¥{{ line.amount }}</span>
+                  <span class="plan-amount">{{ formatMoney(Number(line.amount) || 0) }}</span>
                 </div>
                 <div
-                  v-for="line in editVoucherPreview.preview.credit"
-                  :key="`c-${line.accountCode}`"
+                  v-for="(line, idx) in editVoucherPreview.preview.credit"
+                  :key="`c-${line.accountCode}-${idx}`"
                   class="plan-line"
                 >
                   <span class="plan-side credit">贷</span>
                   <span class="plan-code">{{ line.accountCode }}</span>
                   <span class="plan-name">{{ line.accountName }}</span>
                   <span v-if="line.partnerName" class="plan-partner">往来：{{ line.partnerName }}</span>
-                  <span class="plan-amount">¥{{ line.amount }}</span>
+                  <span class="plan-amount">{{ formatMoney(Number(line.amount) || 0) }}</span>
                 </div>
                 <div
                   v-for="warning in editVoucherPreview.preview.warnings"
                   :key="warning.code"
                   class="plan-note warning"
                 >{{ warning.message }}</div>
-              </template>
+              </div>
               <div v-else class="plan-error">
                 {{ editVoucherPreview.error || '保存前会按所选分类生成分录' }}
               </div>
             </div>
+          </div>
+
+          <div
+            v-if="editVoucherBatchSiblings.length > 0"
+            class="edit-voucher-batch-apply"
+            style="margin-top: 8px; padding: 10px 12px; border-radius: 8px; background: var(--solo-bg-blue-soft); border: 1px solid var(--solo-border-light);"
+          >
+            <NCheckbox v-model:checked="editVoucherApplyToSiblings">
+              同时将所选分类应用到本组其余 {{ editVoucherBatchSiblings.length }} 笔待定单据（保留各自原标题与金额）
+            </NCheckbox>
           </div>
         </div>
 
@@ -3443,7 +4306,7 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
             @click="saveEditVoucher"
           >
             <template #icon><i class="ri-check-line" /></template>
-            保存修改
+            {{ editVoucherApplyToSiblings && editVoucherBatchSiblings.length > 0 ? `批量保存 (${editVoucherBatchSiblings.length + 1} 笔)` : '保存修改' }}
           </NButton>
         </div>
       </div>
@@ -3461,36 +4324,57 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
       @accept="handleAskAiAccept"
     />
 
-    <!-- 批量过账确认：列凭证明细 + 说明后果 + 取消/确认 -->
-    <NModal v-model:show="batchPostConfirmVisible" style="width: 540px; max-width: 96vw;">
+    <!-- 关账前账目最终核对单：过账与关账合一，确认无误后统一封存 -->
+    <NModal v-model:show="batchPostConfirmVisible" style="width: 560px; max-width: 96vw;">
       <div class="batch-post-confirm">
         <div class="batch-post-confirm-header">
-          <i class="ri-check-double-line"></i>
-          <h3>确认过账 {{ batchPostEntries.length }} 张凭证</h3>
+          <i class="ri-shield-check-line"></i>
+          <h3>{{ targetMonth }} 账目最终核对（共 {{ batchPostEntries.length }} 笔）</h3>
         </div>
         <div class="batch-post-confirm-tip">
-          过账 = 把这 {{ batchPostEntries.length }} 张草稿正式记入账簿。之后它们才会参与报表、无形资产摊销、固定资产折旧和银行配对；过账后不能单张撤销，要改只能整月反结账。
+          请最后核对本月收支分类与去向。点击任意一笔可查看分录或修改；确认无误后将一次性生成正式凭证号、结转损益并锁定本月账册。
+        </div>
+        <div class="batch-post-confirm-summary">
+          <span>
+            共 {{ batchPostEntries.length }} 笔 · 收款/流入 {{ batchPostEntries.filter(e => !e.isOutflow).length }} 笔 · 付款/流出 {{ batchPostEntries.filter(e => e.isOutflow).length }} 笔
+          </span>
+          <span>点击任意行可查看或调整</span>
         </div>
         <div class="batch-post-confirm-list">
-          <div v-for="e in batchPostEntries" :key="e.id" class="batch-post-confirm-row">
+          <div
+            v-for="e in batchPostEntries"
+            :key="e.id"
+            class="batch-post-confirm-row"
+            @click="openVoucherModal(e.id)"
+          >
             <div class="batch-post-confirm-main">
-              <span class="batch-post-confirm-title">{{ e.title }}</span>
-              <span class="batch-post-confirm-cat">{{ e.category }}<em v-if="e.accountName"> · {{ e.accountName }}</em></span>
+              <div class="batch-post-confirm-title-line">
+                <span v-if="e.shortDate" class="batch-post-confirm-date">{{ e.shortDate }}</span>
+                <span class="batch-post-confirm-title">{{ e.displayTitle }}</span>
+                <NTag size="tiny" :bordered="false" :type="e.isDraft ? 'warning' : 'success'">
+                  {{ e.isDraft ? '待封存' : '已入账' }}
+                </NTag>
+              </div>
+              <span class="batch-post-confirm-cat">{{ e.subtitle }}</span>
             </div>
-            <span class="batch-post-confirm-amt" :class="e.direction === 'income' ? 'income' : 'expense'">
-              {{ e.direction === 'income' ? '+' : '-' }}{{ formatMoney(e.amount) }}
-            </span>
+            <div class="batch-post-confirm-right">
+              <span class="batch-post-confirm-amt" :class="e.isOutflow ? 'expense' : 'income'">
+                {{ e.isOutflow ? '-' : '+' }}{{ formatMoney(e.amount) }}
+              </span>
+              <i class="ri-arrow-right-s-line batch-post-row-arrow"></i>
+            </div>
           </div>
         </div>
         <div class="batch-post-confirm-footer">
           <NButton size="small" quaternary @click="startWalkthroughFromConfirm">
             <template #icon><i class="ri-list-check-2"></i></template>
-            逐笔过账
+            逐笔核对
           </NButton>
           <div style="flex: 1;"></div>
-          <NButton size="small" @click="batchPostConfirmVisible = false">取消</NButton>
-          <NButton size="small" type="primary" :loading="batchPostingLoading" @click="confirmBatchPost">
-            确认过账 {{ batchPostEntries.length }} 张
+          <NButton size="small" @click="batchPostConfirmVisible = false">返回修改</NButton>
+          <NButton size="small" type="primary" :loading="closingLoading" @click="confirmReviewAndClose">
+            <template #icon><i class="ri-lock-line" /></template>
+            确认无误并锁账
           </NButton>
         </div>
       </div>
@@ -3518,6 +4402,68 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
       <div v-else>暂无流水余额数据。</div>
     </NModal>
 
+    <!-- 本次银行流水导入明细弹窗 -->
+    <NModal
+      v-model:show="showBankImportDetailModal"
+      preset="card"
+      title="本次银行流水导入明细"
+      style="width: 780px; max-width: 94vw;"
+    >
+      <div v-if="bankUploadResult">
+        <div class="bank-upload-modal-summary">
+          <span>
+            <i
+              :class="bankUploadResult.errors > 0 || bankUploadResult.skipped > 0 ? 'ri-error-warning-line' : 'ri-checkbox-circle-line'"
+              :style="{ color: bankUploadResult.errors > 0 || bankUploadResult.skipped > 0 ? 'var(--solo-warning)' : 'var(--solo-income)', marginRight: '4px' }"
+              aria-hidden="true"
+            />
+            {{ bankUploadResult.errors > 0 || bankUploadResult.skipped > 0 ? '本次文件解析完成（含异常）' : '本次文件解析与导入成功' }}
+          </span>
+          <span class="bank-upload-summary-stats">
+            已导入: <strong class="stat-income">{{ bankUploadResult.imported }}</strong> 条 |
+            失败: <strong class="stat-expense">{{ bankUploadResult.errors }}</strong> 条<template v-if="bankUploadResult.skipped > 0"> |
+            跳过: <strong class="stat-warn">{{ bankUploadResult.skipped }}</strong> 条（无有效交易日期）</template>
+          </span>
+        </div>
+
+        <div class="report-table-wrapper" style="max-height: 55vh; overflow-y: auto;">
+          <table class="report-table">
+            <thead>
+              <tr>
+                <th style="width: 110px;">交易日期</th>
+                <th>交易内容 (类型/摘要/对方)</th>
+                <th style="text-align: right; width: 110px;">发生额</th>
+                <th style="text-align: right; width: 110px;">账户余额</th>
+                <th style="text-align: center; width: 115px;">对账状态</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="(row, idx) in bankUploadResult.rows" :key="idx">
+                <td>{{ (row.transaction_date || '').slice(0, 10) || '-' }}</td>
+                <td>{{ row.description || '-' }}</td>
+                <td class="amount-cell" :class="safeFloat(row.amount) >= 0 ? 'income' : 'expense'">
+                  {{ formatMoney(safeFloat(row.amount)) }}
+                </td>
+                <td style="text-align: right; color: var(--solo-text-secondary);">
+                  {{ formatMoney(safeFloat(row.balance)) }}
+                </td>
+                <td style="text-align: center;">
+                  <NTag size="small" :type="isItemAutoMatched(row) ? 'success' : 'warning'">
+                    {{ isItemAutoMatched(row) ? '已确认对账' : '待手动对账' }}
+                  </NTag>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <template #footer>
+        <div style="display: flex; justify-content: flex-end;">
+          <NButton type="primary" size="small" @click="showBankImportDetailModal = false">知道了</NButton>
+        </div>
+      </template>
+    </NModal>
+
     <!-- ── In-place Voucher Details Modal (ponytail: zero-redirect inspection) ── -->
     <NModal
       v-model:show="showVoucherModal"
@@ -3533,10 +4479,10 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
             <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
               <span class="manual-dialog-title">{{ currentVoucherEntry?.voucherRef || '记账凭证（草稿）' }}</span>
               <NTag size="small" :type="currentVoucherEntry?.voucherStatus === 'posted' ? 'success' : 'warning'" :bordered="false">
-                {{ currentVoucherEntry?.voucherStatus === 'posted' ? '已过账' : '待过账草稿' }}
+                {{ currentVoucherEntry?.voucherStatus === 'posted' ? '已过账' : '待关账封存' }}
               </NTag>
-              <NTag v-if="currentVoucherEntry?.reconciliationType === 'wechat_settlement'" size="small" type="info" :bordered="false">
-                微信结算凭证
+              <NTag v-if="SETTLEMENT_TYPE_LABELS[currentVoucherEntry?.reconciliationType]" size="small" type="info" :bordered="false">
+                {{ settlementTypeLabel(currentVoucherEntry?.reconciliationType, 'tag') }}
               </NTag>
             </div>
             <div class="manual-dialog-subtitle">{{ currentVoucherEntry?.title || '凭证分录与来源检查' }}</div>
@@ -3545,8 +4491,8 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
 
         <div v-if="batchPostWalkthrough" class="walkthrough-progress">
           <i class="ri-guide-line"></i>
-          逐笔过账中 · 第 {{ batchPostWalkthroughTotal - batchPostEntries.length + 1 }} / {{ batchPostWalkthroughTotal }} 笔
-          <span class="walkthrough-progress-hint">过账后自动进入下一笔</span>
+          逐笔核对中 · 第 {{ walkthroughIndex + 1 }} / {{ batchPostWalkthroughTotal }} 笔
+          <span class="walkthrough-progress-hint">核对无误后点击下一笔</span>
         </div>
 
         <NSpin :show="voucherModalLoading">
@@ -3568,7 +4514,7 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
             </div>
             <div class="voucher-meta-item" v-if="currentVoucherEntry?.reconciliationType">
               <span>对账类型：</span>
-              <strong>{{ currentVoucherEntry?.reconciliationType === 'wechat_settlement' ? '微信净额结算' : currentVoucherEntry?.reconciliationType }}</strong>
+              <strong>{{ settlementTypeLabel(currentVoucherEntry?.reconciliationType, 'full') }}</strong>
             </div>
           </div>
 
@@ -3593,6 +4539,12 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
                   <td>
                     <span style="font-family: monospace; font-weight: 700; margin-right: 6px;">{{ line.code }}</span>
                     <span>{{ line.name }}</span>
+                    <div
+                      v-if="line.auxiliary?.partner_name || line.auxiliary?.partnerName"
+                      class="voucher-line-aux"
+                    >
+                      往来单位：{{ line.auxiliary.partner_name || line.auxiliary.partnerName }}
+                    </div>
                   </td>
                   <td style="text-align: right; font-family: monospace;">
                     {{ line.side === 'debit' ? formatMoney(line.amount) : '-' }}
@@ -3645,14 +4597,13 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
                 修改
               </NButton>
               <NButton
-                v-if="currentVoucherEntry && currentVoucherEntry.voucherStatus !== 'posted'"
+                v-if="batchPostWalkthrough"
                 type="primary"
                 size="small"
-                :loading="voucherPostingLoading"
-                @click="handleModalPostEntry"
+                @click="advanceWalkthrough"
               >
-                <template #icon><i class="ri-check-line" /></template>
-                立即过账
+                <template #icon><i class="ri-arrow-right-line" /></template>
+                {{ walkthroughIndex + 1 < batchPostWalkthroughTotal ? '下一笔' : '完成核对' }}
               </NButton>
             </div>
           </div>
@@ -3710,7 +4661,7 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
         <div class="boss-ledger-drawer-banner">
           <div class="boss-ledger-drawer-amount-row">
             <div>
-              <div class="drawer-amount-label">本月汇总金额</div>
+              <div class="drawer-amount-label">{{ currentBossLedgerDetail.amountLabel || '本月汇总金额' }}</div>
               <div class="drawer-amount-value" :style="{ color: currentBossLedgerDetail.type === 'boss_and_emp' ? 'var(--solo-primary)' : 'var(--solo-text-primary)' }">
                 {{ formatMoney(currentBossLedgerDetail.amount) }}
               </div>
@@ -3724,6 +4675,14 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
             <span>老板垫付：<strong>{{ formatMoney(currentBossLedgerDetail.bossOnly) }}</strong></span>
             <span class="breakdown-divider">·</span>
             <span>员工垫付：<strong>{{ formatMoney(currentBossLedgerDetail.empOnly) }}</strong></span>
+          </div>
+
+          <div v-if="currentBossLedgerDetail.advanceBreakdown" class="drawer-breakdown-row">
+            <span>期初未报 {{ formatMoney(currentBossLedgerDetail.advanceBreakdown.opening) }}</span>
+            <span class="breakdown-divider">+</span>
+            <span>本期垫付 {{ formatMoney(currentBossLedgerDetail.advanceBreakdown.occurred) }}</span>
+            <span class="breakdown-divider">−</span>
+            <span>本期已报 {{ formatMoney(currentBossLedgerDetail.advanceBreakdown.reimbursed) }}</span>
           </div>
 
           <div class="drawer-tip-box">
@@ -3833,6 +4792,17 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
         </div>
       </template>
     </NModal>
+
+    <!-- 多笔单据 / 个人垫付合并核销弹窗 -->
+    <MultiInvoiceMatchModal
+      v-model:show="showMultiMatchModal"
+      :statement="multiMatchTargetStmt"
+      :candidates="multiMatchCandidates"
+      :initial-selected-ids="multiMatchInitialIds"
+      :submitting="multiMatchSubmitting"
+      @confirm="handleConfirmMultiMatch"
+      @open-voucher="openVoucherModal"
+    />
   </div>
 </template>
 
@@ -3852,72 +4822,6 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
-}
-
-.closing-ai-badge-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  height: 26px;
-  padding: 0 10px;
-  border-radius: 999px;
-  border: 1px solid var(--solo-border);
-  background: var(--solo-bg-blue-soft);
-  color: var(--solo-primary);
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: all 0.15s ease;
-}
-
-.closing-ai-badge-btn:hover {
-  background: var(--solo-primary);
-  color: var(--solo-bg-card);
-  border-color: var(--solo-primary);
-}
-
-.closing-filing-inline {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-top: 6px;
-  font-size: 12px;
-  color: var(--solo-text-secondary);
-  flex-wrap: wrap;
-}
-
-.closing-filing-inline i {
-  color: var(--solo-primary);
-  font-size: 13px;
-  flex-shrink: 0;
-}
-
-.filing-inline-title {
-  font-weight: 600;
-  color: var(--solo-text-primary);
-  flex-shrink: 0;
-}
-
-.filing-inline-text {
-  color: var(--solo-text-muted);
-}
-
-.filing-inline-link {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  padding: 0 4px;
-  border: none;
-  background: none;
-  color: var(--solo-primary);
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: color 0.15s ease;
-}
-
-.filing-inline-link:hover {
-  text-decoration: underline;
 }
 
 /* 进度条右侧操作区与邮箱免传收单按钮 */
@@ -4088,6 +4992,21 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
   flex-direction: column;
   gap: 2px;
 }
+.closing-todo-title-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.closing-todo-overdue {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--solo-expense-soft);
+  color: var(--solo-expense);
+  font-size: 11px;
+  font-weight: 600;
+}
 .closing-todo-copy strong {
   font-size: 13.5px;
   font-weight: 600;
@@ -4133,21 +5052,81 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
   flex-direction: column;
 }
 
-/* 结账成果大卡片：体量饱满，居中对齐，赋予老板掌舵财务的成就感 */
+/* 结账成果大卡片：紧凑居中对齐，保障与下方三大动作同屏可见 */
 .ceremony-hero-card {
-  padding: 36px 32px 32px;
+  padding: 0;
+  margin-bottom: 12px;
   background: var(--solo-bg-card);
   border: 1px solid var(--solo-border);
   border-radius: var(--solo-radius-lg, 12px);
+  box-shadow: var(--solo-shadow-sm, 0 1px 3px rgba(0, 0, 0, 0.04));
+}
+
+.ceremony-hero-card :deep(.n-card__content) {
+  padding: 18px 24px 16px;
   display: flex;
   flex-direction: column;
   align-items: center;
   text-align: center;
-  box-shadow: var(--solo-shadow-sm, 0 1px 3px rgba(0, 0, 0, 0.04));
+}
+
+.ceremony-title-bar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin-bottom: 6px;
 }
 
 .ceremony-hero-card .checkmark-wrapper {
-  margin: 0 auto 20px;
+  width: 34px;
+  height: 34px;
+  font-size: 18px;
+  margin: 0;
+  box-shadow: 0 0 0 4px rgba(16, 185, 129, 0.08);
+  animation: closing-thumb-ring 2.2s ease-out 1;
+}
+
+.ceremony-hero-card .checkmark-wrapper i {
+  display: inline-block;
+  transform-origin: 35% 75%;
+  animation: closing-thumb-pop 0.75s cubic-bezier(0.22, 1.4, 0.36, 1) 1;
+}
+
+@keyframes closing-thumb-pop {
+  0% {
+    transform: scale(0.55) rotate(14deg);
+    opacity: 0;
+  }
+  45% {
+    transform: scale(1.25) rotate(-14deg);
+    opacity: 1;
+  }
+  72% {
+    transform: scale(0.95) rotate(6deg);
+  }
+  100% {
+    transform: scale(1) rotate(0deg);
+  }
+}
+
+@keyframes closing-thumb-ring {
+  0% {
+    box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.36);
+  }
+  60% {
+    box-shadow: 0 0 0 12px rgba(16, 185, 129, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 4px rgba(16, 185, 129, 0.08);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ceremony-hero-card .checkmark-wrapper,
+  .ceremony-hero-card .checkmark-wrapper i {
+    animation: none;
+  }
 }
 
 .ceremony-hero-content {
@@ -4155,38 +5134,22 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
   flex-direction: column;
   align-items: center;
   max-width: 680px;
-  margin: 0 auto 24px;
-}
-
-/* 成就勋章胶囊 */
-.ceremony-achievement-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 14px;
-  border-radius: 999px;
-  background: var(--solo-income-soft);
-  color: var(--solo-income);
-  font-size: 12px;
-  font-weight: 600;
-  margin-bottom: 12px;
-  border: 1px solid rgba(15, 115, 84, 0.2);
-  letter-spacing: 0.2px;
+  margin: 0 auto 12px;
 }
 
 .ceremony-hero-content h2.ceremony-title {
-  margin: 0 0 10px;
-  font-size: 24px;
+  margin: 0;
+  font-size: 20px;
   font-weight: 800;
   color: var(--solo-text-primary);
   line-height: 1.25;
 }
 
 .ceremony-hero-content .ceremony-desc {
-  margin: 0 0 14px;
-  font-size: 13.5px;
+  margin: 0 0 8px;
+  font-size: 12.5px;
   color: var(--solo-text-secondary);
-  line-height: 1.6;
+  line-height: 1.5;
 }
 
 .ceremony-meta-tags {
@@ -4197,85 +5160,28 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
   flex-wrap: wrap;
 }
 
-/* 指标大方块（做大一些、更有品质感、带有数据色彩倾向） */
+/* 指标大方块（覆盖 .metrics-row 的 margin-top: 20px，避免叠加间距） */
 .ceremony-metrics-row {
   width: 100%;
   max-width: 880px;
   margin: 0 auto;
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: 16px;
+  gap: 12px;
 }
 
 .ceremony-metric-box {
-  background: var(--solo-bg-card);
-  border: 1px solid var(--solo-border);
+  background: var(--solo-bg-soft);
+  border: 1px solid var(--solo-border-light);
   border-radius: var(--solo-radius, 8px);
-  padding: 18px 20px;
+  padding: 10px 16px;
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 8px;
+  gap: 4px;
   transition: all 0.2s ease;
   position: relative;
   overflow: hidden;
-}
-
-.ceremony-metric-box::before {
-  content: '';
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 3px;
-  background: transparent;
-}
-
-/* 经营收入：绿意温润 */
-.ceremony-metric-box.is-income {
-  background: linear-gradient(180deg, var(--solo-income-soft) 0%, var(--solo-bg-card) 60%);
-  border-color: rgba(15, 115, 84, 0.25);
-}
-.ceremony-metric-box.is-income::before {
-  background: var(--solo-income);
-}
-.ceremony-metric-box.is-income .metric-box-label {
-  color: var(--solo-income);
-}
-
-/* 经营成本：暖红警示 */
-.ceremony-metric-box.is-expense {
-  background: linear-gradient(180deg, var(--solo-expense-soft) 0%, var(--solo-bg-card) 60%);
-  border-color: rgba(189, 61, 61, 0.25);
-}
-.ceremony-metric-box.is-expense::before {
-  background: var(--solo-expense);
-}
-.ceremony-metric-box.is-expense .metric-box-label {
-  color: var(--solo-expense);
-}
-
-/* 净利润：根据盈亏动态着色 */
-.ceremony-metric-box.is-profit.is-positive {
-  background: linear-gradient(180deg, var(--solo-income-soft) 0%, var(--solo-bg-card) 60%);
-  border-color: rgba(15, 115, 84, 0.25);
-}
-.ceremony-metric-box.is-profit.is-positive::before {
-  background: var(--solo-income);
-}
-.ceremony-metric-box.is-profit.is-positive .metric-box-label {
-  color: var(--solo-income);
-}
-
-.ceremony-metric-box.is-profit.is-negative {
-  background: linear-gradient(180deg, var(--solo-expense-soft) 0%, var(--solo-bg-card) 60%);
-  border-color: rgba(189, 61, 61, 0.25);
-}
-.ceremony-metric-box.is-profit.is-negative::before {
-  background: var(--solo-expense);
-}
-.ceremony-metric-box.is-profit.is-negative .metric-box-label {
-  color: var(--solo-expense);
 }
 
 .ceremony-metric-box:hover {
@@ -4293,7 +5199,7 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
 }
 
 .ceremony-metric-box .metric-box-val {
-  font-size: 24px;
+  font-size: 20px;
   font-weight: 800;
   font-family: 'Outfit', sans-serif;
   font-variant-numeric: tabular-nums;
@@ -4311,8 +5217,8 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
 }
 
 @media (max-width: 768px) {
-  .ceremony-hero-card {
-    padding: 24px 16px 20px;
+  .ceremony-hero-card :deep(.n-card__content) {
+    padding: 16px;
   }
   .ceremony-metrics-row {
     grid-template-columns: 1fr;
@@ -4337,11 +5243,11 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  padding: 16px;
+  padding: 14px 16px;
   background: var(--solo-bg-card);
   border: 1px solid var(--solo-border);
   border-radius: var(--solo-radius-lg, 12px);
-  min-height: 200px;
+  min-height: 160px;
   transition: all 0.2s ease;
 }
 
@@ -4355,7 +5261,7 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  margin-bottom: 12px;
+  margin-bottom: 8px;
 }
 
 .action-card-title-group {
@@ -4416,8 +5322,8 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
   display: flex;
   flex-direction: column;
   justify-content: center;
-  margin-bottom: 14px;
-  min-height: 60px;
+  margin-bottom: 10px;
+  min-height: 44px;
 }
 
 .action-card-desc {
@@ -4478,18 +5384,24 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
 .action-card-buttons {
   display: flex;
   align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
+  gap: 10px;
+  flex-wrap: nowrap;
 }
 
-/* 底部轻量辅助工具栏 */
+/* 底部轻量辅助工具栏（右侧留白避让悬浮助手图标） */
 .ceremony-footer-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 10px 4px;
+  padding: 10px 76px 10px 4px;
   flex-wrap: wrap;
   gap: 12px;
+}
+
+@media (max-width: 768px) {
+  .ceremony-footer-bar {
+    padding: 10px 4px;
+  }
 }
 
 .ceremony-footer-links {
@@ -4586,6 +5498,89 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
   font-size: 12px;
   color: var(--solo-text-muted);
   margin-top: 2px;
+}
+.manual-stmt-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: var(--solo-bg-soft);
+  border: 1px solid var(--solo-border-light);
+  margin-bottom: 14px;
+}
+.manual-stmt-banner-main {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+}
+.manual-stmt-banner-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--solo-text-primary);
+  min-width: 0;
+}
+.manual-stmt-banner-meta {
+  font-size: 11px;
+  color: var(--solo-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.manual-stmt-banner-amount {
+  font-size: 16px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+.manual-account-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  background: var(--solo-bg-soft);
+  border: 1px solid var(--solo-border-light);
+  font-size: 12px;
+  color: var(--solo-text-secondary);
+}
+.manual-account-summary-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.manual-account-plain-hint {
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--solo-text-muted);
+}
+.manual-advanced-box {
+  border-top: 1px solid var(--solo-border-light);
+  padding-top: 8px;
+}
+.manual-advanced-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 0;
+  border: none;
+  background: transparent;
+  color: var(--solo-text-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.manual-advanced-toggle:hover {
+  color: var(--solo-primary);
+}
+.manual-advanced-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 10px;
 }
 .manual-stmt-info {
   background: rgba(99, 102, 241, 0.03);
@@ -4801,34 +5796,35 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
 }
 
 .readiness-count {
-  min-width: 116px;
-  padding: 12px 16px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
   border: 1px solid var(--solo-border);
-  border-radius: 8px;
-  background: var(--solo-bg-soft);
-  text-align: right;
+  border-radius: 999px;
+  background: var(--solo-warning-soft);
+  color: var(--solo-warning);
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
-.readiness-count strong,
-.readiness-count span {
-  display: block;
+.readiness-count i {
+  font-size: 15px;
 }
 
 .readiness-count strong {
-  color: var(--solo-text-primary);
-  font-size: 20px;
+  font-size: 15px;
+  font-weight: 700;
   font-variant-numeric: tabular-nums;
-}
-
-.readiness-count span {
-  margin-top: 2px;
-  color: var(--solo-text-secondary);
-  font-size: 12px;
+  margin: 0 2px;
 }
 
 .readiness-count.ready {
   border-color: rgba(18, 128, 92, 0.24);
   background: var(--solo-income-soft);
+  color: var(--solo-income);
 }
 
 .next-task {
@@ -4981,6 +5977,16 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
   color: var(--solo-warning);
 }
 
+.five-check-chip.waiting-post {
+  background: var(--solo-bg-soft);
+  border-style: dashed;
+}
+
+.readiness-collapse-meta {
+  font-size: 12px;
+  color: var(--solo-text-muted);
+}
+
 @media (max-width: 900px) {
   .five-check-chips {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -5118,8 +6124,7 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
   }
 
   .readiness-count {
-    width: 100%;
-    text-align: left;
+    align-self: flex-start;
   }
 
   .next-task .n-button {
@@ -5174,6 +6179,7 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
 .readiness-count.zero {
   border-color: var(--solo-border);
   background: var(--solo-bg-soft);
+  color: var(--solo-text-muted);
 }
 @media (max-width: 768px) {
   .zero-record-confirm {
@@ -5208,22 +6214,89 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
 /* Bank Feed Categorization Workbench (Step 4) */
 .feed-summary-hero {
   display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 20px;
-  flex-wrap: wrap;
-  padding: 16px 20px;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 16px;
   border-radius: var(--solo-radius-lg, 12px);
-  background: linear-gradient(135deg, rgba(99, 102, 241, 0.05) 0%, rgba(16, 185, 129, 0.05) 100%);
-  border: 1px solid rgba(99, 102, 241, 0.15);
-  margin-bottom: 20px;
+  background: var(--solo-bg-soft);
+  border: 1px solid var(--solo-border-light);
+  margin-bottom: 14px;
 }
 
-.feed-hero-left {
+.feed-hero-top {
   display: flex;
   align-items: center;
-  gap: 18px;
+  justify-content: space-between;
+  gap: 16px;
   flex-wrap: wrap;
+}
+
+.feed-hero-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--solo-text-secondary);
+  flex-wrap: wrap;
+}
+
+.feed-hero-bottom {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding-top: 10px;
+  border-top: 1px solid var(--solo-border-light);
+}
+
+.feed-hero-controls {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-left: auto;
+}
+
+.hero-progress-ratio strong {
+  color: var(--solo-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.hero-progress-sep {
+  color: var(--solo-text-muted);
+}
+
+.hero-progress-pending {
+  color: var(--solo-text-primary);
+  font-weight: 600;
+}
+
+.hero-unposted-warn {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--solo-warning);
+  background: var(--solo-warning-bg);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.hero-progress-track {
+  width: 96px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--solo-border-light);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.hero-progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--solo-income);
+  transition: width 0.25s ease;
 }
 
 .feed-hero-stat-circle {
@@ -5286,12 +6359,46 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
   margin-bottom: 14px;
 }
 
+.feed-hero-done-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.feed-hero-done-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--solo-income);
+  font-weight: 600;
+  font-size: 13.5px;
+}
+
+.feed-hero-done-badge i {
+  font-size: 18px;
+}
+
 .feed-empty-box {
-  padding: 48px 24px;
+  padding: 40px 24px;
   text-align: center;
   background: rgba(16, 185, 129, 0.02);
   border: 1px dashed rgba(16, 185, 129, 0.2);
   border-radius: 12px;
+}
+
+.step-nav-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 12px;
+  padding-right: 76px;
+}
+
+@media (max-width: 768px) {
+  .step-nav-footer {
+    padding-right: 0;
+  }
 }
 
 .feed-empty-icon {
@@ -5303,6 +6410,88 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+.feed-group-divider {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 6px 12px;
+  border-radius: 6px;
+  background: var(--solo-bg-soft);
+  border: 1px solid var(--solo-border-light);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--solo-text-primary);
+  margin-top: 4px;
+}
+
+.feed-group-divider:first-child {
+  margin-top: 0;
+}
+
+.feed-group-divider.ready {
+  border-left: 3px solid var(--solo-primary);
+}
+
+.feed-group-divider.attention {
+  border-left: 3px solid var(--solo-warning);
+  background: var(--solo-warning-bg);
+  color: var(--solo-warning);
+}
+
+.feed-group-sub {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--solo-text-muted);
+}
+
+.recent-confirm-undo-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 8px 14px;
+  margin-bottom: 10px;
+  border-radius: 8px;
+  background: var(--solo-income-bg);
+  border: 1px solid var(--solo-border-light);
+}
+
+.recent-confirm-undo-text {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--solo-text-primary);
+}
+
+.recent-confirm-undo-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.recent-confirm-dismiss {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: none;
+  background: transparent;
+  color: var(--solo-text-muted);
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.recent-confirm-dismiss:hover {
+  background: var(--solo-bg-soft);
+  color: var(--solo-text-primary);
 }
 
 /* 商业化紧凑型对账行 (Compact Reconcile Row) */
@@ -5392,6 +6581,22 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
   min-width: 0;
 }
 
+.fact-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.fact-channel {
+  font-size: 11px;
+  color: var(--solo-text-muted);
+  background: var(--solo-bg-soft);
+  padding: 1px 6px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+
 .fact-date {
   font-size: 12px;
   color: var(--solo-text-muted);
@@ -5401,11 +6606,27 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
 
 .fact-desc {
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 600;
   color: var(--solo-text-primary);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.fact-party {
+  font-weight: 600;
+  color: var(--solo-text-primary);
+}
+
+.fact-sep {
+  margin: 0 5px;
+  color: var(--solo-text-muted);
+  font-weight: 400;
+}
+
+.fact-summary {
+  font-weight: 400;
+  color: var(--solo-text-secondary);
 }
 
 .fact-amount {
@@ -5470,6 +6691,31 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
   white-space: nowrap;
 }
 
+.multi-match-chips {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.multi-match-more {
+  font-size: 11px;
+  color: var(--solo-text-muted);
+}
+
+.matched-pending-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 14px;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--solo-text-muted);
+  background: var(--solo-bg-soft);
+  border: 1px dashed var(--solo-border-light);
+  border-radius: var(--solo-radius-sm);
+}
+
 .plan-category {
   font-weight: 600;
   color: var(--solo-text-primary);
@@ -5487,24 +6733,65 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
   white-space: nowrap;
 }
 
+.plan-ambiguity-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
 .plan-alternatives {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 4px;
-  margin-top: 2px;
+  gap: 6px;
+}
+
+.plan-plain-hint {
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--solo-text-muted);
+}
+
+.plan-advance-payable {
+  display: flex;
+  align-items: flex-start;
+  gap: 5px;
+  margin-top: 6px;
+  padding: 5px 9px;
+  border-radius: 8px;
+  background: var(--solo-info-bg);
+  color: var(--solo-text-secondary);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.plan-advance-payable i {
+  color: var(--solo-info);
+  font-size: 13px;
+  line-height: 1.35;
+  flex-shrink: 0;
+}
+
+.plan-advance-payable.is-warn {
+  background: var(--solo-warning-bg);
+  color: var(--solo-text-primary);
+}
+
+.plan-advance-payable.is-warn i {
+  color: var(--solo-warning);
 }
 
 .plan-alt-chip {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 1px 8px;
+  padding: 2px 9px;
   border-radius: 10px;
   border: 1px solid var(--solo-border-light);
   background: #fff;
   color: var(--solo-text-secondary);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 18px;
   cursor: pointer;
   transition: border-color 0.15s, color 0.15s, background 0.15s;
@@ -5518,14 +6805,27 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
 .plan-alt-chip.selected {
   border-color: var(--solo-primary);
   color: var(--solo-primary);
-  background: rgba(23, 71, 176, 0.06);
+  background: rgba(23, 71, 176, 0.07);
   font-weight: 600;
 }
 
 .plan-alt-account {
   color: var(--solo-text-muted);
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 400;
+}
+
+.plan-reason-hint {
+  display: inline-flex;
+  align-items: center;
+  color: var(--solo-text-muted);
+  font-size: 13px;
+  cursor: help;
+  padding: 0 2px;
+}
+
+.plan-reason-hint:hover {
+  color: var(--solo-primary);
 }
 
 .plan-ask-ai {
@@ -5587,8 +6887,19 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
   margin-bottom: 10px;
 }
 
+.batch-post-confirm-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--solo-text-muted);
+  margin-bottom: 8px;
+  padding: 0 2px;
+}
+
 .batch-post-confirm-list {
-  max-height: 260px;
+  max-height: 380px;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
@@ -5601,9 +6912,16 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  padding: 7px 10px;
+  padding: 8px 12px;
   border: 1px solid var(--solo-border-light);
   border-radius: 8px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.batch-post-confirm-row:hover {
+  border-color: var(--solo-primary);
+  background: var(--solo-bg-soft);
 }
 
 .batch-post-confirm-main {
@@ -5611,6 +6929,23 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
   flex-direction: column;
   gap: 2px;
   min-width: 0;
+}
+
+.batch-post-confirm-title-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.batch-post-confirm-date {
+  font-size: 11px;
+  color: var(--solo-text-muted);
+  background: var(--solo-bg-soft);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
 }
 
 .batch-post-confirm-title {
@@ -5631,10 +6966,23 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
   font-style: normal;
 }
 
+.batch-post-confirm-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
 .batch-post-confirm-amt {
   font-size: 13px;
   font-weight: 600;
+  font-variant-numeric: tabular-nums;
   flex-shrink: 0;
+}
+
+.batch-post-row-arrow {
+  color: var(--solo-text-muted);
+  font-size: 15px;
 }
 
 .batch-post-confirm-footer {
@@ -5734,12 +7082,45 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
 }
 
 .reconcile-category-select {
-  width: 170px;
+  width: 108px;
+}
+
+.reconcile-category-select :deep(.n-base-selection) {
+  --n-color: transparent;
+  --n-border: 1px solid transparent;
+  --n-border-hover: 1px solid var(--solo-border-light);
+  --n-placeholder-color: var(--solo-text-muted);
+}
+
+.reconcile-row:hover .reconcile-category-select :deep(.n-base-selection) {
+  --n-color: var(--solo-bg-soft);
+  --n-border: 1px solid var(--solo-border-light);
 }
 
 .reconcile-detail-btn {
   color: var(--solo-text-muted);
   font-size: 12px;
+}
+
+.reconcile-modify-btn {
+  color: var(--solo-text-secondary);
+  font-size: 12px;
+}
+
+.reconcile-primary-btn {
+  min-width: 96px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 @media (max-width: 1100px) {
@@ -6154,6 +7535,97 @@ usePageRefresh(() => Promise.all([loadAllData(), loadRdOptions()]))
   display: flex;
   align-items: center;
   gap: 6px;
+}
+
+.opening-locked-slot {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 88px;
+  padding: 12px 16px;
+  border: 1px dashed var(--solo-border);
+  border-radius: var(--solo-radius);
+  background: var(--solo-bg-soft);
+  color: var(--solo-text-muted);
+  font-size: 13px;
+}
+
+.bank-upload-summary-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius);
+  background: var(--solo-income-bg);
+}
+
+.bank-upload-summary-bar.is-warn {
+  background: var(--solo-warning-bg);
+}
+
+.bank-upload-summary-left {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  min-width: 0;
+}
+
+.bank-upload-summary-icon {
+  font-size: 15px;
+  color: var(--solo-income);
+  flex-shrink: 0;
+}
+
+.bank-upload-summary-bar.is-warn .bank-upload-summary-icon {
+  color: var(--solo-warning);
+}
+
+.bank-upload-summary-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--solo-text-primary);
+}
+
+.bank-upload-summary-stats {
+  font-size: 12px;
+  color: var(--solo-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.bank-upload-summary-stats .stat-income {
+  color: var(--solo-income);
+}
+
+.bank-upload-summary-stats .stat-expense {
+  color: var(--solo-expense);
+}
+
+.bank-upload-summary-stats .stat-warn {
+  color: var(--solo-warning);
+}
+
+.bank-upload-summary-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.bank-upload-modal-summary {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--solo-text-primary);
 }
 
 </style>

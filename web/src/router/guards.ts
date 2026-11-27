@@ -25,10 +25,21 @@ export function safeRedirectTarget(raw: unknown): string | null {
 }
 
 /**
+ * 微信扫码登录落回 /login 时携带的一次性状态参数。
+ * 这类访问必须由登录页自己处理（弹绑定手机号 / 展示错误），
+ * 否则本机若已有旧登录态，守卫会直接重定向走，pending cookie 被静默吞掉。
+ */
+function hasWechatLoginMarker(query?: Record<string, unknown>): boolean {
+  if (!query) return false
+  return Boolean(query.wechat_pending || query.wechat_error)
+}
+
+/**
  * 认证重定向规则（纯函数，便于单测）：
  * - 未登录访问根路径 → 不重定向，由 RootSwitch 在 / 原地呈现官网落地页
  * - 未登录访问受保护路由 → 登录页（携带站内 fullPath 便于登录后回跳）
  * - 已登录访问登录页 → 优先回跳安全的 redirect 参数，否则回工作台
+ *   （微信回调带 wechat_pending / wechat_error 时例外，交给登录页处理）
  * 返回 null 表示不需要重定向。
  */
 export function resolveAuthRedirect(to: GuardRouteLike, token: string | null): string | null {
@@ -40,6 +51,7 @@ export function resolveAuthRedirect(to: GuardRouteLike, token: string | null): s
     return target && target !== '/' ? `/login?redirect=${encodeURIComponent(target)}` : '/login'
   }
   if (to.path === '/login' && token) {
+    if (hasWechatLoginMarker(to.query)) return null
     return safeRedirectTarget(to.query?.redirect) || '/'
   }
   return null

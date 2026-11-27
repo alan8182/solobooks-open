@@ -5,6 +5,7 @@ from decimal import Decimal
 
 from services.bank_service import (
     build_balance_reconciliation,
+    build_group_reconciliation_check,
     diagnose_matched_statement_effect,
     extract_statement_counterparty,
     normalize_statement_description,
@@ -62,6 +63,38 @@ def test_balance_reconciliation_orders_same_day_rows_by_file_row_index():
     assert result["bank_closing_balance"] == 101.0
     assert result["flow_difference"] == 0.0
     assert result["flow_balanced"] is True
+
+
+def test_group_reconciliation_bank_effect_wins_over_clearing_fallthrough():
+    """结算链整组对账按银行影响，清算户净额不得与结算凭证重复计入（2026-11 生产）。
+
+    [结算凭证（借 1002 / 贷 1012001 各 58.47）+ 收入计提（借 1012001 / 贷 5001 各
+    59.00）+ 手续费（贷 1012001 0.53）] 三张一起挂到 58.47 的到账流水时，旧口径
+    把清算户净额（59 - 0.53）与结算凭证的银行影响叠加成 116.94，结账向导
+    「高风险对账问题」误锁关账。组内存在 1002 影响时必须整组只按银行影响；
+    该组完全没有 1002 影响时仍按清算净额（毛收入 - 手续费 = 到账净额）对账。
+    """
+    settlement = {"id": "settle", "title": "微信支付结算到账", "voucherLines": {
+        "debit": [{"accountCode": "1002", "amount": "58.47"}],
+        "credit": [{"accountCode": "1012001", "amount": "58.47"}],
+    }}
+    accrual = {"id": "accrual", "title": "签小抄-人工审核-基础版", "voucherLines": {
+        "debit": [{"accountCode": "1012001", "amount": "59.00"}],
+        "credit": [{"accountCode": "5001", "amount": "59.00"}],
+    }}
+    fee = {"id": "fee", "title": "微信手续费", "voucherLines": {
+        "debit": [{"accountCode": "5603002", "amount": "0.53"}],
+        "credit": [{"accountCode": "1012001", "amount": "0.53"}],
+    }}
+
+    check = build_group_reconciliation_check("58.47", [settlement, accrual, fee])
+    assert check["amountMatches"] is True
+    assert check["directionMatches"] is True
+    assert str(check["entryBankEffect"]) == "58.47"
+
+    check_no_bank = build_group_reconciliation_check("58.47", [accrual, fee])
+    assert check_no_bank["amountMatches"] is True
+    assert str(check_no_bank["entryBankEffect"]) == "58.47"
 
 
 def test_diagnose_missing_wechat_settlement_voucher():

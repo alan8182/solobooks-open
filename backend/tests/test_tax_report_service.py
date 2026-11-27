@@ -624,3 +624,53 @@ def test_ytd_income_statement_reads_directional_gross_and_balance_stays_net():
     assert data.balance_current["retained_earnings"] == Decimal("-100"), "期初 3103 借 300 + 净利 200"
     assert data.balance_current["cash"] == Decimal("1200")
     assert data.balance_current["asset_total"] == data.balance_current["liability_equity_total"]
+
+
+def test_secondary_non_operating_accounts_rollup_in_profit_and_cashflow():
+    """营业外收支二级科目（5301002 政府补助、5711011 罚款支出）在利润表和现金流表中正负方向必须正确。"""
+    from services.tax_filing_export_service import build_statement_data_from_entries
+
+    entries = [
+        {
+            "id": "entry-gov-grant",
+            "occurDate": "2026-10-12",
+            "direction": "income",
+            "category": "政府补助",
+            "amount": 1000,
+            "voucherStatus": "posted",
+            "voucherLines": {
+                "debit": [{"accountCode": "1002", "accountName": "银行存款", "amount": 1000}],
+                "credit": [{"accountCode": "5301002", "accountName": "营业外收入-政府补助", "amount": 1000}],
+            },
+        },
+        {
+            "id": "entry-tax-fine",
+            "occurDate": "2026-10-15",
+            "direction": "expense",
+            "category": "罚款支出",
+            "amount": 200,
+            "voucherStatus": "posted",
+            "voucherLines": {
+                "debit": [{"accountCode": "5711011", "accountName": "营业外支出-罚款支出", "amount": 200}],
+                "credit": [{"accountCode": "1002", "accountName": "银行存款", "amount": 200}],
+            },
+        },
+    ]
+    opening_items = [
+        {"account_code": "1002", "debit_balance": "5000.00", "credit_balance": "0"},
+        {"account_code": "3001", "debit_balance": "0", "credit_balance": "5000.00"},
+    ]
+    data = build_statement_data_from_entries(
+        entries,
+        opening_items,
+        parse_period("2026-10", "month"),
+        {"name": "测试企业", "taxId": "91330000TEST000003"},
+    )
+    assert data.profit_current["non_operating_income"] == Decimal("1000.00")
+    assert data.profit_current["non_operating_expense"] == Decimal("200.00")
+    assert data.profit_current["total_profit"] == Decimal("800.00")
+    assert data.profit_current["net_profit"] == Decimal("800.00")
+    assert data.cash_current["other_operating_in"] == Decimal("1000.00")
+    assert data.cash_current["other_operating_out"] == Decimal("200.00")
+    assert data.balance_current["cash"] == Decimal("5800.00")
+    assert data.balance_current["asset_total"] == data.balance_current["liability_equity_total"]

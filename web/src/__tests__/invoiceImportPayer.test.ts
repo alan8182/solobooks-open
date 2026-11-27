@@ -12,7 +12,10 @@ import {
   INVOICE_PAYER_OPTIONS,
   hasUnnamedEmployeePayer,
   initialInvoicePayer,
+  invoiceCategoryPayload,
+  invoicePreviewRow,
   invoiceRowPayer,
+  resolveInvoiceCategory,
 } from '@/utils/invoiceImport'
 import * as invoiceApi from '@/api/invoice'
 
@@ -65,21 +68,21 @@ async function flush() {
   await nextTick()
 }
 
-async function mountAtPreview() {
+const TENCENT_ROW = {
+  invoice_number: 'INV-TENCENT-1',
+  invoice_date: '2026-10-08',
+  seller_name: '腾讯云计算（北京）有限责任公司',
+  amount: 431.25,
+  direction: 'expense',
+  category: '信息技术服务费',
+}
+
+async function mountAtPreview(validRows: Array<Record<string, unknown>> = [TENCENT_ROW]) {
   vi.mocked(invoiceApi.parseInvoiceRows).mockResolvedValue({
-    valid: [
-      {
-        invoice_number: 'INV-TENCENT-1',
-        invoice_date: '2026-10-08',
-        seller_name: '腾讯云计算（北京）有限责任公司',
-        amount: 431.25,
-        direction: 'expense',
-        category: '信息技术服务费',
-      },
-    ],
+    valid: validRows,
     errors: [],
-    total: 1,
-    valid_count: 1,
+    total: validRows.length,
+    valid_count: validRows.length,
   })
   vi.mocked(invoiceApi.importInvoices).mockResolvedValue({
     imported: 1,
@@ -194,5 +197,89 @@ describe('InvoiceImportDrawer 付款方确认', () => {
     await clickImport(wrapper)
 
     expect(invoiceApi.importInvoices).not.toHaveBeenCalled()
+  })
+})
+
+describe('invoice import category suggestion', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  // 电票 XML 管线不产出分类列：行上没有 category 时才用后端的品名建议
+  const XML_ROW = {
+    invoice_number: '26332000009419088091',
+    invoice_date: '2026-10-31',
+    seller_name: '王翼',
+    amount: 300,
+    direction: 'expense',
+  }
+
+  it('prefills the backend item-name suggestion with its reason', () => {
+    const row = invoicePreviewRow({
+      ...XML_ROW,
+      suggestedCategory: '信息技术服务费',
+      suggestedCategoryReason: '按发票品名「*生产生活服务*软件测试服务」建议',
+    })
+    expect(row._category).toBe('信息技术服务费')
+    expect(row._categoryHint).toContain('软件测试服务')
+    expect(row._categorySource).toBe('suggested')
+    expect(invoiceCategoryPayload(row)).toEqual({ category: '信息技术服务费' })
+    expect(row._payer).toEqual({ kind: 'company_account', employeeName: '' })
+  })
+
+  it('keeps an explicit category and drops the suggestion hint', () => {
+    const row = invoicePreviewRow({
+      ...XML_ROW,
+      category: '办公费',
+      suggestedCategory: '信息技术服务费',
+      suggestedCategoryReason: '按发票品名建议',
+    })
+    expect(row._category).toBe('办公费')
+    expect(row._categoryHint).toBe('')
+    expect(row._categorySource).toBe('explicit')
+    expect(invoiceCategoryPayload(row)).toEqual({ category: '办公费' })
+  })
+
+  it('falls back by direction only when there is no suggestion at all', () => {
+    const row = invoicePreviewRow({ ...XML_ROW, suggestedCategory: '', suggestedCategoryReason: '' })
+    expect(row._category).toBe('其他支出')
+    expect(row._categoryHint).toContain('自动补分类')
+    expect(row._categorySource).toBe('fallback')
+    // 兜底值只是展示占位，不能当成用户确认的分类提交
+    expect(invoiceCategoryPayload(row)).toEqual({})
+    // 销项票不能兜底「其他支出」，否则挂账凭证过不了收支校验
+    expect(resolveInvoiceCategory('', '', 'income')).toBe('主营业务收入')
+  })
+
+  it('does not submit a fallback category and asks the backend to classify', async () => {
+    const { wrapper } = await mountAtPreview([
+      { ...XML_ROW, suggestedCategory: '', suggestedCategoryReason: '' },
+    ])
+
+    await clickImport(wrapper)
+
+    const [rows, classify] = vi.mocked(invoiceApi.importInvoices).mock.calls[0]
+    expect('category' in rows[0]).toBe(false)
+    expect(classify).toBe(true)
+  })
+
+  it('shares one category rule between preview and closing-wizard batch import', () => {
+    expect(resolveInvoiceCategory(undefined, '信息技术服务费', 'expense')).toBe('信息技术服务费')
+    expect(resolveInvoiceCategory('办公费', '信息技术服务费', 'expense')).toBe('办公费')
+  })
+
+  it('imports the suggested category into the voucher row', async () => {
+    const { wrapper } = await mountAtPreview([
+      {
+        ...XML_ROW,
+        suggestedCategory: '信息技术服务费',
+        suggestedCategoryReason: '按发票品名「*生产生活服务*软件测试服务」建议',
+      },
+    ])
+
+    await clickImport(wrapper)
+
+    const [rows] = vi.mocked(invoiceApi.importInvoices).mock.calls[0]
+    expect(rows[0].category).toBe('信息技术服务费')
   })
 })

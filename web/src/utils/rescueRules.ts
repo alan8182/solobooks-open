@@ -247,6 +247,26 @@ export const RESCUE_RULES: Record<string, RescueRule> = {
       return actions
     },
   },
+
+  OPENING_BALANCE_REQUIRED: {
+    code: 'OPENING_BALANCE_REQUIRED',
+    title: '请先完成期初建账',
+    severity: 'blocker',
+    reason: (ctx) => {
+      const status = text(ctx.openingStatus)
+      if (status === 'locked') {
+        return '该账套从其他代账转入，请先完善启用日期并完成期初建账，再导入业务数据或记账'
+      }
+      if (status === 'doing') {
+        return '该账套的期初余额尚未配平或仍为草稿，请先确认期初凭证后再导入业务数据或记账'
+      }
+      return '该账套从其他代账转入，尚未录入或导入期初余额，请先完成期初建账后再导入业务数据或记账'
+    },
+    actions: () => [
+      { label: '去期初建账', kind: 'primary', path: '/mine/opening' },
+      { label: '知道了', kind: 'ghost' },
+    ],
+  },
 }
 
 /**

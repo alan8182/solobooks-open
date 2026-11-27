@@ -3,17 +3,26 @@
 import { computed, ref, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { NAlert, NCard, NButton, NModal, NForm, NFormItem, NInput, NSelect, NTag, NPopover, NTooltip, NDatePicker, useMessage, NSpace, NGrid, NGi } from 'naive-ui'
+import { etaxRegionKey, etaxRegionSelectOptions } from '@/utils/etaxPortal'
+import { applyLicensePrefill } from '@/utils/companyLicense'
 import { useAuthStore } from '@/stores/auth'
 import { useCompanyStore } from '@/stores/company'
 import { useUsageStore } from '@/stores/usage'
-import { updateCompany as apiUpdateCompany, deleteCompany as apiDeleteCompany } from '@/api/auth'
+import {
+  updateCompany as apiUpdateCompany,
+  deleteCompany as apiDeleteCompany,
+  recognizeCompanyLicense,
+  requestStepUp,
+} from '@/api/auth'
+import { sendVerificationCode } from '@/utils/verificationCode'
 import { listTaxRegistrations, type TaxRegistrationRow } from '@/api/tax-registration'
-import { reportErrorToast } from '@/utils/errorPresenter'
+import { reportErrorToast, errorSummary } from '@/utils/errorPresenter'
 import { restrictedIndustryFor, filterIndustryGroups } from '@/utils/industryTax'
 import {
   companyCreateLandingPath,
+  createSuccessSwitchNotice,
+  deriveStartDateFromIncorporation,
   parseCompanyCreateQuery,
-  shouldSwitchAfterCreate,
 } from '@/utils/companyOnboarding'
 import {
   getIndustryTemplates,
@@ -41,8 +50,12 @@ function defaultCreateForm() {
     name: '', type: '有限责任公司', taxpayerType: '小规模纳税人',
     // formatted-value 的「无值」哨兵是 null，空字符串会被当作待解析日期导致弹窗崩溃
     startDate: null as string | null,
+    // 启用日期是否仍跟随成立日期自动带入；用户手改后置 false
+    startDateAuto: true,
     incorporationDate: null as string | null,
     taxId: '',
+    // 注册地：省份 / 省份|计划单列市。决定跳哪个省的电子税务局，建账时必填
+    region: '',
     restrictedIndustry: 'no', industry: '', industryCode: '',
     industryTouched: false, legacyIndustryName: '',
   }
@@ -50,6 +63,116 @@ function defaultCreateForm() {
 const showCreate = ref(false)
 const createForm = ref(defaultCreateForm())
 const creating = ref(false)
+
+// ---- 营业执照识别：只预填，落库仍走「创建主体」，用户核对后才提交 ----
+// 本地状态下拉默认值「有限责任公司」不算用户的选择：只有亲手改过才保护
+const createTypeTouched = ref(false)
+// 注册地下拉是 filterable 的 naive-ui NSelect：程序赋值后偶发「值已写入、框里空白」
+// （与下方行业下拉同一个渲染缺陷），用哨兵 key 强制重挂载。
+const regionSelectSync = ref(0)
+const licenseInput = ref<HTMLInputElement | null>(null)
+const licenseBusy = ref(false)
+const licenseError = ref('')
+const licenseResult = ref<{
+  tone: 'success' | 'warn'
+  filled: string[]
+  kept: string[]
+  notices: string[]
+} | null>(null)
+
+function pickLicenseFile() {
+  if (licenseBusy.value) return
+  licenseInput.value?.click()
+}
+
+function resetLicenseState() {
+  licenseBusy.value = false
+  licenseError.value = ''
+  licenseResult.value = null
+  if (licenseInput.value) licenseInput.value.value = ''
+}
+
+async function runLicenseOcr(file: File) {
+  licenseBusy.value = true
+  licenseError.value = ''
+  licenseResult.value = null
+  try {
+    const result = await recognizeCompanyLicense(file)
+    const prefilled = applyLicensePrefill(
+      { ...createForm.value, type: createTypeTouched.value ? createForm.value.type : '' },
+      result,
+    )
+    // 识别不出受支持的主体类型时别把下拉清空：保留表单原值，提示里已要求手选
+    if (!prefilled.form.type) prefilled.form.type = createForm.value.type
+    createForm.value = prefilled.form
+    // 成立日期被带入后，启用日期按既有规则跟随（仅「新成立公司」）
+    if (prefilled.filled.includes('公司成立日期')) syncStartDateFromIncorporation()
+    if (prefilled.filled.includes('注册地')) regionSelectSync.value++
+    licenseResult.value = {
+      tone: prefilled.notices.length ? 'warn' : 'success',
+      filled: prefilled.filled,
+      kept: prefilled.kept,
+      notices: prefilled.notices,
+    }
+  } catch (err) {
+    // 识别失败不阻塞新建主体：提示原因，用户照常手填
+    licenseError.value = errorSummary(err, '识别失败，请换一张更清晰的照片，或直接手动填写')
+  } finally {
+    licenseBusy.value = false
+  }
+}
+
+async function onLicensePicked(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0] || null
+  // 清空 value：同一个文件重选一次也要能再次触发 change
+  input.value = ''
+  if (file) await runLicenseOcr(file)
+}
+
+function onLicenseDrop(event: DragEvent) {
+  if (licenseBusy.value) return
+  const file = event.dataTransfer?.files?.[0]
+  if (file) void runLicenseOcr(file)
+}
+
+/** 新成立公司的启用日期默认等于成立日期；用户手改过就不再跟随。 */
+function syncStartDateFromIncorporation() {
+  const derived = deriveStartDateFromIncorporation(createForm.value)
+  if (!derived) return
+  createForm.value.startDate = derived.startDate
+  createForm.value.startDateAuto = derived.startDateAuto
+}
+
+function selectOnboardingType(type: 'new' | 'migration') {
+  createForm.value.onboardingType = type
+  syncStartDateFromIncorporation()
+}
+
+function onIncorporationDateChange(value: string | null) {
+  createForm.value.incorporationDate = value || null
+  syncStartDateFromIncorporation()
+}
+
+function onStartDateChange(value: string | null) {
+  const next = value || null
+  // 用户亲手改过：此后成立日期变化不再覆盖。重复选中仍是自动值的那天不算手改，
+  // 避免只是点开又收起就把联动断掉。
+  createForm.value.startDateAuto = createForm.value.startDateAuto
+    && !!next
+    && next === createForm.value.incorporationDate
+  createForm.value.startDate = next
+  // 清空时若已有成立日期，重新带回默认值，避免必填项莫名空着
+  if (!next) syncStartDateFromIncorporation()
+}
+
+/** 仅在启用日期确实来自成立日期时提示，用户手改后不再显示。 */
+const startDateAutoHint = computed(() =>
+  createForm.value.onboardingType === 'new'
+  && createForm.value.startDateAuto
+  && !!createForm.value.startDate
+  && createForm.value.startDate === createForm.value.incorporationDate,
+)
 // 从建账引导（?create=new|migration）进入：创建后要切到新主体并去下一步，
 // 与页面右上角「新增主体」的既有行为区分开。
 const createFromOnboarding = ref(false)
@@ -59,10 +182,17 @@ interface CreateSuccessState {
   name: string
   onboardingType: 'new' | 'migration'
   switched: boolean
+  /** 创建前停留的账套名：切换失败时弹窗要明确说出「还停在哪个账套」 */
+  prevCompanyName: string | null
 }
 const createSuccessState = ref<CreateSuccessState | null>(null)
 
 function handleNextAction(path: string) {
+  // 切换失败时这些「下一步」页面都按当前账套工作；不先切过去就会重演数据落错账
+  if (createSuccessState.value && !createSuccessState.value.switched) {
+    message.warning('请先在主体列表切换到新账套，再进行后续操作')
+    return
+  }
   closeSuccessModal()
   router.push(path)
 }
@@ -81,6 +211,7 @@ const editForm = ref({
   startDate: null as string | null,
   incorporationDate: null as string | null,
   taxId: '',
+  region: '',
   restrictedIndustry: 'no', industry: '', industryCode: '', vatFilingCycle: '' as string,
   businessIncomeIitFilingCycle: '' as string,
   industryTouched: false, legacyIndustryName: '',
@@ -89,9 +220,22 @@ const saving = ref(false)
 
 const companyTypes = [
   { label: '有限责任公司', value: '有限责任公司' },
-  { label: '个人独资企业', value: '个人独资企业' },
-  { label: '个体工商户', value: '个体工商户' },
+  { label: '个人独资企业（内测中）', value: '个人独资企业', disabled: true },
+  { label: '个体工商户（内测中）', value: '个体工商户', disabled: true },
 ]
+
+function openBetaContact() {
+  window.dispatchEvent(new CustomEvent('solo:open-beta-contact'))
+}
+
+// 注册地选项按省分组，计划单列市（深圳/宁波/厦门/青岛/大连）单列
+const regionOptions = etaxRegionSelectOptions()
+
+/** 下拉值「省|市」拆成主体档案的两个字段；清空时两者都为空。 */
+function regionPayload(key: string) {
+  const [province, city] = String(key || '').split('|')
+  return { province: province || '', city: city || '' }
+}
 
 /** 选定行业后自动判定「是否限制/禁止行业」（不再暴露手动选择框）。 */
 function applyIndustryDefault(target: 'create' | 'edit', industryCode: string | null) {
@@ -201,6 +345,7 @@ async function loadIndustryTemplates() {
 
 // 税费种认定表同步后，申报周期由认定表接管：这两个手填字段降级为「未同步时的兜底」，
 // 留着可编辑只会让用户以为改这里能改征期，实际改了不生效。
+// 接管后直接隐藏整块：只读一句「由认定表决定」对用户没有动作价值，要改就去税费种认定页。
 // 接管判定与后端 effective_vat_cycle / effective_iit_cycle 对齐：按申报表组、
 // 只认生效行里的月/季周期，避免「只录了个税认定时增值税字段也被禁用」的错位。
 function groupCycleSynced(rows: TaxRegistrationRow[], group: string): boolean {
@@ -211,6 +356,7 @@ function groupCycleSynced(rows: TaxRegistrationRow[], group: string): boolean {
       (row.filingCycle === 'month' || row.filingCycle === 'quarter'),
   )
 }
+
 const vatCycleSynced = ref(false)
 const iitCycleSynced = ref(false)
 
@@ -248,6 +394,7 @@ watch(
 // 仍被当成引导入口，创建完又把用户带去建账落点。已填内容保留，取消不丢输入。
 watch(showCreate, (visible) => {
   if (visible) return
+  resetLicenseState()
   createFromOnboarding.value = false
   createForm.value.onboardingType = 'new'
   createSuccessState.value = null
@@ -257,7 +404,7 @@ watch(showCreate, (visible) => {
 function applyCreateQuery() {
   const intent = parseCompanyCreateQuery(route.query.create)
   if (!intent) return
-  createForm.value.onboardingType = intent
+  selectOnboardingType(intent)
   createFromOnboarding.value = true
   showCreate.value = true
   // 消费一次即清掉参数，避免刷新或返回时反复弹窗
@@ -311,6 +458,11 @@ async function handleCreate() {
     message.warning('纳税人识别号格式不正确（15/17/18/20 位字母数字）')
     return
   }
+  // 注册地决定去哪个省的电子税务局；建账时问一次，以后就不用再选
+  if (!createForm.value.region) {
+    message.warning('请选择公司注册地（营业执照登记机关所在省市）')
+    return
+  }
   await submitCreate(rawTaxId)
 }
 
@@ -320,7 +472,10 @@ async function submitCreate(rawTaxId: string) {
   const onboardingType = createForm.value.onboardingType
   // 落点要带启用月，重置表单前先留住
   const startDate = createForm.value.startDate
-  const needSwitch = shouldSwitchAfterCreate(wasDemo, fromOnboarding)
+  // 建账即切换：创建账套的本意就是开始用它。2026-11-21 事故里「主体管理直接
+  // 新建正式账套」不切换，用户带着旧账套的心智去结账、同步税费种认定，数据落错账。
+  const prevCompanyName =
+    authStore.companies.find((co) => co.company_id === authStore.currentCompanyId)?.name ?? null
   creating.value = true
   try {
     const company = await companyStore.create({
@@ -329,27 +484,27 @@ async function submitCreate(rawTaxId: string) {
       type: createForm.value.type,
       taxpayerType: createForm.value.taxpayerType,
       taxId: rawTaxId,
+      ...regionPayload(createForm.value.region),
       restrictedIndustry: createForm.value.restrictedIndustry === 'yes',
       startDate: createForm.value.startDate || undefined,
       incorporationDate: createForm.value.incorporationDate || undefined,
       industryCode: createForm.value.industryCode || undefined,
     })
     let switched = false
-    if (needSwitch) {
-      try {
-        await authStore.switchCompanyContext(company.company_id)
-        switched = true
-      } catch {
-        // 主体已经建好了，切换失败不能再报「创建失败」；提示用户手动切换
-        message.warning('主体已创建，但自动切换失败，请在主体列表里手动切换')
-      }
+    try {
+      await authStore.switchCompanyContext(company.company_id)
+      switched = true
+    } catch {
+      // 主体已经建好了，切换失败不能再报「创建失败」；弹窗会明确告知仍停留在哪个账套
+      message.warning('主体已创建，但自动切换失败，请在主体列表里手动切换')
     }
-    if (!needSwitch || switched) loadCompanies()
+    loadCompanies()
     void usageStore.ensureLoaded(true).catch(() => {})
     message.success(wasDemo && switched ? '已创建正式账套并切换生效' : '创建成功')
-    if (fromOnboarding && (!needSwitch || switched)) {
+    if (fromOnboarding && switched) {
       showCreate.value = false
       createForm.value = defaultCreateForm()
+      createTypeTouched.value = false
       createFromOnboarding.value = false
       await router.push(companyCreateLandingPath(onboardingType, startDate))
     } else {
@@ -358,8 +513,10 @@ async function submitCreate(rawTaxId: string) {
         name: company.name,
         onboardingType,
         switched,
+        prevCompanyName,
       }
       createForm.value = defaultCreateForm()
+      createTypeTouched.value = false
     }
   } catch (err) {
     reportErrorToast(message, err, '创建失败')
@@ -386,13 +543,14 @@ function syncEditIndustryFromCompany(co: CompanyInfo) {
 function openEdit(co: CompanyInfo) {
   editingId.value = co.company_id
   editForm.value = {
-    onboardingType: ((co as any).onboardingType === 'migration' ? 'migration' : 'new'),
+    onboardingType: (co.onboardingType === 'migration' ? 'migration' : 'new'),
     name: co.name || '',
     type: co.type || '有限责任公司',
     taxpayerType: co.taxpayerType || '小规模纳税人',
     startDate: co.startDate || null,
     incorporationDate: co.incorporationDate || null,
     taxId: co.taxId || '',
+    region: etaxRegionKey(co.province, co.city),
     restrictedIndustry: co.restrictedIndustry === undefined || co.restrictedIndustry === null
       ? restrictedIndustryFor(co.industry)
       : (co.restrictedIndustry ? 'yes' : 'no'),
@@ -435,10 +593,12 @@ async function handleSaveEdit() {
       ? { industryCode: editForm.value.industryCode || '' }
       : {}
     await apiUpdateCompany(editingId.value, {
+      onboardingType: editForm.value.onboardingType,
       name: editForm.value.name,
       type: editForm.value.type,
       taxpayerType: editForm.value.taxpayerType,
       taxId: rawTaxId,
+      ...regionPayload(editForm.value.region),
       restrictedIndustry: editForm.value.restrictedIndustry === 'yes',
       startDate: editForm.value.startDate || undefined,
       // 可选字段要能清空：undefined 会被 JSON 丢掉，后端就收不到删除意图
@@ -466,9 +626,17 @@ const deleteTarget = ref<CompanyInfo | null>(null)
 const deleteStep = ref(1)
 const deleteNameInput = ref('')
 const deleting = ref(false)
+// 永久删除不可恢复：名称确认之外再加一道短信二次认证（action=delete_company）。
+const deletePhone = ref('')
+const deleteCode = ref('')
+const deleteBizId = ref('')
+const deleteSending = ref(false)
 
 const deleteNameMatches = computed(
   () => (deleteTarget.value?.name || '').trim() === deleteNameInput.value.trim(),
+)
+const deleteStepUpReady = computed(
+  () => Boolean(deletePhone.value.trim() && deleteCode.value.trim()),
 )
 
 function openDelete(co: CompanyInfo) {
@@ -479,15 +647,43 @@ function openDelete(co: CompanyInfo) {
   deleteTarget.value = co
   deleteStep.value = 1
   deleteNameInput.value = ''
+  deletePhone.value = ''
+  deleteCode.value = ''
+  deleteBizId.value = ''
   showDelete.value = true
+}
+
+async function sendDeleteCode() {
+  deleteSending.value = true
+  try {
+    const outcome = await sendVerificationCode(
+      message,
+      deletePhone.value,
+      '请输入账号绑定的手机号',
+    )
+    if (outcome.ok) deleteBizId.value = outcome.bizId
+  } finally {
+    deleteSending.value = false
+  }
 }
 
 async function confirmDelete() {
   const target = deleteTarget.value
   if (!target) return
+  if (!deleteStepUpReady.value) {
+    message.warning('请输入手机号和短信验证码完成安全验证')
+    return
+  }
   deleting.value = true
   try {
-    await apiDeleteCompany(target.company_id, deleteNameInput.value.trim())
+    const stepUp = await requestStepUp({
+      action: 'delete_company',
+      companyId: target.company_id,
+      phone: deletePhone.value.trim(),
+      code: deleteCode.value.trim(),
+      bizId: deleteBizId.value || undefined,
+    })
+    await apiDeleteCompany(target.company_id, deleteNameInput.value.trim(), stepUp.stepUpToken)
     showDelete.value = false
     deleteTarget.value = null
     message.success(`主体「${target.name}」已永久删除`)
@@ -653,6 +849,32 @@ async function confirmDelete() {
           <p class="delete-final">
             最后确认：主体「{{ deleteTarget.name }}」删除后不可恢复，确定继续吗？
           </p>
+          <div class="delete-stepup">
+            <p class="delete-warning">短信二次验证（验证码发送至账号绑定手机号）</p>
+            <NSpace vertical :size="12">
+              <NInput
+                v-model:value="deletePhone"
+                placeholder="账号绑定手机号"
+                :maxlength="11"
+                :disabled="deleting"
+              />
+              <NSpace>
+                <NInput
+                  v-model:value="deleteCode"
+                  placeholder="6 位短信验证码"
+                  :maxlength="6"
+                  :disabled="deleting"
+                />
+                <NButton
+                  :loading="deleteSending"
+                  :disabled="deleteSending || deleting"
+                  @click="sendDeleteCode"
+                >
+                  发送验证码
+                </NButton>
+              </NSpace>
+            </NSpace>
+          </div>
         </template>
       </div>
       <template #footer>
@@ -668,7 +890,15 @@ async function confirmDelete() {
           >
             下一步
           </NButton>
-          <NButton v-else type="error" :loading="deleting" @click="confirmDelete">永久删除</NButton>
+          <NButton
+            v-else
+            type="error"
+            :loading="deleting"
+            :disabled="!deleteStepUpReady"
+            @click="confirmDelete"
+          >
+            永久删除
+          </NButton>
         </NSpace>
       </template>
     </NModal>
@@ -688,7 +918,7 @@ async function confirmDelete() {
           <div class="success-header-text">
             <h3>「{{ createSuccessState.name }}」已创建完成</h3>
             <p>
-              {{ createSuccessState.switched ? '当前账套已自动切换至该主体。' : '' }}
+              {{ createSuccessSwitchNotice(createSuccessState.switched, createSuccessState.prevCompanyName) }}
               每一步明确推进，为你规划接下来的推荐操作：
             </p>
           </div>
@@ -751,6 +981,70 @@ async function confirmDelete() {
 
       <template v-else>
         <NForm>
+          <!-- 营业执照识别：只做预填。取消上传或识别失败都不影响手填，照片不落库 -->
+          <div class="license-ocr">
+            <button
+              type="button"
+              class="license-ocr-drop"
+              :class="{ 'is-busy': licenseBusy }"
+              :disabled="creating || licenseBusy"
+              @click="pickLicenseFile"
+              @dragover.prevent
+              @drop.prevent="onLicenseDrop"
+            >
+              <span class="license-ocr-icon" aria-hidden="true">
+                <i :class="licenseBusy ? 'ri-loader-4-line is-spinning' : 'ri-scan-2-line'" />
+              </span>
+              <span class="license-ocr-copy">
+                <strong>{{ licenseBusy ? '正在识别营业执照…' : '上传营业执照，自动填写' }}</strong>
+                <span>{{
+                  licenseBusy
+                    ? '通常几秒完成，识别结果会先请你核对'
+                    : '照片或截图均可，仅用于本次识别，不会保存'
+                }}</span>
+              </span>
+              <span class="license-ocr-action" aria-hidden="true">
+                {{ licenseBusy ? '识别中' : '选择图片' }}
+              </span>
+            </button>
+            <input
+              ref="licenseInput"
+              class="license-ocr-input"
+              type="file"
+              accept="image/png,image/jpeg,image/bmp"
+              @change="onLicensePicked"
+            />
+            <div v-if="licenseError" class="license-ocr-status is-error" role="status">
+              <p class="license-ocr-status-line">
+                <i class="ri-error-warning-line" aria-hidden="true" />
+                <span>{{ licenseError }}</span>
+              </p>
+            </div>
+            <div
+              v-else-if="licenseResult"
+              class="license-ocr-status"
+              :class="`is-${licenseResult.tone}`"
+              role="status"
+            >
+              <p class="license-ocr-status-line">
+                <i
+                  :class="licenseResult.tone === 'success' ? 'ri-checkbox-circle-fill' : 'ri-information-line'"
+                  aria-hidden="true"
+                />
+                <span v-if="licenseResult.filled.length">
+                  已填入 {{ licenseResult.filled.length }} 项：{{ licenseResult.filled.join(' · ') }}
+                </span>
+                <span v-else>没有空字段可填，你已填的内容保持不动</span>
+              </p>
+              <p v-if="licenseResult.kept.length" class="license-ocr-status-line is-muted">
+                <i class="ri-shield-check-line" aria-hidden="true" />
+                <span>保留了你已填的 {{ licenseResult.kept.length }} 项：{{ licenseResult.kept.join(' · ') }}</span>
+              </p>
+              <ul v-if="licenseResult.notices.length" class="license-ocr-notes">
+                <li v-for="note in licenseResult.notices" :key="note">{{ note }}</li>
+              </ul>
+            </div>
+          </div>
           <NGrid :cols="2" :x-gap="16">
             <NGi :span="2">
               <NFormItem label="第一步：选择建账情况">
@@ -762,7 +1056,7 @@ async function confirmDelete() {
                     class="onboarding-option"
                     :class="{ active: createForm.onboardingType === 'new' }"
                     :aria-checked="createForm.onboardingType === 'new'"
-                    @click="createForm.onboardingType = 'new'"
+                    @click="selectOnboardingType('new')"
                   >
                     <i class="ri-seedling-line" aria-hidden="true" />
                     <span class="onboarding-copy">
@@ -777,7 +1071,7 @@ async function confirmDelete() {
                     class="onboarding-option"
                     :class="{ active: createForm.onboardingType === 'migration' }"
                     :aria-checked="createForm.onboardingType === 'migration'"
-                    @click="createForm.onboardingType = 'migration'"
+                    @click="selectOnboardingType('migration')"
                   >
                     <i class="ri-exchange-box-line" aria-hidden="true" />
                     <span class="onboarding-copy">
@@ -818,11 +1112,30 @@ async function confirmDelete() {
           <NGi>
             <NFormItem label="主体类型">
               <div class="entity-type-stack">
-                <NSelect v-model:value="createForm.type" :options="companyTypes" />
+                <NSelect
+                  v-model:value="createForm.type"
+                  :options="companyTypes"
+                  @update:value="createTypeTouched = true"
+                />
+                <div class="entity-type-hint">
+                  个体工商户 / 个人独资企业暂在内测中，如需优先体验请
+                  <button type="button" class="entity-beta-link" @click="openBetaContact">加微信申请内测</button>
+                </div>
                 <div v-if="createForm.type !== '有限责任公司'" class="entity-type-hint">
                   该主体不缴企业所得税，按经营所得缴纳个人所得税（5%–35%）；税务申报模块的企业所得税作业包不适用。
                 </div>
               </div>
+            </NFormItem>
+          </NGi>
+          <NGi>
+            <NFormItem label="注册地" required>
+              <NSelect
+                :key="`create-region-${regionSelectSync}`"
+                v-model:value="createForm.region"
+                :options="regionOptions"
+                filterable
+                placeholder="选择公司注册所在省市"
+              />
             </NFormItem>
           </NGi>
           <NGi>
@@ -837,13 +1150,14 @@ async function confirmDelete() {
                 </NPopover>
               </template>
               <NDatePicker
-                v-model:formatted-value="createForm.incorporationDate"
+                :formatted-value="createForm.incorporationDate"
                 value-format="yyyy-MM-dd"
                 type="date"
                 clearable
                 style="width: 100%"
                 placeholder="选择公司成立日期（选填）"
                 :is-date-disabled="(ts: number) => ts > Date.now()"
+                @update:formatted-value="onIncorporationDateChange"
               />
             </NFormItem>
           </NGi>
@@ -859,18 +1173,20 @@ async function confirmDelete() {
                 </NPopover>
               </template>
               <NDatePicker
-                v-model:formatted-value="createForm.startDate"
+                :formatted-value="createForm.startDate"
                 value-format="yyyy-MM-dd"
                 type="date"
                 clearable
                 style="width: 100%"
                 placeholder="选择账套启用日期"
                 :is-date-disabled="(ts: number) => ts > Date.now()"
+                @update:formatted-value="onStartDateChange"
               />
+              <div v-if="startDateAutoHint" class="form-tip">
+                <i class="ri-information-line" aria-hidden="true" />
+                已按公司成立日期带入；实际开始记账更晚，直接改这里即可。
+              </div>
             </NFormItem>
-          </NGi>
-          <NGi :span="2">
-            <div class="form-section-label">税务信息</div>
           </NGi>
           <NGi :span="2">
             <NFormItem>
@@ -991,53 +1307,64 @@ async function confirmDelete() {
             <NFormItem label="主体类型">
               <div class="entity-type-stack">
                 <NSelect v-model:value="editForm.type" :options="companyTypes" />
+                <div class="entity-type-hint">
+                  个体工商户 / 个人独资企业暂在内测中，如需优先体验请
+                  <button type="button" class="entity-beta-link" @click="openBetaContact">加微信申请内测</button>
+                </div>
                 <div v-if="editForm.type !== '有限责任公司'" class="entity-type-hint">
                   该主体不缴企业所得税，按经营所得缴纳个人所得税（5%–35%）；企业所得税作业包不适用，
                   经营所得 A 表预缴与 B 表汇算作业包见税务申报页。
                 </div>
-                <div v-if="editForm.type !== '有限责任公司'" class="entity-type-hint iit-cycle-field">
+                <div
+                  v-if="editForm.type !== '有限责任公司' && !iitCycleSynced"
+                  class="entity-type-hint iit-cycle-field"
+                >
                   <span>经营所得税预缴周期（按税局核定，缺省季报）</span>
                   <NSelect
                     v-model:value="editForm.businessIncomeIitFilingCycle"
                     size="small"
                     clearable
                     style="max-width: 160px"
-                    :disabled="iitCycleSynced"
                     :options="[
                       { label: '季报', value: 'quarter' },
                       { label: '月报', value: 'month' },
                     ]"
                     placeholder="季报（缺省）"
                   />
-                  <span v-if="iitCycleSynced" class="entity-type-hint">
-                    已由「<router-link to="/tax-registration">税费种认定</router-link>」接管，此处只在未同步认定表时兜底。
-                  </span>
                 </div>
               </div>
             </NFormItem>
           </NGi>
-          <NGi>
+          <!-- 认定表已接管时整格隐去（v-if 必须在 NGi 上：留在 NFormItem 会空出一个格子），
+               周期去税费种认定页看/改，这里不重复解释 -->
+          <NGi v-if="!vatCycleSynced">
             <NFormItem label="增值税申报周期">
               <div class="entity-type-stack">
                 <NSelect
                   v-model:value="editForm.vatFilingCycle"
-                  :disabled="vatCycleSynced"
                   :options="[
                     { label: '季报（季销售额 30 万以下免征）', value: 'quarter' },
                     { label: '月报（月销售额 10 万以下免征）', value: 'month' },
                   ]"
                   placeholder="季报（缺省）"
                 />
-                <div v-if="vatCycleSynced" class="entity-type-hint">
-                  该主体的申报周期由「<router-link to="/tax-registration">税费种认定</router-link>」按税局认定表决定，
-                  这里不再生效。要改周期请先更新认定表。
-                </div>
-                <div v-else class="entity-type-hint">
+                <div class="entity-type-hint">
                   按主管税务机关核定的纳税期限填写。小规模纳税人可选月报或季报，
                   <strong>一经选择，一个会计年度内不得变更</strong>；免税额度随周期变化，
                   选错会直接影响增值税计算与申报。
                 </div>
               </div>
+            </NFormItem>
+          </NGi>
+          <NGi>
+            <NFormItem label="注册地">
+              <NSelect
+                v-model:value="editForm.region"
+                :options="regionOptions"
+                filterable
+                clearable
+                placeholder="选择公司注册所在省市"
+              />
             </NFormItem>
           </NGi>
           <NGi>
@@ -1083,9 +1410,6 @@ async function confirmDelete() {
                 :is-date-disabled="(ts: number) => ts > Date.now()"
               />
             </NFormItem>
-          </NGi>
-          <NGi :span="2">
-            <div class="form-section-label">税务信息</div>
           </NGi>
           <NGi :span="2">
             <NFormItem>
@@ -1168,6 +1492,22 @@ async function confirmDelete() {
               </div>
             </NFormItem>
           </NGi>
+          <NGi :span="2">
+            <NFormItem label="建账方式">
+              <div class="entity-type-stack">
+                <NSelect
+                  v-model:value="editForm.onboardingType"
+                  :options="[
+                    { label: '新成立公司从零记账（无历史期初余额）', value: 'new' },
+                    { label: '从其他代账/软件转入（需先完成期初建账）', value: 'migration' },
+                  ]"
+                />
+                <div class="entity-type-hint">
+                  未产生业务凭证前可调整；从其他代账转入需先完成期初建账。
+                </div>
+              </div>
+            </NFormItem>
+          </NGi>
         </NGrid>
       </NForm>
       <div class="form-tip"><i class="ri-information-line" />目前仅支持小规模纳税人，一般纳税人暂不支持</div>
@@ -1185,13 +1525,6 @@ async function confirmDelete() {
 .companies-page {
   max-width: var(--page-width-narrow);
   margin: 0 auto;
-}
-.form-section-label {
-  font-size: 12.5px;
-  font-weight: 600;
-  color: var(--solo-text-muted);
-  letter-spacing: 0.5px;
-  padding: 2px 0 0 2px;
 }
 .form-tip {
   display: flex;
@@ -1338,6 +1671,143 @@ async function confirmDelete() {
 .empty {
   margin-top: 48px;
 }
+/* 营业执照识别：上传入口做成一张可点击的拖放卡，状态区单独成块 */
+.license-ocr {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.license-ocr-drop {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px dashed var(--solo-border);
+  border-radius: var(--solo-radius);
+  background: var(--solo-bg-soft);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+.license-ocr-drop:hover:not(:disabled) {
+  border-color: var(--solo-primary);
+  background: var(--solo-bg-blue-soft);
+}
+.license-ocr-drop:focus-visible {
+  outline: 2px solid var(--solo-primary);
+  outline-offset: 2px;
+}
+.license-ocr-drop.is-busy {
+  cursor: progress;
+}
+.license-ocr-drop:disabled {
+  opacity: 0.72;
+}
+.license-ocr-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: var(--solo-bg-card);
+  color: var(--solo-primary);
+  font-size: 20px;
+  box-shadow: var(--solo-shadow-sm);
+}
+.license-ocr-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+.license-ocr-copy strong {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--solo-text-primary);
+}
+.license-ocr-copy span {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--solo-text-muted);
+}
+.license-ocr-action {
+  flex: none;
+  padding-left: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--solo-primary);
+}
+.license-ocr-input {
+  display: none;
+}
+.license-ocr-status {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--solo-border-light);
+  border-radius: var(--solo-radius);
+  background: var(--solo-bg-card);
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--solo-text-secondary);
+}
+.license-ocr-status-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0;
+  color: var(--solo-text-primary);
+}
+.license-ocr-status-line i {
+  flex: none;
+  margin-top: 1px;
+  font-size: 14px;
+}
+.license-ocr-status-line.is-muted {
+  color: var(--solo-text-muted);
+}
+.license-ocr-status.is-success .license-ocr-status-line:first-child i {
+  color: var(--solo-income);
+}
+.license-ocr-status.is-warn .license-ocr-status-line:first-child i {
+  color: var(--solo-warning);
+}
+.license-ocr-status.is-error {
+  border-color: var(--solo-expense-bg);
+  background: var(--solo-expense-bg);
+}
+.license-ocr-status.is-error .license-ocr-status-line,
+.license-ocr-status.is-error .license-ocr-status-line i {
+  color: var(--solo-expense);
+}
+.license-ocr-notes {
+  margin: 2px 0 0;
+  padding-left: 20px;
+  color: var(--solo-text-secondary);
+}
+.license-ocr-notes li {
+  list-style: disc;
+}
+.is-spinning {
+  display: inline-block;
+  animation: license-spin 0.8s linear infinite;
+}
+@keyframes license-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .is-spinning {
+    animation: none;
+  }
+}
 .entity-type-stack {
   display: flex;
   flex-direction: column;
@@ -1350,6 +1820,19 @@ async function confirmDelete() {
   font-size: 12px;
   line-height: 1.6;
   color: var(--solo-text-muted);
+}
+.entity-beta-link {
+  display: inline;
+  padding: 0;
+  border: none;
+  background: transparent;
+  font-size: inherit;
+  line-height: inherit;
+  color: var(--solo-primary);
+  cursor: pointer;
+}
+.entity-beta-link:hover {
+  text-decoration: underline;
 }
 .iit-cycle-field {
   display: flex;
@@ -1364,7 +1847,7 @@ async function confirmDelete() {
   color: var(--solo-text-muted);
 }
 .industry-restriction-hint.is-restricted {
-  color: var(--solo-expense, #bd3d3d);
+  color: var(--solo-expense);
 }
 .industry-more-toggle {
   padding-left: 0;
@@ -1391,7 +1874,7 @@ async function confirmDelete() {
   color: var(--solo-primary);
 }
 .icon-action.is-danger:hover {
-  color: var(--solo-expense, #bd3d3d);
+  color: var(--solo-expense);
 }
 .delete-steps {
   display: flex;
@@ -1427,8 +1910,17 @@ async function confirmDelete() {
 }
 .delete-final {
   margin: 8px 0;
-  color: var(--solo-expense, #bd3d3d);
+  color: var(--solo-expense);
   font-weight: 600;
+}
+.delete-stepup {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--solo-border);
+}
+.delete-stepup .delete-warning {
+  margin: 0 0 8px;
+  font-weight: 500;
 }
 .industry-override-link {
   padding-left: 0;

@@ -1,14 +1,14 @@
 # Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司
 # Licensed under the SoloBooks License v2.0.
 
-"""辅助核算主数据路由（P0 WP2）：往来单位 / 部门 / 项目。
+"""辅助核算主数据路由（P0 WP2 + 职员扩展）：往来单位 / 部门 / 项目 / 职员。
 
-三个维度的形状高度一致，用一张路由表生成 CRUD，避免三份复制粘贴的端点
+四个维度的形状高度一致，用一张路由表生成 CRUD，避免复制粘贴的端点
 在字段校验上慢慢漂移。业务规则全部在 ``services/auxiliary_service``。
 """
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import APIRouter, Body, Depends, Query
 
@@ -25,7 +25,12 @@ from services.auxiliary_service import (
 router = APIRouter(prefix="/api", tags=["auxiliary"], dependencies=[Depends(require_auth)])
 
 # kind → 路由前缀；与 auxiliary_service.KINDS 保持一致
-_ROUTES = (("partners", "partner"), ("departments", "department"), ("projects", "project"))
+_ROUTES = (
+    ("partners", "partner"),
+    ("departments", "department"),
+    ("projects", "project"),
+    ("employees", "employee"),
+)
 
 
 @router.get("/auxiliary/options")
@@ -34,7 +39,7 @@ async def auxiliary_options(
     limit: int = Query(20, ge=1, le=100),
     ctx: AuthContext = Depends(require_auth),
 ):
-    """录一笔账时的辅助核算下拉（三维度一次返回）。"""
+    """录一笔账时的辅助核算下拉（四维度一次返回）。"""
     return await resolve_auxiliary_options(ctx.company_id, keyword=keyword, limit=limit)
 
 

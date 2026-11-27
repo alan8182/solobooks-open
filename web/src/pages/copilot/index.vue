@@ -4,7 +4,7 @@ import { usePageRefresh } from '@/composables/usePageRefresh'
 import { accountingErrorText } from '@/utils/errors'
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NButton, NCard, NInput, NSpin, NTooltip, useMessage } from 'naive-ui'
+import { NButton, NCard, NInput, NModal, NSpace, NSpin, NTooltip, useMessage } from 'naive-ui'
 import {
   chatAgentStream,
   getAgentAction,
@@ -14,6 +14,8 @@ import {
   type ClosingLink,
 } from '@/api/agent'
 import { recordReceipt, recordSpeech } from '@/api/record'
+import { fetchMyUsage } from '@/api/usage'
+import { blobToWav16kMono } from '@/utils/audio'
 import { useAuthStore } from '@/stores/auth'
 import { useEntryStore } from '@/stores/entry'
 import { useWorkspaceViewStore } from '@/stores/workspaceView'
@@ -131,10 +133,10 @@ const stripActions = computed(() => {
 const examplePrompts = computed(() => (
   viewStore.isBoss
     ? [
-        '这个月赚了多少？钱主要花在哪？',
-        '我现在还欠别人多少钱？别人还欠我多少？',
-        '这个月要交多少税？什么时候截止？',
-        '公司买台电脑，这笔钱能抵税吗？',
+        '本月赚了多少？钱花在哪？',
+        '还有多少应收、应付没结？',
+        '本月要交多少税？何时截止？',
+        '公司买电脑这笔钱能抵税吗？',
       ]
     : [
         '查一下本月未过账凭证和异常分录',
@@ -184,11 +186,23 @@ async function onImagePicked(event: Event) {
   }
 }
 
-// ── 语音输入（ASR 转写后自动发送）──────────────────────────────────
+// ── 语音输入（付费会员专属：ASR 转写后自动发送）──────────────────────────────────
 const recording = ref(false)
 const transcribing = ref(false)
+const currentPlanCode = ref<string | null>(null)
+const isPaidMember = computed(() => Boolean(currentPlanCode.value && currentPlanCode.value !== 'trial'))
+const showVoiceUpgradeModal = ref(false)
 let mediaRecorder: MediaRecorder | null = null
 let audioChunks: Blob[] = []
+
+async function refreshPlanStatus() {
+  try {
+    const res = await fetchMyUsage(1)
+    currentPlanCode.value = res?.quota?.planCode ?? 'trial'
+  } catch {
+    // 加载失败时不覆盖已有状态；后端 /api/record/speech 仍会做最终权限兜底
+  }
+}
 
 async function toggleRecording() {
   if (recording.value) {
@@ -196,8 +210,17 @@ async function toggleRecording() {
     return
   }
   if (streaming.value || transcribing.value) return
+  if (currentPlanCode.value === null) {
+    await refreshPlanStatus()
+  }
+  if (!isPaidMember.value) {
+    showVoiceUpgradeModal.value = true
+    return
+  }
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+    })
     audioChunks = []
     mediaRecorder = new MediaRecorder(stream)
     mediaRecorder.ondataavailable = (ev) => {
@@ -206,11 +229,12 @@ async function toggleRecording() {
     mediaRecorder.onstop = async () => {
       stream.getTracks().forEach((t) => t.stop())
       recording.value = false
-      const blob = new Blob(audioChunks, { type: mediaRecorder?.mimeType || 'audio/webm' })
-      if (blob.size < 2000) return // 过短视为误触
+      const rawBlob = new Blob(audioChunks, { type: mediaRecorder?.mimeType || 'audio/webm' })
+      if (rawBlob.size < 1000) return // 过短视为误触
       transcribing.value = true
       try {
-        const { text } = await recordSpeech(blob)
+        const uploadBlob = await blobToWav16kMono(rawBlob).catch(() => rawBlob)
+        const { text } = await recordSpeech(uploadBlob)
         const cleaned = text.trim()
         if (!cleaned) {
           message.warning('没有听清，请再说一次')
@@ -464,6 +488,11 @@ function startCompanySetup(onboardingType: CompanyOnboardingType) {
   router.push({ path: '/mine/companies', query: { create: onboardingType } })
 }
 
+function askExamplePrompt(prompt: string) {
+  input.value = prompt
+  void send()
+}
+
 function saveChatToStorage(companyId: string | null = authStore.currentCompanyId) {
   saveCopilotChat(
     companyId,
@@ -601,6 +630,7 @@ async function consumeRouteQuery() {
 }
 
 onMounted(async () => {
+  void refreshPlanStatus()
   if (typeof window !== 'undefined') {
     showRightBoard.value = window.innerWidth >= 1024
   }
@@ -646,42 +676,45 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
 
 <template>
   <div class="copilot-page">
-    <div class="page-header">
-      <div class="header-titles">
-        <h2>AI 财务官 · 交互工作台</h2>
-        <NTooltip trigger="hover" placement="bottom-start" :style="{ maxWidth: '340px' }">
-          <template #trigger>
-            <span class="header-badge-tag">
-              数字员工 · 安全确认
-              <i class="ri-information-line badge-info-icon" />
-            </span>
-          </template>
-          AI 生成内容仅供参考；所有入账以人工确认为准，申报以税务局口径为准。
-        </NTooltip>
-      </div>
-      <div class="header-actions">
-        <NButton
-          size="tiny"
-          quaternary
-          class="toggle-board-btn"
-          :title="showRightBoard ? '收起右侧工作板' : '展开业务工作板'"
-          @click="showRightBoard = !showRightBoard"
-        >
-          <i :class="showRightBoard ? 'ri-layout-right-line' : 'ri-layout-right-fill'" />
-          <span>{{ showRightBoard ? '收起工作板' : '业务工作板' }}</span>
-          <span v-if="stripActions.length > 0" class="header-badge">{{ stripActions.length }}</span>
-        </NButton>
-        <NButton size="tiny" text @click="clearChat" v-if="messages.length > 0 && !streaming">
-          <i class="ri-delete-bin-line" /> 清空
-        </NButton>
-      </div>
-    </div>
-
     <div class="workbench-grid" :class="{ 'board-hidden': !showRightBoard }">
       <!-- 左栏：AI 会话与交互工作流 -->
       <section class="workbench-main">
         <!-- 对话区 -->
         <NCard :bordered="false" class="chat-card" ref="chatCardRef">
+          <!-- 对话区右上角轻量工具条 -->
+          <div class="chat-card-toolbar">
+            <NButton
+              v-if="messages.length > 0 && !streaming"
+              size="tiny"
+              quaternary
+              class="floating-tool-btn"
+              @click="clearChat"
+            >
+              <i class="ri-delete-bin-line" />
+              <span>清空</span>
+            </NButton>
+            <NButton
+              v-if="!showRightBoard"
+              size="tiny"
+              secondary
+              class="floating-tool-btn"
+              title="展开业务工作板"
+              @click="showRightBoard = true"
+            >
+              <i class="ri-layout-right-fill" />
+              <span>工作板</span>
+              <span v-if="stripActions.length > 0" class="header-badge">{{ stripActions.length }}</span>
+            </NButton>
+            <NTooltip trigger="hover" placement="bottom-end" :style="{ maxWidth: '320px' }">
+              <template #trigger>
+                <span class="chat-info-icon" aria-label="AI 合规提示">
+                  <i class="ri-information-line" />
+                </span>
+              </template>
+              AI 生成内容仅供参考；所有入账以人工确认为准，申报以税务局口径为准。
+            </NTooltip>
+          </div>
+
           <div class="chat-messages" v-if="messages.length > 0">
             <div v-for="(msg, i) in messages" :key="i" class="message" :class="[msg.role, { streaming: msg.streaming }]">
               <div class="msg-avatar" :class="{ 'is-streaming': msg.streaming }" :title="msg.role === 'user' ? '我' : '梭罗 · AI 财务官'">
@@ -799,43 +832,32 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
 
           <div v-else class="chat-empty">
             <div class="empty-icon"><i class="ri-chat-3-line"></i></div>
-            <p>你好，我是梭罗，你的 AI 财务官。刚开始用？可以先选你的建账情况：</p>
-            <div class="onboarding-entry-cards">
-              <button
-                type="button"
-                class="onboarding-entry-card is-new"
-                @click="startCompanySetup('new')"
-              >
-                <div class="onboarding-card-head">
-                  <i class="ri-seedling-line" />
-                  <strong>我是新成立的公司 · 从零记账</strong>
-                </div>
-                <span>刚拿营业执照、之前没记过账，0 期初快速建账</span>
-              </button>
-              <button
-                type="button"
-                class="onboarding-entry-card is-migration"
-                @click="startCompanySetup('migration')"
-              >
-                <div class="onboarding-card-head">
-                  <i class="ri-exchange-box-line" />
-                  <strong>已记账公司 · 从其他代账/软件转入</strong>
-                </div>
-                <span>填一次主体信息，到期初建账页导入原代账的科目余额表 Excel</span>
-              </button>
-            </div>
-            <p class="empty-sub-label">或者直接问我公司的财税问题：</p>
-            <div class="prompt-list">
+            <h3 class="empty-title">有什么财税问题，直接问我</h3>
+            <p class="empty-subtitle">支持大白话提问，或点击左下角上传单据 / 语音记账</p>
+
+            <div class="prompt-grid">
               <button
                 v-for="prompt in examplePrompts"
                 :key="prompt"
-                class="prompt-chip"
-                @click="input = prompt"
+                type="button"
+                class="prompt-card"
+                @click="askExamplePrompt(prompt)"
               >
-                {{ prompt }}
+                <span>{{ prompt }}</span>
+                <i class="ri-arrow-right-line" />
               </button>
             </div>
-            <p class="empty-note">不用记会计术语，照平时的说法问就行。</p>
+
+            <div class="empty-onboarding-links">
+              <span>还没建账？</span>
+              <button type="button" class="inline-setup-link" @click="startCompanySetup('new')">
+                新公司从零建账
+              </button>
+              <span class="link-dot">·</span>
+              <button type="button" class="inline-setup-link" @click="startCompanySetup('migration')">
+                从其他代账转入
+              </button>
+            </div>
           </div>
 
           <!-- 上翻阅读时的回底按钮：sticky 吸在滚动容器底部，恢复跟随用 -->
@@ -876,7 +898,7 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
             size="small"
             quaternary
             :type="recording ? 'error' : 'default'"
-            :title="recording ? '点击结束录音' : '语音提问：点击开始/结束'"
+            :title="recording ? '点击结束录音' : isPaidMember ? '语音提问：点击开始/结束' : '语音提问（付费会员专属）'"
             :disabled="streaming || transcribing"
             :loading="transcribing"
             @click="toggleRecording"
@@ -884,20 +906,24 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
             <i :class="recording ? 'ri-stop-circle-fill' : 'ri-mic-line'" />
             <span v-if="recording" class="recording-text">录音中</span>
           </NButton>
-          <NButton
-            size="small"
-            :type="enableThinking ? 'primary' : 'default'"
-            :secondary="enableThinking"
-            :quaternary="!enableThinking"
-            class="thinking-toggle-btn"
-            :class="{ active: enableThinking }"
-            title="深度思考：默认关闭保证日常记账秒开；复杂税务筹划建议开启"
-            :disabled="streaming"
-            @click="enableThinking = !enableThinking"
-          >
-            <i class="ri-brain-line" />
-            <span class="thinking-label">{{ enableThinking ? '思考已开' : '深度思考' }}</span>
-          </NButton>
+          <NTooltip trigger="hover" placement="top" :style="{ maxWidth: '280px' }">
+            <template #trigger>
+              <NButton
+                size="small"
+                :type="enableThinking ? 'primary' : 'default'"
+                :secondary="enableThinking"
+                :quaternary="!enableThinking"
+                class="thinking-toggle-btn"
+                :class="{ active: enableThinking }"
+                :disabled="streaming"
+                @click="enableThinking = !enableThinking"
+              >
+                <i class="ri-brain-line" />
+                <span class="thinking-label">{{ enableThinking ? '思考已开' : '深度思考' }}</span>
+              </NButton>
+            </template>
+            开启后 AI 会先展示推理过程再作答，适合复杂税务筹划与账务排查；日常简单记账保持关闭响应更快。
+          </NTooltip>
           <NInput
             v-model:value="input"
             type="textarea"
@@ -925,6 +951,25 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
         />
       </aside>
     </div>
+
+    <NModal
+      v-model:show="showVoiceUpgradeModal"
+      preset="card"
+      title="付费会员专属功能"
+      style="width: min(400px, 90vw);"
+    >
+      <p class="voice-upgrade-desc">
+        语音提问功能仅对「云端标准版」及「人机双签版」付费会员开放，升级后即可直接语音记账与提问。
+      </p>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton size="small" @click="showVoiceUpgradeModal = false">暂不</NButton>
+          <NButton size="small" type="primary" @click="showVoiceUpgradeModal = false; router.push('/mine/plan')">
+            立即升级
+          </NButton>
+        </NSpace>
+      </template>
+    </NModal>
   </div>
 </template>
 
@@ -939,51 +984,40 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
   padding: 16px 0 16px !important;
   box-sizing: border-box;
 }
-.page-header {
+.chat-card-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 4;
   display: flex;
-  justify-content: space-between;
   align-items: center;
-  margin-bottom: 8px;
-  height: 32px;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-bottom: 8px;
+  margin-bottom: 4px;
+  background: var(--solo-bg-card, #ffffff);
   flex-shrink: 0;
 }
-.header-titles {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.header-titles h2 {
-  margin: 0;
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--solo-text-primary, #182230);
-  line-height: 1;
-}
-.header-badge-tag {
-  font-size: 11px;
-  color: var(--solo-text-muted, #636e7c);
-  background: var(--solo-bg-soft, #f1f4f8);
-  border: 1px solid var(--solo-border, #dde3ea);
-  padding: 1px 6px;
-  border-radius: 4px;
-  line-height: 16px;
-  cursor: help;
-}
-.badge-info-icon {
-  margin-left: 2px;
-  font-size: 12px;
-  vertical-align: -2px;
-}
-.header-actions {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.toggle-board-btn {
+.floating-tool-btn {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 4px;
   font-size: 12px;
+}
+.chat-info-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  color: var(--solo-text-muted, #636e7c);
+  font-size: 15px;
+  cursor: help;
+  transition: color 0.16s ease, background-color 0.16s ease;
+}
+.chat-info-icon:hover {
+  color: var(--solo-text-primary, #182230);
+  background: var(--solo-bg-soft, #f1f4f8);
 }
 .header-badge {
   background: var(--solo-primary, #1747b0);
@@ -1008,6 +1042,7 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
   grid-template-columns: 1fr;
 }
 .workbench-main {
+  position: relative;
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -1464,7 +1499,7 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
 /* naive 的内容层要撑满卡片，空态才能垂直居中；
    否则内容贴着卡片顶端，下面留出一整屏死白 */
 .chat-card :deep(.n-card-content) {
-  height: 100%;
+  min-height: 100%;
   display: flex;
   flex-direction: column;
 }
@@ -1474,98 +1509,102 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 32px 20px;
+  padding: 28px 20px;
+  text-align: center;
   color: var(--solo-text-secondary);
 }
 .empty-icon {
-  width: 72px;
-  height: 72px;
+  width: 56px;
+  height: 56px;
   border-radius: 50%;
   display: flex;
   align-items: center;
   justify-content: center;
-  margin-bottom: 16px;
+  margin-bottom: 14px;
   background: radial-gradient(circle, var(--solo-ai-glow) 0%, transparent 75%);
   box-shadow: inset 0 0 0 1px rgba(22, 93, 255, 0.15);
 }
 .empty-icon i {
-  font-size: 36px;
+  font-size: 26px;
   color: var(--solo-ai);
 }
-.prompt-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-top: 12px;
-  width: 100%;
-  max-width: 360px;
-}
-.prompt-chip {
-  border: 1px solid var(--solo-border, #dde3ea);
-  background: #fff;
-  border-radius: 8px;
-  padding: 8px 12px;
-  font-size: 13px;
+.empty-title {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
   color: var(--solo-text-primary);
-  cursor: pointer;
-  text-align: left;
-  transition: border-color 0.2s;
 }
-.prompt-chip:hover {
-  border-color: var(--solo-ai, var(--solo-primary));
-  color: var(--solo-ai, var(--solo-primary));
-}
-.empty-note {
-  margin-top: 14px;
-  font-size: 12px;
+.empty-subtitle {
+  margin: 6px 0 0;
+  font-size: 13px;
   color: var(--solo-text-muted);
 }
-.empty-sub-label {
-  margin: 10px 0 0;
-  font-size: 12px;
-  color: var(--solo-text-muted);
-}
-.onboarding-entry-cards {
+.prompt-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
+  margin-top: 20px;
   width: 100%;
-  max-width: 520px;
-  margin-top: 10px;
+  max-width: 540px;
 }
-.onboarding-entry-card {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 4px;
-  padding: 12px 14px;
-  border-radius: 10px;
-  border: 1px solid var(--solo-border, #dde3ea);
-  background: #fff;
-  cursor: pointer;
-  text-align: left;
-  transition: all 0.16s ease;
-}
-.onboarding-entry-card:hover {
-  border-color: var(--solo-ai, var(--solo-primary));
-  background: #f5f8ff;
-  transform: translateY(-1px);
-}
-.onboarding-card-head {
+.prompt-card {
   display: flex;
   align-items: center;
-  gap: 6px;
+  justify-content: space-between;
+  gap: 8px;
+  border: 1px solid var(--solo-border);
+  background: var(--solo-bg-card);
+  border-radius: 10px;
+  padding: 11px 14px;
   font-size: 13px;
   color: var(--solo-text-primary);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.16s ease, background-color 0.16s ease, color 0.16s ease;
 }
-.onboarding-card-head i {
-  font-size: 16px;
-  color: var(--solo-ai, var(--solo-primary));
-}
-.onboarding-entry-card span {
-  font-size: 11.5px;
+.prompt-card i {
+  font-size: 14px;
   color: var(--solo-text-muted);
-  line-height: 1.45;
+  flex-shrink: 0;
+  transition: transform 0.16s ease, color 0.16s ease;
+}
+.prompt-card:hover {
+  border-color: var(--solo-primary);
+  background: var(--solo-bg-blue-soft);
+  color: var(--solo-primary);
+}
+.prompt-card:hover i {
+  color: var(--solo-primary);
+  transform: translateX(2px);
+}
+.empty-onboarding-links {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 4px;
+  margin-top: 20px;
+  font-size: 12px;
+  color: var(--solo-text-muted);
+}
+.inline-setup-link {
+  border: 0;
+  background: transparent;
+  padding: 2px 4px;
+  font-size: 12px;
+  color: var(--solo-primary);
+  cursor: pointer;
+}
+.inline-setup-link:hover {
+  text-decoration: underline;
+}
+.link-dot {
+  color: var(--solo-border);
+}
+@media (max-width: 600px) {
+  .prompt-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .loading-indicator {
@@ -1610,6 +1649,12 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
   margin-left: 4px;
   font-size: 12px;
 }
+.voice-upgrade-desc {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--solo-text-secondary);
+}
 
 @media (max-width: 1099px) {
   .workbench-grid {
@@ -1631,9 +1676,6 @@ usePageRefresh(() => Promise.all([refreshPending(), entryStore.fetchEntries()]))
   .copilot-page {
     height: calc(100vh - var(--navbar-height) - var(--page-tabs-height));
     padding: 12px 0 12px !important;
-  }
-  .page-header h2 {
-    font-size: 17px;
   }
   .msg-main {
     max-width: 90%;

@@ -28,9 +28,13 @@ const reportSerial = ref('')
 const companyTypes = [
   { val: 'OPC', label: '一人有限责任公司' },
   { val: 'LTD', label: '多股东公司' },
-  { val: 'INDIVIDUAL', label: '个体工商户' },
+  { val: 'INDIVIDUAL', label: '个体工商户（内测中）', disabled: true },
   { val: 'UNKNOWN', label: '暂不确定' },
 ]
+
+function openBetaContact() {
+  window.dispatchEvent(new CustomEvent('solo:open-beta-contact'))
+}
 
 interface QuizQuestion {
   key: string
@@ -139,7 +143,7 @@ const balanceDiffText = computed(() => {
   return diff.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 })
 
-const disclaimer = '本报告基于您提供的数据或回答按现行公开财税规则初筛，仅供经营自查与风险梳理参考，不构成法定审计、税务鉴证或贷款授信结论。'
+const disclaimer = '本报告基于您提供的数据或回答按现行公开财税规则初筛，仅供经营自查与风险梳理参考，不构成法定审计、税务筹划担保或贷款授信结论；具体税前扣除、税务处理与申报结果，以主管税务机关口径及企业真实业务凭据为准。'
 
 function fmtYuan(val: number): string {
   return `¥${val.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
@@ -303,7 +307,7 @@ function goAction(route?: string) {
         </button>
         <div class="header-actions">
           <NButton quaternary size="small" @click="router.push('/')">返回官网</NButton>
-          <NButton type="primary" size="small" @click="router.push('/login')">免费建账</NButton>
+          <NButton type="primary" size="small" @click="router.push('/login')">免费平行试记</NButton>
         </div>
       </div>
     </header>
@@ -345,13 +349,19 @@ function goAction(route?: string) {
             <button
               v-for="item in companyTypes"
               :key="item.val"
+              type="button"
               class="pill-btn"
               :class="{ active: companyType === item.val }"
-              @click="companyType = item.val"
+              :disabled="Boolean(item.disabled)"
+              @click="!item.disabled && (companyType = item.val)"
             >
               {{ item.label }}
             </button>
           </div>
+          <span class="strip-beta-note">
+            个体户 / 个独内测中，
+            <button type="button" class="strip-beta-link" @click="openBetaContact">加微信申请体验</button>
+          </span>
         </div>
 
         <!-- 2A. 90秒经营快检（分步单卡） -->
@@ -565,6 +575,7 @@ function goAction(route?: string) {
                 <button class="primary-convert-btn" @click="goAction(report.flags?.[0]?.ctaRoute || '/login')">
                   {{ report.flags?.[0]?.ctaLabel || '免费开启干净账本' }} →
                 </button>
+                <p class="hero-cta-hint">已有代账也不用先转出：可先用首月 20 万 Token（新人可 ¥1 扩容至 100 万）平行试记 1 个月对比效果，报税仍由原代账完成。</p>
               </div>
             </div>
           </div>
@@ -677,6 +688,10 @@ function goAction(route?: string) {
 .pill-group { display: flex; flex-wrap: wrap; gap: 8px; }
 .pill-btn { border: 1px solid #cbd5e1; background: #fff; color: #334155; border-radius: 999px; padding: 6px 14px; font-size: 13px; cursor: pointer; transition: all .15s; }
 .pill-btn.active { background: #0f172a; border-color: #0f172a; color: #fff; font-weight: 600; }
+.pill-btn:disabled { opacity: 0.55; cursor: not-allowed; background: var(--solo-bg-subtle); color: var(--solo-text-muted); }
+.strip-beta-note { font-size: 12px; color: var(--solo-text-muted); }
+.strip-beta-link { display: inline; padding: 0; border: none; background: transparent; font-size: inherit; color: var(--solo-primary); cursor: pointer; }
+.strip-beta-link:hover { text-decoration: underline; }
 
 /* 问卷分步向导 */
 .wizard-progress { margin-bottom: 20px; }
@@ -756,6 +771,7 @@ function goAction(route?: string) {
 .verdict-headline { font-size: 18px; font-weight: 700; color: #0f172a; margin: 0 0 10px; line-height: 1.4; }
 .urgent-strip { font-size: 13px; color: #334155; background: rgba(255, 255, 255, 0.78); padding: 8px 12px; border-radius: 8px; margin-bottom: 12px; }
 .primary-convert-btn { border: 0; background: #0f172a; color: #fff; padding: 10px 18px; border-radius: 8px; font-size: 13px; font-weight: 700; cursor: pointer; }
+.hero-cta-hint { margin: 8px 0 0; font-size: 12px; line-height: 1.5; color: inherit; opacity: 0.78; }
 
 .perspectives-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 20px; }
 .perspective-card { border: 1px solid #e2e8f0; border-radius: 12px; padding: 16px; background: #fff; }

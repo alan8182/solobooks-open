@@ -61,7 +61,15 @@ async function handleDeleteDemo() {
     const result = await deleteDemoCompany(target.company_id)
     guideStore.patch({ demoCompanyId: null })
     if (result.nextCompanyId) {
-      await authStore.switchCompanyContext(result.nextCompanyId)
+      if (result.accessToken) {
+        authStore.setSession({
+          access_token: result.accessToken,
+          user_id: authStore.userId || authStore.user?.user_id || '',
+          company_id: result.nextCompanyId,
+        })
+      } else {
+        await authStore.switchCompanyContext(result.nextCompanyId)
+      }
       message.success('演示账套已删除，已切换账套')
     } else {
       message.success('演示账套已删除')
@@ -210,10 +218,17 @@ function clearWaived() {
       </header>
       <p class="card-body">清单只在你没配完时出现，配完会自动收起。想再看一遍可以从这里重放。</p>
       <div class="card-actions">
-        <SoloButton variant="secondary" icon="ri-restart-line" @click="replayWelcome">
+        <SoloButton
+          v-if="isDemoCurrent"
+          variant="secondary"
+          icon="ri-restart-line"
+          @click="replayWelcome"
+        >
           重看新手引导
         </SoloButton>
-        <SoloButton variant="secondary" @click="expandChecklist">重新展开清单</SoloButton>
+        <SoloButton v-if="!isDemoCurrent" variant="secondary" @click="expandChecklist">
+          在首页重新展开清单
+        </SoloButton>
         <SoloButton variant="ghost" @click="clearWaived">清除跳过标记</SoloButton>
       </div>
     </section>

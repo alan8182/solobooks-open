@@ -156,22 +156,22 @@ export const SAFETY_RULES: { icon: string; title: string; detail: string }[] = [
   {
     icon: 'ri-key-2-line',
     title: '令牌分级，最小权限',
-    detail: '只读令牌只能查账；「读写草稿」才允许调用 propose_*。令牌绑定单一公司，可随时吊销，吊销立即生效。',
+    detail: '只读与「读写草稿」两级权限，绑定单一账套，支持随时吊销并立即生效。',
   },
   {
     icon: 'ri-draft-line',
     title: 'AI 只起草，不入账',
-    detail: '所有写入都落成 pending 待确认草稿，必须你在产品内逐笔确认才生成凭证。结账修复草稿绑定 snapshotHash；run_close_checks 会返回 manualClose 网页链接，最终锁账由登录用户在网页确认，MCP 不暴露锁账接口。',
+    detail: '所有写操作仅生成待确认草稿；最终入账与锁账必须由用户在产品内确认。',
   },
   {
     icon: 'ri-shield-keyhole-line',
-    title: '不碰税局账密，不代点提交',
-    detail: '报税技能包全程零凭据接触；表单填完即停，最终「提交申报」必须老板本人点击。',
+    title: '不碰税局账密，不代提交',
+    detail: '报税技能包不读取税局账号密码，预填完成后停在提交前由本人确认。',
   },
   {
     icon: 'ri-file-search-line',
-    title: '全程留痕，可审计',
-    detail: '每次工具调用记录令牌指纹、参数摘要、耗时与成败；默认每分钟 60 次限流，异常调用有告警。',
+    title: '全程审计与限流',
+    detail: '每次调用记录令牌指纹与参数摘要；默认 60 次/分钟限流防异常刷写。',
   },
 ]
 
@@ -183,32 +183,27 @@ export const CLIENT_GUIDES: ClientGuide[] = [
     name: 'WorkBuddy',
     vendor: '腾讯 · AI 办公工作台',
     icon: 'ri-robot-2-line',
-    tagline: '连接器面板一键挂载，适合非技术老板',
-    transport: 'Streamable HTTP（远程端点 + Bearer 令牌）',
-    summary:
-      'WorkBuddy 把 MCP 服务统一叫「连接器」。挂上梭罗记账后，在对话里勾选连接器就能直接查账、跑结账体检、起草凭证。',
+    tagline: '官方插件商城搜「梭罗记账」，填令牌即用',
+    transport: '官方插件商城 / Streamable HTTP',
+    summary: 'WorkBuddy 官方插件商城已上架「梭罗记账」，搜索安装并配置访问令牌即可直接使用。',
     steps: [
       {
-        title: '先在梭罗记账签发令牌',
-        detail: '「我的 → AI 连接（MCP）」→ 新建令牌，权限按需选「只读」或「读写草稿」，复制 sbk_ 开头的明文（只显示一次）。',
+        title: '签发访问令牌',
+        detail: '在「我的 → AI 连接」新建令牌并复制 sbk_ 明文。',
       },
       {
-        title: '打开连接器面板',
-        detail: 'WorkBuddy 左侧导航进入「连接器」→ 切到「自定义连接器」→ 添加 MCP 服务；也可以直接编辑本地 mcp.json 配置文件。',
+        title: '插件商城安装「梭罗记账」',
+        detail: '打开 WorkBuddy 官方插件商城，搜索「梭罗记账」并安装，填入访问令牌即可。',
       },
       {
-        title: '填入端点与鉴权头',
-        detail: '服务地址填本页给出的 MCP 端点，请求头加一行 Authorization: Bearer <令牌>。保存后点「信任」激活。',
-      },
-      {
-        title: '在对话里勾选并试用',
-        detail: '新建对话，输入框左下角「+ → 连接器」勾选 solobooks，问一句「帮我查上个月收支汇总」即可验证。',
+        title: '对话中启用',
+        detail: '启用后在对话输入框勾选梭罗记账连接器，即可直接查账与起草凭证。',
       },
     ],
     samples: (ctx) => [
       {
         lang: 'json',
-        label: '自定义连接器配置（mcp.json）',
+        label: '手动配置兜底（自托管 / mcp.json）',
         paths: {
           macos: '~/.workbuddy-ai/mcp.json（新版）/ ~/.workbuddy/mcp.json（旧版）',
           windows: '%USERPROFILE%\\.workbuddy-ai\\mcp.json（新版）/ %USERPROFILE%\\.workbuddy\\mcp.json（旧版）',
@@ -216,10 +211,10 @@ export const CLIENT_GUIDES: ClientGuide[] = [
         code: remoteConfig(ctx.endpoint, ctx.token),
       },
     ],
-    verify: '连接器列表里 solobooks 显示绿色「已连接」；对话中工具调用会显示 mcp__solobooks__* 前缀。',
+    verify: '插件启用后连接状态显示「已连接」，对话中出现 mcp__solobooks__* 工具调用。',
     tips: [
-      '改完配置文件必须重启客户端，或在连接器页点「重新连接」，否则新服务不会被加载。',
-      '客户端只信任 HTTPS 端点；本地调试请用 http://127.0.0.1:8001/mcp，不要用局域网 IP。',
+      '官方商城版免写配置即可接入；自托管或本地调试可使用右侧 mcp.json 手动配置（本地请用 http://127.0.0.1:8001/mcp）。',
+      '更换或吊销令牌后，在插件配置中更新令牌并重新连接即可生效。',
     ],
   },
   {
@@ -227,22 +222,21 @@ export const CLIENT_GUIDES: ClientGuide[] = [
     name: 'Claude',
     vendor: 'Anthropic · Claude Desktop',
     icon: 'ri-chat-3-line',
-    tagline: '官方参考客户端，配置一次长期可用',
-    transport: 'Streamable HTTP；旧版客户端用 mcp-remote 代理兜底',
-    summary:
-      'Claude Desktop 通过本地配置文件注册 MCP 服务。新版客户端原生支持远程 url + 请求头；旧版只认 command，用 mcp-remote 转一层即可。',
+    tagline: '原生支持远程端点，稳定通用',
+    transport: 'Streamable HTTP / mcp-remote',
+    summary: '在 claude_desktop_config.json 中写入远程配置后重启。',
     steps: [
       {
-        title: '找到配置文件',
-        detail: '首次配置需要手动创建文件（目录已存在、文件不存在是正常的）。改完完全退出 Claude 再重开。',
+        title: '打开配置文件',
+        detail: '打开对应系统路径下的 claude_desktop_config.json（首次配置需新建）。',
       },
       {
         title: '写入服务配置',
-        detail: '把下面的 JSON 合并进 mcpServers（不要覆盖已有的其他服务）。令牌填 sbk_ 开头的明文。',
+        detail: '将右侧 JSON 合并至 mcpServers，并替换为你的 sbk_ 令牌。',
       },
       {
-        title: '重启并检查工具',
-        detail: '重开后在对话框输入框右下角点工具图标，应看到 solobooks 下 27 个工具。',
+        title: '重启生效',
+        detail: '完全退出 Claude Desktop 并重开，加载全部 27 个工具。',
       },
     ],
     samples: (ctx) => [
@@ -274,10 +268,10 @@ export const CLIENT_GUIDES: ClientGuide[] = [
 }`,
       },
     ],
-    verify: '对话框工具图标点亮，展开能看到 27 个账务工具；问「这个月赚了多少」应触发 get_month_summary。',
+    verify: '输入框工具图标点亮并列出 27 个工具，提问「这个月赚了多少」会调用 get_month_summary。',
     tips: [
-      'Claude 需要 Node.js 才能跑 npx；没装 Node 请用远程端点配置。',
-      'JSON 不允许注释和尾逗号，粘错一个逗号整份配置都会失效。',
+      '仅旧版 command + mcp-remote 方式依赖 Node.js，推荐优先使用远程配置。',
+      'JSON 严禁出现注释或末尾多余逗号。',
     ],
   },
   {
@@ -285,26 +279,21 @@ export const CLIENT_GUIDES: ClientGuide[] = [
     name: '通义千问 / 百炼',
     vendor: '阿里云 · 百炼智能体平台',
     icon: 'ri-cloud-line',
-    tagline: '把账套能力挂进中文票据理解场景',
-    transport: 'MCP 服务（Streamable HTTP / SSE）或 OpenAPI 工具',
-    summary:
-      '在阿里云百炼控制台把梭罗记账注册为自定义 MCP 服务，再挂到智能体应用上。适合「拍票识别 + 账套核对」这类中文场景。',
+    tagline: '适合票据识别与中文智能体编排',
+    transport: 'Streamable HTTP / Bearer',
+    summary: '在百炼控制台创建自定义 MCP 服务并绑定到智能体。',
     steps: [
       {
-        title: '进入百炼 MCP 服务管理',
-        detail: '百炼控制台 → 工具 / MCP 服务 → 创建自定义 MCP 服务，传输方式选 Streamable HTTP（若控制台只提供 SSE，选 SSE）。',
+        title: '创建自定义 MCP 服务',
+        detail: '百炼控制台进入「工具 / MCP 服务」，传输方式选 Streamable HTTP。',
       },
       {
-        title: '填写端点与鉴权',
-        detail: '服务地址填本页端点，鉴权方式选 Bearer / 自定义 Header，值为 Authorization: Bearer <令牌>。保存后平台会做一次连通性探测。',
+        title: '配置端点与鉴权',
+        detail: '填入服务地址与 Authorization: Bearer <令牌> 请求头，保存完成连通性探测。',
       },
       {
-        title: '挂到智能体应用',
-        detail: '在智能体编排页添加该 MCP 服务作为工具集，写好系统提示词（例如「涉及账务先调 solobooks 工具取数，不要编造金额」）。',
-      },
-      {
-        title: '用中文票据场景验证',
-        detail: '上传一张增值税发票让模型识别，再让它调 list_invoice_entries 核对是否已入账。',
+        title: '绑定智能体应用',
+        detail: '在智能体工具集添加 solobooks，提示词要求优先调用工具取数。',
       },
     ],
     samples: (ctx) => [
@@ -317,13 +306,13 @@ export const CLIENT_GUIDES: ClientGuide[] = [
 服务地址：${ctx.endpoint}
 鉴权类型：Bearer Token / 自定义 Header
 请求头：Authorization: Bearer ${ctx.token}
-超时：60s（报表与结账检查类工具耗时较长）`,
+超时：60s`,
       },
     ],
-    verify: '平台连通性探测通过、工具列表出现 27 项；智能体调试台能看到工具调用日志。',
+    verify: '平台连通性探测通过并识别 27 项工具，调试台可见调用日志。',
     tips: [
-      '百炼运行在公网，端点必须公网可达；本地实例请用内网穿透或反向代理暴露。',
-      '部分版本控制台只支持 SSE，而梭罗记账是 Streamable HTTP 端点，若探测失败优先确认平台是否支持该传输。',
+      '百炼云端调用要求端点公网可达，本地调试需配合反向代理或穿透。',
+      '请确认所选控制台版本已支持 Streamable HTTP 传输协议。',
     ],
   },
   {
@@ -331,22 +320,21 @@ export const CLIENT_GUIDES: ClientGuide[] = [
     name: 'Trae / Cursor / Windsurf',
     vendor: 'AI IDE 三件套',
     icon: 'ri-code-s-slash-line',
-    tagline: '写代码间隙顺手查账，开发者最顺手的姿势',
-    transport: 'Streamable HTTP（IDE 内置 MCP 面板）',
-    summary:
-      '三家 IDE 都内置 MCP 面板，配置结构基本一致：一个 JSON、一个 url、一个鉴权头。项目级配置跟着仓库走，全局配置所有项目可用。',
+    tagline: '编码时直接查账与核对财务数据',
+    transport: 'Streamable HTTP（IDE 内置）',
+    summary: '在 IDE MCP 设置中添加或直接编辑 mcp.json。',
     steps: [
       {
-        title: '打开 MCP 设置',
-        detail: 'Cursor：设置 → MCP → Add new MCP server；Trae：设置 → MCP → 添加；Windsurf：Cascade → MCP。也可以直接编辑配置文件。',
+        title: '打开 MCP 配置',
+        detail: '在 Cursor / Trae 设置的 MCP 面板新增服务，或直接新建 mcp.json。',
       },
       {
-        title: '粘贴配置',
-        detail: '项目级配置放 .cursor/mcp.json 或 .trae/mcp.json（跟着仓库走）；全局配置放用户目录。结构见右侧。',
+        title: '填入配置 JSON',
+        detail: '写入右侧配置，推荐放全局目录以避免令牌误提交进仓库。',
       },
       {
-        title: '在对话里提问',
-        detail: '回到 Chat 面板，工具列表出现 solobooks 后，直接问「上季度研发费用累计多少，需要补提折旧吗」。',
+        title: '在 Chat 中调用',
+        detail: '待状态变为绿灯后，直接在对话中查询账目或生成草稿。',
       },
     ],
     samples: (ctx) => [
@@ -369,10 +357,10 @@ export const CLIENT_GUIDES: ClientGuide[] = [
         code: remoteConfig(ctx.endpoint, ctx.token),
       },
     ],
-    verify: 'MCP 面板里 solobooks 显示绿灯、工具数 27；Chat 里 @ 工具能看到 propose_voucher 等写入工具。',
+    verify: 'MCP 面板显示绿灯且列出 27 个工具，Chat 中可正常调用。',
     tips: [
-      '项目级配置文件会进 Git。令牌不要提交到仓库——用全局配置，或把文件加进 .gitignore。',
-      'IDE 的 MCP 连接失败通常没有明显报错，先在终端用 curl 打一次端点确认令牌有效。',
+      '项目级 mcp.json 容易误入 Git，切勿将令牌提交到代码仓库。',
+      '若面板无报错但连不上，可先用 curl 验证端点与令牌是否返回 200。',
     ],
   },
   {
@@ -380,22 +368,21 @@ export const CLIENT_GUIDES: ClientGuide[] = [
     name: 'CLI / 自托管',
     vendor: 'Claude Code · 本地 stdio',
     icon: 'ri-terminal-box-line',
-    tagline: '本地部署与命令行调试的完整路径',
-    transport: '远程 HTTP，或本地 stdio 单进程模式',
-    summary:
-      '已经本地部署了梭罗记账？stdio 模式让 MCP 直接跑在你的机器上，不经过网络、不需要公网域名，适合私有化与开发调试。',
+    tagline: '命令行接入与私有化部署',
+    transport: 'HTTP / 本地 stdio',
+    summary: '支持 claude mcp add 一键注册、stdio 本地直连与 Docker 部署。',
     steps: [
       {
-        title: '远程模式：一条命令注册',
-        detail: 'Claude Code 用户可直接用 claude mcp add 注册远程 HTTP 端点，令牌写在请求头里。',
+        title: '命令行注册远程端点',
+        detail: 'Claude Code 执行右侧 claude mcp add 命令即可完成接入。',
       },
       {
-        title: '本地模式：stdio 直连',
-        detail: '用仓库里的 scripts/mcp_stdio.py，把数据库地址与令牌通过环境变量传进去，客户端按 command 方式启动它。',
+        title: '本地 stdio 直连（可选）',
+        detail: '私有化环境可直接通过 scripts/mcp_stdio.py 以进程模式连接数据库。',
       },
       {
-        title: '自托管起服务',
-        detail: '仓库自带 Docker Compose，起完服务后 /mcp 端点即可用；反代记得关闭缓冲并放宽读超时。',
+        title: 'Docker 自托管启动',
+        detail: '使用 Docker Compose 启动服务后，用验证脚本确认 27 个工具握手正常。',
       },
     ],
     samples: (ctx) => [
@@ -423,17 +410,16 @@ export const CLIENT_GUIDES: ClientGuide[] = [
       },
       {
         lang: 'bash',
-        label: '自托管起服务',
+        label: '自托管启动与自检',
         code: `git clone ${ctx.repoUrl}.git && cd solobooks-open
 docker compose -f deploy/docker-compose.yml up -d
-# 端点就绪后自检：未带令牌应返回 401，带令牌应广播 27 个工具
 python scripts/verify_workbuddy_mcp.py --url http://127.0.0.1:8001/mcp --token ${ctx.token}`,
       },
     ],
-    verify: 'verify_workbuddy_mcp.py 三项全 PASS：401 安全边界、握手成功、关键工具齐备。',
+    verify: 'verify_workbuddy_mcp.py 输出三项全 PASS（鉴权边界 / 握手 / 工具完整）。',
     tips: [
-      'stdio 模式的令牌同样绑定公司，别用生产令牌跑测试库。',
-      '反代配置：proxy_buffering off、proxy_read_timeout 600s，否则长连接会被截断。',
+      'stdio 模式同样严格校验公司绑定关系，切勿混用测试与生产令牌。',
+      'Nginx 反代需配置 proxy_buffering off 与 proxy_read_timeout 600s。',
     ],
   },
 ]
@@ -442,69 +428,69 @@ python scripts/verify_workbuddy_mcp.py --url http://127.0.0.1:8001/mcp --token $
 
 export const SKILL_INSTALL_STEPS: GuideStep[] = [
   {
-    title: '拿到技能包',
-    detail: '从开源仓库克隆，或直接下载 skills/ 目录。每个技能包是一个独立文件夹，核心是 SKILL.md。',
+    title: '获取技能目录',
+    detail: '克隆开源仓库或下载 skills/ 目录，每个技能包核心为 SKILL.md。',
   },
   {
-    title: '放进客户端的技能目录',
-    detail: '支持 Agent Skills 规范的客户端（WorkBuddy / Claude Code 等）扫描 skills/ 目录；把整个 solobooks-tax-filing 文件夹放进去即可被识别。',
+    title: '放入客户端 skills 目录',
+    detail: '将 solobooks-tax-filing 文件夹放入客户端对应的技能扫描路径。',
   },
   {
-    title: '同时挂上 MCP 服务',
-    detail: '技能包只描述「怎么做」，取数要靠 MCP。所以 solobooks MCP 必须已连接，报税技能还需要一个浏览器 MCP（Chrome DevTools 或 Playwright）。',
+    title: '配合 MCP 使用',
+    detail: '确保已连接 solobooks MCP（报税技能还需搭配浏览器 MCP）。',
   },
   {
-    title: '用一句话触发',
-    detail: '「去电子税务局报这个季度的增值税」——技能描述里的触发条件命中后，Agent 会按 SOP 一步步执行。',
+    title: '自然语言触发',
+    detail: '输入「去电子税务局报这季度增值税」即可按标准 SOP 执行。',
   },
 ]
 
 export const TAX_SKILL_STEPS: { step: string; title: string; detail: string }[] = [
   {
     step: '01',
-    title: '拉税局底账',
-    detail: '在已登录的电子税务局页面读取应申报清册、金税归集的开票销售额、历史待弥补亏损与已预缴税额。全程只读快照，不碰账密。',
+    title: '读取税局底账',
+    detail: '只读获取已登录电子税务局的清册、开票销售额及历史预缴/亏损数据。',
   },
   {
     step: '02',
-    title: '账 ↔ 税逆向对账',
-    detail: '调 generate_filing_package 取账套测算值，与税局底账逐项比对。税局额度更大 = 有票没记账，Agent 会定位到具体发票。',
+    title: '账税逆向对账',
+    detail: '调用 generate_filing_package 逐项比对，自动定位漏记发票。',
   },
   {
     step: '03',
-    title: '阻塞拦截 / 补记草稿',
-    detail: '结账体检未过或存在重大差异时严禁填表，先列阻塞原因；确认漏记的，用 propose_voucher 起草补记凭证，等你确认。',
+    title: '阻塞校验 / 补记草稿',
+    detail: '结账未过即拦截并列出原因；确认漏记则调用 propose_voucher 生成草稿。',
   },
   {
     step: '04',
-    title: '预填 + 高亮，停在提交前',
-    detail: '把免税额、实际利润额填进申报表并黄色高亮标记，输出核对清单。绝不点「提交申报」——那一下必须由你亲手点。',
+    title: '预填并停在提交前',
+    detail: '填表并高亮关键金额、输出核对清单，最终「提交申报」由老板本人点击。',
   },
 ]
 
 export const ROADMAP_SKILLS: { title: string; detail: string }[] = [
-  { title: '月末结账五项体检', detail: '一键跑完账证 / 账账 / 账实 / 账表 / 税表检查，阻塞项直接给修复动作。' },
-  { title: '流水批量对平', detail: '微信、网银流水与账目批量勾稽，重复入账与漏记一次清干净。' },
+  { title: '月末结账五项体检', detail: '一键跑完账证/账账/账实/账表/税表核查并给出修复建议。' },
+  { title: '流水批量对平', detail: '微信、网银流水与账目批量勾稽，自动拦截重复与漏记。' },
 ]
 
 // ── 排错 ──
 
 export const TROUBLESHOOTING: { q: string; a: string }[] = [
   {
-    q: '返回 401 / 无效或已失效的访问令牌',
-    a: '令牌只显示一次，丢了只能重新签发。另外确认没有多复制空格、没有把 sbk_ 前缀丢掉、令牌没被吊销或过期。',
+    q: '401 / 无效或已失效令牌',
+    a: '检查是否遗漏 sbk_ 前缀、多了空格，或令牌已吊销/过期（明文丢失需重新签发）。',
   },
   {
-    q: '连接成功但工具列表是空的',
-    a: '多为令牌绑定的公司与当前账套不匹配，或令牌只有 read 权限却去找 propose_*。到「我的 → AI 连接」核对权限与绑定公司。',
+    q: '连接成功但工具为空',
+    a: '检查令牌绑定的公司是否正确，以及是否具备「读写草稿」权限。',
   },
   {
-    q: '调用报「调用过于频繁」',
-    a: '默认每个令牌每分钟 60 次。批量场景请合并查询条件、减少轮次，而不是提高频率。',
+    q: '提示「调用过于频繁」',
+    a: '默认每令牌限流 60 次/分钟，建议合并批量查询条件减少请求次数。',
   },
   {
-    q: 'AI 说它不能记账 / 只能生成草稿',
-    a: '这是设计如此。写入工具只产生待确认草稿，回到梭罗记账「待确认」列表逐笔确认后才会生成凭证。',
+    q: 'AI 提示只能生成草稿',
+    a: '安全机制设计如此，所有写操作需在「待确认」列表人工确认后才正式入账。',
   },
 ]
 

@@ -15,7 +15,10 @@ import dashscope
 from dashscope.audio.asr import Recognition, RecognitionCallback, Transcription
 from dashscope.utils.oss_utils import OssUtils
 
-from config import DASHSCOPE_API_KEY
+from config import DASHSCOPE_API_KEY, DEEPSEEK_SEARCH_API_KEY, DEEPSEEK_SEARCH_BASE_URL
+
+# 可选：deepseek / dashscope；默认 deepseek（支持 WAV / Ogg Opus）
+_ASR_PROVIDER = os.getenv("ASR_PROVIDER", "deepseek").strip().lower()
 
 # 与百炼文档一致：https://help.aliyun.com/zh/model-studio/paraformer-realtime-speech-recognition-python-sdk
 _ASR_MODEL = os.getenv("DASHSCOPE_ASR_MODEL", "paraformer-realtime-v2")
@@ -62,6 +65,8 @@ def _guess_audio_format(filename: Optional[str], content_type: Optional[str], co
         return "amr"
     if len(blob) >= 4 and blob[:4] == b"OggS":
         return "opus"
+    if len(blob) >= 4 and blob[:4] == b"\x1a\x45\xdf\xa3":
+        return "webm"
     if len(blob) >= 12 and blob[4:8] == b"ftyp":
         return "m4a"
 
@@ -72,6 +77,7 @@ def _guess_audio_format(filename: Optional[str], content_type: Optional[str], co
         (".wav", "wav"),
         (".aac", "aac"),
         (".m4a", "m4a"),
+        (".webm", "webm"),
         (".amr", "amr"),
         (".opus", "opus"),
         (".pcm", "pcm"),
@@ -83,6 +89,8 @@ def _guess_audio_format(filename: Optional[str], content_type: Optional[str], co
         return "mp3"
     if "wav" in ct:
         return "wav"
+    if "webm" in ct:
+        return "webm"
     if "aac" in ct or "m4a" in ct:
         return "aac"
     if "amr" in ct:
@@ -273,6 +281,32 @@ def _file_transcribe_paraformer_v2(local_path: str) -> str:
     return " ".join(texts).strip()
 
 
+def _transcribe_with_deepseek(content: bytes, filename: Optional[str], content_type: Optional[str]) -> str:
+    """调用 DeepSeek `/tools/asr`（支持 16-bit PCM WAV / Ogg Opus）。"""
+    api_key = os.getenv("DEEPSEEK_ASR_API_KEY", "").strip() or DEEPSEEK_SEARCH_API_KEY
+    base_url = (os.getenv("DEEPSEEK_ASR_BASE_URL", "").strip() or DEEPSEEK_SEARCH_BASE_URL).rstrip("/")
+    if not api_key:
+        raise RuntimeError("未配置 DeepSeek API Key，无法调用语音识别")
+    fname = filename or "speech.wav"
+    ctype = content_type or "audio/wav"
+    with httpx.Client(timeout=60.0) as client:
+        resp = client.post(
+            f"{base_url}/tools/asr",
+            headers={"Authorization": f"Bearer {api_key}"},
+            files={"file": (fname, content, ctype)},
+        )
+    if resp.status_code != 200:
+        detail = ""
+        try:
+            body = resp.json()
+            detail = (body.get("error") or {}).get("message") or body.get("message") or resp.text
+        except Exception:  # noqa: BLE001
+            detail = resp.text
+        raise RuntimeError(f"DeepSeek 语音识别失败（{resp.status_code}）：{detail[:200]}")
+    data = resp.json()
+    return str(data.get("text") or "").strip()
+
+
 def transcribe_uploaded_audio(
     content: bytes,
     filename: Optional[str],
@@ -298,10 +332,14 @@ def transcribe_uploaded_audio(
     from services.llm import _record_usage  # 用量统计与 LLM 同一出口（token 数 ASR 接口不提供，记 0）
 
     _asr_started = time.monotonic()
+    provider = os.getenv("ASR_PROVIDER", _ASR_PROVIDER).strip().lower()
+    fmt = _guess_audio_format(filename, content_type, content)
+    use_deepseek = provider == "deepseek" and fmt in ("wav", "opus")
+    usage_model = "deepseek-asr" if use_deepseek else _FILE_ASR_MODEL
 
     def _record_asr(status: str, error_type: Optional[str] = None) -> None:
         _record_usage(
-            model=_FILE_ASR_MODEL,
+            model=usage_model,
             scene=scene,
             user_id=user_id,
             company_id=company_id,
@@ -310,7 +348,15 @@ def transcribe_uploaded_audio(
             error_type=error_type,
         )
 
-    fmt = _guess_audio_format(filename, content_type, content)
+    if use_deepseek:
+        try:
+            text_out = _transcribe_with_deepseek(content, filename, content_type)
+            _record_asr("ok")
+            return text_out
+        except Exception as exc:  # noqa: BLE001
+            _record_asr("error", error_type=type(exc).__name__)
+            raise
+
     suffix = ".m4a" if fmt == "m4a" else (f".{fmt}" if fmt else ".mp3")
     dashscope.api_key = DASHSCOPE_API_KEY
 
@@ -324,8 +370,8 @@ def transcribe_uploaded_audio(
 
         work_path = tmp_path
         work_fmt = fmt
-        # m4a / 微信「aac」真机：ISO BMFF 须按容器处理，不能按裸 aac 送 DashScope
-        if _is_mp4_family(content) or fmt == "m4a":
+        # m4a / webm / 微信「aac」真机：容器须转成 16kHz 单声道 wav，不能直接按裸流送 DashScope
+        if _is_mp4_family(content) or fmt in ("m4a", "webm"):
             fd_w, wav_path = tempfile.mkstemp(suffix=".wav")
             os.close(fd_w)
             _ffmpeg_to_wav_16k_mono(tmp_path, wav_path)

@@ -301,6 +301,92 @@ async def _get_advance_balances(ctx: ToolContext, month: Optional[str] = None) -
     return await query_advance_balances(ctx.company_id, target_month)
 
 
+async def _list_auxiliary_items(
+    ctx: ToolContext,
+    kind: str,
+    keyword: str = "",
+    include_inactive: bool = False,
+    limit: int = 50,
+) -> Any:
+    """查询辅助核算档案（往来单位 / 部门 / 项目 / 职员）。"""
+    from services.auxiliary_service import list_master
+
+    safe_limit = max(1, min(int(limit or 50), 100))
+    return await list_master(
+        ctx.company_id,
+        kind,
+        keyword=str(keyword or ""),
+        include_inactive=bool(include_inactive),
+        page=1,
+        page_size=safe_limit,
+    )
+
+
+async def _get_auxiliary_balances(
+    ctx: ToolContext,
+    kind: str,
+    month: Optional[str] = None,
+    account_code: Optional[str] = None,
+    include_zero: bool = False,
+) -> Any:
+    """查询核算项目余额表（往来单位 / 部门 / 项目 / 职员）。"""
+    from datetime import datetime, timezone
+    from services.auxiliary_ledger_service import query_auxiliary_balances
+
+    target_month = month or datetime.now(timezone.utc).strftime("%Y-%m")
+    return await query_auxiliary_balances(
+        ctx.company_id,
+        kind,
+        target_month,
+        account_code=account_code,
+        include_zero=bool(include_zero),
+    )
+
+
+async def _get_auxiliary_sub_ledger(
+    ctx: ToolContext,
+    kind: str,
+    item_id: str,
+    month: Optional[str] = None,
+    account_code: Optional[str] = None,
+) -> Any:
+    """查询核算项目明细账（逐笔凭证分录与滚动余额）。"""
+    from datetime import datetime, timezone
+    from services.auxiliary_ledger_service import query_auxiliary_sub_ledger
+
+    target_month = month or datetime.now(timezone.utc).strftime("%Y-%m")
+    return await query_auxiliary_sub_ledger(
+        ctx.company_id,
+        kind,
+        item_id,
+        target_month,
+        account_code=account_code,
+    )
+
+
+async def _get_auxiliary_combination(
+    ctx: ToolContext,
+    row_dim: str,
+    col_dim: str,
+    month: Optional[str] = None,
+    metric: str = "net",
+    account_code: Optional[str] = None,
+) -> Any:
+    """查询核算项目组合表（两维交叉统计矩阵）。"""
+    from datetime import datetime, timezone
+    from services.auxiliary_ledger_service import query_auxiliary_combination
+
+    target_month = month or datetime.now(timezone.utc).strftime("%Y-%m")
+    return await query_auxiliary_combination(
+        ctx.company_id,
+        row_dim,
+        col_dim,
+        target_month,
+        metric=str(metric or "net"),
+        account_code=account_code,
+    )
+
+
 async def _list_private_expenses(
     ctx: ToolContext,
     owner_name: Optional[str] = None,
@@ -1408,6 +1494,10 @@ _VOUCHER_PROPOSAL_SCHEMA = {
         "occur_date": {"type": "string", "description": "业务发生日期 YYYY-MM-DD，可选", "pattern": DATE_PATTERN},
         "payer": _PAYER_SCHEMA,
         "merchant": {"type": "string", "description": "对方商户/单位，可选"},
+        "partner_id": {"type": "string", "description": "往来单位档案 ID（可先通过 list_auxiliary_items 获取），可选"},
+        "department_id": {"type": "string", "description": "部门档案 ID，可选"},
+        "project_id": {"type": "string", "description": "项目档案 ID，可选"},
+        "employee_id": {"type": "string", "description": "职员档案 ID，可选"},
         "note": {"type": "string", "description": "给用户的备注，可选"},
         "statementId": {
             "type": "string",
@@ -1472,6 +1562,10 @@ async def _propose_vouchers(ctx: ToolContext, proposals: List[dict], note: Optio
         for optional_key, payload_key in (
             ("occur_date", "occurDate"),
             ("merchant", "merchant"),
+            ("partner_id", "partner_id"),
+            ("department_id", "department_id"),
+            ("project_id", "project_id"),
+            ("employee_id", "employee_id"),
         ):
             if cleaned.get(optional_key):
                 item[payload_key] = cleaned[optional_key]
@@ -1733,6 +1827,10 @@ async def _propose_voucher(
     occur_date: Optional[str] = None,
     payer: str = "company_account",
     merchant: Optional[str] = None,
+    partner_id: Optional[str] = None,
+    department_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    employee_id: Optional[str] = None,
     note: Optional[str] = None,
     evidence: Optional[dict] = None,
 ) -> Any:
@@ -1751,6 +1849,14 @@ async def _propose_voucher(
         payload["occurDate"] = occur_date
     if merchant:
         payload["merchant"] = merchant
+    for aux_key, aux_val in (
+        ("partner_id", partner_id),
+        ("department_id", department_id),
+        ("project_id", project_id),
+        ("employee_id", employee_id),
+    ):
+        if aux_val:
+            payload[aux_key] = aux_val
     action = await agent_actions.create_action(
         company_id=ctx.company_id,
         user_id=ctx.user_id,
@@ -2114,6 +2220,91 @@ TOOLS: List[Tool] = [
         handler=_get_advance_balances,
     ),
     Tool(
+        name="list_auxiliary_items",
+        description="查询辅助核算档案（往来单位 partner / 部门 department / 项目 project / 职员 employee）。",
+        parameters=_obj(
+            {
+                "kind": {
+                    "type": "string",
+                    "enum": ["partner", "department", "project", "employee"],
+                    "description": "辅助核算维度：partner=往来单位，department=部门，project=项目，employee=职员",
+                },
+                "keyword": {"type": "string", "description": "可选，名称/编码关键字过滤"},
+                "include_inactive": {"type": "boolean", "description": "是否包含已停用档案，默认 false"},
+                "limit": {"type": "integer", "description": "返回条数上限，默认 50，最大 100"},
+            },
+            ["kind"],
+        ),
+        handler=_list_auxiliary_items,
+    ),
+    Tool(
+        name="get_auxiliary_balances",
+        description=(
+            "查询核算项目余额表（支持往来单位 / 部门 / 项目 / 职员），汇总期初、本期借贷、本年累计与期末余额。"
+        ),
+        parameters=_obj(
+            {
+                "kind": {
+                    "type": "string",
+                    "enum": ["partner", "department", "project", "employee"],
+                    "description": "辅助核算维度",
+                },
+                "month": {"type": "string", "description": "账期 YYYY-MM，默认当前月", "pattern": MONTH_PATTERN},
+                "account_code": {"type": "string", "description": "可选，科目编码前缀（如 1122、5602）"},
+                "include_zero": {"type": "boolean", "description": "是否包含零余额启用档案，默认 false"},
+            },
+            ["kind"],
+        ),
+        handler=_get_auxiliary_balances,
+    ),
+    Tool(
+        name="get_auxiliary_sub_ledger",
+        description="查询核算项目明细账：指定维度与档案项（或 __unassigned__）的期初、逐笔发生、滚动余额与期末。",
+        parameters=_obj(
+            {
+                "kind": {
+                    "type": "string",
+                    "enum": ["partner", "department", "project", "employee"],
+                    "description": "辅助核算维度",
+                },
+                "item_id": {"type": "string", "description": "档案 ID，或 __unassigned__ 查看未指定项"},
+                "month": {"type": "string", "description": "账期 YYYY-MM，默认当前月", "pattern": MONTH_PATTERN},
+                "account_code": {"type": "string", "description": "可选，科目编码前缀"},
+            },
+            ["kind", "item_id"],
+        ),
+        handler=_get_auxiliary_sub_ledger,
+    ),
+    Tool(
+        name="get_auxiliary_combination",
+        description=(
+            "查询核算项目组合表（二维交叉表，如部门×项目、科目×部门、科目×职员、往来单位×科目）。"
+        ),
+        parameters=_obj(
+            {
+                "row_dim": {
+                    "type": "string",
+                    "enum": ["account", "partner", "department", "project", "employee"],
+                    "description": "行维度",
+                },
+                "col_dim": {
+                    "type": "string",
+                    "enum": ["account", "partner", "department", "project", "employee"],
+                    "description": "列维度（不能与行维度相同）",
+                },
+                "month": {"type": "string", "description": "账期 YYYY-MM，默认当前月", "pattern": MONTH_PATTERN},
+                "metric": {
+                    "type": "string",
+                    "enum": ["net", "debit", "credit", "closing"],
+                    "description": "统计口径：net=本期净发生（借-贷），debit=本期借方，credit=本期贷方，closing=期末余额",
+                },
+                "account_code": {"type": "string", "description": "可选，科目范围前缀"},
+            },
+            ["row_dim", "col_dim"],
+        ),
+        handler=_get_auxiliary_combination,
+    ),
+    Tool(
         name="list_private_expenses",
         description=(
             "查询老板小私账台账（老板个人垫付与代收明细及汇总统计）。"
@@ -2165,12 +2356,12 @@ TOOLS: List[Tool] = [
     Tool(
         name="list_todos",
         description=(
-            "查询当前待办与风险事项（缺票、待对账、待处理等），可按类型/级别过滤。"
+            "查询当前待办与风险事项（申报、缺票、报销、开票、资产等），可按类型/级别过滤。"
             "只需某一类待办时务必带过滤参数，避免全量拉取。"
         ),
         parameters=_obj(
             {
-                "type": {"type": "string", "description": "可选，按类型过滤：filing 申报 / bank 流水待处理 / receipt 补票据 / tax 开票确认 / task 任务 / risk 风险"},
+                "type": {"type": "string", "description": "可选，按类型过滤：filing 申报 / receipt 补票据 / tax 开票确认 / task 任务 / risk 风险"},
                 "level": {"type": "string", "enum": ["high", "medium", "low"], "description": "可选，按级别过滤"},
                 "limit": {"type": "integer", "description": "返回条数上限，默认 50"},
             }
@@ -2445,6 +2636,10 @@ TOOLS: List[Tool] = [
                 "occur_date": {"type": "string", "description": "业务发生日期 YYYY-MM-DD，可选", "pattern": DATE_PATTERN},
                 "payer": _PAYER_SCHEMA,
                 "merchant": {"type": "string", "description": "对方商户/单位，可选"},
+                "partner_id": {"type": "string", "description": "往来单位档案 ID，可选"},
+                "department_id": {"type": "string", "description": "部门档案 ID，可选"},
+                "project_id": {"type": "string", "description": "项目档案 ID，可选"},
+                "employee_id": {"type": "string", "description": "职员档案 ID，可选"},
                 "note": {"type": "string", "description": "给用户的备注说明，可选"},
                 "evidence": {"type": "string", "description": "用户原话中与该笔相关的关键信息，可选"},
             },

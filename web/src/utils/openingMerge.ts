@@ -144,6 +144,21 @@ export function mergeOpeningRows<T extends OpeningRowLike>(
     knownCodes.add(row.account_code)
   }
 
+  // 按系统科目编码升序排列（同科目无客商行在前，客商明细按原编码与中文名排序），
+  // 防止导入追加的 1122/1123/2202 客商行全部落到 3104006 未分配利润之后。
+  const cmpAscii = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
+  merged.sort((a, b) => {
+    const codeCmp = cmpAscii(String(a.account_code || ''), String(b.account_code || ''))
+    if (codeCmp !== 0) return codeCmp
+    const aPartner = String(a.partner_name || '')
+    const bPartner = String(b.partner_name || '')
+    if (!aPartner && bPartner) return -1
+    if (aPartner && !bPartner) return 1
+    const origCmp = cmpAscii(String(a.originalCode || ''), String(b.originalCode || ''))
+    if (origCmp !== 0) return origCmp
+    return aPartner.localeCompare(bPartner, 'zh-CN')
+  })
+
   return merged
 }
 

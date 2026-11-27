@@ -54,6 +54,27 @@ describe('GlobalSearch / Command Palette', () => {
     expect(text).not.toContain('上传银行流水')
   })
 
+  it('finds boss-visible low-frequency pages in the boss view', async () => {
+    wrapper = mount(GlobalSearch, { attachTo: document.body })
+    const input = document.body.querySelector('.palette-input input') as HTMLInputElement
+    expect(input).toBeTruthy()
+
+    input.value = '工资'
+    input.dispatchEvent(new Event('input'))
+    await wrapper.vm.$nextTick()
+    expect(document.body.textContent || '').toContain('工资薪金')
+
+    input.value = '备份'
+    input.dispatchEvent(new Event('input'))
+    await wrapper.vm.$nextTick()
+    expect(document.body.textContent || '').toContain('备份与归档')
+
+    input.value = 'MCP'
+    input.dispatchEvent(new Event('input'))
+    await wrapper.vm.$nextTick()
+    expect(document.body.textContent || '').toContain('AI 连接（MCP）')
+  })
+
   it('matches pinyin abbreviations like fp for invoice', async () => {
     wrapper = mount(GlobalSearch, { attachTo: document.body })
     const input = document.body.querySelector('.palette-input input') as HTMLInputElement

@@ -21,15 +21,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.chart_policy import auxiliary_kinds_for_account
 from core.errors import AccountingError
-from db.models import Department, JournalEntry, JournalLine, Partner, Project
+from db.models import Department, Employee, JournalEntry, JournalLine, Partner, Project, RdSalaryAllocation
 from db.session import session_scope
 from services.account_mapper import EMPLOYEE_PAYER_PREFIX, PAYER_BOSS, normalize_payer
 
-KINDS = ("partner", "department", "project")
-MODELS = {"partner": Partner, "department": Department, "project": Project}
-NAME_FIELD = {"partner": "name", "department": "name", "project": "name"}
-ID_KEY = {"partner": "partner_id", "department": "department_id", "project": "project_id"}
-NAME_KEY = {"partner": "partner_name", "department": "department_name", "project": "project_name"}
+KINDS = ("partner", "department", "project", "employee")
+MODELS = {"partner": Partner, "department": Department, "project": Project, "employee": Employee}
+NAME_FIELD = {"partner": "name", "department": "name", "project": "name", "employee": "name"}
+ID_KEY = {
+    "partner": "partner_id",
+    "department": "department_id",
+    "project": "project_id",
+    "employee": "employee_id",
+}
+NAME_KEY = {
+    "partner": "partner_name",
+    "department": "department_name",
+    "project": "project_name",
+    "employee": "employee_name",
+}
 CODE_PREFIX = {"customer": "C", "supplier": "S", "both": "B", "person": "P"}
 # 个人（股东/员工）不是客户也不是供应商，单独一类；三处校验共用，避免各写一份漂移
 PARTNER_TYPES = ("customer", "supplier", "both", "person")
@@ -38,6 +48,20 @@ POSTED_STATUSES = ("posted", "reversed")
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _active_clause(model: Any, active: bool = True) -> Any:
+    if model is Employee:
+        return Employee.is_active == (1 if active else 0)
+    return model.is_active.is_(active)
+
+
+def _iso_text(value: Any) -> str:
+    if not value:
+        return ""
+    if isinstance(value, str):
+        return value
+    return value.isoformat()
 
 
 def _normalize_name(value: Any) -> str:
@@ -49,11 +73,11 @@ def _serialize(model: Any) -> dict[str, Any]:
     data = {
         "id": model.id,
         "companyId": model.company_id,
-        "code": model.code,
+        "code": model.code or "",
         "name": model.name,
         "isActive": bool(model.is_active),
-        "createdAt": model.created_at.isoformat() if model.created_at else "",
-        "updatedAt": model.updated_at.isoformat() if model.updated_at else "",
+        "createdAt": _iso_text(model.created_at),
+        "updatedAt": _iso_text(model.updated_at),
     }
     if isinstance(model, Partner):
         data.update(
@@ -64,6 +88,13 @@ def _serialize(model: Any) -> dict[str, Any]:
                 "phone": model.phone,
                 "address": model.address,
                 "mnemonic": model.mnemonic,
+            }
+        )
+    elif isinstance(model, Employee):
+        data.update(
+            {
+                "department": model.department or "",
+                "isOwner": bool(model.is_owner),
             }
         )
     return data
@@ -84,13 +115,15 @@ async def list_master(
     model = _model(kind)
     conditions = [model.company_id == company_id]
     if not include_inactive:
-        conditions.append(model.is_active.is_(True))
+        conditions.append(_active_clause(model, True))
     keyword = (keyword or "").strip()
     if keyword:
         like = f"%{keyword}%"
         fields = [model.name.like(like), model.code.like(like)]
         if isinstance(model, Partner):
             fields.extend([Partner.mnemonic.like(like), Partner.tax_id.like(like)])
+        elif isinstance(model, Employee):
+            fields.append(Employee.department.like(like))
         from sqlalchemy import or_
 
         conditions.append(or_(*fields))
@@ -104,7 +137,7 @@ async def list_master(
             await session.execute(
                 select(model)
                 .where(*conditions)
-                .order_by(model.code)
+                .order_by(model.code, model.name)
                 .offset((page - 1) * page_size)
                 .limit(page_size)
             )
@@ -120,10 +153,11 @@ def _model(kind: str) -> Any:
 
 async def _next_code(session: AsyncSession, company_id: str, model: Any, prefix: str) -> str:
     existing = {
-        str(code)
+        str(code).strip()
         for code in (
             await session.execute(select(model.code).where(model.company_id == company_id))
         ).scalars().all()
+        if str(code or "").strip()
     }
     index = 1
     while True:
@@ -154,7 +188,7 @@ async def create_master(
             raise AccountingError(
                 "DUPLICATE_AUXILIARY", f"「{name}」已存在", 409, {"id": duplicate.id}
             )
-        prefix = "PT" if kind == "partner" else ("DP" if kind == "department" else "PJ")
+        prefix = {"partner": "PT", "department": "DP", "project": "PJ", "employee": "EM"}[kind]
         code = str(payload.get("code") or "").strip()
         if kind == "partner":
             partner_type = str(payload.get("type") or "both").strip()
@@ -172,14 +206,27 @@ async def create_master(
         ).scalar_one_or_none():
             raise AccountingError("DUPLICATE_AUXILIARY_CODE", f"编码 {code} 已存在", 409)
 
-        row = model(company_id=company_id, code=code, name=name)
-        if kind == "partner":
-            row.type = partner_type
-            row.tax_id = str(payload.get("taxId") or payload.get("tax_id") or "").strip()
-            row.contact = str(payload.get("contact") or "").strip()
-            row.phone = str(payload.get("phone") or "").strip()
-            row.address = str(payload.get("address") or "").strip()
-            row.mnemonic = str(payload.get("mnemonic") or _mnemonic(name)).strip()
+        if kind == "employee":
+            now_iso = _now().isoformat()
+            row = Employee(
+                company_id=company_id,
+                code=code,
+                name=name,
+                department=str(payload.get("department") or "").strip(),
+                is_owner=1 if payload.get("isOwner") else 0,
+                is_active=1,
+                created_at=now_iso,
+                updated_at=now_iso,
+            )
+        else:
+            row = model(company_id=company_id, code=code, name=name)
+            if kind == "partner":
+                row.type = partner_type
+                row.tax_id = str(payload.get("taxId") or payload.get("tax_id") or "").strip()
+                row.contact = str(payload.get("contact") or "").strip()
+                row.phone = str(payload.get("phone") or "").strip()
+                row.address = str(payload.get("address") or "").strip()
+                row.mnemonic = str(payload.get("mnemonic") or _mnemonic(name)).strip()
         session.add(row)
         await session.flush()
         result = _serialize(row)
@@ -248,9 +295,15 @@ async def update_master(
             ):
                 if key in payload:
                     setattr(row, field, str(payload.get(key) or "").strip())
+        elif isinstance(row, Employee):
+            if "department" in payload:
+                row.department = str(payload.get("department") or "").strip()
+            if "isOwner" in payload or "is_owner" in payload:
+                row.is_owner = 1 if payload.get("isOwner", payload.get("is_owner")) else 0
         if "isActive" in payload or "is_active" in payload:
-            row.is_active = bool(payload.get("isActive", payload.get("is_active")))
-        row.updated_at = _now()
+            active_val = bool(payload.get("isActive", payload.get("is_active")))
+            row.is_active = (1 if active_val else 0) if isinstance(row, Employee) else active_val
+        row.updated_at = _now().isoformat() if isinstance(row, Employee) else _now()
         await session.flush()
         result = _serialize(row)
     await _audit(company_id, user_id, "update", kind, item_id, payload)
@@ -262,8 +315,37 @@ async def deactivate_master(company_id: str, kind: str, item_id: str, *, user_id
     return await update_master(company_id, kind, item_id, {"isActive": False}, user_id=user_id)
 
 
+async def _employee_salary_references(session: AsyncSession, company_id: str, employee_id: str) -> int:
+    """检查员工是否已被工资表或研发人员工时分摊引用，避免误删工资底稿主数据。"""
+    refs = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(RdSalaryAllocation)
+                .where(
+                    RdSalaryAllocation.company_id == company_id,
+                    RdSalaryAllocation.employee_id == employee_id,
+                )
+            )
+        ).scalar_one()
+        or 0
+    )
+    has_salary_records = await session.run_sync(
+        lambda sync_session: inspect(sync_session.connection()).has_table("salary_records")
+    )
+    if has_salary_records:
+        sr_count = (
+            await session.execute(
+                text("SELECT COUNT(*) FROM salary_records WHERE employee_id = :eid"),
+                {"eid": employee_id},
+            )
+        ).scalar_one()
+        refs += int(sr_count or 0)
+    return refs
+
+
 async def delete_master(company_id: str, kind: str, item_id: str, *, user_id: str = "") -> dict[str, Any]:
-    """删除：仅允许未被任何凭证行引用。被引用只能停用。"""
+    """删除：仅允许未被任何凭证行（及员工工资/研发记录）引用。被引用只能停用。"""
     model = _model(kind)
     async with session_scope() as session:
         row = (
@@ -274,10 +356,12 @@ async def delete_master(company_id: str, kind: str, item_id: str, *, user_id: st
         if row is None:
             raise AccountingError("AUXILIARY_NOT_FOUND", "辅助核算档案不存在", 404)
         references = await count_references(session, company_id, kind, item_id)
+        if kind == "employee":
+            references += await _employee_salary_references(session, company_id, item_id)
         if references:
             raise AccountingError(
                 "AUXILIARY_IN_USE",
-                f"该档案已被 {references} 条凭证分录引用，只能停用不能删除",
+                f"该档案已被 {references} 条业务/凭证记录引用，只能停用不能删除",
                 409,
                 {"references": references},
             )
@@ -378,7 +462,7 @@ async def _match_by_name(session: AsyncSession, company_id: str, kind: str, name
     model = MODELS[kind]
     rows = (
         await session.execute(
-            select(model).where(model.company_id == company_id, model.is_active.is_(True))
+            select(model).where(model.company_id == company_id, _active_clause(model, True))
         )
     ).scalars().all()
     target = _normalize_name(name)
@@ -386,6 +470,45 @@ async def _match_by_name(session: AsyncSession, company_id: str, kind: str, name
         if _normalize_name(row.name) == target:
             return row
     return None
+
+
+def attach_auxiliary_to_voucher(voucher: dict[str, Any], auxiliary: dict[str, str | None]) -> dict[str, Any]:
+    """把辅助核算 id 挂到允许的科目行上（白名单见 core.chart_policy）。
+
+    客户端只传 id；name 由服务端在落库时按主数据回填（accounting_core._add_lines），
+    这里不复制任何客户端文案。``confirm`` 与 Agent 动作入账共用。
+    """
+    requested = {key: value for key, value in auxiliary.items() if value}
+    if not requested:
+        return voucher
+    output: dict[str, Any] = {}
+    for side in ("debit", "credit"):
+        lines = []
+        for line in voucher.get(side) or []:
+            allowed = auxiliary_kinds_for_account(str(line.get("accountCode") or ""))
+            matched = {key: value for key, value in requested.items() if key.removesuffix("_id") in allowed}
+            lines.append({**line, "auxiliary": {**(line.get("auxiliary") or {}), **matched}} if matched else line)
+        output[side] = lines
+    return output
+
+
+async def resolve_entry_employee(
+    session: AsyncSession,
+    company_id: str,
+    *,
+    payer: Any,
+) -> dict[str, str] | None:
+    """员工垫付（``employee_personal:<姓名>``）同步匹配在职员工名册，补挂 employee_id。"""
+    normalized = normalize_payer(payer)
+    if not normalized.startswith(f"{EMPLOYEE_PAYER_PREFIX}:"):
+        return None
+    name = normalized.split(":", 1)[1].strip()
+    if not name:
+        return None
+    matched = await _match_by_name(session, company_id, "employee", name)
+    if matched is None:
+        return None
+    return {"id": str(matched.id), "name": str(matched.name)}
 
 
 async def resolve_auxiliary_options(company_id: str, keyword: str = "", limit: int = 20) -> dict[str, Any]:
@@ -581,6 +704,93 @@ async def ensure_person_partner(
     return result
 
 
+# ── 银行流水对手方 → 往来单位 ──────────────────────────────────────────────
+
+# 个人姓名：2–8 个汉字（允许少数民族姓名里的间隔点）。公司名会命中下面的
+# 组织类关键词，长名/英文名按单位处理，宁可归到「客户/供应商」也不误建个人。
+_PERSON_NAME_RE = re.compile(r"^[一-龥][一-龥·]{1,7}$")
+_ORG_NAME_KEYWORDS = (
+    "公司", "企业", "集团", "银行", "中心", "事务所", "合作社", "工作室", "经营部",
+    "商行", "商店", "门店", "协会", "学会", "大学", "学校", "医院",
+    "平台", "商贸", "贸易", "实业", "控股", "投资", "基金", "证券", "保险", "金库",
+    "税务", "政府", "委员会", "传媒", "文化", "科技", "网络", "信息技术", "人工智能",
+    "研究院", "研究所",
+)
+# 银行附言里的泛称/科目名，不是真实交易对手：建了档案只会让账龄表多出假单位。
+_PLACEHOLDER_COUNTERPARTIES = frozenset(
+    {"个人", "个人客户", "客户", "供应商", "对方", "对方单位", "未知", "不详", "无",
+     "应付利息", "应收利息", "利息", "-", "—"}
+)
+
+
+def counterparty_is_confident(name: Any) -> bool:
+    """名字是否明显是「单位」或「个人」——用于从摘要末尾括号里保守地取对手方。
+
+    只有命中组织关键词或纯中文姓名才算数；「(5元)」「(个人客户)」这类
+    说明性内容不会被误当成交易对手建档案。
+    """
+    text = re.sub(r"\s+", "", str(name or ""))
+    if not text or text in _PLACEHOLDER_COUNTERPARTIES:
+        return False
+    return any(keyword in text for keyword in _ORG_NAME_KEYWORDS) or bool(_PERSON_NAME_RE.match(text))
+
+
+def counterparty_partner_type(name: Any) -> str | None:
+    """判断银行对手方该建成什么类型的往来单位；``None`` 表示不该建。
+
+    个人（股东实缴、员工报销）走 ``person``；公司/组织走 ``both``——同一个
+    单位既可能是客户也可能是供应商，方向只影响筛选展示，不该在流水阶段猜错。
+    """
+    text = re.sub(r"\s+", "", str(name or ""))
+    if not text or text in _PLACEHOLDER_COUNTERPARTIES:
+        return None
+    if any(keyword in text for keyword in _ORG_NAME_KEYWORDS):
+        return "both"
+    if _PERSON_NAME_RE.match(text):
+        return "person"
+    return "both"
+
+
+async def ensure_counterparty_partner(
+    session: AsyncSession,
+    company_id: str,
+    name: Any,
+    *,
+    user_id: str = "",
+) -> dict[str, str] | None:
+    """按银行对手方取/建往来单位，**复用调用方事务**（与 ensure_person_partner 同理）。
+
+    同名（规范化后）已启用档案直接复用，不因流水里的括号/空格差异重复建档。
+    """
+    partner_type = counterparty_partner_type(name)
+    if partner_type is None:
+        return None
+    # 建档保留原始（去首尾空格）名称，与发票导入/手工建档的口径一致；
+    # 仅判定类型时忽略内部空格，避免英文单位名被粘成一串。
+    target = str(name or "").strip()
+    rows = (
+        await session.execute(select(Partner).where(Partner.company_id == company_id))
+    ).scalars().all()
+    normalized = _normalize_name(target)
+    for row in rows:
+        if row.is_active and _normalize_name(row.name) == normalized:
+            return {"id": row.id, "name": row.name}
+    code = await _next_code(session, company_id, Partner, CODE_PREFIX[partner_type])
+    partner = Partner(
+        company_id=company_id,
+        code=code,
+        name=target,
+        type=partner_type,
+        mnemonic=_mnemonic(target),
+    )
+    session.add(partner)
+    await session.flush()
+    result = {"id": partner.id, "name": partner.name}
+    if user_id:
+        await _audit(company_id, user_id, "auto_create", "partner", result["id"], {"name": target})
+    return result
+
+
 # 这些分类无论付款人字段写的是什么，对手方都是股东本人（股东取现通常走公户）
 SHAREHOLDER_CATEGORIES = frozenset(
     {"股东取现", "老板取现", "股东垫付", "老板垫付", "股东垫付报销", "老板垫付报销"}
@@ -641,12 +851,19 @@ async def assign_entry_auxiliary(
     entry_id: str,
     auxiliary: dict[str, Any],
 ) -> dict[str, Any]:
-    """给草稿凭证补挂辅助核算（已过账凭证不可改，只能红冲后重做）。
+    """给草稿凭证补挂或清除辅助核算（已过账凭证不可改，只能红冲后重做）。
 
-    挂载科目仍由 chart_policy 白名单决定：只挂"该科目允许的维度"，
-    不会把往来单位挂到管理费用这种无意义组合上。
+    - 传入非空 id：校验有效后挂载到科目白名单允许的行；
+    - 显式传入 None 或空串：从行上移除该维度（id 与 name 一并清除）。
     """
     from services.accounting_core_service import _entry_lines, record_audit
+
+    to_set = {k: str(v).strip() for k, v in auxiliary.items() if v is not None and str(v).strip()}
+    to_clear = {
+        k for k, v in auxiliary.items() if k in ID_KEY.values() and (v is None or not str(v).strip())
+    }
+    if not to_set and not to_clear:
+        return {"ok": True, "updatedLines": 0}
 
     async with session_scope() as session:
         entry = await session.get(JournalEntry, entry_id)
@@ -668,9 +885,19 @@ async def assign_entry_auxiliary(
         lines = await _entry_lines(session, entry_id)
         updated = 0
         for line in lines:
-            normalized = await normalize_line_auxiliary(session, company_id, line.account_code, auxiliary)
-            if normalized:
-                line.auxiliary = {**(line.auxiliary or {}), **normalized}
+            current = dict(line.auxiliary or {})
+            next_aux = dict(current)
+            for kind in KINDS:
+                id_key, name_key = ID_KEY[kind], NAME_KEY[kind]
+                if id_key in to_clear:
+                    next_aux.pop(id_key, None)
+                    next_aux.pop(name_key, None)
+            if to_set:
+                normalized = await normalize_line_auxiliary(session, company_id, line.account_code, to_set)
+                if normalized:
+                    next_aux.update(normalized)
+            if next_aux != current:
+                line.auxiliary = next_aux
                 updated += 1
         if updated:
             entry.version += 1

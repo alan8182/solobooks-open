@@ -10,6 +10,15 @@
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
+from services.todo_service import _has_invoice, _silent_non_invoice_expense_reason
+
+_SALARY_SETTLEMENT_SOURCES = frozenset(
+    {"salary_pay", "salary_social", "salary_housing_fund", "salary_iit"}
+)
+_INTERNAL_ASSET_SOURCES = frozenset(
+    {"fixed_asset_depreciation", "intangible_amortization"}
+)
+
 
 def _to_decimal(val: Any) -> Decimal:
     if val is None:
@@ -75,13 +84,23 @@ def calculate_health_score(
         if direction == "income":
             income += amount
         elif direction == "expense":
-            expense += amount
-            expense_count += 1
-            billing_status = str(e.get("billingStatus") or "").lower()
-            if billing_status in ("has_invoice", "has_receipt"):
-                invoice_count += 1
-            else:
-                if amount >= Decimal("1000"):
+            source_type = str(e.get("sourceType") or e.get("source") or "").strip()
+            # 工资发放/社保公积金个税缴纳是负债清偿（借2211/2221 贷1002），费用已在计提时计入，不重复拉低盈利分
+            if source_type not in _SALARY_SETTLEMENT_SOURCES:
+                expense += amount
+            category = str(e.get("category") or "").strip()
+            is_non_invoice_exempt = (
+                bool(_silent_non_invoice_expense_reason(e))
+                or source_type.startswith("salary_")
+                or source_type in _INTERNAL_ASSET_SOURCES
+                or category in ("折旧", "摊销")
+            )
+            if not is_non_invoice_exempt:
+                expense_count += 1
+                billing_status = str(e.get("billingStatus") or "").lower()
+                if billing_status in ("has_invoice", "has_receipt") or _has_invoice(e):
+                    invoice_count += 1
+                elif amount >= Decimal("1000"):
                     large_unbilled_expenses.append(e)
 
     # ----------------------------------------------------
@@ -92,17 +111,33 @@ def calculate_health_score(
 
     if checks:
         if not checks.get("canClose", True):
-            # 结账有阻断性检查
-            check_details = checks.get("checks") or {}
-            if check_details.get("trial_balance") is False:
-                integrity_score -= 8
-                add_penalty("integrity", "期末试算平衡不平", "借贷总额存在偏差，账套数据不平衡", 8, "high", "/closing-wizard", "去核对结账")
-            if check_details.get("numbering_gap") is True:
-                integrity_score -= 4
-                add_penalty("integrity", "记账凭证存在断号", "凭证编号不连续，需重新整理凭证号", 4, "medium", "/closing-wizard", "去整理凭证")
-            if check_details.get("profit_transfer") is False:
-                integrity_score -= 4
-                add_penalty("integrity", "期末损益未完成结转", "当期存在未结转的收入或费用科目余额", 4, "medium", "/closing-wizard", "去结转损益")
+            # 结账有阻断性检查：兼容测试桩的 dict 格式与 period_close_checks 返回的 list[dict] 格式
+            raw_checks = checks.get("checks")
+            if isinstance(raw_checks, dict):
+                if raw_checks.get("trial_balance") is False:
+                    integrity_score -= 8
+                    add_penalty("integrity", "期末试算平衡不平", "借贷总额存在偏差，账套数据不平衡", 8, "high", "/closing-wizard", "去核对结账")
+                if raw_checks.get("numbering_gap") is True:
+                    integrity_score -= 4
+                    add_penalty("integrity", "记账凭证存在断号", "凭证编号不连续，需重新整理凭证号", 4, "medium", "/closing-wizard", "去整理凭证")
+                if raw_checks.get("profit_transfer") is False:
+                    integrity_score -= 4
+                    add_penalty("integrity", "期末损益未完成结转", "当期存在未结转的收入或费用科目余额", 4, "medium", "/closing-wizard", "去结转损益")
+            elif isinstance(raw_checks, list):
+                by_code = {
+                    str(item.get("code") or ""): item
+                    for item in raw_checks
+                    if isinstance(item, dict)
+                }
+                if (by_code.get("LEDGER_TO_LEDGER") or {}).get("status") == "blocking":
+                    integrity_score -= 8
+                    add_penalty("integrity", "期末试算平衡不平", "借贷总额存在偏差，账套数据不平衡", 8, "high", "/closing-wizard", "去核对结账")
+                if (by_code.get("VOUCHER_TO_SOURCE") or {}).get("status") == "blocking":
+                    integrity_score -= 4
+                    add_penalty("integrity", "存在待过账或缺少来源的凭证", "部分凭证尚未过账或缺少原始单据关联，需在结账向导核对", 4, "medium", "/closing-wizard", "去核对凭证")
+                if (by_code.get("BOOK_TO_ACTUAL") or {}).get("status") == "blocking":
+                    integrity_score -= 4
+                    add_penalty("integrity", "存在未完成的银行或资产账实核对", "当期银行流水或固定资产总账尚未核对一致", 4, "medium", "/closing-wizard", "去账实核对")
     else:
         # 无 checks 数据时，检查草稿状态条目
         draft_count = sum(1 for e in entries if e.get("status") in ("draft", "pending", "pending_review"))

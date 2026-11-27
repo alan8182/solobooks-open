@@ -13,11 +13,13 @@
 import { ref, type Ref } from 'vue'
 import { useDialog, useMessage } from 'naive-ui'
 import apiClient from '@/api/client'
+import { createLedgerPdfArchive } from '@/api/backup'
 import { getAIDiagnosis, getIncomeStatement } from '@/api/report'
 import { getTodos } from '@/api/todo'
 import { buildClosingTodoSummary, type ClosingTodoSummary } from '@/utils/closingTodos'
-import { getClosingReadiness, canBatchPostDrafts } from '@/utils/closingReadiness'
+import { getClosingReadiness, canBatchPostDrafts, summarizeClosedIncomeStatement } from '@/utils/closingReadiness'
 import { reportErrorToast } from '@/utils/errorPresenter'
+import { saveBlobFile } from '@/utils/download'
 import { offerRescue } from '@/composables/useRescue'
 import type { useEntryStore } from '@/stores/entry'
 
@@ -42,9 +44,11 @@ export function useClosingFlow(options: {
 
   const closed = ref(false)
   const closingLoading = ref(false)
+  const reportLoading = ref(false)
   const monthlyIncome = ref(0)
   const monthlyExpense = ref(0)
   const netProfit = ref(0)
+  const monthlyInterestIncome = ref(0)
   const cfoDiagnosis = ref<any>(null)
   const diagnosisLoading = ref(false)
   // 本次结账自动生成的期末损益结转凭证号（完成页持久展示，不只靠瞬时 toast）
@@ -62,10 +66,11 @@ export function useClosingFlow(options: {
   async function fetchClosedMetrics() {
     try {
       const statement = await getIncomeStatement(month.value, 'summary')
-      const value = (key: string) => Number(statement.rows.find(row => row.key === key)?.values?.current || 0)
-      monthlyIncome.value = value('operating_revenue') + value('nonoperating_income') + value('investment_income')
-      netProfit.value = Number(statement.totals?.netProfit?.current || 0)
-      monthlyExpense.value = monthlyIncome.value - netProfit.value
+      const summary = summarizeClosedIncomeStatement(statement)
+      monthlyIncome.value = summary.monthlyIncome
+      monthlyExpense.value = summary.monthlyExpense
+      netProfit.value = summary.netProfit
+      monthlyInterestIncome.value = summary.interestIncome
     } catch {
       // ignore
     }
@@ -77,6 +82,11 @@ export function useClosingFlow(options: {
         title: `${month.value} 尚无业务记录`,
         content: '本月凭证、银行流水和发票均为空。若您还没有录入或导入本月业务，建议先返回检查；继续结账后，本期将按零收支锁定归档。',
       }
+    }
+    // 过账与关账合并后，未关账月的草稿在点关账时才会随事务过账，
+    // 已过账口径的利润表此时为 0 属正常现象，不再误报「收入和支出均为 0」。
+    if (canBatchPostAndClose()) {
+      return null
     }
 
     try {
@@ -228,16 +238,40 @@ export function useClosingFlow(options: {
     }
   }
 
-  function downloadReport() {
-    message.success('月度财务报销报告及凭证归档包 PDF 生成成功，正在下载...')
+  /**
+   * 结账完成页的「导出 PDF 包」：真正生成月度电子账簿 PDF 并留痕归档。
+   *
+   * 此前这里只弹一句成功 toast，用户拿不到文件——归档入口必须落到真实请求，
+   * 失败也要显式报错，不能假装成功。
+   */
+  async function downloadReport() {
+    if (reportLoading.value) return
+    const [yearText, monthText] = String(month.value || '').split('-')
+    const year = Number(yearText)
+    if (!year || !monthText) {
+      message.error('无法识别当前结账月份，不能生成电子账簿 PDF')
+      return
+    }
+    reportLoading.value = true
+    try {
+      const blob = await createLedgerPdfArchive({ year, month: month.value, scope: 'month' })
+      saveBlobFile(blob, `电子账簿_${month.value}.pdf`)
+      message.success('月度电子账簿 PDF 已生成并归档，可在「数据备份」中重新下载')
+    } catch (err) {
+      reportErrorToast(message, err, '生成电子账簿 PDF 失败')
+    } finally {
+      reportLoading.value = false
+    }
   }
 
   return {
     closed,
     closingLoading,
+    reportLoading,
     monthlyIncome,
     monthlyExpense,
     netProfit,
+    monthlyInterestIncome,
     cfoDiagnosis,
     diagnosisLoading,
     closingVoucherRefs,

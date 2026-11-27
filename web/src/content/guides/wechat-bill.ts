@@ -13,6 +13,11 @@ export const wechatBillGuide: Guide = {
   summary: '从微信支付商户平台按月导出交易账单，上传后自动拆分收款与手续费。',
   updatedAt: '2026-11',
   sourceUrl: 'https://docs.qq.com/doc/DTE91YVZzd2hjYkJo',
+  entry: {
+    label: '去微信支付商家后台',
+    url: 'https://pay.weixin.qq.com/',
+    hint: '登录后进「交易中心 → 交易账单」按月打包下载',
+  },
   notice: '用微信支付收款才需要导入；不用微信收款，这一步直接跳过。',
   steps: [
     {

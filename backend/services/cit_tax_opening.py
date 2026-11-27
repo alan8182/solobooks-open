@@ -69,6 +69,9 @@ async def get_tax_opening_memo(
             "startPeriod": str(memo.get("startPeriod") or "").strip(),
             "priorYearLoss": memo.get("priorYearLoss") or 0,
             "prepaidCitTax": memo.get("prepaidCitTax") or 0,
+            "carryforwardAdvertising": memo.get("carryforwardAdvertising") or 0,
+            "carryforwardEducation": memo.get("carryforwardEducation") or 0,
+            "carryforwardDonations": list(memo.get("carryforwardDonations") or []),
         }
 
     try:

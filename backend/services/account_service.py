@@ -4,11 +4,14 @@
 """Account and company persistence (async SQLite)."""
 from __future__ import annotations
 
+import hashlib
 import json
+import secrets
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
 
+from config import WECHAT_WEB_TICKET_TTL_SECONDS
 from db.session import database_url
 from core.errors import AccountingError, START_DATE_CONFLICT
 from services.database import get_conn
@@ -85,6 +88,9 @@ async def _ensure_schema() -> None:
                 phone TEXT NOT NULL DEFAULT '',
                 phone_verified_at TEXT NOT NULL DEFAULT '',
                 wechat_openid_bound_at TEXT NOT NULL DEFAULT '',
+                wechat_web_openid TEXT NOT NULL DEFAULT '',
+                wechat_unionid TEXT NOT NULL DEFAULT '',
+                wechat_web_bound_at TEXT NOT NULL DEFAULT '',
                 current_company_id TEXT NOT NULL DEFAULT '',
                 nickname TEXT NOT NULL DEFAULT '',
                 avatar TEXT NOT NULL DEFAULT '',
@@ -100,6 +106,28 @@ async def _ensure_schema() -> None:
                 ON auth_users(openid) WHERE openid != '';
             CREATE UNIQUE INDEX IF NOT EXISTS uniq_auth_users_phone_nonempty
                 ON auth_users(phone) WHERE phone != '';
+            CREATE UNIQUE INDEX IF NOT EXISTS uniq_auth_users_wechat_web_openid_nonempty
+                ON auth_users(wechat_web_openid) WHERE wechat_web_openid != '';
+            CREATE UNIQUE INDEX IF NOT EXISTS uniq_auth_users_wechat_unionid_nonempty
+                ON auth_users(wechat_unionid) WHERE wechat_unionid != '';
+
+            CREATE TABLE IF NOT EXISTS wechat_login_tickets (
+                ticket_hash TEXT PRIMARY KEY,
+                openid TEXT NOT NULL DEFAULT '',
+                unionid TEXT NOT NULL DEFAULT '',
+                nickname TEXT NOT NULL DEFAULT '',
+                avatar TEXT NOT NULL DEFAULT '',
+                privacy_accepted_at TEXT NOT NULL DEFAULT '',
+                tos_version TEXT NOT NULL DEFAULT '',
+                privacy_version TEXT NOT NULL DEFAULT '',
+                purpose TEXT NOT NULL,
+                user_id TEXT,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                used_at TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS ix_wechat_login_tickets_expires
+                ON wechat_login_tickets(expires_at);
 
             CREATE TABLE IF NOT EXISTS auth_companies (
                 company_id TEXT PRIMARY KEY,
@@ -161,11 +189,15 @@ def _row_to_user(row) -> Dict:
         "phone": row["phone"] or "",
         "phone_verified_at": row["phone_verified_at"] or "",
         "wechat_openid_bound_at": row["wechat_openid_bound_at"] or "",
+        "wechat_web_openid": row["wechat_web_openid"] or "",
+        "wechat_unionid": row["wechat_unionid"] or "",
+        "wechat_web_bound_at": row["wechat_web_bound_at"] or "",
         "current_company_id": row["current_company_id"] or "",
         "nickname": row["nickname"] or "",
         "avatar": row["avatar"] or "",
         "password_hash": row["password_hash"] or "",
         "password_updated_at": row["password_updated_at"] or "",
+        "is_disabled": bool(row["is_disabled"]),
         "created_at": row["created_at"] or "",
         "last_login_at": row["last_login_at"] or "",
         "updated_at": row["updated_at"] or "",
@@ -181,9 +213,10 @@ async def _persist_user(conn, user: Dict) -> None:
         """
         INSERT INTO auth_users (
             user_id, openid, phone, phone_verified_at, wechat_openid_bound_at,
+            wechat_web_openid, wechat_unionid, wechat_web_bound_at,
             current_company_id, nickname, avatar, password_hash, password_updated_at,
             is_platform_admin, is_disabled, created_at, last_login_at, updated_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,FALSE,FALSE,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,FALSE,FALSE,?,?,?)
         ON CONFLICT(user_id) DO UPDATE SET
             openid=excluded.openid,
             phone=excluded.phone,
@@ -201,6 +234,9 @@ async def _persist_user(conn, user: Dict) -> None:
             user.get("phone") or "",
             user.get("phone_verified_at") or "",
             user.get("wechat_openid_bound_at") or "",
+            user.get("wechat_web_openid") or "",
+            user.get("wechat_unionid") or "",
+            user.get("wechat_web_bound_at") or "",
             user.get("current_company_id") or "",
             user.get("nickname") or "",
             user.get("avatar") or "",
@@ -322,6 +358,9 @@ async def get_or_create_user(openid: str) -> Tuple[Dict, Dict | None, bool]:
                 "phone": "",
                 "phone_verified_at": "",
                 "wechat_openid_bound_at": _now_iso(),
+                "wechat_web_openid": "",
+                "wechat_unionid": "",
+                "wechat_web_bound_at": "",
                 "current_company_id": "",
                 "nickname": "",
                 "avatar": "",
@@ -359,6 +398,9 @@ async def get_or_create_user_by_phone(phone: str) -> Tuple[Dict, Dict | None, bo
                 "phone": phone,
                 "phone_verified_at": _now_iso(),
                 "wechat_openid_bound_at": "",
+                "wechat_web_openid": "",
+                "wechat_unionid": "",
+                "wechat_web_bound_at": "",
                 "current_company_id": "",
                 "nickname": "",
                 "avatar": "",
@@ -439,6 +481,321 @@ async def get_user_login_by_phone(phone: str) -> Dict | None:
         cursor = await conn.execute("SELECT * FROM auth_users WHERE phone = ?", (phone,))
         row = await cursor.fetchone()
         return _row_to_user(row) if row else None
+    finally:
+        await conn.close()
+
+
+# ── 微信开放平台网站应用扫码登录（与小程序 openid 严格分开）─────────────────
+
+
+def _ticket_hash(token: str) -> str:
+    return hashlib.sha256((token or "").encode("utf-8")).hexdigest()
+
+
+def _row_to_dict(row) -> Dict:
+    """aiosqlite.Row / CompatRow 统一转 dict。"""
+    if hasattr(row, "keys"):
+        return {key: row[key] for key in row.keys()}
+    return dict(row)
+
+
+def _is_unique_violation(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "unique" in text or "duplicate key" in text
+
+
+async def _insert_consent_on(conn, user_id: str, ticket: Dict) -> None:
+    """在调用方事务内写一条隐私同意记录（与用户绑定同提交/回滚）。"""
+    accepted_at = (ticket or {}).get("privacy_accepted_at") or ""
+    if not accepted_at:
+        return
+    await conn.execute(
+        "INSERT INTO auth_consents "
+        "(user_id, privacy_accepted_at, tos_version, privacy_version, created_at) "
+        "VALUES (?,?,?,?,?)",
+        (
+            user_id,
+            accepted_at,
+            (ticket or {}).get("tos_version") or "v1.0",
+            (ticket or {}).get("privacy_version") or "v1.0",
+            _now_iso(),
+        ),
+    )
+
+
+async def find_user_by_wechat_web(
+    openid: str, unionid: str = ""
+) -> Tuple[Dict, Dict | None] | None:
+    """按网站应用 openid / unionid 查账号。
+
+    两者都命中但指向不同用户时视为数据冲突，交由上层拒绝，绝不自行搬移。
+    """
+    await _ensure_db_ready()
+    conn = await get_conn()
+    try:
+        by_union = None
+        by_openid = None
+        if unionid:
+            cursor = await conn.execute(
+                "SELECT * FROM auth_users WHERE wechat_unionid = ?", (unionid,)
+            )
+            by_union = await cursor.fetchone()
+        if openid:
+            cursor = await conn.execute(
+                "SELECT * FROM auth_users WHERE wechat_web_openid = ?", (openid,)
+            )
+            by_openid = await cursor.fetchone()
+        if (
+            by_union is not None
+            and by_openid is not None
+            and by_union["user_id"] != by_openid["user_id"]
+        ):
+            raise ValueError("该微信身份已绑定不同账号")
+        row = by_union if by_union is not None else by_openid
+        if row is None:
+            return None
+        user = _row_to_user(row)
+        company = await _ensure_user_company(conn, user)
+        await conn.commit()
+        return user, company
+    finally:
+        await conn.close()
+
+
+async def create_wechat_login_ticket(
+    *,
+    openid: str,
+    unionid: str = "",
+    nickname: str = "",
+    avatar: str = "",
+    privacy_accepted_at: str = "",
+    tos_version: str = "v1.0",
+    privacy_version: str = "v1.0",
+    purpose: str,
+    user_id: str | None = None,
+) -> str:
+    """生成一次性 ticket；返回明文，库里只落 SHA-256。"""
+    await _ensure_db_ready()
+    plain = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    conn = await get_conn()
+    try:
+        await conn.execute(
+            "INSERT INTO wechat_login_tickets ("
+            "ticket_hash, openid, unionid, nickname, avatar, privacy_accepted_at,"
+            "tos_version, privacy_version, purpose, user_id, created_at, expires_at, used_at"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                _ticket_hash(plain),
+                openid or "",
+                unionid or "",
+                nickname or "",
+                avatar or "",
+                privacy_accepted_at or "",
+                tos_version or "v1.0",
+                privacy_version or "v1.0",
+                purpose,
+                user_id,
+                now.isoformat(),
+                (now + timedelta(seconds=WECHAT_WEB_TICKET_TTL_SECONDS)).isoformat(),
+                "",
+            ),
+        )
+        await conn.commit()
+        return plain
+    finally:
+        await conn.close()
+
+
+async def get_wechat_login_ticket(token: str, purpose: str | None = None) -> Dict | None:
+    """只读查询未使用且未过期的 ticket。"""
+    if not token:
+        return None
+    await _ensure_db_ready()
+    now = _now_iso()
+    sql = (
+        "SELECT * FROM wechat_login_tickets "
+        "WHERE ticket_hash = ? AND used_at = '' AND expires_at > ?"
+    )
+    params: list[Any] = [_ticket_hash(token), now]
+    if purpose:
+        sql += " AND purpose = ?"
+        params.append(purpose)
+    conn = await get_conn()
+    try:
+        cursor = await conn.execute(sql, tuple(params))
+        row = await cursor.fetchone()
+        return _row_to_dict(row) if row else None
+    finally:
+        await conn.close()
+
+
+async def _consume_wechat_login_ticket(conn, token: str, purpose: str) -> Dict | None:
+    """在调用方事务内原子消费 ticket；并发只有一次 rowcount==1。"""
+    if not token:
+        return None
+    now = _now_iso()
+    cursor = await conn.execute(
+        "UPDATE wechat_login_tickets SET used_at = ? "
+        "WHERE ticket_hash = ? AND purpose = ? AND used_at = '' AND expires_at > ?",
+        (now, _ticket_hash(token), purpose, now),
+    )
+    if int(getattr(cursor, "rowcount", 0) or 0) != 1:
+        return None
+    cursor = await conn.execute(
+        "SELECT * FROM wechat_login_tickets WHERE ticket_hash = ?", (_ticket_hash(token),)
+    )
+    row = await cursor.fetchone()
+    return _row_to_dict(row) if row else None
+
+
+async def exchange_wechat_login_ticket(token: str) -> Tuple[Dict, Dict | None]:
+    """消费 login ticket 并返回 (user, company)；company 可能为 None。"""
+    await _ensure_db_ready()
+    conn = await get_conn()
+    try:
+        ticket = await _consume_wechat_login_ticket(conn, token, "login")
+        if ticket is None:
+            await conn.rollback()
+            raise ValueError("登录会话已失效，请重新扫码")
+        user_id = ticket.get("user_id") or ""
+        cursor = await conn.execute("SELECT * FROM auth_users WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        if row is None or bool(row["is_disabled"]):
+            await conn.rollback()
+            raise ValueError("账号不可用")
+        user = _row_to_user(row)
+        user["last_login_at"] = _now_iso()
+        await _persist_user(conn, user)
+        await _insert_consent_on(conn, user_id, ticket)
+        company = await _ensure_user_company(conn, user)
+        await conn.commit()
+        return user, company
+    except Exception:
+        await conn.rollback()
+        raise
+    finally:
+        await conn.close()
+
+
+async def bind_phone_with_wechat_web(
+    token: str, phone: str, *, _retry: bool = False
+) -> Tuple[Dict, Dict | None, bool, bool]:
+    """短信验证通过后，把网站微信身份绑定到手机号账号（不存在则新建）。
+
+    返回 ``(user, company, is_new, merged)``。ticket 消费、用户写入、隐私同意
+    在同一事务内；号码冲突回滚后 ticket 不烧掉，允许用户换号重试。
+    """
+    await _ensure_db_ready()
+    conn = await get_conn()
+    try:
+        ticket = await _consume_wechat_login_ticket(conn, token, "bind")
+        if ticket is None:
+            await conn.rollback()
+            raise ValueError("绑定会话已失效，请重新扫码")
+        openid = (ticket.get("openid") or "").strip()
+        unionid = (ticket.get("unionid") or "").strip()
+        if not openid:
+            await conn.rollback()
+            raise ValueError("微信身份缺失，请重新扫码")
+
+        # 该 openid / unionid 是否已属于某个账号
+        cursor = await conn.execute(
+            "SELECT user_id FROM auth_users WHERE wechat_web_openid = ? "
+            "OR (wechat_unionid != '' AND wechat_unionid = ?)",
+            (openid, unionid),
+        )
+        occupied = await cursor.fetchone()
+
+        cursor = await conn.execute("SELECT * FROM auth_users WHERE phone = ?", (phone,))
+        row = await cursor.fetchone()
+        now = _now_iso()
+        nickname = (ticket.get("nickname") or "")[:255]
+        avatar = ticket.get("avatar") or ""
+
+        if row is not None:
+            user = _row_to_user(row)
+            if bool(row["is_disabled"]):
+                await conn.rollback()
+                raise ValueError("该手机号账号已被禁用，请联系管理员")
+            if user.get("wechat_web_openid") and user["wechat_web_openid"] != openid:
+                await conn.rollback()
+                raise ValueError("该手机号已绑定其他微信账号")
+            if occupied is not None and occupied["user_id"] != user["user_id"]:
+                await conn.rollback()
+                raise ValueError("该微信已绑定其他账号")
+            cursor = await conn.execute(
+                "UPDATE auth_users SET "
+                "wechat_web_openid = ?, wechat_unionid = ?, wechat_web_bound_at = ?, "
+                "nickname = CASE WHEN nickname = '' THEN ? ELSE nickname END, "
+                "avatar = CASE WHEN avatar = '' THEN ? ELSE avatar END, "
+                "last_login_at = ?, updated_at = ? "
+                "WHERE user_id = ? AND is_disabled = FALSE "
+                "AND (wechat_web_openid = '' OR wechat_web_openid = ?) "
+                "AND (wechat_unionid = '' OR wechat_unionid = ?)",
+                (
+                    openid,
+                    unionid,
+                    now,
+                    nickname,
+                    avatar,
+                    now,
+                    now,
+                    user["user_id"],
+                    openid,
+                    unionid,
+                ),
+            )
+            if int(getattr(cursor, "rowcount", 0) or 0) != 1:
+                await conn.rollback()
+                raise ValueError("绑定冲突，请重试")
+            cursor = await conn.execute(
+                "SELECT * FROM auth_users WHERE user_id = ?", (user["user_id"],)
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                await conn.rollback()
+                raise ValueError("用户不存在")
+            user = _row_to_user(row)
+            is_new = False
+            merged = True
+        else:
+            user = {
+                "user_id": _new_id("u"),
+                "openid": "",
+                "phone": phone,
+                "phone_verified_at": now,
+                "wechat_openid_bound_at": "",
+                "wechat_web_openid": openid,
+                "wechat_unionid": unionid,
+                "wechat_web_bound_at": now,
+                "current_company_id": "",
+                "nickname": nickname,
+                "avatar": avatar,
+                "created_at": now,
+                "last_login_at": now,
+                "updated_at": "",
+            }
+            try:
+                await _persist_user(conn, user)
+            except Exception as exc:  # noqa: BLE001 - 区分唯一索引冲突
+                if not _is_unique_violation(exc):
+                    raise
+                await conn.rollback()
+                if _retry:
+                    raise ValueError("手机号绑定冲突，请重试") from exc
+                # 并发下同号先被别人创建：回滚（ticket 未烧）后重走一次合并
+                return await bind_phone_with_wechat_web(token, phone, _retry=True)
+            is_new = True
+            merged = False
+
+        await _insert_consent_on(conn, user["user_id"], ticket)
+        company = await _ensure_user_company(conn, user)
+        await conn.commit()
+        return user, company, is_new, merged
+    except Exception:
+        await conn.rollback()
+        raise
     finally:
         await conn.close()
 
@@ -661,9 +1018,15 @@ async def update_company(user_id: str, company_id: str, updates: dict) -> Dict:
             "industryTemplateVersion", "industryTemplateAppliedAt",
             "vatRate", "vatFilingCycle", "businessIncomeIitFilingCycle",
             "onboardingType",
+            # 注册地：决定跳转哪个省的电子税务局、社保费率口径。缺省不影响记账，
+            # 因此允许为空，但一旦提交就按字符串存（前端只给固定选项）。
+            "province", "city",
         ]:
             if key in normalized_updates:
                 company[key] = normalized_updates[key]
+        if "province" in normalized_updates or "city" in normalized_updates:
+            company["province"] = str(company.get("province") or "").strip()
+            company["city"] = str(company.get("city") or "").strip()
         if (
             any(key in updates for key in ("industry", "industryCode"))
             and not str(normalized_updates.get("industryCode") or "").strip()

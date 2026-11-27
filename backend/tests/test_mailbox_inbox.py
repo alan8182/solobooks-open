@@ -5,7 +5,7 @@
 
 覆盖的根因（回归锚点）：
 - 同一附件重复投递只留一条（(company_id, sha256) 幂等）；
-- 白名单外（zip/pdf）不进待导入、note 说明引导手动上传；
+- 白名单（xlsx/xls/csv/xml/zip/ofd/pdf）外不进待导入、note 说明引导手动上传；
 - 收件地址按本地部分定位账套，未匹配的邮件整封丢弃；
 - 落盘路径不使用用户文件名（路径注入防护）。
 """
@@ -166,14 +166,33 @@ async def test_store_attachment_dedupes_by_content(company_c1, inbox_dir):
 
 
 async def test_store_attachment_whitelist_and_notes(company_c1, inbox_dir):
-    zip_doc = await svc.store_attachment(
-        "c1", filename="银行流水.zip", payload=b"PK\x03\x04fake"
-    )
-    assert zip_doc["document"]["status"] == "unsupported"
-    assert "手动上传" in zip_doc["document"]["note"]
+    """xml/zip/ofd/pdf 是数电票原件通道（Phase 1 单据整理），进待导入；
+    其余类型仍留档 unsupported 并引导手动上传。"""
+    xml_doc = await svc.store_attachment("c1", filename="dzfp_26337000000000000001.xml", payload=b"<EInvoice/>")
+    assert xml_doc["document"]["status"] == "pending"
+    assert xml_doc["document"]["importKind"] == "invoice"
 
-    pdf_doc = await svc.store_attachment("c1", filename="回单.pdf", payload=b"%PDF-1.4")
-    assert pdf_doc["document"]["status"] == "unsupported"
+    zip_doc = await svc.store_attachment("c1", filename="发票批量下载.zip", payload=b"PK\x03\x04fake")
+    assert zip_doc["document"]["status"] == "pending"
+    assert zip_doc["document"]["importKind"] == "invoice"
+
+    ofd_doc = await svc.store_attachment("c1", filename="电子发票.ofd", payload=b"OFD")
+    assert ofd_doc["document"]["status"] == "pending"
+    assert ofd_doc["document"]["importKind"] == "invoice"
+
+    invoice_pdf = await svc.store_attachment("c1", filename="电子发票.pdf", payload=b"%PDF-1.4")
+    assert invoice_pdf["document"]["status"] == "pending"
+    assert invoice_pdf["document"]["importKind"] == "invoice"
+
+    # PDF 文件名不含发票字样 → 不猜类型（unknown）
+    plain_pdf = await svc.store_attachment("c1", filename="回单.pdf", payload=b"%PDF-1.4-plain")
+    assert plain_pdf["document"]["status"] == "pending"
+    assert plain_pdf["document"]["importKind"] == "unknown"
+
+    # 白名单外仍留档引导
+    png_doc = await svc.store_attachment("c1", filename="拍照.png", payload=b"\x89PNG")
+    assert png_doc["document"]["status"] == "unsupported"
+    assert "仅留档" in png_doc["document"]["note"]
 
     xlsx_doc = await svc.store_attachment("c1", filename="销项发票.xlsx", payload=b"PK\x03\x04xlsx")
     assert xlsx_doc["document"]["status"] == "pending"
@@ -191,6 +210,7 @@ async def test_store_attachment_rejects_oversize(company_c1, inbox_dir, monkeypa
     "filename,expected",
     [
         ("微信支付账单(2026-06).csv", "wechat_bill"),
+        ("支付宝商家对账单_业务明细.csv", "alipay_bill"),
         ("招商银行对账单.xlsx", "bank"),
         ("2026进项发票明细.xlsx", "invoice"),
         ("随手记导出.csv", "unknown"),
@@ -395,7 +415,7 @@ async def test_purge_expired_only_touches_processed(company_c1, inbox_dir):
 
     consumed = await svc.store_attachment("c1", filename="旧-已导入.csv", payload=b"a1")
     pending = await svc.store_attachment("c1", filename="旧-未处理.csv", payload=b"a2")
-    unsupported = await svc.store_attachment("c1", filename="旧-压缩包.zip", payload=b"a3")
+    unsupported = await svc.store_attachment("c1", filename="旧-拍照.png", payload=b"a3")
     await svc.mark_consumed("c1", consumed["document"]["id"])
 
     async with session_scope() as session:
@@ -417,4 +437,4 @@ async def test_purge_expired_only_touches_processed(company_c1, inbox_dir):
     # 被清理条目的落盘文件一并删除，保留条目的文件不受影响
     assert not (inbox_dir / f"{consumed['document']['id']}.csv").exists()
     assert (inbox_dir / f"{pending['document']['id']}.csv").exists()
-    assert (inbox_dir / f"{unsupported['document']['id']}.zip").exists()
+    assert (inbox_dir / f"{unsupported['document']['id']}.png").exists()

@@ -322,6 +322,9 @@ def _serialize(invoice: Invoice) -> dict[str, Any]:
         "remark": invoice.remark,
         "partnerId": invoice.partner_id,
         "source": invoice.source,
+        # 电子税务局查验状态（用户人工标记，财会〔2020〕6号「查验合法真实」）
+        "verifyStatus": getattr(invoice, "verify_status", "unverified") or "unverified",
+        "verifiedAt": invoice.verified_at.isoformat() if getattr(invoice, "verified_at", None) else "",
     }
 
 
@@ -419,6 +422,26 @@ async def list_invoices(
         "page": page,
         "pageSize": page_size,
     }
+
+
+async def list_invoices_with_attachments(
+    company_id: str,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """台账列表 + 附件聚合（原件张数 / 是否有 XML 原件）。
+
+    聚合来自 attachments 表（active 行），与列表同源派生，前端不再另算（A3）。
+    """
+    result = await list_invoices(company_id, **kwargs)
+    from services.attachment_storage_service import attachment_aggregates
+
+    invoice_ids = [item["id"] for item in result.get("items", [])]
+    aggregates = await attachment_aggregates(company_id, invoice_ids)
+    for item in result.get("items", []):
+        agg = aggregates.get(item["id"], {})
+        item["attachmentCount"] = int(agg.get("count") or 0)
+        item["hasOriginalXml"] = bool(agg.get("hasOriginalXml"))
+    return result
 
 
 async def invoice_summary(

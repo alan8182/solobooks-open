@@ -84,12 +84,12 @@ for s in "${STEPS[@]}"; do
         if [ "$key" = test ]; then
             detail="（$(sed 's/\x1b\[[0-9;]*m//g' "$log" | grep -E '^ *(Test Files|Tests) ' | tr -s ' ' | sed 's/^ //' | tr '\n' ';' | sed 's/;$//; s/;/; /g' || true)）"
         fi
-        RESULTS+=("✓ 前端 $name$detail")
+        RESULTS+=("✓ 前端 ${name}${detail}")
     else
         web_failed=1
-        FAILED+=("前端 $name")
-        RESULTS+=("✗ 前端 $name（日志：$log）")
-        echo "------ $name 日志末尾 ------"
+        FAILED+=("前端 ${name}")
+        RESULTS+=("✗ 前端 ${name}（日志：${log}）")
+        echo "------ ${name} 日志末尾 ------"
         tail -n 30 "$log"
     fi
 done

@@ -28,6 +28,7 @@ import {
   TROUBLESHOOTING,
   WRITE_TOOLS,
   detectOS,
+  remoteConfig,
   resolveEndpoint,
   type VisitorOS,
 } from './data'
@@ -69,6 +70,7 @@ const configCtx = computed(() => ({
   token: tokenForConfig.value,
   repoUrl: GITHUB_URL,
 }))
+const quickJson = computed(() => remoteConfig(endpoint.value, tokenForConfig.value))
 
 // ── 客户端 Tab ──
 const activeClientId = ref(CLIENT_GUIDES[0].id)
@@ -154,21 +156,21 @@ onMounted(() => {
       </div>
     </header>
 
-    <!-- 1. Hero：标语 + 行动 + 30 秒速览 -->
+    <!-- 1. Hero：精简定位 + 即拿即用端点/配置卡 -->
     <section class="hero">
       <div class="hero-glow" />
       <div class="hero-inner">
         <div class="hero-copy">
           <span class="hero-eyebrow">
             <i class="ri-plug-2-line" />
-            MCP &amp; Agent Skills · 开放生态
+            MCP &amp; Agent Skills
           </span>
           <h1 class="hero-title">
             把账套变成<br />
             <em>懂财税的 AI 数字员工</em>
           </h1>
           <p class="hero-sub">
-            原生支持 Model Context Protocol 协议与 Agent Skills 规范。连入任意智能体，即刻驱动记账、对账、结账与报税。
+            原生支持 MCP 协议与 Skills 规范。连接 Claude、Cursor、WorkBuddy 等客户端，安全驱动查账、对账、结账与报税。
           </p>
           <div class="hero-cta">
             <button class="btn-primary btn-lg" type="button" @click="goTokenPage">
@@ -181,136 +183,98 @@ onMounted(() => {
               <span v-if="stars !== null" class="star-count">★ {{ stars }}</span>
             </a>
           </div>
-          <p class="hero-note">
-            <i class="ri-information-line" />
-            {{
-              isLoggedIn
-                ? '令牌在「我的 → AI 连接（MCP）」签发，明文只显示一次。'
-                : '未登录也可阅读全部配置；签发令牌需要先登录。'
-            }}
-          </p>
-          <ul class="hero-facts">
-            <li><b>{{ TOOL_TOTAL }}</b> 个原子账务工具</li>
-            <li><b>{{ CLIENT_GUIDES.length }}</b> 类客户端配置</li>
-            <li><b>2</b> 级令牌权限</li>
-            <li><b>0</b> 次 AI 直接入账</li>
-          </ul>
         </div>
 
         <aside class="quick-card">
           <div class="quick-head">
             <span class="quick-dot" />
-            30 秒配置速览
+            <span>快速接入</span>
+            <span class="quick-meta">Streamable HTTP · {{ TOOL_TOTAL }} 个工具</span>
           </div>
-          <ol class="quick-steps">
-            <li>
-              <span class="quick-num">1</span>
-              <div>
-                <b>签发令牌</b>
-                <p>「我的 → AI 连接（MCP）」新建，复制 <code>sbk_</code> 开头的明文。</p>
-              </div>
-            </li>
-            <li>
-              <span class="quick-num">2</span>
-              <div>
-                <b>填入客户端</b>
-                <p>粘一个 url、一行鉴权头，重启客户端。</p>
-              </div>
-            </li>
-            <li>
-              <span class="quick-num">3</span>
-              <div>
-                <b>开口问账</b>
-                <p>「帮我查上个月收支汇总」，AI 自动调工具取数。</p>
-              </div>
-            </li>
-          </ol>
+
           <div class="endpoint-box">
-            <span class="endpoint-label">远程 MCP 端点</span>
-            <div class="endpoint-row">
-              <code>{{ endpoint }}</code>
+            <div class="endpoint-top">
+              <span class="endpoint-label">远程 MCP 端点</span>
               <button class="copy-mini" type="button" @click="copyText('endpoint', endpoint)">
                 <i :class="copiedKey === 'endpoint' ? 'ri-check-line' : 'ri-file-copy-line'" />
-                {{ copiedKey === 'endpoint' ? '已复制' : '复制' }}
+                {{ copiedKey === 'endpoint' ? '已复制' : '复制端点' }}
               </button>
             </div>
-            <span class="endpoint-meta">Streamable HTTP · Bearer 鉴权 · 单端点覆盖全部 {{ TOOL_TOTAL }} 个工具</span>
+            <code class="endpoint-url">{{ endpoint }}</code>
           </div>
+
+          <div class="endpoint-box quick-json-box">
+            <div class="endpoint-top">
+              <span class="endpoint-label">通用配置（mcpServers）</span>
+              <button class="copy-mini" type="button" @click="copyText('quick-json', quickJson)">
+                <i :class="copiedKey === 'quick-json' ? 'ri-check-line' : 'ri-file-copy-line'" />
+                {{ copiedKey === 'quick-json' ? '已复制' : '复制 JSON' }}
+              </button>
+            </div>
+            <pre class="quick-json"><code>{{ quickJson }}</code></pre>
+          </div>
+
+          <a class="quick-jump" href="#clients">
+            <span>前往下方粘贴令牌自动填入 / 查看各客户端路径</span>
+            <i class="ri-arrow-down-line" />
+          </a>
         </aside>
       </div>
     </section>
 
-    <!-- 2. 概念解析 -->
+    <!-- 2. 能力与安全边界 -->
     <section id="concepts" class="section">
       <div class="section-inner">
         <div class="section-head">
-          <span class="section-kicker">01 / 概念</span>
-          <h2>双轮驱动：MCP 是手脚，Skills 是大脑</h2>
-          <p>只连 MCP，AI 会「查账」；再挂技能包，AI 才「会做账」。两者叠加，才是完整的数字员工。</p>
+          <span class="section-kicker">01 / 能力与边界</span>
+          <h2>MCP 取数与起草，Skills 跑通财税 SOP</h2>
+          <p>所有写入仅生成待确认草稿，不直接入账。</p>
         </div>
 
         <div class="concept-grid">
           <article class="concept-card">
-            <div class="concept-icon blue"><i class="ri-plug-2-line" /></div>
-            <span class="concept-tag">MCP · 工具协议</span>
-            <h3>AI 的「手和眼」</h3>
-            <p>
-              把账套能力暴露成 {{ TOOL_TOTAL }} 个原子工具：查余额、拉流水发票、给对账建议、跑结账体检、出申报作业包、读资产台账。
-              任何兼容 MCP 的客户端挂载后，AI 就能读懂你的账。
-            </p>
-            <div class="concept-metrics">
-              <span><b>{{ READ_TOOL_COUNT }}</b> 只读</span>
-              <span><b>{{ WRITE_TOOLS.length }}</b> 草稿</span>
-              <span><b>1</b> 个端点</span>
+            <div class="concept-head">
+              <div class="concept-icon blue"><i class="ri-plug-2-line" /></div>
+              <div>
+                <span class="concept-tag">MCP · 工具协议</span>
+                <h3>{{ TOOL_TOTAL }} 个原子账务工具</h3>
+              </div>
             </div>
+            <p>
+              {{ READ_TOOL_COUNT }} 个只读（查账、票流、结账体检、报税底稿）+ {{ WRITE_TOOLS.length }} 个草稿工具，单端点接入任意 MCP 客户端。
+            </p>
           </article>
 
-          <div class="concept-link">
-            <i class="ri-add-line" />
-            <span>叠加</span>
-          </div>
-
           <article class="concept-card">
-            <div class="concept-icon purple"><i class="ri-brain-line" /></div>
-            <span class="concept-tag">Skills · 技能包</span>
-            <h3>AI 的「专业大脑」</h3>
-            <p>
-              封装中国小微财税业务 SOP，例如已落地的
-              <code>solobooks-tax-filing</code> 报税伴侣。Agent 会遵循「先拉税局底账比对 → 逆向排查漏记发票 → 补记凭证 → 预填税表」的完整工作流。
-            </p>
-            <div class="concept-metrics">
-              <span><b>1</b> 个已发布技能</span>
-              <span><b>2</b> 个在研</span>
+            <div class="concept-head">
+              <div class="concept-icon purple"><i class="ri-brain-line" /></div>
+              <div>
+                <span class="concept-tag">Skills · 技能包</span>
+                <h3>标准化财税工作流</h3>
+              </div>
             </div>
+            <p>
+              如 <code>solobooks-tax-filing</code> 报税伴侣：拉税局底账比对 → 定位漏记发票 → 补记草稿 → 预填税表。
+            </p>
           </article>
         </div>
 
-        <!-- 安全红线：深色块，作为视觉节奏断点 -->
         <div class="safety-panel">
-          <div class="safety-head">
-            <i class="ri-shield-check-line" />
-            <div>
-              <h3>不可逾越的四条安全红线</h3>
-              <p>开放能力不等于交出账本钥匙。这四条写在代码里，不是营销话术。</p>
-            </div>
-          </div>
           <div class="safety-grid">
             <div v-for="rule in SAFETY_RULES" :key="rule.title" class="safety-item">
-              <i :class="rule.icon" />
-              <b>{{ rule.title }}</b>
+              <div class="safety-item-head">
+                <i :class="rule.icon" />
+                <b>{{ rule.title }}</b>
+              </div>
               <p>{{ rule.detail }}</p>
             </div>
           </div>
         </div>
 
-        <!-- 工具清单：只列名字与业务域，逐条说明交给客户端握手时的工具描述 -->
         <div class="tools-panel">
           <div class="tools-head">
-            <h3>{{ TOOL_TOTAL }} 个原子工具，全部按账套隔离</h3>
-            <p>
-              令牌绑定单一公司，跨账套一律查不到。只读 {{ READ_TOOL_COUNT }} 个 + 草稿 {{ WRITE_TOOLS.length }} 个，
-              连上客户端后每个工具的用法会由 AI 自己读取。
-            </p>
+            <h3>{{ TOOL_TOTAL }} 个原子工具（按账套隔离）</h3>
+            <span>只读 {{ READ_TOOL_COUNT }} + 草稿 {{ WRITE_TOOLS.length }} · 工具参数在握手时自动同步</span>
           </div>
           <div class="tools-grid">
             <div v-for="group in READ_TOOL_GROUPS" :key="group.title" class="tool-group">
@@ -326,40 +290,38 @@ onMounted(() => {
             <div class="tool-group write">
               <div class="tool-group-head">
                 <i class="ri-draft-line" />
-                <b>写入草稿</b>
+                <b>写入草稿（需读写权限）</b>
                 <span class="tool-count">{{ WRITE_TOOLS.length }}</span>
               </div>
               <div class="tool-chips">
                 <code v-for="name in WRITE_TOOLS" :key="name">{{ name }}</code>
               </div>
-              <p class="tool-group-note">需「读写草稿」权限，产出全部是待确认草稿</p>
             </div>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- 3. 客户端实战矩阵 -->
+    <!-- 3. 客户端接入 -->
     <section id="clients" class="section section-alt">
       <div class="section-inner">
         <div class="section-head">
           <span class="section-kicker">02 / 接入</span>
-          <h2>主流 AI 客户端配置实战</h2>
-          <p>五类客户端，同一套端点与令牌。配置结构几乎一致，选你手上正在用的那个。</p>
+          <h2>主流客户端配置</h2>
+          <p>五类客户端共用同一端点与令牌，粘贴后配置自动填好。</p>
         </div>
 
         <!-- 令牌临时注入 -->
         <div class="inject-bar">
           <div class="inject-copy">
-            <b><i class="ri-key-2-line" /> 把令牌粘进来，下面的配置会自动填好</b>
+            <b><i class="ri-key-2-line" /> 临时填入令牌（仅内存生效，刷新即清除）</b>
             <p v-if="tokenInjected" class="inject-ok">
               <i class="ri-checkbox-circle-line" />
-              已注入，配置块中的 <code>{{ TOKEN_PLACEHOLDER }}</code> 已替换。令牌只存在本页内存，刷新即失效。
+              已替换配置中的 <code>{{ TOKEN_PLACEHOLDER }}</code>。
             </p>
             <p v-else>
-              令牌在签发时只显示一次，所以无法自动读取。
               <button class="link-btn" type="button" @click="goTokenPage">
-                {{ isLoggedIn ? '去令牌页复制 →' : '登录后签发 →' }}
+                {{ isLoggedIn ? '去令牌页复制 sbk_ 令牌 →' : '登录后签发令牌 →' }}
               </button>
             </p>
           </div>
@@ -369,7 +331,7 @@ onMounted(() => {
               type="password"
               autocomplete="off"
               spellcheck="false"
-              :placeholder="TOKEN_PLACEHOLDER + '（可选，仅本次页面）'"
+              :placeholder="TOKEN_PLACEHOLDER + '（可选）'"
               aria-label="临时粘贴 MCP 令牌"
             />
             <button v-if="injectedToken" class="inject-clear" type="button" @click="injectedToken = ''">
@@ -379,11 +341,11 @@ onMounted(() => {
         </div>
         <p v-if="!tokenLooksValid" class="inject-warn">
           <i class="ri-error-warning-line" />
-          这个值不像梭罗记账的令牌（应以 <code>sbk_</code> 开头），粘贴前请确认没有截断。
+          令牌应以 <code>sbk_</code> 开头，请核对是否完整复制。
         </p>
 
         <!-- Tab -->
-        <div class="client-tabs" role="tablist">
+        <div class="client-tabs" role="tablist" aria-label="AI 客户端配置选择">
           <button
             v-for="client in CLIENT_GUIDES"
             :key="client.id"
@@ -403,7 +365,7 @@ onMounted(() => {
         </div>
 
         <!-- 面板 -->
-        <div class="client-panel">
+        <div class="client-panel" role="tabpanel">
           <div class="panel-left">
             <div class="panel-head">
               <div>
@@ -412,7 +374,6 @@ onMounted(() => {
               </div>
               <span class="transport-badge"><i class="ri-router-line" /> {{ activeClient.transport }}</span>
             </div>
-            <p class="panel-summary">{{ activeClient.summary }}</p>
 
             <ol class="step-list">
               <li v-for="(step, idx) in activeClient.steps" :key="step.title">
@@ -427,7 +388,7 @@ onMounted(() => {
             <div class="verify-box">
               <i class="ri-check-double-line" />
               <div>
-                <b>怎么确认接上了</b>
+                <b>验证方式</b>
                 <p>{{ activeClient.verify }}</p>
               </div>
             </div>
@@ -443,7 +404,7 @@ onMounted(() => {
           <div class="panel-right">
             <div class="panel-right-head">
               <span><i class="ri-file-code-line" /> 配置代码</span>
-              <span v-if="os !== 'other'" class="os-hint">已为 {{ osLabel }} 高亮文件路径</span>
+              <span v-if="os !== 'other'" class="os-hint">已高亮 {{ osLabel }} 路径</span>
             </div>
             <CodeBlock
               v-for="sample in activeSamples"
@@ -454,14 +415,14 @@ onMounted(() => {
             />
             <p class="panel-footnote">
               <i class="ri-lock-2-line" />
-              令牌等同密码：不要提交到 Git、不要发群、不要写进截图。
+              令牌等同密码，请勿提交到代码仓库或公开分享。
             </p>
           </div>
         </div>
 
         <!-- 排错 -->
         <div class="trouble-panel">
-          <h3><i class="ri-bug-line" /> 连不上？先看这四条</h3>
+          <h3><i class="ri-bug-line" /> 常见排错</h3>
           <div class="trouble-grid">
             <div v-for="item in TROUBLESHOOTING" :key="item.q" class="trouble-item">
               <b>{{ item.q }}</b>
@@ -477,13 +438,13 @@ onMounted(() => {
       <div class="section-inner">
         <div class="section-head">
           <span class="section-kicker">03 / 技能包</span>
-          <h2>从「单步查账」到「端到端办事」</h2>
-          <p>MCP 给工具，Skills 给方法。挂上技能包，AI 才会按财税 SOP 一步步走完复杂业务。</p>
+          <h2>安装 Skills，让 AI 按财税 SOP 办事</h2>
+          <p>结合 MCP 使用，覆盖从底账比对到税表预填的完整流程。</p>
         </div>
 
         <div class="skill-layout">
           <div class="skill-install">
-            <h3><i class="ri-install-line" /> 安装方式</h3>
+            <h3><i class="ri-install-line" /> 安装步骤</h3>
             <ol class="install-steps">
               <li v-for="(step, idx) in SKILL_INSTALL_STEPS" :key="step.title">
                 <span>{{ idx + 1 }}</span>
@@ -496,7 +457,7 @@ onMounted(() => {
             <div class="install-path">
               <div class="install-path-head">
                 <i class="ri-folder-open-line" />
-                <span>技能包位置</span>
+                <span>技能包路径</span>
                 <button
                   class="copy-mini dark"
                   type="button"
@@ -514,11 +475,7 @@ onMounted(() => {
             <div class="skill-showcase-head">
               <span class="skill-badge">标杆技能</span>
               <h3>solobooks-tax-filing</h3>
-              <p>半自动纳税申报伴侣 · 多工具联动</p>
-            </div>
-            <div class="skill-deps">
-              <span><i class="ri-plug-2-line" /> SoloBooks MCP（取数）</span>
-              <span><i class="ri-chrome-line" /> Chrome DevTools / Playwright MCP（操作税局页面）</span>
+              <p>半自动纳税申报伴侣 · 需连接 SoloBooks MCP 与浏览器 MCP</p>
             </div>
             <div class="skill-flow">
               <div v-for="item in TAX_SKILL_STEPS" :key="item.step" class="skill-flow-item">
@@ -531,13 +488,13 @@ onMounted(() => {
             </div>
             <div class="skill-stop">
               <i class="ri-hand-line" />
-              <span>最后一步永远是「人」：AI 停在提交按钮前，输出核对清单，由老板本人点击提交。</span>
+              <span>AI 停在「提交申报」前输出核对清单，最终由老板本人点击提交。</span>
             </div>
           </div>
         </div>
 
         <div class="roadmap">
-          <span class="roadmap-label"><i class="ri-road-map-line" /> 在路上</span>
+          <span class="roadmap-label"><i class="ri-road-map-line" /> 规划中</span>
           <div v-for="item in ROADMAP_SKILLS" :key="item.title" class="roadmap-item">
             <b>{{ item.title }}</b>
             <p>{{ item.detail }}</p>
@@ -546,20 +503,19 @@ onMounted(() => {
       </div>
     </section>
 
-    <!-- 5. 开源与共建 -->
+    <!-- 5. 开源与自托管 -->
     <section id="opensource" class="section section-alt">
       <div class="section-inner">
         <div class="section-head">
-          <span class="section-kicker">04 / 共建</span>
-          <h2>开源生态与开发者共建</h2>
-          <p>代码、技能包、接入文档全部开放。私有化部署跑在自己的机器上，数据不出门。</p>
+          <span class="section-kicker">04 / 开源与部署</span>
+          <h2>开源仓库与私有化部署</h2>
         </div>
 
         <div class="oss-grid">
           <article class="oss-card repo">
             <i class="ri-github-fill oss-icon" />
             <h3>{{ GITHUB_REPO }}</h3>
-            <p>后端、前端、MCP 服务与技能包同仓维护，Issues 与 PR 都欢迎。</p>
+            <p>前后端、MCP 服务与技能包同仓开源，欢迎 Issue 与 PR。</p>
             <div class="repo-actions">
               <a class="btn-primary" :href="GITHUB_URL" target="_blank" rel="noreferrer">
                 <i class="ri-star-line" /> Star 仓库
@@ -573,8 +529,7 @@ onMounted(() => {
 
           <article class="oss-card">
             <i class="ri-server-line oss-icon" />
-            <h3>自托管部署</h3>
-            <p>Docker Compose 一条命令起服务，端点即插即用。</p>
+            <h3>Docker Compose 自托管</h3>
             <div class="oss-cmd">
               <code>docker compose -f deploy/docker-compose.yml up -d</code>
               <button
@@ -586,17 +541,15 @@ onMounted(() => {
                 {{ copiedKey === 'docker' ? '已复制' : '' }}
               </button>
             </div>
-            <p class="oss-note">反代记得 <code>proxy_buffering off</code> 与 <code>proxy_read_timeout 600s</code>。</p>
+            <p class="oss-note">反代配置 <code>proxy_buffering off</code> 与 <code>proxy_read_timeout 600s</code>。</p>
           </article>
 
           <article class="oss-card">
             <i class="ri-team-line oss-icon" />
             <h3>社区共建</h3>
-            <p>欢迎贡献地区专属税务技能（各省电子税局适配）、行业科目模板与对账规则。</p>
             <ul class="oss-list">
-              <li><i class="ri-git-pull-request-line" /> 提交 PR 前先开 Issue 对齐方案</li>
-              <li><i class="ri-file-text-line" /> 技能包请附 SKILL.md 与最小复现步骤</li>
-              <li><i class="ri-mail-line" /> 商务与合作：见仓库 README 联系方式</li>
+              <li><i class="ri-git-pull-request-line" /> 欢迎贡献各省电子税局适配、行业科目与对账规则</li>
+              <li><i class="ri-file-text-line" /> 技能包 PR 请附 SKILL.md 与最小复现步骤</li>
             </ul>
           </article>
         </div>
@@ -651,7 +604,6 @@ onMounted(() => {
 .hero-sub,
 .concept-card p,
 .safety-item p,
-.tool-group-note,
 .step-list p,
 .tip-list li,
 .trouble-item p {
@@ -900,59 +852,29 @@ onMounted(() => {
 }
 
 .hero-sub {
-  margin: 0 0 26px;
+  margin: 0 0 24px;
   font-size: 14.5px;
-  line-height: 1.78;
+  line-height: 1.72;
   color: #475569;
-  max-width: 520px;
+  max-width: 500px;
 }
 
 .hero-cta {
   display: flex;
   flex-wrap: wrap;
   gap: 12px;
-  margin-bottom: 14px;
 }
 
-.hero-note {
-  display: flex;
-  align-items: flex-start;
-  gap: 5px;
-  margin: 0 0 24px;
-  font-size: 12px;
-  color: #636e7c;
-  line-height: 1.6;
-}
-
-.hero-facts {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px 22px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.hero-facts li {
-  font-size: 12px;
-  color: #586474;
-}
-
-.hero-facts b {
-  font-size: 17px;
-  font-weight: 700;
-  color: #1747b0;
-  margin-right: 3px;
-  font-variant-numeric: tabular-nums;
-}
-
-/* 速览卡 */
+/* 速览卡（端点 + JSON 配置） */
 .quick-card {
   background: #ffffff;
   border: 1px solid #e2e8f0;
   border-radius: 14px;
-  padding: 20px;
+  padding: 18px;
   box-shadow: 0 14px 40px rgba(15, 23, 42, 0.07);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
 .quick-head {
@@ -962,8 +884,13 @@ onMounted(() => {
   font-size: 13px;
   font-weight: 650;
   color: #0f172a;
-  padding-bottom: 14px;
-  border-bottom: 1px dashed #e2e8f0;
+}
+
+.quick-meta {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 500;
+  color: #636e7c;
 }
 
 .quick-dot {
@@ -974,81 +901,29 @@ onMounted(() => {
   box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.14);
 }
 
-.quick-steps {
-  margin: 16px 0 18px;
-  padding: 0;
-  list-style: none;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-
-.quick-steps li {
-  display: flex;
-  gap: 10px;
-  align-items: flex-start;
-}
-
-.quick-num {
-  width: 20px;
-  height: 20px;
-  border-radius: 50%;
-  background: #edf3ff;
-  color: #1747b0;
-  font-size: 11px;
-  font-weight: 700;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-  margin-top: 1px;
-}
-
-.quick-steps b {
-  font-size: 13px;
-  color: #0f172a;
-}
-
-.quick-steps p {
-  margin: 3px 0 0;
-  font-size: 12px;
-  line-height: 1.6;
-  color: #586474;
-}
-
-.quick-steps code,
-.endpoint-meta code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 11.5px;
-  background: #f1f4f8;
-  border-radius: 4px;
-  padding: 1px 4px;
-  color: #1747b0;
-}
-
 .endpoint-box {
   background: #0f172a;
   border-radius: 10px;
-  padding: 12px 13px;
+  padding: 11px 13px;
+}
+
+.endpoint-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
 }
 
 .endpoint-label {
   font-size: 10.5px;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.04em;
   color: #93c5fd;
   font-weight: 600;
 }
 
-.endpoint-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 6px 0 5px;
-}
-
-.endpoint-row code {
-  flex: 1;
-  min-width: 0;
+.endpoint-url {
+  display: block;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12.5px;
   color: #e2e8f0;
@@ -1057,11 +932,34 @@ onMounted(() => {
   white-space: nowrap;
 }
 
-.endpoint-meta {
-  font-size: 10.5px;
-  color: #64748b;
-  line-height: 1.5;
-  display: block;
+.quick-json {
+  margin: 0;
+  overflow-x: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: #cbd5e1;
+}
+
+.quick-json code {
+  font-family: inherit;
+  white-space: pre;
+}
+
+.quick-jump {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 500;
+  color: #1747b0;
+  text-decoration: none;
+  padding-top: 2px;
+}
+
+.quick-jump:hover {
+  text-decoration: underline;
 }
 
 .copy-mini {
@@ -1098,7 +996,8 @@ onMounted(() => {
 
 /* ── 通用 section ── */
 .section {
-  padding: 68px 20px;
+  padding: 52px 20px;
+  scroll-margin-top: 56px;
 }
 
 .section-alt {
@@ -1114,7 +1013,7 @@ onMounted(() => {
 
 .section-head {
   max-width: 720px;
-  margin-bottom: 34px;
+  margin-bottom: 24px;
 }
 
 .section-kicker {
@@ -1123,40 +1022,46 @@ onMounted(() => {
   font-weight: 700;
   letter-spacing: 0.08em;
   color: #1747b0;
-  margin-bottom: 9px;
+  margin-bottom: 7px;
 }
 
 .section-head h2 {
-  margin: 0 0 10px;
-  font-size: 27px;
+  margin: 0 0 8px;
+  font-size: 25px;
   line-height: 1.3;
   font-weight: 700;
-  letter-spacing: -0.6px;
+  letter-spacing: -0.5px;
   color: #0b1526;
 }
 
 .section-head p {
   margin: 0;
   font-size: 13.5px;
-  line-height: 1.75;
+  line-height: 1.65;
   color: #586474;
 }
 
 /* ── 概念卡 ── */
 .concept-grid {
   display: grid;
-  grid-template-columns: 1fr 56px 1fr;
-  align-items: stretch;
-  gap: 0;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
 }
 
 .concept-card {
   background: #ffffff;
   border: 1px solid #e2e8f0;
   border-radius: 14px;
-  padding: 24px;
+  padding: 20px;
   display: flex;
   flex-direction: column;
+  gap: 12px;
+}
+
+.concept-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
 
 .concept-icon {
@@ -1167,7 +1072,7 @@ onMounted(() => {
   align-items: center;
   justify-content: center;
   font-size: 19px;
-  margin-bottom: 14px;
+  flex-shrink: 0;
 }
 
 .concept-icon.blue {
@@ -1181,16 +1086,17 @@ onMounted(() => {
 }
 
 .concept-tag {
+  display: block;
   font-size: 10.5px;
   font-weight: 700;
   letter-spacing: 0.06em;
   color: #636e7c;
-  margin-bottom: 5px;
+  margin-bottom: 2px;
 }
 
 .concept-card h3 {
-  margin: 0 0 9px;
-  font-size: 18px;
+  margin: 0;
+  font-size: 16.5px;
   font-weight: 680;
   color: #0b1526;
 }
@@ -1198,9 +1104,8 @@ onMounted(() => {
 .concept-card p {
   margin: 0;
   font-size: 13px;
-  line-height: 1.78;
+  line-height: 1.7;
   color: #475569;
-  flex: 1;
 }
 
 .concept-card code {
@@ -1212,79 +1117,13 @@ onMounted(() => {
   color: #1747b0;
 }
 
-.concept-metrics {
-  display: flex;
-  gap: 16px;
-  margin-top: 16px;
-  padding-top: 14px;
-  border-top: 1px dashed #e2e8f0;
-  font-size: 12px;
-  color: #636e7c;
-}
-
-.concept-metrics b {
-  font-size: 16px;
-  color: #0f172a;
-  margin-right: 3px;
-  font-variant-numeric: tabular-nums;
-}
-
-.concept-link {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 4px;
-  color: #94a3b8;
-  font-size: 10.5px;
-}
-
-.concept-link i {
-  font-size: 18px;
-  color: #1747b0;
-  background: #edf3ff;
-  border-radius: 50%;
-  width: 30px;
-  height: 30px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
 /* ── 安全红线（深色块）── */
 .safety-panel {
-  margin-top: 26px;
+  margin-top: 18px;
   background: #0f172a;
   border-radius: 14px;
-  padding: 26px;
+  padding: 20px 22px;
   color: #e2e8f0;
-}
-
-.safety-head {
-  display: flex;
-  gap: 12px;
-  align-items: flex-start;
-  margin-bottom: 22px;
-}
-
-.safety-head > i {
-  font-size: 20px;
-  color: #4ade80;
-  margin-top: 2px;
-}
-
-.safety-head h3 {
-  margin: 0 0 5px;
-  font-size: 16px;
-  font-weight: 650;
-  color: #ffffff;
-}
-
-.safety-head p {
-  margin: 0;
-  font-size: 12.5px;
-  color: #94a3b8;
-  line-height: 1.65;
 }
 
 .safety-grid {
@@ -1293,46 +1132,59 @@ onMounted(() => {
   gap: 18px;
 }
 
-.safety-item i {
-  font-size: 16px;
-  color: #93c5fd;
+.safety-item-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 6px;
 }
 
-.safety-item b {
-  display: block;
+.safety-item-head i {
+  font-size: 15px;
+  color: #93c5fd;
+  flex-shrink: 0;
+}
+
+.safety-item-head b {
   font-size: 12.5px;
   color: #f1f5f9;
-  margin: 7px 0 5px;
 }
 
 .safety-item p {
   margin: 0;
   font-size: 11.5px;
-  line-height: 1.72;
+  line-height: 1.65;
   color: #94a3b8;
 }
 
 /* ── 工具清单 ── */
 .tools-panel {
-  margin-top: 26px;
+  margin-top: 18px;
   background: #ffffff;
   border: 1px solid #e2e8f0;
   border-radius: 14px;
-  padding: 24px;
+  padding: 20px 22px;
+}
+
+.tools-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin-bottom: 16px;
 }
 
 .tools-head h3 {
-  margin: 0 0 6px;
-  font-size: 15.5px;
+  margin: 0;
+  font-size: 15px;
   font-weight: 650;
   color: #0b1526;
 }
 
-.tools-head p {
-  margin: 0 0 20px;
-  font-size: 12.5px;
+.tools-head span {
+  font-size: 12px;
   color: #636e7c;
-  line-height: 1.7;
 }
 
 .tools-grid {
@@ -1385,13 +1237,6 @@ onMounted(() => {
   border: 1px solid #e8edf4;
   border-radius: 5px;
   padding: 1px 6px;
-}
-
-.tool-group-note {
-  margin: 9px 0 0;
-  font-size: 10.5px;
-  color: #636e7c;
-  line-height: 1.6;
 }
 
 .tool-group.write .tool-group-head i {
@@ -1518,15 +1363,22 @@ onMounted(() => {
   color: #a05c10;
 }
 
-/* ── 客户端 Tab ── */
+/* ── 客户端 Tab（单行横向滚动 + aria-selected 指示）── */
 .client-tabs {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  scrollbar-width: none;
   gap: 8px;
   margin-bottom: 18px;
 }
 
+.client-tabs::-webkit-scrollbar {
+  display: none;
+}
+
 .client-tab {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 9px;
@@ -1535,13 +1387,12 @@ onMounted(() => {
   border-radius: 10px;
   padding: 9px 14px;
   min-height: 54px;
-  /* 均分一行、窄屏自动换行；比横向滚动好——被切掉一半的 Tab 看着像坏了 */
-  flex: 1 1 200px;
-  min-width: 0;
+  flex: 1 0 auto;
+  min-width: 170px;
   cursor: pointer;
   text-align: left;
   font-family: inherit;
-  transition: border-color 0.18s, background 0.18s, box-shadow 0.18s;
+  transition: border-color 0.18s, background 0.18s;
 }
 
 .client-tab > i {
@@ -1578,10 +1429,16 @@ onMounted(() => {
   border-color: #b9cdf5;
 }
 
-.client-tab.active {
+.client-tab[aria-selected='true'] {
   border-color: #1747b0;
   background: #f5f8ff;
-  box-shadow: 0 2px 10px rgba(23, 71, 176, 0.09);
+}
+
+.client-tab[aria-selected='true']::after {
+  content: '';
+  position: absolute;
+  inset: auto 10px 0;
+  border-bottom: 2.5px solid #1747b0;
 }
 
 .client-tab.active > i,
@@ -1638,15 +1495,8 @@ onMounted(() => {
   flex-shrink: 0;
 }
 
-.panel-summary {
-  margin: 0 0 20px;
-  font-size: 12.5px;
-  line-height: 1.78;
-  color: #475569;
-}
-
 .step-list {
-  margin: 0 0 18px;
+  margin: 4px 0 18px;
   padding: 0;
   list-style: none;
   display: flex;
@@ -1923,7 +1773,7 @@ onMounted(() => {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 11.5px;
   color: #1747b0;
-  word-break: break-all;
+  overflow-wrap: anywhere;
 }
 
 .skill-showcase {
@@ -1958,29 +1808,6 @@ onMounted(() => {
   margin: 0 0 16px;
   font-size: 12px;
   color: #94a3b8;
-}
-
-.skill-deps {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-bottom: 18px;
-}
-
-.skill-deps span {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 11px;
-  color: #cbd5e1;
-  background: #1e293b;
-  border: 1px solid #334155;
-  border-radius: 6px;
-  padding: 4px 9px;
-}
-
-.skill-deps i {
-  color: #93c5fd;
 }
 
 .skill-flow {
@@ -2205,7 +2032,8 @@ onMounted(() => {
 .site-footer {
   border-top: 1px solid #e2e8f0;
   background: #ffffff;
-  padding: 28px 20px;
+  /* 留出右下角悬浮「公测中」入口的空间，滚动到底部时不遮挡备案号 */
+  padding: 28px 20px 72px;
 }
 
 .footer-inner {
@@ -2283,12 +2111,6 @@ onMounted(() => {
   .concept-grid {
     grid-template-columns: 1fr;
     gap: 14px;
-  }
-
-  .concept-link {
-    flex-direction: row;
-    gap: 6px;
-    padding: 2px 0;
   }
 
   .safety-grid {

@@ -2,7 +2,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useRouter } from 'vue-router'
-import { SoloStatusBadge } from '@/components/ui'
+import { SoloButton, SoloStatusBadge } from '@/components/ui'
 import { useAuthStore } from '@/stores/auth'
 import { useGuideStateStore, resolveChecklistDisplay, isArchived } from '@/stores/guideState'
 import type { SetupReadiness, SetupStep, SetupStepStatus } from '@/api/types'
@@ -48,6 +48,14 @@ const items = computed<SetupStep[]>(() => props.readiness?.items ?? [])
 const completed = computed(() => props.readiness?.completed ?? 0)
 const total = computed(() => props.readiness?.total ?? 0)
 const archived = computed(() => isArchived(guideStore.state))
+const nextStep = computed<SetupStep | null>(() => {
+  if (display.value !== 'expanded') return null
+  return (
+    items.value.find(
+      (item) => (item.status === 'doing' || item.status === 'todo') && !item.informational,
+    ) ?? null
+  )
+})
 
 const heading = computed(() => {
   if (props.loading) return '正在检查账套'
@@ -104,6 +112,16 @@ function goGuide() {
         <h2 id="setup-checklist-title">{{ heading }}</h2>
       </div>
       <div class="checklist-actions">
+        <SoloButton
+          v-if="mode === 'home' && display === 'expanded' && nextStep"
+          variant="primary"
+          size="small"
+          class="checklist-next-btn"
+          @click="openItem(nextStep)"
+        >
+          下一步：{{ nextStep.title }}
+          <i class="ri-arrow-right-line" aria-hidden="true" />
+        </SoloButton>
         <button
           v-if="mode === 'home' && display === 'expanded'"
           type="button"
@@ -143,7 +161,12 @@ function goGuide() {
         v-for="(item, index) in items"
         :key="item.key"
         class="checklist-row"
-        :class="{ 'is-locked': !isClickable(item), 'is-informational': item.informational }"
+        :class="{
+          'is-locked': !isClickable(item),
+          'is-informational': item.informational,
+          'is-next': item.key === nextStep?.key,
+          'is-done': item.status === 'done',
+        }"
         :type="isClickable(item) ? 'button' : undefined"
         @click="openItem(item)"
       >
@@ -184,7 +207,8 @@ function goGuide() {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  flex-wrap: wrap;
+  gap: 12px 16px;
   padding: 16px 18px 12px;
 }
 
@@ -210,8 +234,15 @@ function goGuide() {
 .checklist-actions {
   display: flex;
   align-items: center;
-  gap: 4px;
+  flex-wrap: wrap;
+  gap: 6px;
   flex-shrink: 0;
+}
+
+.checklist-next-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 
 .checklist-link {
@@ -271,6 +302,23 @@ button.checklist-row:hover {
 .checklist-row.is-locked {
   cursor: default;
   opacity: 0.55;
+}
+
+.checklist-row.is-next {
+  background: var(--solo-bg-blue-soft);
+}
+
+button.checklist-row.is-next:hover {
+  background: var(--solo-bg-blue-soft);
+}
+
+.checklist-row.is-next .checklist-state {
+  background: var(--solo-primary);
+  color: var(--solo-bg-card);
+}
+
+.checklist-row.is-done .checklist-title {
+  color: var(--solo-text-secondary);
 }
 
 .checklist-state {

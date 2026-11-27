@@ -31,6 +31,38 @@ export const RESCUE_COOLDOWN_HOURS = 24
 
 export type ChecklistDisplay = 'expanded' | 'summary' | 'hidden'
 
+export interface DemoTourStep {
+  key: string
+  label: string
+  hint: string
+  path: string
+  icon: string
+}
+
+export const DEMO_TOUR_STEPS: readonly DemoTourStep[] = [
+  {
+    key: 'reports',
+    label: '1. 看真实利润与现金',
+    hint: '老板白话视图与会计报表同源',
+    path: '/reports',
+    icon: 'ri-bar-chart-box-line',
+  },
+  {
+    key: 'bank',
+    label: '2. 看银行流水对账',
+    hint: '公户流水与凭证 100% 勾稽',
+    path: '/bank',
+    icon: 'ri-wallet-3-line',
+  },
+  {
+    key: 'closing',
+    label: '3. 体验一键月度结账',
+    hint: '检查完备度并一键合规封账',
+    path: '/closing-wizard',
+    icon: 'ri-calendar-check-line',
+  },
+]
+
 export interface GuideState {
   version: 1
   collapsed: boolean
@@ -43,6 +75,8 @@ export interface GuideState {
   l0SeenAt: string | null
   /** 用户主动跳过的可选项（如 accounting 的 legacy_import） */
   waived: string[]
+  /** 演示账套 3 步体验路线已点过的步骤 key */
+  demoTourVisited: string[]
   demoCompanyId: string | null
   /** 救援弹窗「不再提示」——按错误码粒度，静音一个码不该让别的码也不响 */
   rescueMutedCodes: string[]
@@ -61,6 +95,7 @@ export function emptyGuideState(): GuideState {
     archivedAt: null,
     l0SeenAt: null,
     waived: [],
+    demoTourVisited: [],
     demoCompanyId: null,
     rescueMutedCodes: [],
     rescueShownAt: [],
@@ -72,22 +107,20 @@ export function guideStorageKey(companyId: string | null): string {
   return `${GUIDE_PREFIX}${companyId || 'default'}`
 }
 
+function dedupeStrings(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return [...new Set(value.filter((item): item is string => typeof item === 'string'))]
+}
+
 function parseGuideState(raw: string | null): GuideState {
   const base = emptyGuideState()
   if (!raw) return base
   try {
     const data = JSON.parse(raw) as Partial<GuideState> | null
     if (!data || typeof data !== 'object') return base
-    const waived = Array.isArray(data.waived)
-      ? [...new Set(data.waived.filter((item): item is string => typeof item === 'string'))]
-      : []
-    const rescueMutedCodes = Array.isArray(data.rescueMutedCodes)
-      ? [
-          ...new Set(
-            data.rescueMutedCodes.filter((item): item is string => typeof item === 'string'),
-          ),
-        ]
-      : []
+    const waived = dedupeStrings(data.waived)
+    const demoTourVisited = dedupeStrings(data.demoTourVisited)
+    const rescueMutedCodes = dedupeStrings(data.rescueMutedCodes)
     const rescueShownAt = Array.isArray(data.rescueShownAt)
       ? data.rescueShownAt.filter(
           (item): item is { code: string; at: string } =>
@@ -100,6 +133,7 @@ function parseGuideState(raw: string | null): GuideState {
       ...data,
       version: 1,
       waived,
+      demoTourVisited,
       rescueMutedCodes,
       rescueShownAt,
     }
@@ -125,9 +159,15 @@ export function writeGuideState(
     ...current,
     ...patch,
     version: 1,
-    waived: patch.waived
-      ? [...new Set(patch.waived.filter((item) => typeof item === 'string'))]
-      : current.waived,
+    waived: patch.waived !== undefined ? dedupeStrings(patch.waived) : current.waived,
+    demoTourVisited:
+      patch.demoTourVisited !== undefined
+        ? dedupeStrings(patch.demoTourVisited)
+        : current.demoTourVisited,
+    rescueMutedCodes:
+      patch.rescueMutedCodes !== undefined
+        ? dedupeStrings(patch.rescueMutedCodes)
+        : current.rescueMutedCodes,
   }
   try {
     localStorage.setItem(guideStorageKey(companyId), JSON.stringify(next))
@@ -255,12 +295,17 @@ export const useGuideStateStore = defineStore('guideState', () => {
     patch({ l0SeenAt: new Date().toISOString() })
   }
 
+  function markDemoTourStep(key: string) {
+    if (!key || state.value.demoTourVisited.includes(key)) return
+    patch({ demoTourVisited: [...state.value.demoTourVisited, key] })
+  }
+
   watch(
     () => authStore.currentCompanyId,
     () => load(),
   )
 
-  return { state, load, patch, reset, markReady, markL0Seen }
+  return { state, load, patch, reset, markReady, markL0Seen, markDemoTourStep }
 })
 
 /* ── 救援弹窗的克制（纯函数，便于 vitest 直接断言） ── */

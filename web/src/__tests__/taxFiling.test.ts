@@ -5,6 +5,7 @@
 
 import { describe, expect, it } from 'vitest'
 import {
+  buildVatFilingGuide,
   calculateDeadlineSummary,
   calculateExemptionGauge,
   formatCopyAmount,
@@ -12,6 +13,7 @@ import {
   isFilingCardPending,
   periodToQuarter,
   quarterLabel,
+  recommendVatFilingMode,
   resolveNextPendingCard,
   summarizeOtherTaxes,
 } from '@/utils/taxFiling'
@@ -333,6 +335,120 @@ describe('tax filing calculation & intelligence copilot utilities', () => {
         ],
       }
       expect(resolveNextPendingCard(pkg, 'other_taxes')).toBeNull()
+    })
+  })
+
+  describe('buildVatFilingGuide', () => {
+    const belowData = {
+      periodType: 'quarter',
+      totalSales: 88000,
+      goodsLaborSales: 30000,
+      serviceSales: 58000,
+      isBelowThreshold: true,
+      vatPayable: 0,
+      invoiceTotal: 0,
+    }
+
+    it('keeps the confirm-mode entry when there is no uninvoiced income', () => {
+      const guide = buildVatFilingGuide(belowData, 'confirm')
+
+      expect(guide.steps[0].title).toContain('本期销售情况')
+      expect(guide.steps.some(step => step.title.includes('业务信息表'))).toBe(false)
+      expect(guide.warnings.join('')).toContain('自动归集发票')
+    })
+
+    it('recommends form mode when there is uninvoiced income', () => {
+      expect(recommendVatFilingMode({ ...belowData, uninvoicedPositiveSales: 88000 })).toBe('form')
+      expect(recommendVatFilingMode({ ...belowData, uninvoicedNegativeSales: -500 })).toBe('form')
+      expect(recommendVatFilingMode(belowData)).toBe('confirm')
+    })
+
+    it('form mode routes uninvoiced income through 业务信息表 and 附1', () => {
+      const guide = buildVatFilingGuide(
+        { ...belowData, uninvoicedPositiveSales: 5000 },
+        'form',
+      )
+      const text = guide.steps.map(step => `${step.title} ${step.detail}`).join('\n')
+
+      expect(guide.steps[0].title).toContain('报表列表')
+      expect(text).toContain('未开具发票销售业务')
+      expect(text).toContain('附列资料（一）附1')
+      // 回归：填表式不能把用户又指回「本期销售情况」入口
+      expect(guide.steps.some(step => step.title.includes('本期销售情况'))).toBe(false)
+      const unfilled = guide.steps.find(step => step.title.includes('附1'))
+      expect(unfilled?.amounts?.[0]).toMatchObject({ amount: 5000 })
+    })
+
+    it('form mode over threshold includes 减免税明细表 and 主表应补税额', () => {
+      const guide = buildVatFilingGuide({
+        periodType: 'quarter',
+        totalSales: 101000,
+        goodsLaborSales: 101000,
+        serviceSales: 0,
+        isBelowThreshold: false,
+        vatPayable: 1000,
+        vatReduction: 2000,
+        surchargeTotal: 60,
+        uninvoicedPositiveSales: 101000,
+        invoiceTotal: 0,
+      }, 'form')
+
+      const relief = guide.steps.find(step => step.title.includes('减免税'))
+      expect(relief?.amounts?.[0].amount).toBe(2000)
+      const main = guide.steps.find(step => step.title.startsWith('主表'))
+      expect(main?.amounts?.some(row => row.label.includes('第 22 栏') && row.amount === 1000)).toBe(true)
+      expect(guide.warnings.join('')).toContain('减税项目没填对')
+    })
+
+    it('form mode below threshold pins the exempt amount to 主表第 10 栏', () => {
+      const guide = buildVatFilingGuide(
+        { ...belowData, uninvoicedPositiveSales: 88000 },
+        'form',
+      )
+      const main = guide.steps.find(step => step.title.includes('主表'))
+
+      expect(main?.amounts?.[0].label).toContain('第 10 栏')
+      expect(main?.amounts?.[0].amount).toBe(88000)
+      expect(main?.detail).toContain('第 1 栏')
+    })
+
+    it('warns about negative uninvoiced adjustments and their 属期', () => {
+      const guide = buildVatFilingGuide({
+        ...belowData,
+        totalSales: 300,
+        uninvoicedPositiveSales: 500,
+        uninvoicedNegativeSales: -200,
+      }, 'form')
+      const text = guide.steps.map(step => `${step.title} ${step.detail}`).join('\n')
+
+      expect(text).toContain('第 4 列')
+      expect(text).toContain('属期')
+      expect(guide.warnings.join('')).toContain('不存在有效申报记录')
+    })
+
+    it('stops at a reconcile-first step when the period total is negative', () => {
+      const guide = buildVatFilingGuide({ totalSales: -200 }, 'form')
+
+      expect(guide.steps).toHaveLength(1)
+      expect(guide.steps[0].title).toContain('先核对再申报')
+      expect(guide.warnings.join('')).toContain('负数冲减')
+    })
+
+    it('does not short-circuit to zero filing when there are uninvoiced adjustments', () => {
+      const guide = buildVatFilingGuide({
+        ...belowData,
+        totalSales: 0,
+        uninvoicedPositiveSales: 200,
+        uninvoicedNegativeSales: -200,
+      }, 'form')
+
+      expect(guide.steps.some(step => step.title.includes('无需填报销售额'))).toBe(false)
+      expect(guide.steps.some(step => step.title.includes('附1'))).toBe(true)
+    })
+
+    it('keeps a two-step zero filing card in both modes', () => {
+      expect(buildVatFilingGuide({ totalSales: 0 }, 'confirm').steps).toHaveLength(2)
+      expect(buildVatFilingGuide({ totalSales: 0 }, 'form').steps).toHaveLength(2)
     })
   })
 })

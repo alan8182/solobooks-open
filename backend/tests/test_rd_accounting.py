@@ -3,7 +3,34 @@
 
 from __future__ import annotations
 
+import sqlite3
 from uuid import uuid4
+
+from tests.conftest import TEST_CORE_DB
+
+
+def _pick_open_2027_month() -> str:
+    """挑一个未被共享测试库锁账的 2027 月份。
+
+    原实现用 uuid 随机抽月：全套件并行跑时，其他测试锁掉的期间（如 2027-04）
+    一旦被抽中，计提就在 PERIOD_CLOSED 上误报，部署预检随机挂。这里确定性
+    排雷——只绕开已 closing/closed 的期间，不改变测试覆盖的业务路径。
+    """
+    conn = sqlite3.connect(TEST_CORE_DB)
+    try:
+        locked = {
+            str(row[0])[:7]
+            for row in conn.execute(
+                "SELECT period_start FROM accounting_periods WHERE status IN ('closing', 'closed')"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+    for number in range(1, 13):
+        candidate = f"2027-{number:02d}"
+        if candidate not in locked:
+            return candidate
+    raise AssertionError("2027 年 12 个月均被其他测试锁账，无法挑选可计提月份")
 
 
 def _active_project(client, auth_headers, *, start="2026-01-01", end="2026-12-31"):
@@ -170,7 +197,7 @@ def test_salary_accrual_requires_and_uses_project_timesheet(client, auth_headers
     )
     assert employee.status_code == 200, employee.text
     employee_id = employee.json()["id"]
-    month = f"2027-{(int(uuid4().hex[:2], 16) % 12) + 1:02d}"
+    month = _pick_open_2027_month()
     sheet = client.get(f"/api/salary/sheets/{month}", headers=auth_headers)
     assert sheet.status_code == 200, sheet.text
 

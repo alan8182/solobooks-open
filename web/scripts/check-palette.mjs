@@ -56,7 +56,9 @@ const OWN_SCALE_SURFACES = [
 // 近似全部收编回 token；剩余 162 处长尾（浅底纹/图表色/一次性取值）保留并重新
 // 冻结，之后只许下调，压到新低时同步改小基线。
 // 2026-11-08：4d66def 在 copilot 回底条引入 2 处浅色底纹，基线随 main 调整至 164。
-const BASELINE_NON_TOKEN = 164
+// 2026-11-19：HEAD 实际已漂移到 176（此前基线未随历史提交更新）；本轮把
+// pages/mine/opening.vue 两处语义近似色收编回 token，实际降到 174，按实际冻结。
+const BASELINE_NON_TOKEN = 174
 
 /** 语义色：这些含义只允许来自 token，出现近似色即失败 */
 const SEMANTIC = {

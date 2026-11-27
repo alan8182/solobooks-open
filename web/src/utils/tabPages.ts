@@ -36,6 +36,7 @@ export const TAB_PATHS = [
   '/mine/salary',
   '/private-expenses',
   '/aggregation',
+  '/tools',
 ] as const
 
 /** 首页标签：固定在最左、不可关闭，也不被「关闭其他 / 关闭右侧」带走 */

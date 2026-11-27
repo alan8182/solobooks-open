@@ -148,29 +148,23 @@ const migrateIn = {
   title: '前任代账账套 · 一键体检洗净',
   icon: 'ri-radar-line',
   items: [
-    { b: '历史糊涂账排雷', t: '导入科目余额表，AI 自动扫描大额往来挂账与公私混同隐患' },
-    { b: '费用科目重梳理', t: '纠正粗暴计入管理费用的支出，还原企业真实净利润' },
-    { b: '流水发票免模板', t: '企银流水、商户账单、税局发票直接拖入，无缝开新账' },
+    { b: '历史账排雷', t: '导入余额表，AI 扫描大额挂账与公私混同' },
+    { b: '费用重梳理', t: '纠正乱入管理费用的支出，还原真实净利' },
+    { b: '流水发票免模板', t: '银行流水、商户账单、税局发票直接拖入' },
   ],
-  tags: ['Excel / CSV 直导', '历史风险扫描', '无缝平滑切换'],
+  tags: ['Excel / CSV 直导', '风险扫描', '平滑切换'],
 }
 
 const migrateOut = {
   title: '标准规范账套 · 随时交付',
   icon: 'ri-links-line',
   items: [
-    { b: 'Solo Audit Share', t: '一键签发只读协审链接，银行与投资人免注册在线验账' },
-    { b: '三大报表与明细', t: '科目余额表、明细账、资产负债表与利润表一键导出' },
-    { b: '数据绝不锁定', t: '完整账套与原始凭证票据整包带走，所有权 100% 归你' },
+    { b: 'Solo Audit Share', t: '一键签发只读链接，银行/投资人免注册验账' },
+    { b: '报表与明细', t: '余额表、明细账、资产负债表与利润表一键导出' },
+    { b: '数据不锁定', t: '账套与原始凭证整包带走，所有权 100% 归你' },
   ],
   tags: ['一键协审链接', '准则报表直出', '数据完全归你'],
 }
-
-const migratePromises = [
-  { icon: 'ri-stethoscope-line', title: '迁入即享账本风险体检' },
-  { icon: 'ri-share-forward-box-line', title: '一键签发银行/投资人只读链接' },
-  { icon: 'ri-shield-check-line', title: '数据所有权 100% 归你' },
-]
 
 // ── 展台导航 ──
 type ShowcaseKey = 'batch' | 'reconcile' | 'closing' | 'dashboard' | 'mcp'
@@ -225,25 +219,21 @@ const personaChips = [
   {
     role: '出海贸易与跨境电商',
     icon: 'ri-global-line',
-    metrics: [{ val: '10 秒', label: '账单自动导入' }, { val: '100%', label: '流水对平闭环' }],
     tags: ['多平台账单对平', '分期回款自动核销', '汇兑流水清晰留痕'],
   },
   {
     role: '设计与咨询工作室',
     icon: 'ri-palette-line',
-    metrics: [{ val: '0 风险', label: '个人垫资免税冲销' }, { val: '透明', label: '合伙人分红对账' }],
     tags: ['项目采买垫资隔离', '阶段收款核对', '合伙人透明分红'],
   },
   {
     role: '技术团队与一人公司',
     icon: 'ri-code-s-slash-line',
-    metrics: [{ val: '0 门槛', label: '一键确认入账' }, { val: 'MCP', label: 'Claude / Agent 直连' }],
     tags: ['云服务器与算力归集', '无形资产合规摊销', 'MCP 自动化做账'],
   },
   {
     role: '新零售与现代主理人',
     icon: 'ri-store-2-line',
-    metrics: [{ val: '98 分', label: '账本健康度' }, { val: '0 挂账', label: '借款红线清零' }],
     tags: ['垫资免税转回', '避开 20% 视同分红税', '银行经营贷标准账表'],
   },
 ]
@@ -253,26 +243,22 @@ const complianceEvidence = [
   {
     icon: 'ri-shield-keyhole-line',
     title: '仅本人可访问 · 多层防护',
-    desc: '仅本人账号授权方可访问账本。手机动态核验、微信防冒用与多层账号防护，底层行级强隔离防穿透。',
-    points: ['仅本人账号授权访问', '多层防护与防穿透隔离'],
+    desc: '仅本人授权可访问：手机动态核验 + 行级隔离，防冒用防穿透。',
   },
   {
     icon: 'ri-robot-2-line',
     title: 'AI 不用企业数据训练',
-    desc: '对接 DeepSeek 等商用专线 API，财务流水绝不进入公网大模型训练集；AI 仅出草稿，人机双签。',
-    points: ['商用 API 绝不入训练集', 'AI 仅出草稿不越权'],
+    desc: '走商用专线 API，流水不入训练集；AI 负责起草整理，拍板权与方向盘永远属于你。',
   },
   {
     icon: 'ri-lock-2-line',
     title: '全链路双向加密与留痕',
-    desc: '全站强制 TLS 1.3 双向传输加密与核心密钥密文存储；每笔操作时间戳留痕，对外查验支持只读脱敏。',
-    points: ['全链路双向传输加密', '审计留痕与只读脱敏'],
+    desc: 'TLS 1.3 双向加密，密钥密文存储；每笔操作留痕，协审只读脱敏。',
   },
   {
     icon: 'ri-database-2-line',
     title: '数据自主，绝不锁客',
-    desc: '账套资产 100% 归企业所有。随时一键导出带数据指纹的 Excel 账套与凭证，自由迁移无后顾之忧。',
-    points: ['带指纹标准账套导出', '不锁客随时自由迁移'],
+    desc: '账套 100% 归企业：随时导出带指纹的 Excel 与凭证，自由迁移。',
   },
 ]
 
@@ -326,20 +312,18 @@ interface PricingTier {
 const pricingTiers: PricingTier[] = [
   {
     key: 'trial',
-    badge: '零门槛体验 · 月赠 10 万 Token',
+    badge: '零门槛体验 · 首月 20 万 Token',
     badgeType: 'neutral',
     name: '云端免费试用版',
     target: '适合刚起步的独立开发者 · 尝鲜体验',
     price: '0',
     unit: '基础免费',
-    desc: '免部署开箱即用，功能与标准版完全一致，每月享 10 万 Token 体验额度（最多 3 个企业账套）。',
+    desc: '免部署开箱即用，功能与标准版一致，新用户首月 20 万 Token（新人可 ¥1 扩容至 100 万，次月起每月 10 万，最多 3 个账套）。',
     features: [
-      { text: '全功能无阉割：智能记账、三张报表与申报小抄（最多 3 个账套）', included: true },
-      { text: '每月 10 万 Token 体验额度（含多模态票据识别与问答）', included: true },
-      { text: '免买云服务器，Web 与移动端实时云同步', included: true },
-      { text: '银行流水、微信/支付宝账单与发票自动解析导入', included: true },
-      { text: '1对1 历史旧账导入服务', included: false, note: '需自助导入' },
-      { text: '专属问题服务群与会计师审账', included: false, note: '社区文档自助' },
+      { text: '全功能无阉割：智能记账、三张报表、申报小抄（3 个账套）', included: true },
+      { text: '首月 20 万 Token（新人可 ¥1 扩容至 100 万），次月起每月 10 万', included: true },
+      { text: '银行流水、微信/支付宝账单与发票自动导入', included: true },
+      { text: '1对1 历史旧账导入', included: false, note: '需自助导入' },
     ],
     btnText: '免费开启云端体验',
     btnAction: 'trial',
@@ -353,34 +337,31 @@ const pricingTiers: PricingTier[] = [
     price: '598',
     unit: '元 / 年',
     popular: true,
-    desc: '花小钱买省心。专业财务会计师 1 对 1 帮你把旧账导进来，年享 500 万 Token 额度与专属服务群答疑。',
+    desc: '财务顾问 1 对 1 帮你导入旧账，年享 1000 万 Token 与专属服务群。',
     features: [
-      { text: '每年 500 万 AI Token 额度（含多模态票据识别与智能问答）', included: true },
-      { text: '最多支持 3 个企业账套（更多账套将面向代账机构版本开放）', included: true },
-      { text: '1对1 历史旧账导入与期初建账（由注册财务会计师负责）', included: true },
-      { text: '专属问题服务群（系统实操指导 + 日常财税问题响应）', included: true },
-      { text: '老板私卡垫资与免税提现冲销台账（规避 20% 个税风险）', included: true },
-      { text: '研发费用辅助账自动归集与电子税局申报小抄模式', included: true },
+      { text: '每年 1000 万 Token（含票据识别与问答，最多 3 账套）', included: true },
+      { text: '1对1 旧账导入与期初建账（顾问/会计师协助）', included: true },
+      { text: '私卡垫资合规冲销台账（防 20% 个税风险）', included: true },
+      { text: '研发费用辅助账自动归集、申报小抄', included: true },
     ],
     btnText: '开启云端标准版',
     btnAction: 'standard',
   },
   {
     key: 'pro',
-    badge: 'AI 记账 + 会计师季度审账',
+    badge: 'AI 记账 + 会计师季审',
     badgeType: 'premium',
     name: '人机双签版',
     target: '流水稳定 · 重视合规与经营分析',
     price: '2,980',
     unit: '元 / 年',
     popular: false,
-    desc: 'AI 搞定日常流水，中级注册财务会计师每季度审账并出具财务分析报告，提供视频与日常经营问答。',
+    desc: 'AI 搞定日常流水，会计师每季度审账并出财务分析报告。',
     features: [
-      { text: '包含 598 标准版全部功能、每年 500 万 Token（3 个账套）与 1对1 旧账导入', included: true },
-      { text: '中级注册财务会计师每季度审账复核（人机双签把关）', included: true },
-      { text: '每季度出具专属《季度财务分析报告》（净利/税负/现金流穿透）', included: true },
-      { text: '每季度 30 分钟视频在线问答（1对1 深度解读与筹划建议）', included: true },
-      { text: '日常经营财务问答（合同节税、公转私合规、政策适用随时问）', included: true },
+      { text: '含 598 标准版全部功能、1000 万 Token 与 1对1 旧账导入', included: true },
+      { text: '会计师每季度审账复核（内部把关，非事务所法定审计）', included: true },
+      { text: '每季度《季度财务分析报告》（净利/税负/现金流）', included: true },
+      { text: '每季度 30 分钟视频问答（1对1 筹划建议）', included: true },
     ],
     btnText: '开启人机双签版',
     btnAction: 'pro',
@@ -405,19 +386,11 @@ const pricingTiers: PricingTier[] = [
         <nav class="nav-links">
           <a href="#pillars">核心优势</a>
           <a href="#showcase">功能展台</a>
-          <a href="#showcase" @click.prevent="router.push('/ai-connect')">AI 连接 (MCP & Skills)</a>
-          <a href="/audit-scan" @click.prevent="router.push('/audit-scan')">AI 账本体检</a>
           <a href="#compare">方案对比</a>
-          <a href="#story">初衷手记</a>
-          <a href="#migrate">账本迁移</a>
-          <a href="#personas">适用场景</a>
-          <a href="#trust">合规与安全</a>
-          <a href="#pricing">开源与定价</a>
+          <a href="#pricing">定价</a>
+          <a href="#faq">常见问题</a>
         </nav>
         <div class="nav-actions">
-          <NButton quaternary size="small" class="desktop-action-btn" @click="router.push('/landing-old')">
-            旧版官网
-          </NButton>
           <template v-if="isLoggedIn">
             <NButton type="primary" size="small" class="btn-primary desktop-action-btn" @click="router.push('/')">
               进入工作台
@@ -453,6 +426,18 @@ const pricingTiers: PricingTier[] = [
                 <i class="ri-layout-grid-line" />
                 <span>功能展台</span>
               </a>
+              <a href="#compare" @click.prevent="navigateToAnchor('#compare')">
+                <i class="ri-scales-3-line" />
+                <span>方案对比</span>
+              </a>
+              <a href="#pricing" @click.prevent="navigateToAnchor('#pricing')">
+                <i class="ri-price-tag-3-line" />
+                <span>定价</span>
+              </a>
+              <a href="#faq" @click.prevent="navigateToAnchor('#faq')">
+                <i class="ri-question-answer-line" />
+                <span>常见问题</span>
+              </a>
               <a href="/ai-connect" @click.prevent="mobileMenuOpen = false; router.push('/ai-connect')">
                 <i class="ri-terminal-box-line" />
                 <span>AI 连接 (MCP & Skills)</span>
@@ -466,30 +451,6 @@ const pricingTiers: PricingTier[] = [
               <a href="/free" @click.prevent="mobileMenuOpen = false; router.push('/free')">
                 <i class="ri-money-cny-circle-line" />
                 <span>免费说明</span>
-              </a>
-              <a href="#compare" @click.prevent="navigateToAnchor('#compare')">
-                <i class="ri-scales-3-line" />
-                <span>方案对比</span>
-              </a>
-              <a href="#story" @click.prevent="navigateToAnchor('#story')">
-                <i class="ri-quill-pen-line" />
-                <span>初衷手记</span>
-              </a>
-              <a href="#migrate" @click.prevent="navigateToAnchor('#migrate')">
-                <i class="ri-exchange-box-line" />
-                <span>账本迁移</span>
-              </a>
-              <a href="#personas" @click.prevent="navigateToAnchor('#personas')">
-                <i class="ri-user-star-line" />
-                <span>适用场景</span>
-              </a>
-              <a href="#trust" @click.prevent="navigateToAnchor('#trust')">
-                <i class="ri-shield-check-line" />
-                <span>合规与安全</span>
-              </a>
-              <a href="#pricing" @click.prevent="navigateToAnchor('#pricing')">
-                <i class="ri-price-tag-3-line" />
-                <span>开源与定价</span>
               </a>
             </div>
             <div class="mobile-drawer-bottom">
@@ -512,20 +473,20 @@ const pricingTiers: PricingTier[] = [
       <div class="hero-inner">
         <!-- 身份胶囊 -->
         <div class="hero-kicker-pill">
-          <span>驻场 AI 财务官 · 专为小微与一人公司设计</span>
+          <span>小微企业的驻场 AI 财务官</span>
         </div>
 
-        <!-- 主标题 -->
+        <!-- 品牌记忆句 -->
         <h1 class="hero-title">
-          点一点把账做清爽，<br class="hero-br-mobile" />
-          <span class="title-highlight">问一问把公司养值钱。</span>
+          不做糊涂账，<br class="hero-br-mobile" />
+          <span class="title-highlight">合规用梭罗。</span>
         </h1>
 
-        <!-- 价值副标：干净短促，绝不拖泥带水 -->
-        <p class="hero-sub">
-          日常账务一键确认，财税疑难随时提问。<br class="desktop-only" />
-          告别外包糊涂账与公私混同风险，做一本科目规范、借贷平衡的干净账。
-        </p>
+        <!-- 体验副标 -->
+        <p class="hero-subline">点一点把账做清爽，问一问把公司养值钱。</p>
+
+        <!-- 价值说明：一句说清「看得懂 + 拿得出手」，不提科目/借贷这类术语 -->
+        <p class="hero-sub">把机械对账交给 AI，把时间留给值得的事；钱花在哪一眼看清，授信、补贴、尽调随时接得住。</p>
 
         <!-- 行动按钮 -->
         <div class="hero-action-block">
@@ -534,54 +495,18 @@ const pricingTiers: PricingTier[] = [
               <span>免费开启干净账本</span>
               <span class="btn-arrow-icon"><i class="ri-arrow-right-line" /></span>
             </button>
+            <!-- 老板视角：关心的是公司有没有税务/合规风险，不是「账本」本身；
+                 时间口径对齐落点的默认页签（90 秒经营快检） -->
             <button class="hero-scan-btn" @click="router.push('/audit-scan')">
               <i class="ri-shield-flash-line" />
-              <span>30秒 AI 账本体检</span>
+              <span>90秒自查财税风险</span>
             </button>
           </div>
-        </div>
-
-        <!-- 底部 4 张 Bento 卡片：干练清晰 -->
-        <div class="hero-proof-bento">
-          <div class="proof-card">
-            <div class="proof-card-top">
-              <div class="proof-icon-wrap"><i class="ri-cursor-line" /></div>
-              <span class="proof-badge blue">零门槛</span>
-            </div>
-            <div class="proof-val">点一点 · 问一问</div>
-            <div class="proof-title">不懂会计也能管好账</div>
-            <p class="proof-desc">AI 预制入账方案，老板只需确认；疑难问题随时大白话提问。</p>
-          </div>
-
-          <div class="proof-card">
-            <div class="proof-card-top">
-              <div class="proof-icon-wrap"><i class="ri-shield-keyhole-line" /></div>
-              <span class="proof-badge emerald">公私防雷</span>
-            </div>
-            <div class="proof-val">公私合规隔离</div>
-            <div class="proof-title">杜绝 20% 股东借款个税</div>
-            <p class="proof-desc">个人垫资合规冲销，避免公私混同被税局误判为股东分红。</p>
-          </div>
-
-          <div class="proof-card">
-            <div class="proof-card-top">
-              <div class="proof-icon-wrap"><i class="ri-medal-line" /></div>
-              <span class="proof-badge amber">信用资产</span>
-            </div>
-            <div class="proof-val">小企业准则</div>
-            <div class="proof-title">标准科目 · 双向留痕</div>
-            <p class="proof-desc">遵循小企业会计准则，资产负债表与利润表规范联动，凭证回单双向穿透。</p>
-          </div>
-
-          <div class="proof-card hover-glow" @click="router.push('/ai-connect')">
-            <div class="proof-card-top">
-              <div class="proof-icon-wrap"><i class="ri-terminal-box-line" /></div>
-              <span class="proof-badge purple">开放协议</span>
-            </div>
-            <div class="proof-val text-gradient">MCP & Skills</div>
-            <div class="proof-title">Claude / Cursor / Agent 直连</div>
-            <p class="proof-desc">27 项原生账务工具与报税 Skills，人机双签，只出草稿不越权。</p>
-          </div>
+          <button class="hero-ai-link" @click="router.push('/ai-connect')">
+            <i class="ri-terminal-box-line" />
+            <span>AI 连接 (MCP &amp; Skills)：让 Claude / Cursor 直接读写你的账本</span>
+            <i class="ri-arrow-right-line" />
+          </button>
         </div>
       </div>
     </section>
@@ -593,7 +518,7 @@ const pricingTiers: PricingTier[] = [
           <p class="section-tag">核心优势</p>
           <h2 class="section-headline">四个底气，告别外包糊涂账</h2>
           <p class="section-subtitle">
-            告别外包糊涂账，做一本规范透明、经得起查验的干净账本。
+            把大机构级的《小企业会计准则》合规护栏，变成小微团队点一点就能用的日常外骨骼。
           </p>
         </div>
 
@@ -653,12 +578,12 @@ const pricingTiers: PricingTier[] = [
               <div class="stage-left">
                 <h3 class="stage-title">流水发票一拖即入，<br />确认即可入账</h3>
                 <p class="stage-desc">
-                  无需繁琐记账。月末将银行流水、发票包与平台账单拖入，AI 自动预制分录，老板确认即完成入账。
+                  月末把银行流水、发票和平台账单拖进来，AI 预制分录，你点确认即入账。
                 </p>
                 <div class="stage-bullets">
-                  <div class="stage-bullet"><i class="ri-checkbox-circle-line" /><span><b>① 硬规则直解</b>：税费、手续费等确定性项精准硬确认，零误差不走大模型</span></div>
-                  <div class="stage-bullet"><i class="ri-sparkling-line" /><span><b>② AI 语义推导</b>：依据交易对手与备注推导分录给出依据，人工点一点确认</span></div>
-                  <div class="stage-bullet"><i class="ri-brain-line" /><span><b>③ 专属记忆沉淀</b>：纠正一次即永久沉淀为企业专属规则，系统越用越准</span></div>
+                  <div class="stage-bullet"><i class="ri-checkbox-circle-line" /><span><b>① 硬规则直解</b>：税费、手续费等确定项硬确认，不走大模型</span></div>
+                  <div class="stage-bullet"><i class="ri-sparkling-line" /><span><b>② AI 语义推导</b>：按交易对手与备注推导分录，你点一点确认</span></div>
+                  <div class="stage-bullet"><i class="ri-brain-line" /><span><b>③ 专属记忆沉淀</b>：纠正一次即沉淀为专属规则，越用越准</span></div>
                 </div>
               </div>
               <div class="stage-right">
@@ -755,12 +680,12 @@ const pricingTiers: PricingTier[] = [
               <div class="stage-left">
                 <h3 class="stage-title">财税疑难随时发问，<br />给出合规方案</h3>
                 <p class="stage-desc">
-                  垫资怎么拿回？合同怎么签省税？随时提问，AI 结合公司真实账面给出清晰合规路径。
+                  垫资怎么拿回、合同怎么签省税？随时问，AI 结合真实账面给合规路径。
                 </p>
                 <div class="stage-bullets">
-                  <div class="stage-bullet"><i class="ri-check-line" /><span>联动真实账本数据，量身定制合规方案</span></div>
-                  <div class="stage-bullet"><i class="ri-check-line" /><span>金税四期口径预警，拦截公私混同与 20% 分红个税雷区</span></div>
-                  <div class="stage-bullet"><i class="ri-check-line" /><span>咨询方案一键转化为合规凭据草稿，闭环落地</span></div>
+                  <div class="stage-bullet"><i class="ri-check-line" /><span>联动真实账本，给出定制方案</span></div>
+                  <div class="stage-bullet"><i class="ri-check-line" /><span>金税四期口径预警，拦截公私混同与 20% 分红个税</span></div>
+                  <div class="stage-bullet"><i class="ri-check-line" /><span>方案一键转成合规凭据草稿</span></div>
                 </div>
               </div>
               <div class="stage-right">
@@ -808,12 +733,12 @@ const pricingTiers: PricingTier[] = [
               <div class="stage-left">
                 <h3 class="stage-title">4 步向导结账，<br />报税数据直出</h3>
                 <p class="stage-desc">
-                  将复杂的期末损益结转降维为 4 步清晰向导。往来核销、设备折旧与税额测算一步到位。
+                  期末损益结转拆成 4 步向导：往来核销、折旧与税额测算一步到位。
                 </p>
                 <div class="stage-bullets">
-                  <div class="stage-bullet"><i class="ri-check-line" /><span>应收应付往来款项一键冲平</span></div>
-                  <div class="stage-bullet"><i class="ri-check-line" /><span>电脑器材与固定资产自动计提折旧</span></div>
-                  <div class="stage-bullet"><i class="ri-check-line" /><span>小微纳税申报底稿自动对齐，防篡改锁账</span></div>
+                  <div class="stage-bullet"><i class="ri-check-line" /><span>往来款项一键冲平</span></div>
+                  <div class="stage-bullet"><i class="ri-check-line" /><span>固定资产自动计提折旧</span></div>
+                  <div class="stage-bullet"><i class="ri-check-line" /><span>申报底稿自动对齐，防篡改锁账</span></div>
                 </div>
               </div>
               <div class="stage-right">
@@ -871,12 +796,12 @@ const pricingTiers: PricingTier[] = [
               <div class="stage-left">
                 <h3 class="stage-title">实时财务三张表，<br />看懂企业经营</h3>
                 <p class="stage-desc">
-                  账目实时联动资产负债表、利润表与现金流，随时掌握真实净利与可用资金储备。
+                  三张表实时联动，随时掌握真实净利与可用资金。
                 </p>
                 <div class="stage-bullets">
-                  <div class="stage-bullet"><i class="ri-check-line" /><span>标准三张表实时联动生成，无需等待代账滞后汇报</span></div>
-                  <div class="stage-bullet"><i class="ri-check-line" /><span>研发费用辅助账自动归集：基于入驻园区研发补助实战，流水工时自动打标，轻松申报科小与税惠</span></div>
-                  <div class="stage-bullet"><i class="ri-check-line" /><span>真实净利润与现金流跑道测算，应收账款账龄智能预警</span></div>
+                  <div class="stage-bullet"><i class="ri-check-line" /><span>标准三张表实时生成，不等代账滞后汇报</span></div>
+                  <div class="stage-bullet"><i class="ri-check-line" /><span>研发费用辅助账自动归集，流水工时自动打标，便于申报科小与税惠</span></div>
+                  <div class="stage-bullet"><i class="ri-check-line" /><span>净利与现金跑道测算，应收账龄预警</span></div>
                 </div>
               </div>
               <div class="stage-right">
@@ -928,12 +853,12 @@ const pricingTiers: PricingTier[] = [
               <div class="stage-left">
                 <h3 class="stage-title">原生支持 MCP + Skills，<br />打造懂小微财税的数字员工</h3>
                 <p class="stage-desc">
-                  全面支持 Model Context Protocol 协议与 Agent Skills 规范。不仅能在 Claude、Cursor 中对话查账起草凭证，更可挂载专属财税技能包，驱动半自动报税核对等端到端高阶工作流。
+                  支持 MCP 协议与 Agent Skills：在 Claude、Cursor 里查账、起草凭证，还能挂载财税技能包跑通报税核对。
                 </p>
                 <div class="stage-bullets">
-                  <div class="stage-bullet"><i class="ri-check-line" /><span><b>27 个原生 MCP 工具</b>：覆盖记账起草、三方流水对账、结账五项检查、申报作业包与资产台账</span></div>
-                  <div class="stage-bullet"><i class="ri-check-line" /><span><b>专属 Agent Skills 技能包</b>：挂载半自动报税伴侣，一键生成报税数据、识别无票收入、引导申报表填写</span></div>
-                  <div class="stage-bullet"><i class="ri-check-line" /><span><b>人机双签安全红线</b>：AI 只产生待确认草稿不直接入账、不碰税局密码与提交按钮，数据可审计</span></div>
+                  <div class="stage-bullet"><i class="ri-check-line" /><span><b>27 个原生 MCP 工具</b>：记账起草、流水对账、结账五项检查、申报作业包与资产台账</span></div>
+                  <div class="stage-bullet"><i class="ri-check-line" /><span><b>专属 Agent Skills</b>：一键生成报税数据、识别无票收入、引导填表</span></div>
+                  <div class="stage-bullet"><i class="ri-check-line" /><span><b>人机双签红线</b>：AI 只出待确认草稿，不碰税局密码与提交按钮，全程可审计</span></div>
                 </div>
                 <div class="stage-cta-row">
                   <button class="stage-cta-primary" @click="router.push('/ai-connect')">
@@ -1017,7 +942,7 @@ const pricingTiers: PricingTier[] = [
           <p class="section-tag">合规优先 · 方案对比</p>
           <h2 class="section-headline">为什么不用传统代账？</h2>
           <p class="section-subtitle">
-            金税四期“以数治税、穿透监管”，过去廉价代账留下的公私不分与糊涂烂账成了定时炸弹。规范透明，才是小微企业的立身之本。
+            金税四期穿透监管，廉价代账留下的公私不分就是定时炸弹；规范透明才能立身。
           </p>
         </div>
 
@@ -1063,43 +988,12 @@ const pricingTiers: PricingTier[] = [
             </span>
             <h2 class="story-title">原本，这只是我们写给自己用的工具</h2>
             <p class="story-sub">
-              从评选入驻政府科技园区、获得官方研发补助支持，到踩遍小微记账的所有坑——这是一位创业者做给更多创业者的干净账税系统。
+              从入驻政府科技园区、拿到官方研发补助支持，到踩遍小微记账的坑——这是芥子星辰团队做给创业者的账税系统。
             </p>
           </div>
 
           <div class="story-grid">
-            <!-- 左侧：亲身踩过的三难困境 -->
-            <div class="story-pane story-pain">
-              <div class="pane-head">
-                <span class="pane-tag pain-tag">切身体会的小微三难</span>
-                <h3 class="pane-title">找代账糊涂、自记账繁琐、招会计太贵</h3>
-              </div>
-              <div class="story-pains-list">
-                <div class="pain-box">
-                  <div class="pain-icon-wrap"><i class="ri-close-line" /></div>
-                  <div class="pain-content">
-                    <b>找过外部廉价代账</b>
-                    <p>200 块一个月，只管填表不管账，发票乱塞、往来乱挂。金税四期大数据一穿透，全是随时暴雷的个税与补税炸弹；</p>
-                  </div>
-                </div>
-                <div class="pain-box">
-                  <div class="pain-icon-wrap"><i class="ri-close-line" /></div>
-                  <div class="pain-content">
-                    <b>用过市面自记账产品</b>
-                    <p>满屏都是死板复杂的会计术语和大表格，既不专业又难用，根本无法长期坚持；</p>
-                  </div>
-                </div>
-                <div class="pain-box">
-                  <div class="pain-icon-wrap"><i class="ri-close-line" /></div>
-                  <div class="pain-content">
-                    <b>想招专职会计坐班</b>
-                    <p>一年 8~12 万的刚性成本，对于初创小团队、一人公司来说，养专职财务实在太重太奢侈。</p>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <!-- 右侧：自己造工具 + 专家打磨 + 开放共创 -->
+            <!-- 自己造工具 + 专家打磨 + 开放共创 -->
             <div class="story-pane story-resolve">
               <div class="pane-head">
                 <span class="pane-tag resolve-tag">从自用到开放共创</span>
@@ -1107,34 +1001,33 @@ const pricingTiers: PricingTier[] = [
               </div>
               <div class="story-resolve-text">
                 <p>
-                  既然市面上没有称心的，<b>我们索性结合工程师的自动化能力，为自己开发了这套系统</b>。
-                  后来我们找了资深专业财务朋友，严格对照《小企业会计准则 (2013)》反复打磨：从硬规则直解、AI推导到规则记忆，把底层借贷平衡、已过账只准红冲、私卡垫资隔离等专业规矩一件件焊死在底层。
+                  很多创业者心里都有一条想出发的 318，困住我们的往往不是热爱的事，而是对不完的账与填不完的表。我们坚信
+                  <b>AI 替代的从来不是人，而是消耗生命的机械劳动</b>。
                 </p>
                 <p>
-                  身边很多创业朋友、独立主理人看我们用得顺畅，纷纷问能不能用。我们才决定<b>开源复式记账内核破除锁客，正式上线商业云端版</b>。
+                  市面上没有称心的工具，<b>我们索性自己写了一套</b>：把大机构级的专业外骨骼交到小微手里——请资深财务朋友对照《小企业会计准则》打磨，把借贷平衡、已过账只准红冲、私卡垫资隔离焊死在底层。好公司不必等到融了资才开始规范。
+                </p>
+                <p>
+                  创业朋友看了也想用，我们才决定<b>开源内核、上线云端版</b>。
                 </p>
                 <p class="resolve-highlight">
-                  目前系统正在面向技术、设计、咨询、电商、实体等更多行业深度测试。我们真诚欢迎你来试用，并给出宝贵的使用反馈与批评意见。
+                  目前正在技术、设计、咨询、电商等行业深度测试，欢迎试用并拍砖。
                 </p>
               </div>
 
               <!-- 背书信赖胶囊条 -->
               <div class="story-badges-row">
                 <div class="s-badge-item">
+                  <i class="ri-sparkling-line text-emerald" />
+                  <span>芥子星辰 · 消灭机械劳动</span>
+                </div>
+                <div class="s-badge-item">
                   <i class="ri-government-line text-blue" />
                   <span>政府园区入驻评审</span>
                 </div>
                 <div class="s-badge-item">
-                  <i class="ri-funds-box-line text-emerald" />
-                  <span>科技创新研发补助支持</span>
-                </div>
-                <div class="s-badge-item">
                   <i class="ri-shield-check-line text-indigo" />
                   <span>资深 CPA 联合打磨</span>
-                </div>
-                <div class="s-badge-item">
-                  <i class="ri-user-smile-line text-amber" />
-                  <span>多行业创业者测试中</span>
                 </div>
               </div>
             </div>
@@ -1150,7 +1043,7 @@ const pricingTiers: PricingTier[] = [
           <p class="section-tag">无痛迁移</p>
           <h2 class="section-headline">前任代账账套，<br class="hero-br-mobile" />一键导入洗干净</h2>
           <p class="section-subtitle">
-            直接导入历史科目余额表，AI 自动扫描挂账风险；账套随时完整导出，绝不锁定。
+            导入历史余额表，AI 扫出挂账风险；账套随时完整导出，绝不锁定。
           </p>
         </div>
 
@@ -1192,13 +1085,6 @@ const pricingTiers: PricingTier[] = [
             </div>
           </div>
         </div>
-
-        <div class="migrate-promises">
-          <div v-for="p in migratePromises" :key="p.title" class="promise-item">
-            <i :class="p.icon" />
-            <span>{{ p.title }}</span>
-          </div>
-        </div>
       </div>
     </section>
 
@@ -1218,14 +1104,6 @@ const pricingTiers: PricingTier[] = [
               <h3 class="p-role">{{ p.role }}</h3>
             </div>
 
-            <!-- 关键指标大字 -->
-            <div class="p-metrics">
-              <div v-for="m in p.metrics" :key="m.label" class="p-metric">
-                <span class="p-val">{{ m.val }}</span>
-                <span class="p-lbl">{{ m.label }}</span>
-              </div>
-            </div>
-
             <!-- 业务场景标签 -->
             <div class="p-tags">
               <span v-for="t in p.tags" :key="t" class="p-tag"><i class="ri-check-line" />{{ t }}</span>
@@ -1242,7 +1120,7 @@ const pricingTiers: PricingTier[] = [
           <p class="section-tag">数据安全与合规</p>
           <h2 class="section-headline">企业级数据安全，底线经得起查验</h2>
           <p class="section-subtitle">
-            全链路双向加密、多层账号防护仅本人可访问、AI 商业数据绝不入训练集。
+            在错不起的账务里，AI 负责不知疲倦地整理核算，拍板权与方向盘永远属于你——全链路加密、绝不入训练集。
           </p>
         </div>
 
@@ -1254,11 +1132,6 @@ const pricingTiers: PricingTier[] = [
             </div>
             <h3 class="evidence-title">{{ e.title }}</h3>
             <p class="evidence-desc">{{ e.desc }}</p>
-            <div class="evidence-points">
-              <span v-for="pt in e.points" :key="pt" class="evidence-point-tag">
-                <i class="ri-check-line" />{{ pt }}
-              </span>
-            </div>
           </div>
         </div>
       </div>
@@ -1348,7 +1221,7 @@ const pricingTiers: PricingTier[] = [
             </div>
             <p class="docker-title">全功能开源无阉割，终端一行命令本地私有化部署</p>
             <p class="docker-sub">
-              自备服务器与大模型 API Key 即可完整运行全套功能，财务数据 100% 保存在本地。
+              自备服务器与 API Key 即可运行全套功能，数据 100% 保存在本地。
             </p>
           </div>
           <div class="docker-callout-right">
@@ -1395,20 +1268,12 @@ const pricingTiers: PricingTier[] = [
         <div class="cta-glow-mesh" />
         <div class="cta-inner text-center">
           <h2 class="cta-title">给公司配一个懂业务的 AI 财务官</h2>
-          <p class="cta-sub">告别外包糊涂账，做一本规范透明、经得起查验的干净账本。</p>
+          <p class="cta-sub">不用懂借贷，也能拿到一本经得起查验的账。</p>
           <div class="cta-buttons">
             <button class="island-cta-btn" @click="router.push('/login')">
-              <span>免费开启清爽账本</span>
+              <span>免费开启干净账本</span>
               <span class="btn-arrow-icon"><i class="ri-arrow-right-line" /></span>
             </button>
-          </div>
-
-          <!-- 开放共创测试提示 -->
-          <div class="cta-co-build-bar">
-            <span class="co-build-pill"><i class="ri-compass-3-line" /> 开放共测</span>
-            <span class="co-build-text">
-              目前系统正面向技术、设计、咨询、电商、实体等更多行业开放测试。诚邀体验并反馈真实意见，与我们一起打磨更懂创业者的账税工具。
-            </span>
           </div>
         </div>
       </div>
@@ -1419,10 +1284,12 @@ const pricingTiers: PricingTier[] = [
             <img src="/solo-logo.png" alt="梭罗记账" class="footer-logo" />
             <div class="footer-brand-info">
               <b>梭罗记账 SoloBooks</b>
-              <p>把账记简单，把经营看清楚。</p>
+              <p>不做糊涂账，合规用梭罗 · 消灭机械劳动，把生命还给真正值得的事。</p>
             </div>
           </div>
           <nav class="footer-nav">
+            <a href="https://jiezixingchen.com" target="_blank" rel="noreferrer">芥子星辰</a>
+            <a href="https://visanote.cn" target="_blank" rel="noreferrer">签小抄 VisaNote</a>
             <a href="/free" @click.prevent="router.push('/free')">免费说明</a>
             <a href="/agreement" target="_blank">服务协议</a>
             <a href="/privacy" target="_blank">隐私政策</a>
@@ -1430,7 +1297,7 @@ const pricingTiers: PricingTier[] = [
           </nav>
         </div>
         <div class="section-inner footer-sub">
-          <span>© {{ new Date().getFullYear() }} 梭罗记账 SoloBooks · 保留所有权利</span>
+          <span>© {{ new Date().getFullYear() }} 芥子星辰（杭州）智能科技 · 梭罗记账 SoloBooks</span>
           <div class="footer-filings">
             <a v-if="ICP_LICENSE" href="https://beian.miit.gov.cn" target="_blank" rel="noreferrer">{{ ICP_LICENSE }}</a>
             <a v-if="PSB_RECORD" :href="PSB_RECORD_URL" target="_blank" rel="noreferrer">{{ PSB_RECORD }}</a>
@@ -1616,12 +1483,21 @@ const pricingTiers: PricingTier[] = [
 }
 
 .hero-title {
-  margin: 0 0 22px;
+  margin: 0 0 14px;
   font-size: 58px;
   line-height: 1.16;
   font-weight: 850;
   color: #0f172a;
   letter-spacing: -1.2px;
+}
+
+.hero-subline {
+  margin: 0 0 14px;
+  font-size: 24px;
+  line-height: 1.5;
+  font-weight: 700;
+  color: #1e293b;
+  letter-spacing: -0.3px;
 }
 
 .hero-br-mobile {
@@ -1666,113 +1542,26 @@ const pricingTiers: PricingTier[] = [
   cursor: pointer;
 }
 
-/* 底部 4 栏 Bento 价值看板 (横向舒展 1120px) */
-.hero-proof-bento {
-  width: 100%;
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 18px;
-  text-align: left;
-}
-
-.proof-card {
-  background: #ffffff;
-  border: 1px solid rgba(226, 232, 240, 0.9);
-  border-radius: 12px;
-  padding: 22px 20px;
-  display: flex;
-  flex-direction: column;
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.9),
-    0 4px 16px -2px rgba(15, 23, 42, 0.04),
-    0 1px 3px rgba(0, 0, 0, 0.02);
-  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
-  position: relative;
-}
-
-.proof-card:hover {
-  transform: translateY(-3px);
-  border-color: rgba(23, 71, 176, 0.3);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 1),
-    0 16px 32px -8px rgba(23, 71, 176, 0.12);
-}
-
-.proof-card.hover-glow:hover {
-  border-color: rgba(126, 34, 206, 0.35);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 1),
-    0 16px 32px -8px rgba(126, 34, 206, 0.15);
-}
-
-.proof-card-top {
-  display: flex;
+/* Hero 内 AI 连接入口（原 Bento 卡片的轻量替代） */
+.hero-ai-link {
+  margin-top: 18px;
+  display: inline-flex;
   align-items: center;
-  justify-content: space-between;
-  margin-bottom: 14px;
-}
-
-.proof-icon-wrap {
-  width: 34px;
-  height: 34px;
-  border-radius: 8px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 16px;
-  background: #f8fafc;
+  gap: 6px;
+  padding: 6px 14px;
+  border-radius: 999px;
   border: 1px solid #e2e8f0;
+  background: #ffffff;
   color: #475569;
-  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+  font-size: 13px;
+  cursor: pointer;
   transition: all 0.2s ease;
 }
 
-.proof-card:hover .proof-icon-wrap {
-  border-color: #cbd5e1;
-  color: #0f172a;
-  background: #ffffff;
-}
-
-.proof-badge {
-  font-size: 11px;
-  font-weight: 500;
-  padding: 2px 8px;
-  border-radius: 999px;
-  letter-spacing: 0.02em;
-}
-
-.proof-badge.blue { background: #f0f6ff; color: #1d4ed8; border: 1px solid #dbeafe; }
-.proof-badge.emerald { background: #eaf7f1; color: #0f7354; border: 1px solid #dcfce7; }
-.proof-badge.purple { background: #faf5ff; color: #6b21a8; border: 1px solid #f3e8ff; }
-.proof-badge.amber { background: #fffbeb; color: #a05c10; border: 1px solid #fef3c7; }
-
-.proof-val {
-  font-size: 26px;
-  font-weight: 800;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Noto Sans SC", sans-serif;
-  color: #0f172a;
-  line-height: 1.15;
-  margin-bottom: 6px;
-}
-
-.proof-val.text-gradient {
-  background: linear-gradient(135deg, #1747b0 0%, #7e22ce 100%);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-}
-
-.proof-title {
-  font-size: 14px;
-  font-weight: 700;
-  color: #1e293b;
-  margin-bottom: 6px;
-}
-
-.proof-desc {
-  margin: 0;
-  font-size: 12px;
-  color: #5b6a7c;
-  line-height: 1.55;
+.hero-ai-link:hover {
+  color: #1747b0;
+  border-color: rgba(23, 71, 176, 0.35);
+  box-shadow: 0 4px 12px -4px rgba(23, 71, 176, 0.18);
 }
 
 /* 岛式按钮架构 (Island Button Architecture) */
@@ -2192,11 +1981,10 @@ const pricingTiers: PricingTier[] = [
 
 .text-emerald { color: #0f7354; }
 
-/* ── 通用 Section (幻灯片 Slide 单元) ── */
+/* ── 通用 Section：内容决定高度，不再强制满屏（2026-11 精简） ── */
 .section {
   padding: 60px 0;
   position: relative;
-  min-height: calc(100vh - 56px);
   width: 100%;
   max-width: 100%;
   box-sizing: border-box;
@@ -3263,37 +3051,6 @@ const pricingTiers: PricingTier[] = [
   white-space: nowrap;
 }
 
-.migrate-promises {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 14px;
-  margin-top: 26px;
-}
-
-.promise-item {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  padding: 13px 16px;
-  background: #f0f5ff;
-  border: 1px solid rgba(23, 71, 176, 0.14);
-  border-radius: 8px;
-  font-size: 13px;
-  font-weight: 700;
-  color: #0f172a;
-}
-
-.promise-item i {
-  flex-shrink: 0;
-  font-size: 15px;
-  color: #1747b0;
-}
-
-.promise-text span {
-  font-size: 11.5px;
-  color: #5b6a7c;
-}
 
 /* ── 典型场景 ── */
 .persona-grid {
@@ -3348,34 +3105,6 @@ const pricingTiers: PricingTier[] = [
   font-size: 14px;
   font-weight: 750;
   color: #0f172a;
-}
-
-.p-metrics {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
-  padding: 8px 10px;
-  background: #f8fafc;
-  border-radius: 8px;
-  margin-bottom: 14px;
-}
-
-.p-metric {
-  display: flex;
-  flex-direction: column;
-}
-
-.p-val {
-  font-size: 16px;
-  font-weight: 800;
-  color: #1747b0;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-}
-
-.p-lbl {
-  font-size: 10.5px;
-  color: #5b6a7c;
-  margin-top: 2px;
 }
 
 .p-tags {
@@ -3454,33 +3183,11 @@ const pricingTiers: PricingTier[] = [
 }
 
 .evidence-desc {
-  margin: 0 0 20px;
+  margin: 0;
   font-size: 13.5px;
   color: #5b6a7c;
   line-height: 1.65;
   flex: 1;
-}
-
-.evidence-points {
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-  padding-top: 16px;
-  border-top: 1px solid #e2e8f0;
-}
-
-.evidence-point-tag {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  font-weight: 600;
-  color: #0f7354;
-}
-
-.evidence-point-tag i {
-  font-size: 13.5px;
-  font-weight: bold;
 }
 
 /* ── 最后一页：底部 CTA + 页脚整合 (Slide 7 · 首尾呼应) ── */
@@ -3595,7 +3302,9 @@ const pricingTiers: PricingTier[] = [
 
 .footer-nav {
   display: flex;
-  gap: 20px;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 16px 20px;
 }
 
 .footer-nav a {
@@ -3862,9 +3571,8 @@ const pricingTiers: PricingTier[] = [
     font-size: 44px;
   }
 
-  .hero-proof-bento {
-    grid-template-columns: repeat(2, 1fr);
-    gap: 14px;
+  .hero-subline {
+    font-size: 21px;
   }
 
   .pillars-grid {
@@ -3975,7 +3683,13 @@ const pricingTiers: PricingTier[] = [
     font-size: 34px;
     line-height: 1.2;
     letter-spacing: -0.6px;
-    margin-bottom: 14px;
+    margin-bottom: 10px;
+  }
+
+  .hero-subline {
+    font-size: 17px;
+    line-height: 1.55;
+    margin-bottom: 10px;
   }
 
   .hero-br-mobile {
@@ -3999,49 +3713,6 @@ const pricingTiers: PricingTier[] = [
   .cta-buttons button {
     width: 100%;
     justify-content: center;
-  }
-
-  /* Bento 价值看板：移动端保持精巧 2x2 栅格，严防 1 列超长堆叠 */
-  .hero-proof-bento {
-    grid-template-columns: repeat(2, 1fr);
-    gap: 10px;
-  }
-
-  .proof-card {
-    padding: 12px 10px;
-    border-radius: 10px;
-  }
-
-  .proof-card-top {
-    margin-bottom: 8px;
-  }
-
-  .proof-icon-wrap {
-    width: 28px;
-    height: 28px;
-    font-size: 13px;
-  }
-
-  .proof-badge {
-    font-size: 10px;
-    padding: 1px 5px;
-  }
-
-  .proof-val {
-    font-size: 19px;
-    margin-bottom: 3px;
-  }
-
-  .proof-title {
-    font-size: 12.5px;
-    margin-bottom: 3px;
-    line-height: 1.3;
-  }
-
-  .proof-desc {
-    font-size: 10.5px;
-    line-height: 1.4;
-    color: #64748b;
   }
 
   /* 四大支柱 */
@@ -4341,12 +4012,6 @@ const pricingTiers: PricingTier[] = [
     padding: 16px 14px;
   }
 
-  .migrate-promises {
-    grid-template-columns: 1fr;
-    gap: 8px;
-    margin-top: 18px;
-  }
-
   /* 适用场景与合规保障 */
   .persona-grid {
     grid-template-columns: 1fr;
@@ -4430,26 +4095,6 @@ const pricingTiers: PricingTier[] = [
 
   .hero-inner {
     padding: 16px 10px 0;
-  }
-
-  .hero-proof-bento {
-    gap: 8px;
-  }
-
-  .proof-card {
-    padding: 10px 8px;
-  }
-
-  .proof-val {
-    font-size: 17px;
-  }
-
-  .proof-title {
-    font-size: 11.5px;
-  }
-
-  .proof-desc {
-    font-size: 10px;
   }
 
   .section-headline {
@@ -5143,9 +4788,11 @@ const pricingTiers: PricingTier[] = [
 
 .story-grid {
   display: grid;
-  grid-template-columns: 1fr 1.1fr;
+  grid-template-columns: 1fr;
   gap: 28px;
   align-items: stretch;
+  max-width: 880px;
+  margin: 0 auto;
 }
 
 .story-pane {
@@ -5170,11 +4817,6 @@ const pricingTiers: PricingTier[] = [
   margin-bottom: 6px;
 }
 
-.pain-tag {
-  background: #fff1f2;
-  color: #e11d48;
-}
-
 .resolve-tag {
   background: #f0fdf4;
   color: #16a34a;
@@ -5184,46 +4826,6 @@ const pricingTiers: PricingTier[] = [
   font-size: 15px;
   font-weight: 700;
   color: #0f172a;
-  margin: 0;
-}
-
-.story-pains-list {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-
-.pain-box {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-}
-
-.pain-icon-wrap {
-  width: 20px;
-  height: 20px;
-  border-radius: 50%;
-  background: #ffe4e6;
-  color: #e11d48;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 13px;
-  flex-shrink: 0;
-  margin-top: 2px;
-}
-
-.pain-content b {
-  display: block;
-  font-size: 13px;
-  color: #1e293b;
-  margin-bottom: 2px;
-}
-
-.pain-content p {
-  font-size: 12px;
-  color: #64748b;
-  line-height: 1.45;
   margin: 0;
 }
 
@@ -5253,7 +4855,7 @@ const pricingTiers: PricingTier[] = [
 .story-badges-row {
   margin-top: 20px;
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(3, 1fr);
   gap: 10px;
   padding-top: 16px;
   border-top: 1px dashed #e2e8f0;
@@ -5276,41 +4878,6 @@ const pricingTiers: PricingTier[] = [
   font-size: 14px;
 }
 
-/* 底部 CTA 开放共测卡条 */
-.cta-co-build-bar {
-  margin-top: 24px;
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
-  background: #ffffff;
-  border: 1px solid #cbd5e1;
-  box-shadow: 0 2px 12px rgba(15, 23, 42, 0.06);
-  padding: 8px 18px;
-  border-radius: 999px;
-  max-width: 680px;
-}
-
-.co-build-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  background: #eff6ff;
-  border: 1px solid #bfdbfe;
-  color: #1d4ed8;
-  font-size: 11.5px;
-  font-weight: 700;
-  padding: 3px 10px;
-  border-radius: 999px;
-  flex-shrink: 0;
-}
-
-.co-build-text {
-  font-size: 12.5px;
-  color: #334155;
-  line-height: 1.5;
-  text-align: left;
-}
-
 @media (max-width: 900px) {
   .story-card {
     padding: 24px 16px;
@@ -5327,14 +4894,6 @@ const pricingTiers: PricingTier[] = [
 
   .story-badges-row {
     grid-template-columns: 1fr;
-  }
-
-  .cta-co-build-bar {
-    flex-direction: column;
-    border-radius: 12px;
-    align-items: flex-start;
-    padding: 12px 14px;
-    margin-top: 18px;
   }
 }
 

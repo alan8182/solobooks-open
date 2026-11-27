@@ -94,6 +94,32 @@ describe('BossTaxCheatSheet electronic tax bureau cheat sheet', () => {
     expect(wrapper.emitted('markFiled')![0]).toEqual(['dl-stamp-1'])
   })
 
+  it('puts the social insurance guide next to the pending social task, not on filed rows', () => {
+    const makePkg = (status: string) => ({
+      ...defaultPkg,
+      checklist: [
+        ...defaultPkg.checklist,
+        { taxKind: 'social_insurance', name: '社保费申报缴纳（8 月）', deadlineId: 'dl-ss-1', status, dueDate: '2026-08-15' },
+      ],
+    })
+
+    // 未办结的社保行要有「社保怎么申报？」入口（老板按小抄去税局办事）
+    const pending = mount(BossTaxCheatSheet, {
+      props: { pkg: makePkg('pending'), period: '2026-Q3' },
+      global: { stubs: { RouterLink: true } },
+    })
+    expect(pending.text()).toContain('社保费申报缴纳（8 月）')
+    expect(pending.text()).toContain('社保怎么申报？')
+
+    // 已办结的行不再挂指引，避免办完后还引着去申报
+    const filed = mount(BossTaxCheatSheet, {
+      props: { pkg: makePkg('filed'), period: '2026-Q3' },
+      global: { stubs: { RouterLink: true } },
+    })
+    expect(filed.text()).toContain('社保费申报缴纳（8 月）')
+    expect(filed.text()).not.toContain('社保怎么申报？')
+  })
+
   it('displays blocking issues warning box and allows filing VAT, CIT, and exporting financial statements', async () => {
     const pkgWithBlockersAndDeadlines = {
       periodType: 'quarter',
@@ -150,5 +176,126 @@ describe('BossTaxCheatSheet electronic tax bureau cheat sheet', () => {
     const exportBtn = wrapper.findAll('button').find((b) => b.text().includes('一键导出标准财务三表 (XLS)'))!
     await exportBtn.trigger('click')
     expect(wrapper.emitted('exportXls')).toBeDefined()
+  })
+
+  it('orders pending tasks above filed ones and marks done step cards to sink below', () => {
+    const wrapper = mount(BossTaxCheatSheet, {
+      props: {
+        pkg: {
+          ...defaultPkg,
+          vat: { ...defaultPkg.vat, deadline: { deadlineId: 'dl-vat', status: 'filed' } },
+          cit: { ...defaultPkg.cit, deadline: { deadlineId: 'dl-cit', status: 'filed' } },
+          checklist: [
+            { taxKind: 'fin_statements', name: '财务报表报送', deadlineId: 'dl-fin', status: 'filed' },
+            { taxKind: 'stamp_duty', name: '印花税', deadlineId: 'dl-stamp', status: 'filed' },
+            { taxKind: 'iit_withholding', name: '个税扣缴（7 月）', deadlineId: 'dl-iit-7', status: 'pending' },
+            { taxKind: 'culture_fee', name: '文化事业建设费', deadlineId: 'dl-culture', status: 'waived' },
+            { taxKind: 'iit_withholding', name: '个税扣缴（8 月）', deadlineId: 'dl-iit-8', status: 'pending' },
+          ],
+        },
+        period: '2026-Q3',
+      },
+      global: { stubs: { RouterLink: true } },
+    })
+
+    // 步骤 4 仍有未办结事项，不应标为 step-done（保持排在前面）；前三个已办结步骤均标为 step-done（CSS order: 1 下沉）
+    const stepCards = wrapper.findAll('.step-card')
+    expect(stepCards.slice(0, 3).every((c) => c.classes().includes('step-done'))).toBe(true)
+    expect(stepCards[3].classes()).not.toContain('step-done')
+
+    // 其他税种清单内：未完成的排在前面，已办结/免征的沉到后面，且组内保持原顺序
+    const titles = wrapper.findAll('.other-task-title strong').map((el) => el.text())
+    expect(titles).toEqual(['个税扣缴（7 月）', '个税扣缴（8 月）', '印花税', '文化事业建设费'])
+  })
+
+  it('collapses done steps by default with expand toggle and shows celebration when all near-term tasks are done', async () => {
+    const wrapper = mount(BossTaxCheatSheet, {
+      props: {
+        pkg: {
+          ...defaultPkg,
+          vat: { ...defaultPkg.vat, deadline: { deadlineId: 'dl-vat', status: 'filed' } },
+          cit: { ...defaultPkg.cit, deadline: { deadlineId: 'dl-cit', status: 'filed' } },
+          checklist: [
+            { taxKind: 'fin_statements', name: '财务报表报送', deadlineId: 'dl-fin', status: 'filed' },
+            { taxKind: 'stamp_duty', name: '印花税', deadlineId: 'dl-stamp', status: 'filed' },
+          ],
+        },
+        period: '2026-Q3',
+      },
+      global: { stubs: { RouterLink: true } },
+    })
+
+    // 全部近期待办均已办结：顶部展示称赞横幅
+    expect(wrapper.find('.all-done-celebration').exists()).toBe(true)
+    expect(wrapper.find('.celebration-title').text().length).toBeGreaterThan(0)
+
+    // 已办结卡片默认折叠，不直接铺开增值税第 10 栏指引
+    expect(wrapper.text()).not.toContain('第 10 栏【小微企业免税销售额】')
+
+    // 点击增值税卡片的「展开核对」后可回看填报金额，再点「收起」恢复折叠
+    const vatCard = wrapper.findAll('.step-card')[1]
+    const toggleBtn = vatCard.findAll('button').find((b) => b.text().includes('展开核对'))!
+    await toggleBtn.trigger('click')
+    expect(wrapper.text()).toContain('第 10 栏【小微企业免税销售额】')
+    await toggleBtn.trigger('click')
+    expect(wrapper.text()).not.toContain('第 10 栏【小微企业免税销售额】')
+  })
+
+  it('renders the third-party demo as a safe external link', () => {
+    const wrapper = mount(BossTaxCheatSheet, {
+      props: { pkg: defaultPkg, period: '2026-Q3' },
+      global: { stubs: { RouterLink: true } },
+    })
+
+    const link = wrapper.find('a[href*="h5.hzdykj.cn"]')
+    expect(link.exists()).toBe(true)
+    expect(link.attributes('target')).toBe('_blank')
+    expect(link.attributes('rel')).toContain('noopener')
+    expect(link.text()).toContain('第三方')
+  })
+
+  it('switches the VAT instruction to the 填表式 form path when vatMode is form', () => {
+    const wrapper = mount(BossTaxCheatSheet, {
+      props: {
+        pkg: {
+          ...defaultPkg,
+          vat: { ...defaultPkg.vat, uninvoicedPositiveSales: 5000 },
+        },
+        period: '2026-Q3',
+        vatMode: 'form',
+      },
+      global: { stubs: { RouterLink: true } },
+    })
+
+    // 回归：填表式不能再让用户去找「本期销售情况」弹窗
+    expect(wrapper.text()).toContain('报表列表')
+    expect(wrapper.text()).toContain('附1 第 2 列')
+    expect(wrapper.text()).toContain('5,000.00')
+    expect(wrapper.text()).not.toContain('在「本期销售情况」弹窗填入')
+  })
+
+  it('shows the 减免税明细表 checkpoints for 填表式 above the exemption threshold', () => {
+    const wrapper = mount(BossTaxCheatSheet, {
+      props: {
+        pkg: {
+          ...defaultPkg,
+          vat: {
+            ...defaultPkg.vat,
+            totalSales: 350000,
+            isBelowThreshold: false,
+            totalVatPayable: 3500,
+            vatReduction: 7000,
+          },
+          summary: { ...defaultPkg.summary, vatPayable: 3500 },
+        },
+        period: '2026-Q3',
+        vatMode: 'form',
+      },
+      global: { stubs: { RouterLink: true } },
+    })
+
+    expect(wrapper.text()).toContain('减免税申报明细表')
+    expect(wrapper.text()).toContain('7,000.00')
+    expect(wrapper.text()).toContain('3,500.00')
   })
 })

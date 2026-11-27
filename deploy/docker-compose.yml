@@ -14,15 +14,15 @@ services:
       #   docker compose exec -u root postgres chown postgres:postgres /var/lib/postgresql/wal_archive
       - postgres_wal_archive:/var/lib/postgresql/wal_archive
       - ./postgres/init:/docker-entrypoint-initdb.d:ro
-    # D-015：没有基础备份时归档文件零恢复价值，还以 ~4.4G/周 塞满根分区。
-    # /bin/true 让归档器即时"成功"→ pg_wal 正常回收、归档卷不再增长。
-    # 备份方案落地（D-008）时改回真实归档命令并配 pg_basebackup。
+    # D-008：归档卷 → wal-archive-ship.py 上传 COS → 校验后删本地。
+    # 先写 .partial 再原子 mv，避免上传器读到写了一半的段；最终名已存在时用 cmp
+    # 比较，保证归档重试幂等。基础备份见 base-backup-postgres.sh。
     # 注意：注释不能写进下面的折叠块里——块标量内的每一行都是 postgres 参数。
     command: >
       postgres
       -c wal_level=replica
       -c archive_mode=on
-      -c archive_command='/bin/true'
+      -c archive_command='if test ! -f /var/lib/postgresql/wal_archive/%f; then cp %p /var/lib/postgresql/wal_archive/%f.partial && mv /var/lib/postgresql/wal_archive/%f.partial /var/lib/postgresql/wal_archive/%f; else cmp -s %p /var/lib/postgresql/wal_archive/%f; fi'
       -c archive_timeout=300
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-solobooks_owner} -d ${POSTGRES_DB:-solobooks}"]
@@ -53,6 +53,10 @@ services:
       - CORS_ORIGINS=https://solobooks.cn,https://www.solobooks.cn,http://localhost:8080
       - DATABASE_URL=postgresql+asyncpg://${POSTGRES_APP_USER:-solobooks_app}:${POSTGRES_APP_PASSWORD}@postgres:5432/${POSTGRES_DB:-solobooks}
       - MIGRATION_DATABASE_URL=postgresql+psycopg://${POSTGRES_USER:-solobooks_owner}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-solobooks}
+      # 主体永久删除专用连接（数据库属主）：不可变触发器只对属主放行，
+      # 应用角色即使自己设置 solobooks.allow_tenant_purge 也会被拒绝。
+      # 与 MIGRATION_DATABASE_URL 同角色、不同驱动（运行时用 asyncpg）。
+      - TENANT_PURGE_DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-solobooks_owner}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-solobooks}
       - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:?DASHSCOPE_API_KEY is required}
       - ZHIPU_API_KEY=${ZHIPU_API_KEY:-}
       # LLM 供应商（OpenAI 兼容协议）：默认回落到百炼端点，切换 DeepSeek 等在宿主 .env 配置
@@ -64,6 +68,9 @@ services:
       - JWT_SECRET=${JWT_SECRET:?JWT_SECRET is required}
       - WECHAT_APPID=${WECHAT_APPID:-}
       - WECHAT_SECRET=${WECHAT_SECRET:-}
+      # 微信开放平台网站应用（PC 扫码登录）：与小程序、微信支付两套配置相互独立
+      - WECHAT_WEB_APPID=${WECHAT_WEB_APPID:-}
+      - WECHAT_WEB_SECRET=${WECHAT_WEB_SECRET:-}
       - ALIYUN_ACCESS_KEY_ID=${ALIYUN_ACCESS_KEY_ID:-}
       - ALIYUN_ACCESS_KEY_SECRET=${ALIYUN_ACCESS_KEY_SECRET:-}
       - ALIYUN_SMS_SIGN_NAME=${ALIYUN_SMS_SIGN_NAME:-}
@@ -86,11 +93,28 @@ services:
       - ALIPAY_PRIVATE_KEY=${ALIPAY_PRIVATE_KEY:-}
       - ALIPAY_PUBLIC_KEY=${ALIPAY_PUBLIC_KEY:-}
       - ALIPAY_GATEWAY=${ALIPAY_GATEWAY:-}
+      # 微信支付 Native 扫码（第二渠道，docs/billing-runbook.md 微信章节）：
+      # 五项配齐才启用渠道；公钥两可选（未配置回退平台证书运行时拉取）
+      - WECHAT_PAY_MCH_ID=${WECHAT_PAY_MCH_ID:-}
+      - WECHAT_PAY_APP_ID=${WECHAT_PAY_APP_ID:-}
+      - WECHAT_PAY_API_V3_KEY=${WECHAT_PAY_API_V3_KEY:-}
+      - WECHAT_PAY_SERIAL_NO=${WECHAT_PAY_SERIAL_NO:-}
+      - WECHAT_PAY_PRIVATE_KEY=${WECHAT_PAY_PRIVATE_KEY:-}
+      - WECHAT_PAY_PUBLIC_KEY=${WECHAT_PAY_PUBLIC_KEY:-}
+      - WECHAT_PAY_PUBLIC_KEY_ID=${WECHAT_PAY_PUBLIC_KEY_ID:-}
+      - WECHAT_PAY_ORDER_TIMEOUT=${WECHAT_PAY_ORDER_TIMEOUT:-2h}
       # 商业化额度卡口：开源自部署默认 0（不限制）；官方云端 SaaS 设 1 开启免费试用月 10 万 token 限制
       - QUOTA_ENFORCEMENT_ENABLED=${QUOTA_ENFORCEMENT_ENABLED:-0}
     depends_on:
       postgres:
         condition: service_healthy
+    volumes:
+      # 归档件（全账套 XLSX、签发账簿 PDF）必须落在持久卷。否则容器一重建，
+      # backup_records 记录还在、文件全丢，历史归档下载直接 410。
+      - backend_archives:/app/data/archives
+      # 发票电子原件（数电票 XML/PDF/OFD）同理：原件不可变、只增不减，
+      # 卷丢了附件行还在但下载 410（见 docs/finance-core-runbook.md「发票电子原件」）。
+      - backend_attachments:/app/data/attachments
     restart: unless-stopped
     networks:
       - solobooks_net
@@ -123,6 +147,8 @@ services:
 volumes:
   postgres_data:
   postgres_wal_archive:
+  backend_archives:
+  backend_attachments:
 
 networks:
   solobooks_net:

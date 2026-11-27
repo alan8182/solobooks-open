@@ -4,17 +4,26 @@ import { ref, computed, onMounted, watch } from 'vue'
 import { accountingErrorText } from '@/utils/errors'
 import {
   NButton, NTag, NSpace, useMessage, NInput, NSpin, NSelect, NModal, NFormItem,
-  NAlert, NInputNumber, NSwitch,
+  NAlert, NInputNumber, NSwitch, NPopconfirm, NPopover,
 } from 'naive-ui'
 import LegacyImportTab from './legacy-import.vue'
 import TrialBalanceTable from '@/components/business/TrialBalanceTable.vue'
+import FileDropzone from '@/components/business/FileDropzone.vue'
 import * as XLSX from 'xlsx'
 import apiClient from '@/api/client'
-import { getAuthMe, requestStepUp } from '@/api/auth'
+import { getAuthMe, requestStepUp, updateCompany } from '@/api/auth'
 import { useAuthStore } from '@/stores/auth'
+import { useWorkspaceViewStore } from '@/stores/workspaceView'
+import { copyToClipboard } from '@/utils/clipboard'
 import { reportErrorToast } from '@/utils/errorPresenter'
 import { sendVerificationCode } from '@/utils/verificationCode'
 import { SoloFieldHelp } from '@/components/ui'
+import {
+  buildAgencyRequestCopy,
+  shouldShowOpeningBalanceRow,
+  type AgencyRequestScene,
+  type OpeningAccountScope,
+} from '@/utils/openingView'
 import {
   exportOpeningTemplate,
   parseOpeningWorkbook,
@@ -39,11 +48,6 @@ import {
   type TrialBalanceColumns,
   type TrialBalanceRow,
 } from '@/utils/trialBalance'
-import {
-  loadTaxOpeningMemory,
-  saveTaxOpeningMemory,
-  type TaxOpeningMemory,
-} from '@/utils/taxOpeningMemory'
 
 interface BalanceItem {
   id?: string
@@ -67,9 +71,12 @@ type StepUpMode = 'save' | 'reset'
 
 const message = useMessage()
 const authStore = useAuthStore()
+const viewStore = useWorkspaceViewStore()
 
 const loading = ref(false)
 const saving = ref(false)
+const manualEntryExpanded = ref(false)
+const accountScope = ref<OpeningAccountScope>('common')
 const items = ref<BalanceItem[]>([])
 const ytdItems = ref<BalanceItem[]>([])
 // 年初（1 月 1 日）余额快照：只随导入更新、随保存落库，供报表「年初余额」列使用
@@ -99,7 +106,6 @@ const categoryFilter = ref<CategoryFilter>('all')
 const ytdCategoryFilter = ref<YtdCategoryFilter>('all')
 const searchQuery = ref('')
 const onlyFilled = ref(false)
-const taxPanelExpanded = ref(false)
 
 // 短信二次验证与冲销重置状态
 const stepUpVisible = ref(false)
@@ -119,23 +125,31 @@ const startPeriod = computed(() => `${fiscalYear.value}-${startMonth.value}`)
 const startMonthNum = computed(() => parseInt(startMonth.value, 10) || 1)
 const isMidYear = computed(() => startMonthNum.value > 1)
 
-// 税务期初与接续备忘
-const taxMemory = ref<TaxOpeningMemory>({
-  priorYearLoss: 0,
-  prepaidCitTax: 0,
-  migrationNote: '',
-})
+const currentCompany = computed(
+  () => authStore.companies.find((item) => item.company_id === authStore.currentCompanyId) ?? null,
+)
+const isMigrationCompany = computed(() => currentCompany.value?.onboardingType === 'migration')
+const isSmallScaleTaxpayer = computed(
+  () => (currentCompany.value?.taxpayerType || '小规模纳税人') !== '一般纳税人',
+)
+const switchingToZeroStart = ref(false)
 
-function loadLocalTaxMemoryFallback(year: number) {
-  // 读写统一走 utils/taxOpeningMemory.ts，键名按账套+年度隔离，防串账套
-  const memory = loadTaxOpeningMemory(authStore.currentCompanyId, year)
-  if (memory) {
-    taxMemory.value = memory
+async function switchToZeroStart() {
+  const cid = authStore.currentCompanyId
+  if (!cid || switchingToZeroStart.value) return
+  switchingToZeroStart.value = true
+  try {
+    await updateCompany(cid, {
+      onboardingType: 'new',
+      onboardingChangeReason: 'zero_opening_confirmed',
+    })
+    await authStore.fetchProfile()
+    message.success('已转为从零起账，现在可以导入业务数据或记账')
+  } catch (e: unknown) {
+    reportErrorToast(message, e, '切换建账方式失败')
+  } finally {
+    switchingToZeroStart.value = false
   }
-}
-
-function saveLocalTaxMemory(year: number) {
-  saveTaxOpeningMemory(authStore.currentCompanyId, year, taxMemory.value)
 }
 
 watch(startMonth, (m) => {
@@ -195,23 +209,27 @@ function getAccountCategoryLabel(code: string): string {
 
 const balanceItems = computed(() => items.value.filter(i => isBalanceAccount(i.account_code)))
 
+const commonBalanceCount = computed(() =>
+  balanceItems.value.filter((item) =>
+    shouldShowOpeningBalanceRow(item, {
+      scope: 'common',
+      smallScaleTaxpayer: isSmallScaleTaxpayer.value,
+      categoryResolver: getAccountCategory,
+    }),
+  ).length,
+)
+
 const filteredBalanceItems = computed(() => {
-  const q = searchQuery.value.trim().toLowerCase()
-  return balanceItems.value.filter(item => {
-    if (categoryFilter.value !== 'all' && getAccountCategory(item.account_code) !== categoryFilter.value) {
-      return false
-    }
-    if (onlyFilled.value && !(item.debit_balance > 0 || item.credit_balance > 0)) {
-      return false
-    }
-    if (q) {
-      const codeMatch = item.account_code.toLowerCase().includes(q)
-      const nameMatch = (item.account_name || '').toLowerCase().includes(q)
-      const partnerMatch = (item.partner_name || '').toLowerCase().includes(q)
-      if (!codeMatch && !nameMatch && !partnerMatch) return false
-    }
-    return true
-  })
+  return balanceItems.value.filter((item) =>
+    shouldShowOpeningBalanceRow(item, {
+      scope: accountScope.value,
+      category: categoryFilter.value,
+      onlyFilled: onlyFilled.value,
+      query: searchQuery.value,
+      smallScaleTaxpayer: isSmallScaleTaxpayer.value,
+      categoryResolver: getAccountCategory,
+    }),
+  )
 })
 
 const filteredYtdItems = computed(() => {
@@ -237,6 +255,14 @@ const filledBalanceCount = computed(() =>
 )
 const filledYtdCount = computed(() =>
   ytdItems.value.filter(i => (i.debit_balance || 0) > 0 || (i.credit_balance || 0) > 0).length
+)
+const isBlankState = computed(
+  () =>
+    !loading.value &&
+    !isLocked.value &&
+    filledBalanceCount.value === 0 &&
+    filledYtdCount.value === 0 &&
+    !manualEntryExpanded.value,
 )
 
 const totalDebit = computed(() =>
@@ -283,12 +309,6 @@ const filteredReconciliationRows = computed(() => {
 function amountOrDash(val: number): string {
   return Math.abs(Number(val) || 0) < 0.005 ? '—' : formatCurrency(Number(val))
 }
-
-const hasTaxMemoryConfigured = computed(() =>
-  (taxMemory.value.priorYearLoss || 0) > 0 ||
-  (taxMemory.value.prepaidCitTax || 0) > 0 ||
-  Boolean(taxMemory.value.migrationNote?.trim())
-)
 
 // 固定资产卡片对账监控
 const fixedAssetCardCostTotal = computed(() =>
@@ -378,6 +398,19 @@ const expectedPeriod = computed(() =>
   ),
 )
 const expectedPeriodLabel = computed(() => describeExpectedPeriod(expectedPeriod.value))
+const agencyRequestScene = ref<AgencyRequestScene>('check')
+const agencyRequestText = computed(() =>
+  buildAgencyRequestCopy(expectedPeriodLabel.value, currentCompany.value?.name, agencyRequestScene.value),
+)
+
+async function copyAgencyRequest() {
+  const ok = await copyToClipboard(agencyRequestText.value)
+  if (ok) {
+    message.success('已复制发给原代账的要表话术，可直接粘贴到微信')
+  } else {
+    message.warning('复制失败，请手动选中话术复制')
+  }
+}
 const zeroOpening = computed(() => expectedPeriod.value.zeroOpening)
 const hasIncorporationDate = computed(() => Boolean(companyIncorporationDate()))
 // 成立日期优先；没填时退回启用日期，文案必须说成「启用」，不能冒充「成立」。
@@ -435,6 +468,78 @@ const leafAccountOptions = computed(() => {
   }))
 })
 
+const importModalTab = ref<'mapping' | 'preview'>('mapping')
+const suggestedMappingKeys = ref<Record<string, string>>({})
+const highlightedMappingKey = ref('')
+
+function mappingKeyOf(row: UnmatchedOpeningRow): string {
+  return row.originalCode || row.originalName
+}
+
+const unmatchedBalanceRows = computed(() =>
+  unmatchedRows.value.filter(r => r.affects_balance !== false),
+)
+const unmatchedYtdRows = computed(() =>
+  unmatchedRows.value.filter(r => r.affects_balance === false),
+)
+
+const unmatchedMappingGroups = computed(() => {
+  const groups: Array<{ key: 'balance' | 'ytd'; title: string; rows: UnmatchedOpeningRow[] }> = []
+  if (unmatchedBalanceRows.value.length > 0) {
+    groups.push({
+      key: 'balance',
+      title: `影响期初试算平衡（资产 / 负债 / 权益 · ${unmatchedBalanceRows.value.length} 项）`,
+      rows: unmatchedBalanceRows.value,
+    })
+  }
+  if (unmatchedYtdRows.value.length > 0) {
+    groups.push({
+      key: 'ytd',
+      title: `仅影响本年累计发生额（损益类 · ${unmatchedYtdRows.value.length} 项，不影响期初平衡）`,
+      rows: unmatchedYtdRows.value,
+    })
+  }
+  return groups
+})
+
+const mappedBalanceSelectedCount = computed(() =>
+  unmatchedBalanceRows.value.filter(row => Boolean(mappingOverrides.value[mappingKeyOf(row)])).length,
+)
+
+const projectedDiffAfterMapping = computed(() => {
+  if (!importSummary.value) return 0
+  let net = importSummary.value.totalDebit - importSummary.value.totalCredit
+  for (const row of unmatchedBalanceRows.value) {
+    const targetCode = mappingOverrides.value[mappingKeyOf(row)]
+    if (targetCode && !isProfitLossCode(targetCode)) {
+      net += (Number(row.debit) || 0) - (Number(row.credit) || 0)
+    }
+  }
+  return Math.round(net * 100) / 100
+})
+
+const nonDuplicateImportWarnings = computed(() =>
+  (importSummary.value?.warnings || []).filter(
+    w => !w.startsWith('未匹配到系统科目：') && !w.startsWith('已跳过 '),
+  ),
+)
+
+function jumpToUnmatchedMapping(row: TrialBalanceRow) {
+  highlightedMappingKey.value = row.original_code || row.original_name
+  importModalTab.value = 'mapping'
+}
+
+function mappingSourceBadge(row: UnmatchedOpeningRow): {
+  label: string
+  tone: 'warning' | 'info' | 'success'
+} {
+  const key = mappingKeyOf(row)
+  const selected = mappingOverrides.value[key]
+  if (!selected) return { label: '需手选', tone: 'warning' }
+  if (selected === suggestedMappingKeys.value[key]) return { label: '系统建议', tone: 'info' }
+  return { label: '已选定', tone: 'success' }
+}
+
 const importSummary = ref<{
   matchedCount: number
   unmatchedCount: number
@@ -451,6 +556,12 @@ const importPreviewRows = ref<TrialBalanceRow[]>([])
 const importColumns = ref<TrialBalanceColumns | null>(null)
 const savedTrialBalanceRows = ref<TrialBalanceRow[]>([])
 const savedTrialBalanceColumns = ref<TrialBalanceColumns | null>(null)
+const activeTrialBalanceRows = computed(() =>
+  importPreviewRows.value.length > 0 ? importPreviewRows.value : savedTrialBalanceRows.value,
+)
+const activeTrialBalanceColumns = computed(() =>
+  importPreviewRows.value.length > 0 ? importColumns.value : savedTrialBalanceColumns.value,
+)
 
 function triggerUpload() {
   if (isLocked.value) {
@@ -490,6 +601,8 @@ function applyImportResult(parseResult: any) {
   unmatchedRows.value = parseResult.unmatchedRows || []
   importPreviewRows.value = parseResult.previewRows || []
   importColumns.value = parseResult.columns || null
+  importModalTab.value = unmatchedRows.value.length > 0 ? 'mapping' : 'preview'
+  highlightedMappingKey.value = ''
 
   importSummary.value = {
     matchedCount: parseResult.matchedCount,
@@ -500,6 +613,9 @@ function applyImportResult(parseResult: any) {
     isBalanced: parseResult.isBalanced,
     ytdMatchedCount: ytdMatched,
     fixedAssetCount: parseResult.fixedAssets?.length || 0,
+  }
+  if ((parseResult.matchedCount || 0) > 0) {
+    onlyFilled.value = true
   }
 }
 
@@ -546,6 +662,7 @@ function buildPrefilledMappings(
 ): Record<string, string> {
   const persisted = loadOpeningMapping(authStore.currentCompanyId)
   const prefilled: Record<string, string> = {}
+  const suggestions: Record<string, string> = {}
   for (const row of parseResult.unmatchedRows || []) {
     const key = row.originalCode || row.originalName
     if (!key) continue
@@ -558,8 +675,12 @@ function buildPrefilledMappings(
     }
     const direction = row.debit > 0 ? 'debit' : row.credit > 0 ? 'credit' : undefined
     const suggestion = suggestMappingTarget(row.originalCode, row.originalName, allAccounts, direction)
-    if (suggestion) prefilled[key] = suggestion
+    if (suggestion) {
+      prefilled[key] = suggestion
+      suggestions[key] = suggestion
+    }
   }
+  suggestedMappingKeys.value = suggestions
   return prefilled
 }
 
@@ -589,12 +710,7 @@ function applyWorkbook(workbook: XLSX.WorkBook, parsed?: ParseOpeningResult) {
   }
 }
 
-async function onFileSelected(e: Event) {
-  const target = e.target as HTMLInputElement
-  const file = target.files?.[0]
-  target.value = ''
-  if (!file) return
-
+async function processOpeningFile(file: File) {
   importSummary.value = null
   importPreviewRows.value = []
   importColumns.value = null
@@ -633,6 +749,14 @@ async function onFileSelected(e: Event) {
   } finally {
     loading.value = false
   }
+}
+
+async function onFileSelected(e: Event) {
+  const target = e.target as HTMLInputElement
+  const file = target.files?.[0]
+  target.value = ''
+  if (!file) return
+  await processOpeningFile(file)
 }
 
 /** 兜底：表头识别不到期间时，用户手选截止月后重新校验并应用 */
@@ -712,6 +836,9 @@ async function checkPendingImportFromSession() {
     if (Array.isArray(parsed.ytdItems)) {
       ytdItems.value = mergeYtdRows(ytdItems.value, pendingRows(parsed.ytdItems)).rows
     }
+    if (parsed.items.length > 0) {
+      onlyFilled.value = true
+    }
     message.success('已载入从旧账导入带入的期初余额，请核对并试算平衡')
   } catch (e) {
     console.error('Failed to load pending opening import', e)
@@ -740,6 +867,9 @@ async function load() {
     importPreviewRows.value = savedTrialBalanceRows.value
     importColumns.value = savedTrialBalanceColumns.value
     serverLocked.value = Boolean(data.is_locked)
+    onlyFilled.value =
+      serverLocked.value
+      && items.value.some(i => (i.debit_balance || 0) > 0 || (i.credit_balance || 0) > 0)
     voucherNo.value = data.voucher_no || items.value.find(i => i.voucherRef)?.voucherRef || null
 
     // 已保存的建账时间优先；没保存过就跟公司信息里的启用日期对齐，不要一律落到 1 月。
@@ -760,26 +890,6 @@ async function load() {
     } else {
       fixedAssets.value = []
     }
-
-    if (data.tax_memory && typeof data.tax_memory === 'object') {
-      const tm = data.tax_memory
-      const hasServerTax =
-        Number(tm.priorYearLoss || tm.prior_year_loss || 0) > 0 ||
-        Number(tm.prepaidCitTax || tm.prepaid_cit_tax || 0) > 0 ||
-        Boolean(tm.migrationNote || tm.migration_note)
-      if (hasServerTax) {
-        taxMemory.value = {
-          priorYearLoss: Number(tm.priorYearLoss ?? tm.prior_year_loss ?? 0) || 0,
-          prepaidCitTax: Number(tm.prepaidCitTax ?? tm.prepaid_cit_tax ?? 0) || 0,
-          migrationNote: String(tm.migrationNote ?? tm.migration_note ?? ''),
-        }
-      } else {
-        loadLocalTaxMemoryFallback(fiscalYear.value)
-      }
-    } else {
-      loadLocalTaxMemoryFallback(fiscalYear.value)
-    }
-
   } catch {
     message.error('加载期初余额失败')
   } finally {
@@ -804,7 +914,6 @@ function openSaveModal() {
     message.warning('建账年月已变更，这份余额表的期间不再匹配，请重新导入余额表后再生成期初凭证')
     return
   }
-  saveLocalTaxMemory(fiscalYear.value)
   stepUpMode.value = 'save'
   stepUpVisible.value = true
 }
@@ -859,6 +968,7 @@ async function confirmStepUpAction() {
       code.value = ''
       message.success('原期初凭证已红字冲销，现在可以重新编辑或导入期初余额')
       await load()
+      await authStore.fetchProfile().catch(() => {})
       return
     }
 
@@ -900,11 +1010,6 @@ async function confirmStepUpAction() {
           ? importPreviewRows.value
           : undefined,
         trial_balance_columns: importColumns.value || undefined,
-        tax_memory: {
-          prior_year_loss: Number(taxMemory.value.priorYearLoss) || 0,
-          prepaid_cit_tax: Number(taxMemory.value.prepaidCitTax) || 0,
-          migration_note: taxMemory.value.migrationNote?.trim() || '',
-        },
         fixed_assets: fixedAssets.value.length > 0 ? fixedAssets.value : undefined,
       },
       {
@@ -914,11 +1019,11 @@ async function confirmStepUpAction() {
         },
       }
     )
-    saveLocalTaxMemory(fiscalYear.value)
     stepUpVisible.value = false
     code.value = ''
     message.success('期初凭证已生成并过账锁定')
     await load()
+    await authStore.fetchProfile().catch(() => {})
   } catch (e: unknown) {
     reportErrorToast(message, e, '操作失败，请稍后重试')
   } finally {
@@ -993,7 +1098,28 @@ watch(
   (next, prev) => {
     if (next === prev) return
     stepUpVisible.value = false
+    manualEntryExpanded.value = false
+    importSummary.value = null
+    onlyFilled.value = false
     void bootstrapOpeningPage()
+  },
+)
+
+watch(
+  () => reconciliation.value.rows.length,
+  (len) => {
+    if (len === 0 && activeTab.value === 'reconcile') {
+      activeTab.value = 'balance'
+    }
+  },
+)
+
+watch(
+  () => activeTrialBalanceRows.value.length,
+  (len) => {
+    if (len === 0 && activeTab.value === 'trial') {
+      activeTab.value = 'balance'
+    }
   },
 )
 </script>
@@ -1030,17 +1156,14 @@ watch(
               年中建账（{{ startPeriod }}）
             </span>
           </div>
-          <p class="subtitle">
-            将原账套或手工账的科目余额迁入系统，借贷试算平衡后生成不可篡改的系统期初凭证（《小企业会计准则》）。
-          </p>
-          <p v-if="zeroOpening" class="subtitle period-hint">
+          <p v-if="zeroOpening" class="subtitle">
             {{ zeroOpeningHint }}
           </p>
-          <p v-else class="subtitle period-hint">
-            导入的余额表期间应为 {{ expectedPeriodLabel }}：资产负债取期末余额，损益取本年累计发生额。
-            <NButton text size="tiny" type="primary" @click="handleDownloadTemplate">
-              没有现成的表？下载模板
-            </NButton>
+          <p v-else-if="viewStore.isBoss" class="subtitle">
+            把原代账的末级科目余额表（{{ expectedPeriodLabel }}）导进来，系统会自动核对平衡，账目就能连续接上。
+          </p>
+          <p v-else class="subtitle">
+            导入 {{ expectedPeriodLabel }} 末级科目余额表（资产负债取期末余额，损益取本年累计发生额），试算平衡后生成不可篡改的系统期初凭证。
           </p>
         </div>
       </div>
@@ -1066,7 +1189,13 @@ watch(
         <div class="header-divider" />
 
         <div class="action-buttons">
-          <NButton size="medium" secondary :disabled="isLocked" @click="triggerUpload">
+          <NButton
+            size="medium"
+            :type="!isLocked && !isBalanced ? 'primary' : 'default'"
+            :secondary="isLocked || isBalanced"
+            :disabled="isLocked"
+            @click="triggerUpload"
+          >
             <template #icon><i class="ri-upload-2-line" /></template>
             导入余额表
           </NButton>
@@ -1083,7 +1212,8 @@ watch(
           <NButton
             v-else
             size="medium"
-            type="primary"
+            :type="isBalanced ? 'primary' : 'default'"
+            :secondary="!isBalanced"
             :loading="saving"
             :disabled="!isBalanced"
             @click="openSaveModal"
@@ -1095,6 +1225,106 @@ watch(
       </div>
     </div>
 
+    <!-- 空白态：聚焦引导上传原代账科目余额表 -->
+    <NSpin v-if="isBlankState" :show="loading">
+      <div class="surface-card blank-onboarding-card">
+        <div class="blank-onboarding-head">
+          <div>
+            <h3>
+              {{ viewStore.isBoss ? '第一步：把原代账的科目余额表传进来' : `导入科目余额表（期间 ${expectedPeriodLabel}）` }}
+            </h3>
+            <p>
+              {{
+                viewStore.isBoss
+                  ? `向原代账或会计要一份 Excel 版末级科目余额表（截至 ${expectedPeriodLabel}），拖进来系统自动匹配科目与往来明细。`
+                  : '支持主流代账与财务软件导出的 Excel 余额表（资产负债取期末余额，损益取本年累计发生额）。'
+              }}
+            </p>
+          </div>
+          <NButton text size="small" type="primary" @click="handleDownloadTemplate">
+            <template #icon><i class="ri-download-2-line" /></template>
+            下载空白模板
+          </NButton>
+        </div>
+
+        <FileDropzone
+          accept=".xlsx,.xls"
+          icon="ri-file-excel-2-line"
+          title="点击或拖拽原代账科目余额表（.xlsx / .xls）"
+          subtitle="支持金蝶、用友、柠檬云、亿企赢等导出表，自动识别科目编码、名称与借贷金额"
+          :loading="loading"
+          @file="processOpeningFile"
+          @error="message.error($event)"
+        />
+
+        <div class="agency-request-box">
+          <div class="agency-request-head">
+            <div class="agency-request-title-group">
+              <span class="agency-request-label">
+                <i class="ri-chat-3-line" aria-hidden="true" />
+                向原代账要表话术
+              </span>
+              <div class="agency-scene-switch" role="group" aria-label="选择要表沟通场景">
+                <button
+                  type="button"
+                  class="agency-scene-btn"
+                  :class="{ active: agencyRequestScene === 'check' }"
+                  @click="agencyRequestScene = 'check'"
+                >
+                  先要表对账（推荐）
+                </button>
+                <button
+                  type="button"
+                  class="agency-scene-btn"
+                  :class="{ active: agencyRequestScene === 'handover' }"
+                  @click="agencyRequestScene = 'handover'"
+                >
+                  亲戚接手交接
+                </button>
+              </div>
+            </div>
+            <NButton size="tiny" type="primary" secondary @click="copyAgencyRequest">
+              <template #icon><i class="ri-file-copy-line" /></template>
+              一键复制话术
+            </NButton>
+          </div>
+          <p class="agency-request-preview">{{ agencyRequestText }}</p>
+          <div class="agency-request-tip-row">
+            <span class="agency-request-tip">
+              沟通技巧：先礼后兵，尽量别直接提「换了新代账/软件」引发拖延；拿到 Excel 直接拖入上方即可。
+            </span>
+            <NPopover trigger="click" placement="top-end" :style="{ maxWidth: '340px' }">
+              <template #trigger>
+                <button type="button" class="agency-help-trigger">对方拖延不给怎么办？</button>
+              </template>
+              <ul class="agency-help-popover">
+                <li><strong>优先要电子版</strong>：只要带末级明细的 Excel 科目余额表即可导入，发消息时不要附带本页面截图。</li>
+                <li><strong>依法要求移交</strong>：依据《代理记账管理办法》第 12 条，终止合作时原代账必须交接账务资料；有代理记账许可证的可向当地财政局反馈，无证代账可向市场监管（12315）投诉。</li>
+                <li><strong>交接后改权限</strong>：拿到资料后，建议尽快在电子税务局变更财务负责人及办税员。</li>
+              </ul>
+            </NPopover>
+          </div>
+        </div>
+
+        <div class="blank-onboarding-footer">
+          <NButton size="small" secondary @click="manualEntryExpanded = true">
+            <template #icon><i class="ri-edit-line" /></template>
+            手工填写常用科目（{{ commonBalanceCount }} 项）
+          </NButton>
+          <NPopconfirm v-if="isMigrationCompany" @positive-click="switchToZeroStart">
+            <template #trigger>
+              <NButton size="small" quaternary :loading="switchingToZeroStart">
+                原代账一直零申报、无历史余额？转为从零起账
+              </NButton>
+            </template>
+            确认该账套无历史科目余额并转为「从零起账」？切换后将解除导入与记账限制（系统会记录本次变更审计日志）。
+          </NPopconfirm>
+        </div>
+      </div>
+    </NSpin>
+
+    <!-- 已导入 / 手工填表 / 已锁定工作台 -->
+    <template v-else>
     <!-- 吸顶试算平衡监控栏 -->
     <div
       class="balance-summary-bar"
@@ -1107,17 +1337,17 @@ watch(
     >
       <div class="summary-metrics">
         <div class="metric-item">
-          <span class="metric-label">资产负债借方合计</span>
+          <span class="metric-label">期初借方合计</span>
           <span class="metric-value">¥ {{ formatCurrency(totalDebit) }}</span>
         </div>
         <div class="metric-divider" />
         <div class="metric-item">
-          <span class="metric-label">资产负债贷方合计</span>
+          <span class="metric-label">期初贷方合计</span>
           <span class="metric-value">¥ {{ formatCurrency(totalCredit) }}</span>
         </div>
         <div class="metric-divider" />
         <div class="metric-item">
-          <span class="metric-label">借贷试算差额</span>
+          <span class="metric-label">{{ viewStore.isBoss ? '借贷差额' : '借贷试算差额' }}</span>
           <span
             class="metric-value"
             :class="{
@@ -1135,13 +1365,28 @@ watch(
         <template v-if="isMidYear">
           <div class="metric-divider" />
           <div class="metric-item">
-            <span class="metric-label">{{ ytdStartMonth }}-{{ Math.max(1, startMonthNum - 1) }}月累计净损益（自动转入 3103）</span>
-            <span
-              class="metric-value"
-              :class="ytdNetProfit >= 0 ? 'text-income' : 'text-expense'"
-            >
-              {{ ytdNetProfit >= 0 ? '+' : '' }}¥ {{ formatCurrency(ytdNetProfit) }}
-            </span>
+            <template v-if="filledYtdCount > 0 && Math.abs(ytdNetProfit) < 0.01">
+              <span class="metric-label">
+                {{ ytdStartMonth }}-{{ Math.max(1, startMonthNum - 1) }}月损益累计
+              </span>
+              <span class="metric-value">
+                已填 {{ filledYtdCount }} 项
+                <small class="metric-sub-note">原账已结转至 3103</small>
+              </span>
+            </template>
+            <template v-else>
+              <span class="metric-label">
+                {{ viewStore.isBoss
+                  ? `${ytdStartMonth}-${Math.max(1, startMonthNum - 1)}月累计净利（自动结转）`
+                  : `${ytdStartMonth}-${Math.max(1, startMonthNum - 1)}月累计净损益（自动转入 3103）` }}
+              </span>
+              <span
+                class="metric-value"
+                :class="ytdNetProfit >= 0 ? 'text-income' : 'text-expense'"
+              >
+                {{ ytdNetProfit >= 0 ? '+' : '' }}¥ {{ formatCurrency(ytdNetProfit) }}
+              </span>
+            </template>
           </div>
         </template>
       </div>
@@ -1151,17 +1396,23 @@ watch(
           <i class="ri-shield-check-line" />
           期初已过账锁定
         </span>
-        <span v-else-if="isBalanced" class="verdict-badge badge-balanced">
-          <i class="ri-checkbox-circle-line" />
-          借贷平衡 · 满足建账标准
-        </span>
+        <template v-else-if="isBalanced">
+          <span class="verdict-badge badge-balanced">
+            <i class="ri-checkbox-circle-line" />
+            {{ viewStore.isBoss ? '已配平 · 可以生成期初' : '借贷平衡 · 满足建账标准' }}
+          </span>
+          <NButton type="primary" size="small" :loading="saving" @click="openSaveModal">
+            <template #icon><i class="ri-shield-check-line" /></template>
+            生成期初凭证
+          </NButton>
+        </template>
         <span v-else-if="totalDebit === 0 && totalCredit === 0" class="verdict-badge badge-empty">
           <i class="ri-information-line" />
           待录入或导入期初余额
         </span>
         <span v-else class="verdict-badge badge-unbalanced">
           <i class="ri-error-warning-line" />
-          借贷未平 · 差额 ¥{{ formatCurrency(Math.abs(balanceDiff)) }}
+          {{ viewStore.isBoss ? '尚未配平' : '借贷未平' }} · 差额 ¥{{ formatCurrency(Math.abs(balanceDiff)) }}
         </span>
       </div>
 
@@ -1179,81 +1430,6 @@ watch(
           有 {{ unmatchedBalanceImpact.count }} 个未匹配的资产/负债科目（合计
           ¥{{ formatCurrency(Math.abs(unmatchedBalanceImpact.net)) }}）未计入合计，其余差额仍需手工核对。
         </span>
-      </div>
-    </div>
-
-    <!-- 税务期初与申报衔接备忘（可折叠工作台卡片） -->
-    <div class="surface-card tax-memory-section">
-      <button
-        type="button"
-        class="tax-header-toggle"
-        @click="taxPanelExpanded = !taxPanelExpanded"
-      >
-        <div class="tax-header-left">
-          <i class="ri-bank-line tax-icon" />
-          <div>
-            <span class="tax-title">税务期初与申报衔接备忘</span>
-            <span class="tax-subtitle">以前年度可弥补亏损 · 本年已预缴企业所得税 · 换账套抵扣依据</span>
-          </div>
-        </div>
-        <div class="tax-header-right">
-          <span v-if="hasTaxMemoryConfigured" class="tax-status-chip chip-active">
-            <i class="ri-check-line" />
-            已配置抵扣备忘
-          </span>
-          <span v-else class="tax-status-chip">选填</span>
-          <i :class="taxPanelExpanded ? 'ri-arrow-up-s-line' : 'ri-arrow-down-s-line'" class="collapse-arrow" />
-        </div>
-      </button>
-
-      <div v-show="taxPanelExpanded" class="tax-body">
-        <div class="tax-memory-grid">
-          <div class="tax-field">
-            <label class="field-title">以前年度可弥补亏损额（元）</label>
-            <NInputNumber
-              v-model:value="taxMemory.priorYearLoss"
-              :disabled="isLocked"
-              :min="0"
-              :precision="2"
-              :show-button="false"
-              placeholder="0.00"
-              size="medium"
-              @update:value="saveLocalTaxMemory(fiscalYear)"
-            >
-              <template #prefix>¥</template>
-            </NInputNumber>
-            <span class="field-desc">用于企业所得税预缴及汇算清缴时抵扣应纳税所得额（A200000 第 24 行）。</span>
-          </div>
-
-          <div class="tax-field">
-            <label class="field-title">本年已预缴企业所得税额（元）</label>
-            <NInputNumber
-              v-model:value="taxMemory.prepaidCitTax"
-              :disabled="isLocked"
-              :min="0"
-              :precision="2"
-              :show-button="false"
-              placeholder="0.00"
-              size="medium"
-              @update:value="saveLocalTaxMemory(fiscalYear)"
-            >
-              <template #prefix>¥</template>
-            </NInputNumber>
-            <span class="field-desc">年中迁入时前序季度已在税务局实际预缴的所得税额（A200000 第 30 行）。</span>
-          </div>
-
-          <div class="tax-field">
-            <label class="field-title">账套迁入备忘说明（选填）</label>
-            <NInput
-              v-model:value="taxMemory.migrationNote"
-              :disabled="isLocked"
-              placeholder="例如：2026年6月由代账公司/金蝶云迁入"
-              size="medium"
-              @update:value="saveLocalTaxMemory(fiscalYear)"
-            />
-            <span class="field-desc">随期初配置一并持久化至企业档案，供后续结账与审计备查。</span>
-          </div>
-        </div>
       </div>
     </div>
 
@@ -1319,7 +1495,7 @@ watch(
             </button>
 
             <button
-              v-if="savedTrialBalanceRows.length > 0"
+              v-if="activeTrialBalanceRows.length > 0"
               type="button"
               class="sheet-tab-btn"
               :class="{ active: activeTab === 'trial' }"
@@ -1327,11 +1503,11 @@ watch(
             >
               <i class="ri-table-line" />
               <span>科目余额表（原表）</span>
-              <span class="tab-count">{{ savedTrialBalanceRows.length }} 行</span>
+              <span class="tab-count">{{ activeTrialBalanceRows.length }} 行</span>
             </button>
 
             <button
-              v-if="isMidYear || yearStartItems.length > 0"
+              v-if="reconciliation.rows.length > 0 && (isMidYear || yearStartItems.length > 0)"
               type="button"
               class="sheet-tab-btn"
               :class="{ active: activeTab === 'reconcile' }"
@@ -1344,6 +1520,24 @@ watch(
           </div>
 
           <div class="toolbar-right">
+            <NButton
+              v-if="importSummary && !isLocked"
+              size="small"
+              secondary
+              :type="unmatchedRows.length > 0 ? 'warning' : 'default'"
+              @click="importModalVisible = true"
+            >
+              <template #icon><i class="ri-file-list-3-line" /></template>
+              {{ unmatchedRows.length > 0 ? `调整映射（${unmatchedRows.length}）` : '查看导入报告' }}
+            </NButton>
+            <NButton
+              v-if="manualEntryExpanded && filledBalanceCount === 0 && filledYtdCount === 0 && !isLocked"
+              size="small"
+              quaternary
+              @click="manualEntryExpanded = false"
+            >
+              返回导入引导
+            </NButton>
             <NInput
               v-if="activeTab === 'balance' || activeTab === 'ytd'"
               v-model:value="searchQuery"
@@ -1366,13 +1560,32 @@ watch(
         <div class="sub-filter-bar">
           <template v-if="activeTab === 'balance'">
             <div class="category-pills">
+              <div class="scope-switch" role="group" aria-label="科目范围">
+                <button
+                  type="button"
+                  class="pill-btn"
+                  :class="{ active: accountScope === 'common' }"
+                  @click="accountScope = 'common'"
+                >
+                  常用科目（{{ commonBalanceCount }}）
+                </button>
+                <button
+                  type="button"
+                  class="pill-btn"
+                  :class="{ active: accountScope === 'all' }"
+                  @click="accountScope = 'all'"
+                >
+                  全部科目（{{ balanceItems.length }}）
+                </button>
+              </div>
+              <span class="pill-divider" />
               <button
                 type="button"
                 class="pill-btn"
                 :class="{ active: categoryFilter === 'all' }"
                 @click="categoryFilter = 'all'"
               >
-                全部（{{ balanceItems.length }}）
+                全部分类
               </button>
               <button
                 type="button"
@@ -1401,7 +1614,11 @@ watch(
             </div>
             <span class="rule-hint">
               <i class="ri-information-line" />
-              同行借贷自动互斥；应收/应付等往来科目可填写客商名称
+              {{
+                viewStore.isBoss
+                  ? '输入任意一侧金额即可；应收/应付可填写客户或供应商名称'
+                  : '同行借贷自动互斥；应收/应付等往来科目可填写客商名称'
+              }}
             </span>
           </template>
 
@@ -1441,7 +1658,7 @@ watch(
           <template v-else-if="activeTab === 'trial'">
             <span class="rule-hint">
               <i class="ri-information-line" />
-              导入时保存的原表快照，只读核对；不随手工调整变化，也不参与凭证与报表取数。
+              原表逐行核对快照（只读，不随手工调整变化，也不参与凭证与报表取数）。
             </span>
           </template>
 
@@ -1477,7 +1694,9 @@ watch(
               >
                 <td class="col-code">
                   <span>{{ item.account_code }}</span>
-                  <span v-if="item.originalCode" class="col-code-orig">原 {{ item.originalCode }}</span>
+                  <span v-if="item.originalCode && item.originalCode !== item.account_code" class="col-code-orig">
+                    原 {{ item.originalCode }}
+                  </span>
                 </td>
                 <td class="col-name">
                   <span class="acct-name-text">{{ item.account_name || item.account_code }}</span>
@@ -1491,11 +1710,12 @@ watch(
                     {{ isCreditNormal(item.account_code) ? '贷' : '借' }}
                   </span>
                 </td>
-                <td class="col-partner">
+                <td class="col-partner" :title="item.partner_name || ''">
                   <NInput
                     v-if="supportsPartner(item.account_code)"
                     v-model:value="item.partner_name"
                     :disabled="isLocked"
+                    :input-props="{ title: item.partner_name || '' }"
                     placeholder="客户或供应商名称"
                     size="small"
                   />
@@ -1567,7 +1787,9 @@ watch(
               >
                 <td class="col-code">
                   <span>{{ item.account_code }}</span>
-                  <span v-if="item.originalCode" class="col-code-orig">原 {{ item.originalCode }}</span>
+                  <span v-if="item.originalCode && item.originalCode !== item.account_code" class="col-code-orig">
+                    原 {{ item.originalCode }}
+                  </span>
                 </td>
                 <td class="col-name">
                   <span class="acct-name-text">{{ item.account_name || item.account_code }}</span>
@@ -1632,8 +1854,8 @@ watch(
         <!-- 表格 3：科目余额表原表快照（只读，不参与凭证/报表取数） -->
         <div v-else-if="activeTab === 'trial'" class="table-container">
           <TrialBalanceTable
-            :rows="savedTrialBalanceRows"
-            :columns="savedTrialBalanceColumns"
+            :rows="activeTrialBalanceRows"
+            :columns="activeTrialBalanceColumns"
             max-height="62vh"
           />
         </div>
@@ -1773,6 +1995,23 @@ watch(
       </div>
     </NSpin>
 
+    <!-- 手工模式下的零余额逃生口（沉底展示） -->
+    <div v-if="isMigrationCompany && !isLocked && filledBalanceCount === 0 && filledYtdCount === 0" class="migration-zero-bar">
+      <div class="migration-zero-text">
+        <i class="ri-information-line" aria-hidden="true" />
+        <span>如果原代账此前一直零申报、确实无历史科目余额，或建账时误选了从其他代账转入，可转为从零起账。</span>
+      </div>
+      <NPopconfirm @positive-click="switchToZeroStart">
+        <template #trigger>
+          <NButton size="small" secondary :loading="switchingToZeroStart">
+            无历史余额，转为从零起账
+          </NButton>
+        </template>
+        确认该账套无历史科目余额并转为「从零起账」？切换后将解除导入与记账限制（系统会记录本次变更审计日志）。
+      </NPopconfirm>
+    </div>
+    </template>
+
     <!-- 导入诊断反馈弹窗 -->
     <NModal
       v-model:show="importModalVisible"
@@ -1813,99 +2052,154 @@ watch(
 
       <div v-else-if="importSummary" class="import-report-content">
         <NAlert :type="importSummary.isBalanced ? 'success' : 'warning'" :bordered="false">
-          {{ importSummary.isBalanced ? '导入成功且借贷已平衡！核对无误后即可生成期初凭证。' : '数据已填入，但资产负债期初尚有借贷差额：先确认下方映射并重新计算，平衡后才能完成核对；也可关闭本窗后在表格中手工调整。' }}
+          {{
+            importSummary.isBalanced
+              ? '导入成功且借贷已平衡！核对无误后即可生成期初凭证。'
+              : '已识别的数据已填入主表；请优先在「待确认映射」指定未匹配科目并重算，也可随时去主表手工调整。'
+          }}
         </NAlert>
 
-        <div class="import-stats-box">
-          <div class="stat-line">
-            <span>成功匹配并填入科目：</span>
-            <strong>{{ importSummary.matchedCount }} 个</strong>
+        <div class="import-kpi-grid">
+          <div class="import-kpi-card">
+            <span class="kpi-label">期初借方导入</span>
+            <strong class="kpi-value">¥ {{ formatCurrency(importSummary.totalDebit) }}</strong>
           </div>
-          <div v-if="importSummary.ytdMatchedCount > 0" class="stat-line">
-            <span>其中年中损益累计科目：</span>
-            <strong>{{ importSummary.ytdMatchedCount }} 个</strong>
+          <div class="import-kpi-card">
+            <span class="kpi-label">期初贷方导入</span>
+            <strong class="kpi-value">¥ {{ formatCurrency(importSummary.totalCredit) }}</strong>
           </div>
-          <div v-if="importSummary.fixedAssetCount > 0" class="stat-line">
-            <span>成功解析固定资产卡片：</span>
-            <strong>{{ importSummary.fixedAssetCount }} 张</strong>
-          </div>
-          <div class="stat-line">
-            <span>期初借方导入合计：</span>
-            <strong>¥ {{ formatCurrency(importSummary.totalDebit) }}</strong>
-          </div>
-          <div class="stat-line">
-            <span>期初贷方导入合计：</span>
-            <strong>¥ {{ formatCurrency(importSummary.totalCredit) }}</strong>
-          </div>
-          <div v-if="!importSummary.isBalanced" class="stat-line">
-            <span>未平差额：</span>
-            <strong class="text-expense">¥ {{ formatCurrency(Math.abs(importSummary.totalDebit - importSummary.totalCredit)) }}</strong>
-          </div>
-          <div v-if="!importSummary.isBalanced && unmatchedBalanceImpact.count > 0" class="stat-line">
-            <span>其中未匹配的资产/负债科目：</span>
-            <strong class="text-expense">
-              {{ unmatchedBalanceImpact.count }} 项 · ¥ {{ formatCurrency(Math.abs(unmatchedBalanceImpact.net)) }}
-              {{ diffExplainedByUnmatched ? '（差额全部由此产生）' : '' }}
+          <div class="import-kpi-card">
+            <span class="kpi-label">试算差额</span>
+            <strong
+              class="kpi-value"
+              :class="importSummary.isBalanced ? 'text-income' : 'text-expense'"
+            >
+              ¥ {{ formatCurrency(Math.abs(importSummary.totalDebit - importSummary.totalCredit)) }}
             </strong>
+            <span class="kpi-sub">
+              {{
+                importSummary.isBalanced
+                  ? '借贷已平衡'
+                  : diffExplainedByUnmatched
+                    ? `全部来自 ${unmatchedBalanceImpact.count} 项待映射`
+                    : unmatchedBalanceImpact.count > 0
+                      ? `含 ${unmatchedBalanceImpact.count} 项未匹配科目`
+                      : '请核对原表借贷'
+              }}
+            </span>
+          </div>
+          <div class="import-kpi-card">
+            <span class="kpi-label">匹配与入账</span>
+            <strong class="kpi-value">已入账 {{ importSummary.matchedCount }} 个</strong>
+            <span class="kpi-sub">
+              {{
+                [
+                  importSummary.ytdMatchedCount > 0 ? `损益 ${importSummary.ytdMatchedCount}` : '',
+                  unmatchedRows.length > 0 ? `待映射 ${unmatchedRows.length}` : '',
+                  importSummary.fixedAssetCount > 0 ? `固资 ${importSummary.fixedAssetCount}` : '',
+                ].filter(Boolean).join(' · ') || '科目全部匹配'
+              }}
+            </span>
           </div>
         </div>
 
-        <div v-if="importPreviewRows.length > 0" class="import-preview-section">
-          <div class="import-preview-header">
-            <span class="warning-title">原表逐行核对</span>
+        <div
+          v-if="unmatchedRows.length > 0 || importPreviewRows.length > 0"
+          class="import-modal-tabs"
+          role="tablist"
+          aria-label="导入结果核对视图"
+        >
+          <button
+            v-if="unmatchedRows.length > 0"
+            type="button"
+            role="tab"
+            :aria-selected="importModalTab === 'mapping'"
+            class="import-modal-tab"
+            :class="{ active: importModalTab === 'mapping' }"
+            @click="importModalTab = 'mapping'"
+          >
+            <span>待确认映射</span>
+            <span class="tab-badge tone-warning">{{ unmatchedRows.length }}</span>
+          </button>
+          <button
+            v-if="importPreviewRows.length > 0"
+            type="button"
+            role="tab"
+            :aria-selected="importModalTab === 'preview'"
+            class="import-modal-tab"
+            :class="{ active: importModalTab === 'preview' }"
+            @click="importModalTab = 'preview'"
+          >
+            <span>原表逐行核对</span>
+            <span class="tab-badge">{{ importPreviewRows.length }}</span>
+          </button>
+        </div>
+
+        <!-- Tab 1: 未匹配科目在线映射（影响平衡的资产/负债优先） -->
+        <div v-if="importModalTab === 'mapping' && unmatchedRows.length > 0" class="mapping-box">
+          <div class="mapping-box-header">
             <span class="mapping-tip">
-              金额直接取自原表；被层级去重、零余额跳过的行也保留，可逐行对照
+              标注「系统建议」的已按科目名称预填，请核对或补选后点击底部「按当前映射重新计算」；支持直接搜索系统科目。
+            </span>
+            <span
+              v-if="unmatchedBalanceRows.length > 0"
+              class="mapping-preview-pill"
+              :class="{ balanced: Math.abs(projectedDiffAfterMapping) <= 0.01 }"
+            >
+              已指定 {{ mappedBalanceSelectedCount }} / {{ unmatchedBalanceRows.length }} 项资产负债映射 · 预计重算后差额 ¥ {{ formatCurrency(Math.abs(projectedDiffAfterMapping)) }}
             </span>
           </div>
+          <div class="mapping-list">
+            <div v-for="group in unmatchedMappingGroups" :key="group.key" class="mapping-group">
+              <div class="mapping-group-title">{{ group.title }}</div>
+              <div
+                v-for="row in group.rows"
+                :key="mappingKeyOf(row)"
+                class="mapping-item"
+                :class="{ 'mapping-item-highlighted': highlightedMappingKey === mappingKeyOf(row) }"
+              >
+                <div class="mapping-source">
+                  <span class="source-code">{{ row.originalCode || '—' }}</span>
+                  <span class="source-name" :title="row.originalName">{{ row.originalName || '—' }}</span>
+                  <span class="source-amount">
+                    ({{ row.debit > 0 ? `借 ¥${formatCurrency(row.debit)}` : `贷 ¥${formatCurrency(row.credit)}` }})
+                  </span>
+                </div>
+                <span class="mapping-badge" :class="`tone-${mappingSourceBadge(row).tone}`">
+                  {{ mappingSourceBadge(row).label }}
+                </span>
+                <i class="ri-arrow-right-line mapping-arrow" />
+                <NSelect
+                  v-model:value="mappingOverrides[mappingKeyOf(row)]"
+                  :options="leafAccountOptions"
+                  filterable
+                  clearable
+                  placeholder="搜索或指定本账套科目"
+                  size="small"
+                  style="width: 260px;"
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab 2: 原表逐行核对（默认隐藏 0.00 行，支持按状态筛选与搜索） -->
+        <div v-else-if="importPreviewRows.length > 0" class="import-preview-section">
           <TrialBalanceTable
             :rows="importPreviewRows"
             :columns="importColumns"
-            max-height="42vh"
+            :actionable-unmatched="unmatchedRows.length > 0"
+            max-height="46vh"
+            @select-unmatched="jumpToUnmatchedMapping"
           />
         </div>
 
-        <div v-if="importSummary.warnings.length" class="warnings-box">
-          <span class="warning-title">未匹配或跳过项（{{ importSummary.warnings.length }}）：</span>
+        <div v-if="nonDuplicateImportWarnings.length" class="warnings-box">
+          <span class="warning-title">其他提示（{{ nonDuplicateImportWarnings.length }}）：</span>
           <ul class="warning-list">
-            <li v-for="w in importSummary.warnings.slice(0, 5)" :key="w">{{ w }}</li>
-            <li v-if="importSummary.warnings.length > 5">...其余 {{ importSummary.warnings.length - 5 }} 项已略过</li>
+            <li v-for="w in nonDuplicateImportWarnings.slice(0, 5)" :key="w">{{ w }}</li>
+            <li v-if="nonDuplicateImportWarnings.length > 5">...其余 {{ nonDuplicateImportWarnings.length - 5 }} 项</li>
           </ul>
-        </div>
-
-        <!-- 未匹配科目在线映射 -->
-        <div v-if="unmatchedRows.length > 0" class="mapping-box">
-          <div class="mapping-box-header">
-            <span class="warning-title">未匹配科目映射（{{ unmatchedRows.length }} 项）：</span>
-            <span class="mapping-tip">带建议的映射已预填，请逐项确认后重新计算；无建议项需手动指定</span>
-          </div>
-          <div class="mapping-list">
-            <div
-              v-for="row in unmatchedRows"
-              :key="row.originalCode || row.originalName"
-              class="mapping-item"
-            >
-              <div class="mapping-source">
-                <span class="source-code">{{ row.originalCode || '—' }}</span>
-                <span class="source-name">{{ row.originalName || '—' }}</span>
-                <span class="source-amount">({{ row.debit > 0 ? `借 ¥${formatCurrency(row.debit)}` : `贷 ¥${formatCurrency(row.credit)}` }})</span>
-              </div>
-              <i class="ri-arrow-right-line mapping-arrow" />
-              <NSelect
-                v-model:value="mappingOverrides[row.originalCode || row.originalName]"
-                :options="leafAccountOptions"
-                filterable
-                clearable
-                placeholder="指定本账套科目"
-                size="small"
-                style="width: 220px;"
-              />
-            </div>
-          </div>
-          <div class="mapping-actions">
-            <NButton size="small" type="primary" secondary @click="reapplyMapping">
-              按指定映射重新计算
-            </NButton>
-          </div>
         </div>
       </div>
       <template #footer>
@@ -1913,10 +2207,26 @@ watch(
           <template v-if="periodCheck && !periodCheck.ok">
             <NButton @click="importModalVisible = false">放弃本次导入</NButton>
           </template>
+          <template v-else-if="importSummary && !importSummary.isBalanced">
+            <NButton @click="importModalVisible = false">保留已填数据，去主表手工调整</NButton>
+            <NButton
+              v-if="unmatchedRows.length > 0"
+              type="primary"
+              :loading="loading"
+              @click="reapplyMapping"
+            >
+              按当前映射重新计算
+            </NButton>
+          </template>
           <template v-else>
-            <span v-if="importSummary && !importSummary.isBalanced" class="mapping-tip">
-              尚有借贷差额，平衡后才能完成核对
-            </span>
+            <NButton
+              v-if="unmatchedRows.length > 0"
+              secondary
+              :loading="loading"
+              @click="reapplyMapping"
+            >
+              按当前映射重新计算
+            </NButton>
             <NButton type="primary" :disabled="!importSummary?.isBalanced" @click="importModalVisible = false">
               完成核对
             </NButton>
@@ -2015,12 +2325,12 @@ watch(
   font-weight: 500;
 }
 .pill-locked {
-  background: #eaf7f1;
-  color: #0f7354;
+  background: var(--solo-income-bg);
+  color: var(--solo-income);
 }
 .pill-midyear {
-  background: #edf3ff;
-  color: #1747b0;
+  background: var(--solo-info-bg);
+  color: var(--solo-primary);
 }
 .page-header-right {
   flex-wrap: wrap;
@@ -2033,13 +2343,155 @@ watch(
 .header-divider {
   width: 1px;
   height: 22px;
-  background: #dde3ea;
+  background: var(--solo-border);
   margin: 0 2px;
 }
 .action-buttons {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+/* 空白态聚焦引导卡 */
+.blank-onboarding-card {
+  padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.blank-onboarding-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.blank-onboarding-head h3 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--solo-text-primary);
+}
+.blank-onboarding-head p {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: var(--solo-text-secondary);
+  line-height: 1.5;
+}
+.agency-request-box {
+  padding: 12px 14px;
+  border-radius: var(--solo-radius);
+  background: var(--solo-bg-soft);
+  border: 1px solid var(--solo-border-light);
+}
+.agency-request-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.agency-request-title-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.agency-scene-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: var(--solo-radius-sm);
+  background: var(--solo-bg-card);
+  border: 1px solid var(--solo-border-light);
+}
+.agency-scene-btn {
+  border: none;
+  background: transparent;
+  padding: 3px 9px;
+  border-radius: calc(var(--solo-radius-sm) - 2px);
+  font-size: 12px;
+  line-height: 1.3;
+  color: var(--solo-text-secondary);
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+.agency-scene-btn:hover {
+  color: var(--solo-text-primary);
+}
+.agency-scene-btn.active {
+  background: var(--solo-bg-blue-soft);
+  color: var(--solo-primary);
+  font-weight: 600;
+}
+.agency-request-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--solo-text-primary);
+}
+.agency-request-label i {
+  color: var(--solo-primary);
+}
+.agency-request-preview {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--solo-text-secondary);
+  white-space: pre-line;
+}
+.agency-request-tip-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--solo-border-light);
+}
+.agency-request-tip {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--solo-text-muted);
+}
+.agency-help-trigger {
+  border: none;
+  background: transparent;
+  padding: 0;
+  font-size: 12px;
+  color: var(--solo-primary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.agency-help-trigger:hover {
+  text-decoration: underline;
+}
+.agency-help-popover {
+  margin: 0;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--solo-text-secondary);
+}
+.agency-help-popover strong {
+  color: var(--solo-text-primary);
+}
+.blank-onboarding-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding-top: 8px;
+  border-top: 1px solid var(--solo-border-light);
 }
 
 /* 吸顶试算平衡监控栏 */
@@ -2053,21 +2505,21 @@ watch(
   gap: 16px;
   flex-wrap: wrap;
   padding: 14px 20px;
-  border-radius: 12px;
+  border-radius: var(--solo-radius-lg);
   margin-bottom: 16px;
-  background: #ffffff;
-  border: 1px solid #dde3ea;
-  box-shadow: 0 4px 16px rgba(24, 34, 48, 0.05);
+  background: var(--solo-bg-card);
+  border: 1px solid var(--solo-border);
+  box-shadow: var(--solo-shadow-sm);
   transition: border-color 0.2s ease, background-color 0.2s ease;
 }
 .balance-summary-bar.is-balanced,
 .balance-summary-bar.is-locked {
-  border-color: rgba(18, 128, 92, 0.35);
-  background: #fcfefd;
+  border-color: var(--solo-income);
+  background: var(--solo-income-bg);
 }
 .balance-summary-bar.is-unbalanced {
-  border-color: rgba(199, 68, 68, 0.38);
-  background: #fffcfc;
+  border-color: var(--solo-expense);
+  background: var(--solo-expense-bg);
 }
 
 .summary-metrics {
@@ -2083,29 +2535,42 @@ watch(
 }
 .metric-label {
   font-size: 12px;
-  color: var(--solo-text-secondary, #586474);
+  color: var(--solo-text-secondary);
 }
 .metric-value {
   font-size: 18px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
-  color: var(--solo-text-primary, #182230);
+  color: var(--solo-text-primary);
 }
 .diff-side-hint {
   font-size: 12px;
   font-weight: 500;
 }
+.metric-sub-note {
+  margin-left: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--solo-text-secondary);
+}
 .metric-divider {
   width: 1px;
   height: 28px;
-  background: #edf0f4;
+  background: var(--solo-border-light);
+}
+
+.summary-verdict {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 
 .text-income {
-  color: #0f7354 !important;
+  color: var(--solo-income) !important;
 }
 .text-expense {
-  color: #bd3d3d !important;
+  color: var(--solo-expense) !important;
 }
 
 .verdict-badge {
@@ -2113,18 +2578,18 @@ watch(
   align-items: center;
   gap: 6px;
   padding: 6px 12px;
-  border-radius: 999px;
+  border-radius: var(--solo-radius-pill);
   font-size: 12px;
   font-weight: 600;
 }
 .badge-balanced,
 .badge-locked {
-  background: #eaf7f1;
-  color: #0f7354;
+  background: var(--solo-income-bg);
+  color: var(--solo-income);
 }
 .badge-unbalanced {
-  background: #fbeeee;
-  color: #bd3d3d;
+  background: var(--solo-expense-bg);
+  color: var(--solo-expense);
 }
 .unmatched-impact-hint {
   flex-basis: 100%;
@@ -2132,121 +2597,52 @@ watch(
   align-items: flex-start;
   gap: 6px;
   padding: 8px 12px;
-  border-radius: 8px;
-  background: #f6f7f9;
-  color: #586474;
+  border-radius: var(--solo-radius);
+  background: var(--solo-bg-page);
+  color: var(--solo-text-secondary);
   font-size: 12px;
   line-height: 1.5;
 }
 .unmatched-impact-hint.is-exact {
-  background: rgba(22, 93, 255, 0.06);
-  color: #165dff;
+  background: var(--solo-bg-blue-soft);
+  color: var(--solo-primary);
 }
 .badge-empty {
-  background: #f1f4f8;
-  color: #586474;
+  background: var(--solo-bg-soft);
+  color: var(--solo-text-secondary);
 }
 
 /* 通用平面卡片（遵循 DESIGN.md Flat-at-Rest 规范） */
 .surface-card {
-  background: #ffffff;
-  border: 1px solid #dde3ea;
-  border-radius: 12px;
+  background: var(--solo-bg-card);
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius-lg);
   margin-bottom: 16px;
 }
 
-/* 税务期初备忘折叠卡 */
-.tax-header-toggle {
-  width: 100%;
+.migration-zero-bar {
   display: flex;
+  align-items: center;
   justify-content: space-between;
-  align-items: center;
-  padding: 14px 20px;
-  border: none;
-  background: transparent;
-  cursor: pointer;
-  text-align: left;
-}
-.tax-header-left {
-  display: flex;
-  align-items: center;
   gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 16px;
+  margin-bottom: 16px;
+  background: var(--solo-bg-soft);
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius);
 }
-.tax-icon {
-  font-size: 18px;
-  color: #1747b0;
-  background: #edf3ff;
-  width: 34px;
-  height: 34px;
-  border-radius: 8px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-.tax-title {
-  display: block;
-  font-size: 14px;
-  font-weight: 600;
-  color: #182230;
-}
-.tax-subtitle {
-  display: block;
-  font-size: 12px;
-  color: #636e7c;
-  margin-top: 2px;
-}
-.tax-header-right {
+.migration-zero-text {
   display: flex;
   align-items: center;
   gap: 8px;
-}
-.tax-status-chip {
-  font-size: 12px;
-  padding: 3px 8px;
-  border-radius: 999px;
-  background: #f1f4f8;
-  color: #586474;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-.tax-status-chip.chip-active {
-  background: #edf3ff;
-  color: #1747b0;
-}
-.collapse-arrow {
-  font-size: 18px;
-  color: #636e7c;
-}
-.tax-body {
-  padding: 4px 20px 18px;
-  border-top: 1px solid #edf0f4;
-}
-.tax-memory-grid {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 16px;
-  margin-top: 12px;
-}
-@media (max-width: 900px) {
-  .tax-memory-grid {
-    grid-template-columns: 1fr;
-  }
-}
-.tax-field {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.field-title {
   font-size: 13px;
-  font-weight: 600;
-  color: #182230;
+  color: var(--solo-text-secondary);
 }
-.field-desc {
-  font-size: 12px;
-  color: #636e7c;
-  line-height: 1.45;
+.migration-zero-text i {
+  font-size: 16px;
+  color: var(--solo-primary);
+  flex-shrink: 0;
 }
 
 /* 固定资产卡片对账提示条 */
@@ -2255,8 +2651,8 @@ watch(
   justify-content: space-between;
   align-items: center;
   padding: 12px 20px;
-  background: #fbfcfe;
-  border-left: 3px solid #1747b0;
+  background: var(--solo-bg-card);
+  border-left: 3px solid var(--solo-primary);
 }
 .fa-notice-left {
   display: flex;
@@ -2265,11 +2661,11 @@ watch(
 }
 .fa-notice-icon {
   font-size: 18px;
-  color: #1747b0;
-  background: #edf3ff;
+  color: var(--solo-primary);
+  background: var(--solo-bg-blue-soft);
   width: 32px;
   height: 32px;
-  border-radius: 8px;
+  border-radius: var(--solo-radius);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -2282,30 +2678,30 @@ watch(
 .fa-notice-title {
   font-size: 13px;
   font-weight: 600;
-  color: #182230;
+  color: var(--solo-text-primary);
   display: flex;
   align-items: center;
 }
 .fa-notice-desc {
   font-size: 12px;
-  color: #586474;
+  color: var(--solo-text-secondary);
 }
 .fa-status-pill {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   padding: 4px 10px;
-  border-radius: 999px;
+  border-radius: var(--solo-radius-pill);
   font-size: 12px;
   font-weight: 500;
 }
 .fa-status-pill.pill-match {
-  background: #eaf7f1;
-  color: #0f7354;
+  background: var(--solo-income-bg);
+  color: var(--solo-income);
 }
 .fa-status-pill.pill-mismatch {
-  background: #fbeeee;
-  color: #bd3d3d;
+  background: var(--solo-expense-bg);
+  color: var(--solo-expense);
 }
 
 /* 科目明细主表工具栏 */
@@ -2318,7 +2714,7 @@ watch(
   align-items: center;
   gap: 12px;
   padding: 14px 20px;
-  border-bottom: 1px solid #edf0f4;
+  border-bottom: 1px solid var(--solo-border-light);
   flex-wrap: wrap;
 }
 .sheet-tabs {
@@ -2331,30 +2727,30 @@ watch(
   align-items: center;
   gap: 6px;
   padding: 8px 14px;
-  border-radius: 8px;
+  border-radius: var(--solo-radius);
   border: 1px solid transparent;
-  background: #f1f4f8;
-  color: #586474;
+  background: var(--solo-bg-soft);
+  color: var(--solo-text-secondary);
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
 }
 .sheet-tab-btn.active {
-  background: #edf3ff;
-  color: #1747b0;
-  border-color: rgba(22, 93, 255, 0.25);
+  background: var(--solo-bg-blue-soft);
+  color: var(--solo-primary);
+  border-color: var(--solo-border);
 }
 .tab-count {
   font-size: 11px;
   padding: 1px 6px;
-  border-radius: 999px;
-  background: rgba(24, 34, 48, 0.06);
+  border-radius: var(--solo-radius-pill);
+  background: var(--solo-bg-card);
   font-variant-numeric: tabular-nums;
 }
 .sheet-tab-btn.active .tab-count {
-  background: rgba(22, 93, 255, 0.14);
-  color: #1747b0;
+  background: var(--solo-primary-glow);
+  color: var(--solo-primary);
 }
 
 .toolbar-right {
@@ -2367,7 +2763,7 @@ watch(
   align-items: center;
   gap: 6px;
   font-size: 13px;
-  color: #586474;
+  color: var(--solo-text-secondary);
   cursor: pointer;
   user-select: none;
 }
@@ -2378,8 +2774,8 @@ watch(
   align-items: center;
   gap: 12px;
   padding: 10px 20px;
-  background: #f6f7f9;
-  border-bottom: 1px solid #edf0f4;
+  background: var(--solo-bg-page);
+  border-bottom: 1px solid var(--solo-border-light);
   flex-wrap: wrap;
 }
 .category-pills {
@@ -2388,25 +2784,40 @@ watch(
   gap: 6px;
   flex-wrap: wrap;
 }
+.scope-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: var(--solo-radius-pill);
+  background: var(--solo-bg-soft);
+  border: 1px solid var(--solo-border);
+}
+.pill-divider {
+  width: 1px;
+  height: 16px;
+  background: var(--solo-border);
+  margin: 0 4px;
+}
 .pill-btn {
   padding: 4px 12px;
-  border-radius: 999px;
+  border-radius: var(--solo-radius-pill);
   border: 1px solid transparent;
   background: transparent;
-  color: #586474;
+  color: var(--solo-text-secondary);
   font-size: 12px;
   font-weight: 500;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
 }
 .pill-btn:hover {
-  background: #ffffff;
-  color: #182230;
+  background: var(--solo-bg-card);
+  color: var(--solo-text-primary);
 }
 .pill-btn.active {
-  background: #ffffff;
-  color: #1747b0;
-  border-color: #dde3ea;
+  background: var(--solo-bg-card);
+  color: var(--solo-primary);
+  border-color: var(--solo-border);
   font-weight: 600;
 }
 .rule-hint {
@@ -2414,7 +2825,7 @@ watch(
   align-items: center;
   gap: 4px;
   font-size: 12px;
-  color: #636e7c;
+  color: var(--solo-text-muted);
 }
 
 /* 表格与金额右对齐 */
@@ -2430,81 +2841,87 @@ watch(
   text-align: left;
   padding: 10px 16px;
   font-weight: 600;
-  color: #586474;
-  background: #ffffff;
-  border-bottom: 1px solid #dde3ea;
+  color: var(--solo-text-secondary);
+  background: var(--solo-bg-card);
+  border-bottom: 1px solid var(--solo-border);
   white-space: nowrap;
 }
 .balance-table td {
   padding: 7px 16px;
-  border-bottom: 1px solid #edf0f4;
+  border-bottom: 1px solid var(--solo-border-light);
   vertical-align: middle;
 }
 .balance-table tbody tr:hover {
-  background: #f6f7f9;
+  background: var(--solo-bg-page);
 }
 .balance-table tbody tr.row-filled {
-  background: rgba(22, 93, 255, 0.025);
+  background: var(--solo-bg-blue-soft);
+}
+.balance-table tbody tr.row-filled .acct-name-text {
+  font-weight: 600;
+}
+.balance-table tbody tr.row-filled .amount-input :deep(.n-input__input-el) {
+  font-weight: 600;
+  color: var(--solo-text-primary);
 }
 .balance-table tfoot td {
-  border-top: 2px solid #dde3ea;
+  border-top: 2px solid var(--solo-border);
   font-weight: 600;
   padding: 12px 16px;
-  background: #f6f7f9;
+  background: var(--solo-bg-page);
 }
 
 .col-code {
   width: 110px;
   font-variant-numeric: tabular-nums;
   font-weight: 500;
-  color: #586474;
+  color: var(--solo-text-secondary);
 }
 .col-code-orig {
   display: block;
   margin-top: 2px;
   font-size: 11px;
   font-weight: 400;
-  color: #98a2b3;
+  color: var(--solo-text-muted);
 }
 .col-name {
   min-width: 200px;
 }
 .acct-name-text {
-  color: #182230;
+  color: var(--solo-text-primary);
   font-weight: 500;
 }
 .acct-cat-tag {
   margin-left: 8px;
   font-size: 11px;
   padding: 1px 6px;
-  border-radius: 4px;
-  background: #f1f4f8;
-  color: #636e7c;
+  border-radius: var(--solo-radius-sm);
+  background: var(--solo-bg-soft);
+  color: var(--solo-text-muted);
 }
 .col-dir {
-  width: 90px;
+  width: 84px;
 }
 .dir-badge {
   display: inline-block;
   padding: 2px 8px;
-  border-radius: 999px;
+  border-radius: var(--solo-radius-pill);
   font-size: 11px;
   font-weight: 600;
 }
 .dir-debit {
-  background: #edf3ff;
-  color: #1747b0;
+  background: var(--solo-bg-blue-soft);
+  color: var(--solo-primary);
 }
 .dir-credit {
-  background: #fff5e8;
-  color: #a05c10;
+  background: var(--solo-warning-bg);
+  color: var(--solo-warning);
 }
 .col-partner {
-  width: 190px;
+  width: 240px;
 }
 .no-partner {
-  /* 占位破折号不是装饰性的空，它表示"这一行没有辅助核算项"——
-     原来的 #c9d1d9 在 12px 下只有 1.54:1，等于看不见 */
+  /* 占位破折号不是装饰性的空，它表示"这一行没有辅助核算项" */
   color: var(--solo-text-muted);
   font-size: 12px;
 }
@@ -2516,12 +2933,12 @@ watch(
   text-align: right;
   padding-right: 16px;
   font-size: 13px;
-  color: #586474;
+  color: var(--solo-text-secondary);
 }
 .total {
   font-weight: 700;
   font-variant-numeric: tabular-nums;
-  color: #182230;
+  color: var(--solo-text-primary);
 }
 
 .amount-input {
@@ -2531,11 +2948,16 @@ watch(
   text-align: right !important;
   font-variant-numeric: tabular-nums;
 }
+.amount-input :deep(.n-input__placeholder) {
+  text-align: right;
+  color: var(--solo-text-muted);
+  opacity: 0.55;
+}
 
 .empty-table-cell {
   text-align: center;
   padding: 36px 16px !important;
-  color: #636e7c;
+  color: var(--solo-text-muted);
   font-size: 13px;
 }
 .empty-table-cell i {
@@ -2551,10 +2973,10 @@ watch(
   gap: 8px;
   margin: 14px 20px 0;
   padding: 10px 12px;
-  border-radius: 8px;
-  border: 1px solid #f5d9a8;
-  background: #fff8e8;
-  color: #8a5a12;
+  border-radius: var(--solo-radius);
+  border: 1px solid var(--solo-border);
+  background: var(--solo-warning-bg);
+  color: var(--solo-warning);
   font-size: 13px;
   line-height: 1.5;
 }
@@ -2570,18 +2992,18 @@ watch(
   flex-direction: column;
   gap: 4px;
   padding: 10px 14px;
-  border: 1px solid #dde3ea;
-  border-radius: 10px;
-  background: #f8fafc;
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius);
+  background: var(--solo-bg-soft);
 }
 .recon-label {
   font-size: 12px;
-  color: #636e7c;
+  color: var(--solo-text-muted);
 }
 .recon-value {
   font-size: 14px;
   font-weight: 600;
-  color: #182230;
+  color: var(--solo-text-primary);
   font-variant-numeric: tabular-nums;
 }
 .recon-state {
@@ -2589,14 +3011,14 @@ watch(
   font-weight: 500;
 }
 .recon-state.ok {
-  color: #1a7f4b;
+  color: var(--solo-income);
 }
 .recon-state.diff {
-  color: #b42318;
+  color: var(--solo-expense);
 }
 .recon-amount {
   font-variant-numeric: tabular-nums;
-  color: #182230;
+  color: var(--solo-text-primary);
 }
 /* 八列并排时压缩金额列宽，避免横向滚动把「期初贷方」挤出卡片 */
 .recon-table .col-amount {
@@ -2607,14 +3029,14 @@ watch(
 }
 
 .step-up-note {
-  color: #586474;
+  color: var(--solo-text-secondary);
   font-size: 12px;
   line-height: 1.6;
   margin: 4px 0 16px;
 }
 
 .subtitle.period-hint {
-  color: #636e7c;
+  color: var(--solo-text-muted);
   font-size: 12px;
   margin-top: 2px;
 }
@@ -2627,7 +3049,7 @@ watch(
   font-size: 13px;
 }
 .period-meta {
-  color: #586474;
+  color: var(--solo-text-secondary);
 }
 .period-cutoff-row {
   display: flex;
@@ -2639,86 +3061,179 @@ watch(
   margin: 0;
   font-size: 12px;
   line-height: 1.6;
-  color: #636e7c;
+  color: var(--solo-text-muted);
 }
 .import-report-content {
   display: flex;
   flex-direction: column;
   gap: 12px;
 }
-.import-stats-box {
-  background: #f6f7f9;
-  padding: 12px 14px;
-  border-radius: 8px;
+.import-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+.import-kpi-card {
+  background: var(--solo-bg-page);
+  border: 1px solid var(--solo-border-light);
+  border-radius: var(--solo-radius);
+  padding: 10px 12px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  font-size: 13px;
+  gap: 2px;
   font-variant-numeric: tabular-nums;
 }
-.stat-line {
+.kpi-label {
+  font-size: 11px;
+  color: var(--solo-text-muted);
+}
+.kpi-value {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--solo-text-primary);
+}
+.kpi-sub {
+  font-size: 11px;
+  color: var(--solo-text-secondary);
+}
+.import-modal-tabs {
   display: flex;
-  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid var(--solo-border-light);
+  padding-bottom: 8px;
+}
+.import-modal-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border: 1px solid transparent;
+  border-radius: var(--solo-radius);
+  background: transparent;
+  color: var(--solo-text-secondary);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+.import-modal-tab:hover {
+  background: var(--solo-bg-page);
+  color: var(--solo-text-primary);
+}
+.import-modal-tab.active {
+  background: var(--solo-bg-blue-soft);
+  border-color: var(--solo-primary);
+  color: var(--solo-primary);
+  font-weight: 600;
+}
+.tab-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  padding: 0 6px;
+  border-radius: var(--solo-radius-pill);
+  font-size: 11px;
+  background: var(--solo-bg-page);
+  color: var(--solo-text-secondary);
+}
+.tab-badge.tone-warning {
+  background: var(--solo-warning-bg);
+  color: var(--solo-warning);
 }
 .import-preview-section {
   display: flex;
   flex-direction: column;
   gap: 6px;
 }
-.import-preview-header {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
 .warnings-box {
   font-size: 12px;
+  padding: 8px 12px;
+  border-radius: var(--solo-radius);
+  background: var(--solo-warning-bg);
 }
 .warning-title {
-  color: #586474;
+  color: var(--solo-text-secondary);
   font-weight: 600;
 }
 .warning-list {
   margin: 6px 0 0;
   padding-left: 18px;
-  color: #636e7c;
+  color: var(--solo-text-muted);
   line-height: 1.6;
 }
 
 .mapping-box {
-  margin-top: 8px;
-  padding: 12px;
-  background: #fdfdfd;
-  border: 1px solid #e5e8ec;
-  border-radius: 8px;
+  padding: 12px 14px;
+  background: var(--solo-bg-page);
+  border: 1px solid var(--solo-border);
+  border-radius: var(--solo-radius);
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
 }
 .mapping-box-header {
   display: flex;
-  flex-direction: column;
-  gap: 2px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 .mapping-tip {
-  font-size: 11px;
-  color: #8c9ba5;
+  font-size: 11.5px;
+  color: var(--solo-text-muted);
+}
+.mapping-preview-pill {
+  padding: 3px 10px;
+  border-radius: var(--solo-radius-pill);
+  font-size: 11.5px;
+  font-weight: 600;
+  background: var(--solo-warning-bg);
+  color: var(--solo-warning);
+  font-variant-numeric: tabular-nums;
+}
+.mapping-preview-pill.balanced {
+  background: var(--solo-income-bg);
+  color: var(--solo-income);
 }
 .mapping-list {
-  max-height: 200px;
+  max-height: 36vh;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 12px;
   padding-right: 4px;
+}
+.mapping-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.mapping-group-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--solo-text-secondary);
+  padding-bottom: 4px;
+  border-bottom: 1px dashed var(--solo-border-light);
 }
 .mapping-item {
   display: flex;
   align-items: center;
   gap: 8px;
+  padding: 6px 8px;
+  border-radius: var(--solo-radius-sm);
+  background: var(--solo-bg-card);
+  border: 1px solid var(--solo-border-light);
   font-size: 12px;
+}
+.mapping-item-highlighted {
+  border-color: var(--solo-primary);
+  background: var(--solo-bg-blue-soft);
 }
 .mapping-source {
   flex: 1;
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -2727,24 +3242,47 @@ watch(
   white-space: nowrap;
 }
 .source-code {
-  font-family: monospace;
+  font-family: var(--solo-font-mono);
   font-weight: 600;
-  color: #1a2233;
+  color: var(--solo-text-primary);
 }
 .source-name {
-  color: #4b5563;
+  color: var(--solo-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .source-amount {
-  color: #8c9ba5;
+  color: var(--solo-text-muted);
   font-size: 11px;
+  flex-shrink: 0;
+}
+.mapping-badge {
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 11px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.mapping-badge.tone-info {
+  background: var(--solo-bg-blue-soft);
+  color: var(--solo-primary);
+}
+.mapping-badge.tone-warning {
+  background: var(--solo-warning-bg);
+  color: var(--solo-warning);
+}
+.mapping-badge.tone-success {
+  background: var(--solo-income-bg);
+  color: var(--solo-income);
 }
 .mapping-arrow {
-  color: #9ca3af;
+  color: var(--solo-text-muted);
   font-size: 14px;
+  flex-shrink: 0;
 }
-.mapping-actions {
-  display: flex;
-  justify-content: flex-end;
-  padding-top: 4px;
+@media (max-width: 760px) {
+  .import-kpi-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 </style>

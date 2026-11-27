@@ -4,6 +4,7 @@
 """Opening balances represented by immutable system-generated journals."""
 from __future__ import annotations
 
+import re
 from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any, Iterable
@@ -13,13 +14,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.errors import AccountingError, ENTRY_POSTED_IMMUTABLE
 from core.money import ZERO, money, money_text
-from db.models import ChartAccount, Company, JournalEntry, JournalLine
+from db.models import ChartAccount, Company, CompanyProfile, JournalEntry, JournalLine
 from db.session import session_scope
 from services.account_classification import is_profit_loss_code
 from services.accounting_core_service import (
+    POSTING_ROLES,
     book_start_month,
     consume_step_up_token,
     create_entry,
+    record_audit,
     require_role,
     reverse_journal,
     serialize_journal,
@@ -1030,21 +1033,59 @@ async def save_opening_balances(
                 confirm=True,
             )
 
-    # 4. 持久化税务备忘与建账起始期
-    if tax_memory or period_str:
-        from db.models import CompanyProfile
+    # 4. 持久化税务备忘与建账起始期（未传 tax_memory 时保留已配置的亏损/预缴基数，只同步 startPeriod）
+    if tax_memory is not None or period_str:
         try:
             prof_row = (
                 await session.execute(
                     select(CompanyProfile).where(CompanyProfile.company_id == company_id)
                 )
             ).scalar_one_or_none()
-            tax_dict = {
-                "priorYearLoss": float((tax_memory or {}).get("prior_year_loss") or (tax_memory or {}).get("priorYearLoss") or 0),
-                "prepaidCitTax": float((tax_memory or {}).get("prepaid_cit_tax") or (tax_memory or {}).get("prepaidCitTax") or 0),
-                "migrationNote": str((tax_memory or {}).get("migration_note") or (tax_memory or {}).get("migrationNote") or ""),
-                "startPeriod": period_str,
-            }
+            existing_tax = dict((prof_row.profile or {}).get("taxOpening") or {}) if prof_row else {}
+            if tax_memory is not None:
+                tax_dict = {
+                    "priorYearLoss": float(tax_memory.get("prior_year_loss") or tax_memory.get("priorYearLoss") or 0),
+                    "prepaidCitTax": float(tax_memory.get("prepaid_cit_tax") or tax_memory.get("prepaidCitTax") or 0),
+                    "migrationNote": str(tax_memory.get("migration_note") or tax_memory.get("migrationNote") or ""),
+                    "startPeriod": period_str,
+                    "carryforwardAdvertising": float(
+                        tax_memory.get("carryforward_advertising")
+                        if tax_memory.get("carryforward_advertising") is not None
+                        else (
+                            tax_memory.get("carryforwardAdvertising")
+                            if tax_memory.get("carryforwardAdvertising") is not None
+                            else existing_tax.get("carryforwardAdvertising") or 0
+                        )
+                    ),
+                    "carryforwardEducation": float(
+                        tax_memory.get("carryforward_education")
+                        if tax_memory.get("carryforward_education") is not None
+                        else (
+                            tax_memory.get("carryforwardEducation")
+                            if tax_memory.get("carryforwardEducation") is not None
+                            else existing_tax.get("carryforwardEducation") or 0
+                        )
+                    ),
+                    "carryforwardDonations": list(
+                        tax_memory.get("carryforward_donations")
+                        if tax_memory.get("carryforward_donations") is not None
+                        else (
+                            tax_memory.get("carryforwardDonations")
+                            if tax_memory.get("carryforwardDonations") is not None
+                            else existing_tax.get("carryforwardDonations") or []
+                        )
+                    ),
+                }
+            else:
+                tax_dict = {
+                    "priorYearLoss": float(existing_tax.get("priorYearLoss") or 0),
+                    "prepaidCitTax": float(existing_tax.get("prepaidCitTax") or 0),
+                    "migrationNote": str(existing_tax.get("migrationNote") or ""),
+                    "startPeriod": period_str,
+                    "carryforwardAdvertising": float(existing_tax.get("carryforwardAdvertising") or 0),
+                    "carryforwardEducation": float(existing_tax.get("carryforwardEducation") or 0),
+                    "carryforwardDonations": list(existing_tax.get("carryforwardDonations") or []),
+                }
             if prof_row is None:
                 session.add(CompanyProfile(company_id=company_id, profile={"taxOpening": tax_dict}))
             else:
@@ -1270,3 +1311,153 @@ async def check_balanced(
         "total_credit": money_text(total_credit),
         "count": sum(1 for item in balance_only if money(item["debit_balance"]) or money(item["credit_balance"])),
     }
+
+
+def _valid_period_for_year(period: str | None, fiscal_year: int) -> str | None:
+    text = str(period or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}", text):
+        return None
+    yr, mo = text.split("-")
+    if int(yr) != fiscal_year or not (1 <= int(mo) <= 12):
+        return None
+    return text
+
+
+def _normalize_donation_buckets(
+    raw: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """校验并合并公益性捐赠结转年度桶（金额不可为负，年份须为合法整数）。"""
+    merged: dict[int, Decimal] = {}
+    for item in raw or []:
+        if not isinstance(item, dict):
+            raise AccountingError("INVALID_TAX_MEMORY", "公益性捐赠结转明细格式无效", 422)
+        try:
+            year = int(item.get("year"))  # type: ignore[arg-type]
+        except (TypeError, ValueError) as exc:
+            raise AccountingError("INVALID_TAX_MEMORY", "公益性捐赠结转年度必须是整数", 422) from exc
+        amt = money(item.get("amount") or ZERO)
+        if amt < ZERO:
+            raise AccountingError("INVALID_TAX_MEMORY", "公益性捐赠结转金额不能为负数", 422)
+        if amt > ZERO:
+            merged[year] = money(merged.get(year, ZERO) + amt)
+    return [{"year": yr, "amount": float(amt)} for yr, amt in sorted(merged.items())]
+
+
+async def save_tax_opening_memory(
+    company_id: str,
+    fiscal_year: int,
+    *,
+    prior_year_loss: Decimal | int | float | str = ZERO,
+    prepaid_cit_tax: Decimal | int | float | str = ZERO,
+    start_period: str | None = None,
+    migration_note: str | None = None,
+    carryforward_advertising: Decimal | int | float | str | None = None,
+    carryforward_education: Decimal | int | float | str | None = None,
+    carryforward_donations: list[dict[str, Any]] | None = None,
+    user_id: str,
+    request_id: str,
+    session: AsyncSession | None = None,
+) -> dict[str, Any]:
+    """独立保存企业所得税期初抵扣基数（不进凭证、解锁后亦可随时补填，写审计流水）。"""
+    if session is None:
+        async with session_scope() as owned_session:
+            return await save_tax_opening_memory(
+                company_id,
+                fiscal_year,
+                prior_year_loss=prior_year_loss,
+                prepaid_cit_tax=prepaid_cit_tax,
+                start_period=start_period,
+                migration_note=migration_note,
+                carryforward_advertising=carryforward_advertising,
+                carryforward_education=carryforward_education,
+                carryforward_donations=carryforward_donations,
+                user_id=user_id,
+                request_id=request_id,
+                session=owned_session,
+            )
+
+    await require_role(session, company_id, user_id, POSTING_ROLES)
+
+    loss_val = money(prior_year_loss)
+    prepaid_val = money(prepaid_cit_tax)
+    if loss_val < ZERO or prepaid_val < ZERO:
+        raise AccountingError(
+            "INVALID_TAX_MEMORY",
+            "企业所得税抵扣基数金额不能为负数",
+            422,
+        )
+
+    entry = await _find_entry(session, company_id, fiscal_year)
+    prof_row = (
+        await session.execute(
+            select(CompanyProfile).where(CompanyProfile.company_id == company_id)
+        )
+    ).scalar_one_or_none()
+    before = dict((prof_row.profile or {}).get("taxOpening") or {}) if prof_row else {}
+
+    cf_adv = (
+        money(carryforward_advertising)
+        if carryforward_advertising is not None
+        else money(before.get("carryforwardAdvertising") or ZERO)
+    )
+    cf_edu = (
+        money(carryforward_education)
+        if carryforward_education is not None
+        else money(before.get("carryforwardEducation") or ZERO)
+    )
+    if cf_adv < ZERO or cf_edu < ZERO:
+        raise AccountingError(
+            "INVALID_TAX_MEMORY",
+            "跨年结转费用余额不能为负数",
+            422,
+        )
+    cf_don = (
+        _normalize_donation_buckets(carryforward_donations)
+        if carryforward_donations is not None
+        else _normalize_donation_buckets(before.get("carryforwardDonations"))
+    )
+
+    if entry is not None:
+        period_str = entry.occurred_on.strftime("%Y-%m")
+    else:
+        period_str = (
+            _valid_period_for_year(start_period, fiscal_year)
+            or _valid_period_for_year(before.get("startPeriod"), fiscal_year)
+            or f"{fiscal_year}-01"
+        )
+
+    tax_dict = {
+        "priorYearLoss": float(loss_val),
+        "prepaidCitTax": float(prepaid_val),
+        "migrationNote": (
+            str(migration_note).strip()
+            if migration_note is not None
+            else str(before.get("migrationNote") or "")
+        ),
+        "startPeriod": period_str,
+        "carryforwardAdvertising": float(cf_adv),
+        "carryforwardEducation": float(cf_edu),
+        "carryforwardDonations": cf_don,
+    }
+
+    if prof_row is None:
+        session.add(CompanyProfile(company_id=company_id, profile={"taxOpening": tax_dict}))
+    else:
+        updated_profile = dict(prof_row.profile or {})
+        updated_profile["taxOpening"] = tax_dict
+        prof_row.profile = updated_profile
+    await session.flush()
+
+    await record_audit(
+        session,
+        company_id=company_id,
+        user_id=user_id,
+        action="update_tax_opening_memory",
+        entity_type="company_profile",
+        entity_id=company_id,
+        request_id=request_id,
+        before=before or None,
+        after=tax_dict,
+        reason=f"更新 {fiscal_year} 年度企业所得税期初抵扣基数",
+    )
+    return tax_dict

@@ -13,26 +13,49 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.money import ZERO, money, money_text
 from db.models import JournalEntry, JournalLine, ReconciliationLink, SourceTransaction
+from services.platform_bill_common import (
+    ALIPAY_CLEARING_CODE,
+    LEGACY_PLATFORM_CLEARING_CODE,
+    WECHAT_CLEARING_CODE,
+)
+
+# 银行摘要 → 平台。与 bank_service 的候选匹配规则保持同一套关键词与订单号字段：
+# 判断「到账是否重复记为收入」只能在该平台自己的账单凭证里找，跨平台比对会误判。
+_PLATFORM_INCOME_RULES = (
+    ("alipay", "支付宝", re.compile(r"支付宝|Alipay|蚂蚁金服", re.I), "alipay_bill",
+     "platform_order_no", ALIPAY_CLEARING_CODE),
+    ("wechat", "微信", re.compile(r"微信|财付通|WeChat|Tenpay", re.I), "wechat_bill",
+     "wechat_order_no", WECHAT_CLEARING_CODE),
+)
 
 
-async def possible_duplicate_wechat_income(session: AsyncSession, entry: JournalEntry) -> list[str]:
-    """Flag a bank import booked as revenue when original settlement groups exist.
+async def possible_duplicate_platform_income(
+    session: AsyncSession, entry: JournalEntry,
+) -> dict[str, Any] | None:
+    """Flag a bank import booked as revenue when original platform settlement groups exist.
 
-    This is a review blocker, not an automatic pairing or data repair.
+    微信/支付宝同一口径：银行到账若被直接记成收入（借 1002 贷 5001），而平台上
+    已有净额相符的收入/手续费账单凭证，就是同一笔钱记了两遍。这里只提示复核、
+    不自动配对、不改数据。
+
+    返回 ``{"platform", "label", "candidateEntryIds"}``；无重复返回 ``None``。
     """
     from services.bank_service import RECONCILIATION_AMOUNT_TOLERANCE
 
-    if str((entry.metadata_json or {}).get("source") or (entry.metadata_json or {}).get("sourceType") or "") != "bank_import":
-        return []
-    if not re.search(r"微信|财付通|WeChat|Tenpay", entry.summary, re.I):
-        return []
+    metadata = entry.metadata_json or {}
+    if str(metadata.get("source") or metadata.get("sourceType") or "") != "bank_import":
+        return None
+    rule = next((item for item in _PLATFORM_INCOME_RULES if item[2].search(entry.summary or "")), None)
+    if rule is None:
+        return None
+    platform, label, _, source, order_field, clearing_code = rule
     own_lines = (await session.execute(select(JournalLine).where(
         JournalLine.journal_entry_id == entry.id, JournalLine.company_id == entry.company_id,
     ))).scalars().all()
     bank_effect = sum((money(line.amount) * (1 if line.direction == "debit" else -1)
                        for line in own_lines if line.account_code == "1002"), ZERO)
     if bank_effect <= ZERO or not any(line.account_code in {"5001", "5051"} for line in own_lines):
-        return []
+        return None
     candidates = (await session.execute(select(JournalEntry, JournalLine).join(
         JournalLine, JournalLine.journal_entry_id == JournalEntry.id,
     ).where(
@@ -41,15 +64,18 @@ async def possible_duplicate_wechat_income(session: AsyncSession, entry: Journal
         JournalEntry.occurred_on >= entry.occurred_on - timedelta(days=5),
         JournalEntry.occurred_on <= entry.occurred_on,
         JournalEntry.status.in_(("draft", "pending_review", "posted")),
-        JournalLine.account_code.in_(("1012001", "1012")),
+        # 1012 是历史平台待结算编码，存量微信/支付宝凭证都可能落在这里，
+        # 下方按 metadata.source 再按平台隔离。
+        JournalLine.account_code.in_((clearing_code, LEGACY_PLATFORM_CLEARING_CODE)),
     ))).all()
     groups: dict[tuple, dict[str, Any]] = {}
     days: dict[date, dict[str, Any]] = {}
     for candidate, line in candidates:
-        metadata = candidate.metadata_json or {}
-        if metadata.get("source") != "wechat_bill" or metadata.get("is_archive_only") or metadata.get("isArchiveOnly"):
+        candidate_meta = candidate.metadata_json or {}
+        if (candidate_meta.get("source") != source
+                or candidate_meta.get("is_archive_only") or candidate_meta.get("isArchiveOnly")):
             continue
-        key = (candidate.occurred_on, metadata.get("wechat_order_no") or candidate.id)
+        key = (candidate.occurred_on, candidate_meta.get(order_field) or candidate.id)
         group = groups.setdefault(key, {"amount": ZERO, "ids": set()})
         group["amount"] += money(line.amount) * (1 if line.direction == "debit" else -1)
         group["ids"].add(candidate.id)
@@ -64,7 +90,9 @@ async def possible_duplicate_wechat_income(session: AsyncSession, entry: Journal
     for group in [*groups.values(), *days.values()]:
         if abs(group["amount"] - bank_effect) <= RECONCILIATION_AMOUNT_TOLERANCE:
             ids.update(group["ids"])
-    return sorted(ids)
+    if not ids:
+        return None
+    return {"platform": platform, "label": label, "candidateEntryIds": sorted(ids)}
 
 
 async def bank_close_validation(session: AsyncSession, company_id: str, month_start: date) -> dict:
@@ -93,7 +121,7 @@ async def bank_close_validation(session: AsyncSession, company_id: str, month_st
     # Read actual statement balances in this transaction; never trust projection
     # billing flags or a separate connection's possibly stale view at close time.
     statements = [dict(row) for row in (await session.execute(text(
-        "SELECT id, transaction_date, amount, balance FROM bank_statements "
+        "SELECT id, transaction_date, amount, balance, source_row_index FROM bank_statements "
         "WHERE company_id = :company AND transaction_date >= :start AND transaction_date < :end "
         # 同秒多笔只靠日期分不出先后，按导入时保存的文件行序；与 bank_service
         # 的 _STATEMENT_ORDER 保持一致，避免结账校验与余额核对各算一套顺序。
@@ -120,9 +148,15 @@ async def bank_close_validation(session: AsyncSession, company_id: str, month_st
                 issues.append({**base, "type": "unposted_match", "reason": "核销凭证尚未过账", "entryId": entry.id})
                 continue
             payloads.append(await serialize_journal(session, entry, api_money=False))
-            duplicates = await possible_duplicate_wechat_income(session, entry)
-            if duplicates:
-                issues.append({**base, "type": "possible_duplicate_income", "reason": "银行到账可能重复记为微信收入，请核对原收入与结算凭证", "entryId": entry.id, "candidateEntryIds": duplicates})
+            duplicate = await possible_duplicate_platform_income(session, entry)
+            if duplicate:
+                issues.append({
+                    **base, "type": "possible_duplicate_income",
+                    "reason": f"银行到账可能重复记为{duplicate['label']}收入，请核对原收入与结算凭证",
+                    "entryId": entry.id,
+                    "platform": duplicate["platform"],
+                    "candidateEntryIds": duplicate["candidateEntryIds"],
+                })
         raw_payload = source.raw_payload or {}
         # ponytail: 兼容 SQLite→PG 迁移生成的 bank_statement 记录（带符号金额存于 amount 字段或 bank_statements 表）
         signed = raw_payload.get("signedAmount")
@@ -169,6 +203,27 @@ async def bank_close_validation(session: AsyncSession, company_id: str, month_st
             issues.append({"entryId": entry.id, "type": "book_only", "reason": "银行存款分录未关联银行流水"})
     reconciliation = build_balance_reconciliation(statements, balance)
     if reconciliation["has_data"]:
+        draft_bank_lines = (await session.execute(select(JournalLine, JournalEntry).join(
+            JournalEntry, JournalEntry.id == JournalLine.journal_entry_id,
+        ).where(
+            JournalEntry.company_id == company_id,
+            JournalLine.company_id == company_id,
+            JournalEntry.period_start == month_start,
+            JournalEntry.status == "draft",
+            JournalLine.account_code == "1002",
+        ))).all()
+        draft_delta = sum(
+            (
+                money(line.amount) * (1 if line.direction == "debit" else -1)
+                for line, entry in draft_bank_lines
+                if not ((entry.metadata_json or {}).get("is_archive_only") or (entry.metadata_json or {}).get("isArchiveOnly"))
+            ),
+            ZERO,
+        )
+        projected_balance = balance + draft_delta
+        projected_diff = money(reconciliation["bank_closing_balance"]) - projected_balance
+        reconciliation["projected_book_bank_balance"] = float(projected_balance)
+        reconciliation["projected_book_difference"] = float(projected_diff)
         if not reconciliation["flow_balanced"]:
             issues.append({"type": "statement_balance_mismatch", "reason": "流水金额与银行期末余额不连续"})
         if abs(reconciliation["book_difference"]) > RECONCILIATION_AMOUNT_TOLERANCE:

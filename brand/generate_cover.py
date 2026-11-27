@@ -2,201 +2,343 @@ import os
 import base64
 import subprocess
 
-workspace = '/Users/ecarx/Documents/solobooks'
+workspace = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 logo_path = os.path.join(workspace, 'brand/solo-logo-256.png')
 
-def get_b64(p):
+
+def get_b64(p: str) -> str:
     if os.path.exists(p):
         with open(p, 'rb') as f:
             return 'data:image/png;base64,' + base64.b64encode(f.read()).decode('utf-8')
     return ''
 
+
 logo_b64 = get_b64(logo_path)
 
+# Strict DESIGN.md palette: #F6F7F9 page, #FFFFFF surface, #DDE3EA border,
+# #182230/#586474 text, #1747B0 primary blue, #0F7354/#EAF7F1 single verification accent.
 html_content = f'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <title>SoloBooks 16:9 Cover - 20min & Clarity</title>
-  <script src="https://cdn.tailwindcss.com"></script>
+  <title>梭罗记账 SoloBooks —— 不做糊涂账，合规用梭罗</title>
   <style>
-    body {{
-      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Segoe UI", sans-serif;
+    * {{
+      box-sizing: border-box;
       margin: 0;
       padding: 0;
+    }}
+    body {{
+      font-family: "Inter", "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       width: 1920px;
       height: 1080px;
       overflow: hidden;
-      background-color: #F8FAFC;
+      background-color: #F6F7F9;
+      background-image:
+        radial-gradient(circle at 82% 20%, rgba(23, 71, 176, 0.06) 0%, transparent 48%),
+        radial-gradient(circle at 1px 1px, rgba(24, 34, 48, 0.05) 1px, transparent 0);
+      background-size: 100% 100%, 40px 40px;
+      color: #182230;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 120px;
       -webkit-font-smoothing: antialiased;
     }}
-    .bg-grid {{
-      background-image: radial-gradient(circle at 1px 1px, #CBD5E1 1.2px, transparent 0);
-      background-size: 36px 36px;
+
+    .left-col {{
+      width: 820px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
     }}
-    .glow-top-right {{
-      position: absolute;
-      width: 900px;
-      height: 900px;
-      right: -100px;
-      top: -150px;
-      background: radial-gradient(circle, rgba(37, 99, 235, 0.14) 0%, rgba(59, 130, 246, 0.04) 50%, transparent 70%);
-      pointer-events: none;
+
+    .brand-lockup {{
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      margin-bottom: 40px;
     }}
-    .glow-bottom-left {{
-      position: absolute;
-      width: 800px;
-      height: 800px;
-      left: -150px;
-      bottom: -150px;
-      background: radial-gradient(circle, rgba(99, 102, 241, 0.08) 0%, transparent 70%);
-      pointer-events: none;
+    .brand-logo {{
+      width: 68px;
+      height: 68px;
+      border-radius: 16px;
+      border: 1px solid #DDE3EA;
+      box-shadow: 0 8px 20px rgba(23, 71, 176, 0.12);
+    }}
+    .brand-name-row {{
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+    }}
+    .brand-cn {{
+      font-size: 32px;
+      font-weight: 700;
+      color: #182230;
+      letter-spacing: -0.02em;
+      line-height: 1.1;
+    }}
+    .brand-en {{
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: 0.14em;
+      color: #1747B0;
+      text-transform: uppercase;
+    }}
+    .brand-meta {{
+      margin-top: 6px;
+      font-size: 15px;
+      font-weight: 500;
+      color: #586474;
+    }}
+
+    .headline {{
+      font-size: 72px;
+      font-weight: 800;
+      line-height: 1.16;
+      letter-spacing: -0.03em;
+      color: #182230;
+      margin-bottom: 26px;
+    }}
+    .headline-accent {{
+      color: #1747B0;
+    }}
+
+    .subtitle {{
+      font-size: 24px;
+      font-weight: 400;
+      line-height: 1.55;
+      color: #586474;
+      max-width: 680px;
+      margin-bottom: 44px;
+    }}
+
+    .specs-row {{
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }}
+    .spec-pill {{
+      padding: 11px 18px;
+      background: #FFFFFF;
+      border: 1px solid #DDE3EA;
+      border-radius: 10px;
+      font-size: 16px;
+      font-weight: 600;
+      color: #182230;
+      box-shadow: 0 1px 3px rgba(24, 34, 48, 0.04);
+    }}
+
+    .right-col {{
+      width: 740px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }}
+
+    .focus-card {{
+      width: 100%;
+      background: #FFFFFF;
+      border: 1px solid #DDE3EA;
+      border-radius: 20px;
+      padding: 40px;
+      box-shadow: 0 24px 60px -16px rgba(24, 34, 48, 0.10);
+    }}
+
+    .card-header {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 28px;
+    }}
+    .card-title-group {{
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }}
+    .card-kicker {{
+      font-size: 13px;
+      font-weight: 600;
+      color: #1747B0;
+      letter-spacing: 0.04em;
+    }}
+    .card-title {{
+      font-size: 22px;
+      font-weight: 700;
+      color: #182230;
+    }}
+    .verified-badge {{
+      padding: 8px 14px;
+      border-radius: 999px;
+      background: #EAF7F1;
+      color: #0F7354;
+      font-size: 14px;
+      font-weight: 600;
+      white-space: nowrap;
+    }}
+
+    .tx-box {{
+      background: #F6F7F9;
+      border: 1px solid #EDF0F4;
+      border-radius: 14px;
+      padding: 26px 28px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 24px;
+    }}
+    .tx-name {{
+      font-size: 21px;
+      font-weight: 700;
+      color: #182230;
+    }}
+    .tx-sub {{
+      margin-top: 6px;
+      font-size: 15px;
+      color: #586474;
+    }}
+    .tx-right {{
+      text-align: right;
+    }}
+    .tx-amount {{
+      font-size: 28px;
+      font-weight: 700;
+      color: #182230;
+      font-variant-numeric: tabular-nums;
+    }}
+    .tx-account {{
+      margin-top: 6px;
+      font-size: 14px;
+      font-weight: 600;
+      color: #1747B0;
+    }}
+
+    .meta-strip {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-bottom: 28px;
+    }}
+    .meta-item {{
+      padding: 16px 18px;
+      border-radius: 12px;
+      border: 1px solid #EDF0F4;
+      background: #FFFFFF;
+    }}
+    .meta-label {{
+      font-size: 13px;
+      font-weight: 600;
+      color: #636E7C;
+      margin-bottom: 4px;
+    }}
+    .meta-val {{
+      font-size: 15px;
+      font-weight: 600;
+      color: #182230;
+      line-height: 1.4;
+    }}
+
+    .cta-bar {{
+      width: 100%;
+      padding: 18px 26px;
+      border-radius: 12px;
+      background: #1747B0;
+      color: #FFFFFF;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 18px;
+      font-weight: 600;
+      box-shadow: 0 10px 24px -6px rgba(23, 71, 176, 0.32);
+    }}
+    .cta-chip {{
+      font-size: 14px;
+      font-weight: 600;
+      padding: 6px 12px;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.16);
+    }}
+
+    .card-foot {{
+      margin-top: 16px;
+      text-align: center;
+      font-size: 14px;
+      font-weight: 500;
+      color: #636E7C;
     }}
   </style>
 </head>
-<body class="relative flex items-center justify-between px-24 bg-slate-50 bg-grid">
+<body>
 
-  <!-- Ambient Glows -->
-  <div class="glow-top-right"></div>
-  <div class="glow-bottom-left"></div>
-
-  <!-- Left Column: Core Brand & 20-Minute Hook -->
-  <div class="w-[830px] flex flex-col justify-center z-10 py-10">
-    
-    <!-- Brand Lockup -->
-    <div class="flex items-center gap-4 mb-6">
-      <img src="{logo_b64}" alt="SoloBooks" class="w-16 h-16 rounded-2xl shadow-lg ring-1 ring-slate-900/10">
+  <div class="left-col">
+    <div class="brand-lockup">
+      <img src="{logo_b64}" alt="SoloBooks" class="brand-logo">
       <div>
-        <div class="flex items-center gap-3">
-          <span class="text-[34px] font-black tracking-tight text-slate-900 leading-none">梭罗记账</span>
-          <span class="text-2xl font-black tracking-widest text-blue-600 uppercase leading-none">SoloBooks</span>
+        <div class="brand-name-row">
+          <span class="brand-cn">梭罗记账</span>
+          <span class="brand-en">SoloBooks</span>
         </div>
-        <div class="text-[13px] font-bold tracking-wider text-slate-500 uppercase mt-1.5 flex items-center gap-2">
-          <span>驻场 AI 财务官 (AI CFO)</span>
-          <span class="text-slate-300">·</span>
-          <span class="text-blue-600 font-extrabold">面向一人公司与小微团队</span>
-        </div>
+        <div class="brand-meta">面向小微企业的确定性 AI 财务底座 · 芥子星辰出品</div>
       </div>
     </div>
 
-    <!-- Highlight Hook Pill (20 Minutes & Total Clarity) -->
-    <div class="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full text-[14px] font-extrabold bg-amber-50 border border-amber-300/80 text-amber-900 shadow-xs w-fit mb-5">
-      <span class="flex h-2 w-2 relative">
-        <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
-        <span class="relative inline-flex rounded-full h-2 w-2 bg-amber-500"></span>
-      </span>
-      <span>⏱️ 每月仅需 20 分钟搞定 · 财务底牌与真实利润轻松全掌握</span>
-    </div>
-
-    <!-- H1 Headline (Huge, Confident, Clean) -->
-    <h1 class="text-[64px] font-black tracking-tight leading-[1.14] text-slate-900 mb-6">
-      点一点把账做清爽，<br>
-      <span class="bg-gradient-to-r from-blue-700 via-indigo-600 to-blue-500 bg-clip-text text-transparent">问一问把公司养值钱。</span>
+    <h1 class="headline">
+      不做糊涂账，<br>
+      <span class="headline-accent">合规用梭罗。</span>
     </h1>
 
-    <!-- Subtitle -->
-    <p class="text-[21px] text-slate-600 leading-relaxed font-normal mb-9 max-w-[730px]">
-      不当甩手掌柜，也不做繁重会计。<strong class="text-slate-900 font-bold">每月花 20 分钟轻拍板</strong>，告别糊涂代账与公私混同雷区，随时看清现金流与真实利润，养出一本接得住尽调的干净账本。
+    <p class="subtitle">
+      AI 接管机械对账，用确定性会计内核守住人机双签。
     </p>
 
-    <!-- Bottom Feature Pills -->
-    <div class="flex items-center gap-3">
-      <div class="px-4 py-2.5 rounded-xl bg-slate-900 text-white text-sm font-bold flex items-center gap-2 shadow-sm">
-        <span>🐳</span> Docker 免费自托管
-      </div>
-      <div class="px-4 py-2.5 rounded-xl bg-blue-600 text-white text-sm font-bold flex items-center gap-2 shadow-sm">
-        <span>🔌</span> 24项原生 MCP 账务工具
-      </div>
-      <div class="px-4 py-2.5 rounded-xl bg-white border border-slate-300 text-slate-800 text-sm font-bold flex items-center gap-2 shadow-sm">
-        <span>🛡️</span> 公私合规隔离
-      </div>
-      <div class="px-4 py-2.5 rounded-xl bg-emerald-50 border border-emerald-300 text-emerald-800 text-sm font-bold flex items-center gap-2 shadow-sm">
-        <span>📑</span> 98分 尽调级账本
-      </div>
+    <div class="specs-row">
+      <span class="spec-pill">《小企业会计准则》</span>
+      <span class="spec-pill">27 个原生 MCP</span>
+      <span class="spec-pill">开源可自托管</span>
     </div>
-
   </div>
 
-  <!-- Right Column: Two Crisp, Standalone High-Impact Cards -->
-  <div class="w-[740px] flex flex-col gap-6 z-10 justify-center">
-
-    <!-- Card 1: 「点一点」智能入账 -->
-    <div class="bg-white rounded-3xl p-7 shadow-[0_20px_50px_rgba(23,71,176,0.12)] border border-slate-200/90 relative overflow-hidden">
-      <div class="flex items-center justify-between mb-4">
-        <div class="flex items-center gap-2.5">
-          <span class="w-8 h-8 rounded-xl bg-blue-100 flex items-center justify-center text-blue-700 font-black text-base">⚡️</span>
-          <span class="text-lg font-black text-slate-900 tracking-tight">点一点 · 20分钟搞定月度账务</span>
+  <div class="right-col">
+    <div class="focus-card">
+      <div class="card-header">
+        <div class="card-title-group">
+          <span class="card-kicker">AI 起草 · 人工确认</span>
+          <div class="card-title">待确认入账凭证</div>
         </div>
-        <span class="text-xs font-bold bg-blue-50 text-blue-700 border border-blue-200 px-3 py-1 rounded-full">
-          微信 / 银行流水自动识别
-        </span>
+        <span class="verified-badge">✓ 借贷已平 · 票流一致</span>
       </div>
 
-      <!-- Transaction Preview -->
-      <div class="bg-slate-50 rounded-2xl p-4 border border-slate-200/70 mb-4 flex items-center justify-between">
+      <div class="tx-box">
         <div>
-          <div class="font-bold text-slate-900 text-base">腾讯云 GPU 算力与模型租赁</div>
-          <div class="text-xs text-slate-500 mt-0.5">已自动匹配专票 · 进项税额已核销</div>
+          <div class="tx-name">腾讯云算力与云主机服务</div>
+          <div class="tx-sub">企银流水自动认领 · 已匹配全电专票</div>
         </div>
-        <div class="text-right">
-          <div class="text-xl font-black text-slate-900">-¥ 2,800.00</div>
-          <div class="text-xs text-blue-600 font-bold">4301 研发支出(加计扣除)</div>
-        </div>
-      </div>
-
-      <!-- Action Button -->
-      <div class="w-full py-3.5 px-6 bg-gradient-to-r from-amber-400 via-amber-500 to-amber-600 text-slate-950 font-black text-base rounded-2xl shadow-lg shadow-amber-500/25 flex items-center justify-between border border-amber-300">
-        <span class="flex items-center gap-2">
-          <span>✨</span> AI 已预制最优方案，点击采纳
-        </span>
-        <span class="bg-amber-200/80 text-amber-950 text-xs px-3 py-1 rounded-lg font-black uppercase">
-          点一下即入账 ✓
-        </span>
-      </div>
-      <div class="text-center text-xs text-slate-400 mt-2 font-medium">零会计借贷门槛 · 凭证与报表全自动生成</div>
-    </div>
-
-    <!-- Card 2: 「问一问」7x24h 战略财税军师 & 财务底牌全掌握 -->
-    <div class="bg-white rounded-3xl p-7 shadow-[0_20px_50px_rgba(79,70,229,0.12)] border border-slate-200/90 relative overflow-hidden">
-      <div class="flex items-center justify-between mb-4">
-        <div class="flex items-center gap-2.5">
-          <span class="w-8 h-8 rounded-xl bg-indigo-100 flex items-center justify-center text-indigo-700 font-black text-base">💬</span>
-          <span class="text-lg font-black text-slate-900 tracking-tight">问一问 · 轻松掌控公司财务底牌</span>
-        </div>
-        <span class="text-xs font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 px-3 py-1 rounded-full">
-          金税四期避坑指南
-        </span>
-      </div>
-
-      <!-- Dialogue Block -->
-      <div class="space-y-3 mb-4">
-        <!-- User Question -->
-        <div class="bg-slate-100 rounded-2xl rounded-tl-sm p-3.5 text-sm font-medium text-slate-800 flex items-start gap-2.5">
-          <span class="text-slate-400 text-xs font-bold shrink-0 mt-0.5">老板提问</span>
-          <span>“我用个人卡替公司付了 3.8 万采购，怎么合规转回给我？”</span>
-        </div>
-
-        <!-- AI CFO Answer -->
-        <div class="bg-indigo-50/80 border border-indigo-100 rounded-2xl rounded-tr-sm p-3.5 text-sm text-indigo-950 flex items-start gap-2.5">
-          <span class="text-indigo-600 text-xs font-bold shrink-0 mt-0.5">AI 财务官</span>
-          <span class="leading-relaxed">已自动生成<strong>《免税垫资冲销单》</strong>并核验发票。直接公转私转回，公私分明，<strong>彻底杜绝 20% 股东分红个税风险</strong>。</span>
+        <div class="tx-right">
+          <div class="tx-amount">-¥ 2,800.00</div>
+          <div class="tx-account">4301 研发支出 / 应交税费</div>
         </div>
       </div>
 
-      <!-- Quick Action / Status -->
-      <div class="flex items-center justify-between pt-1">
-        <div class="flex items-center gap-2">
-          <span class="text-xs font-bold bg-indigo-50 text-indigo-700 border border-indigo-200 px-3 py-1 rounded-lg flex items-center gap-1">
-            <span>⚡️</span> 一键导出垫资冲销底稿
-          </span>
-          <span class="text-xs font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 px-3 py-1 rounded-lg flex items-center gap-1">
-            <span>🛡️</span> 0 违规挂账
-          </span>
+      <div class="meta-strip">
+        <div class="meta-item">
+          <div class="meta-label">规则依据</div>
+          <div class="meta-val">命中企业专属分类记忆规则</div>
         </div>
-        <span class="text-xs text-slate-400 font-medium">结合企业真实账本解答</span>
+        <div class="meta-item">
+          <div class="meta-label">合规边界</div>
+          <div class="meta-val">AI 不直接落账 · 确认后生成三表</div>
+        </div>
+      </div>
+
+      <div class="cta-bar">
+        <span>确认入账并同步三表</span>
+        <span class="cta-chip">人机双签 ✓</span>
+      </div>
+
+      <div class="card-foot">
+        严格借贷平衡 · 账套数据随时完整导出
       </div>
     </div>
-
   </div>
 
 </body>
@@ -215,8 +357,8 @@ cmd = [
     f'--screenshot={output_png}',
     '--window-size=1920,1080',
     '--hide-scrollbars',
-    f'file://{output_html}'
+    f'file://{output_html}',
 ]
 
-subprocess.run(cmd, capture_output=True, text=True)
-print("Updated screenshot generated at:", output_png)
+res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+print('Updated screenshot generated at:', output_png)

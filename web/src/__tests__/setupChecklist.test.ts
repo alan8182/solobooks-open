@@ -161,4 +161,46 @@ describe('SetupChecklist', () => {
 
     expect(wrapper.findAll('.skeleton-row').length).toBeGreaterThan(0)
   })
+
+  it('highlights the first actionable step and navigates via the primary next button', async () => {
+    const wrapper = mountChecklist({
+      readiness: readiness({
+        items: [
+          step({ key: 'company_profile', title: '建好账套', status: 'done', deepLink: '/mine/companies' }),
+          step({
+            key: 'info_tip',
+            title: '提示信息',
+            status: 'todo',
+            informational: true,
+            deepLink: '/guide',
+          }),
+          step({
+            key: 'tax_registration',
+            title: '确认要交哪些税',
+            status: 'todo',
+            deepLink: '/tax-registration',
+          }),
+          step({
+            key: 'opening_balance',
+            title: '录入期初余额',
+            status: 'todo',
+            deepLink: '/mine/opening',
+          }),
+        ],
+      }),
+    })
+
+    const nextBtn = wrapper.find('.checklist-next-btn')
+    expect(nextBtn.exists()).toBe(true)
+    expect(nextBtn.text()).toContain('下一步：确认要交哪些税')
+
+    const rows = wrapper.findAll('.checklist-row')
+    expect(rows[0].classes()).toContain('is-done')
+    expect(rows[1].classes()).not.toContain('is-next')
+    expect(rows[2].classes()).toContain('is-next')
+    expect(rows[3].classes()).not.toContain('is-next')
+
+    await nextBtn.trigger('click')
+    expect(h.push).toHaveBeenCalledWith('/tax-registration')
+  })
 })

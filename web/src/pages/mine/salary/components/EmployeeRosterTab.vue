@@ -1,5 +1,6 @@
 <!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
+import { computed } from 'vue'
 import {
   NButton, NSpace, NTag, useMessage,
 } from 'naive-ui'
@@ -7,6 +8,7 @@ import { deleteEmployee, type Employee, type DepartmentItem } from '@/api/salary
 import { formatMoney } from '@/utils/format'
 import { useDeleteConfirm } from '@/composables/useDeleteConfirm'
 import { SoloEmpty } from '@/components/ui'
+import GuideTrigger from '@/components/business/GuideTrigger.vue'
 
 const props = defineProps<{
   employees: Employee[]
@@ -26,6 +28,18 @@ function isRdDepartment(deptName?: string) {
   if (!deptName) return false
   return Boolean(props.departments.find((d) => d.name === deptName)?.isRd)
 }
+
+const rosterStats = computed(() => {
+  const baseTotal = Math.round(
+    props.employees.reduce((sum, emp) => sum + Number(emp.base_salary || 0), 0) * 100,
+  ) / 100
+  const rdCount = props.employees.filter((emp) => isRdDepartment(emp.department)).length
+  return {
+    count: props.employees.length,
+    baseTotal,
+    rdCount,
+  }
+})
 
 function handleArchive(emp: Employee) {
   if (!emp.id) return
@@ -48,6 +62,23 @@ function handleArchive(emp: Employee) {
 
 <template>
   <div class="roster-tab">
+    <div v-if="employees.length > 0" class="roster-summary">
+      <div class="summary-item">
+        <span class="summary-label">在职人数</span>
+        <strong class="summary-val">{{ rosterStats.count }} 人</strong>
+      </div>
+      <div class="summary-divider" />
+      <div class="summary-item">
+        <span class="summary-label">月固定基本工资合计</span>
+        <strong class="summary-val">{{ formatMoney(rosterStats.baseTotal) }}</strong>
+      </div>
+      <div class="summary-divider" />
+      <div class="summary-item">
+        <span class="summary-label">研发部门人数</span>
+        <strong class="summary-val">{{ rosterStats.rdCount }} 人</strong>
+      </div>
+    </div>
+
     <div class="roster-toolbar">
       <div class="toolbar-left">
         <span class="toolbar-hint">
@@ -56,6 +87,7 @@ function handleArchive(emp: Employee) {
         </span>
       </div>
       <div class="toolbar-right">
+        <GuideTrigger guide="social-enrollment" label="员工参保/停保怎么办理？" />
         <NButton type="primary" size="small" @click="emit('add')">
           <template #icon><i class="ri-user-add-line" /></template>
           录入员工
@@ -72,7 +104,12 @@ function handleArchive(emp: Employee) {
             <th style="min-width: 110px">入职日期</th>
             <th class="col-amount" style="min-width: 120px">基本工资（元）</th>
             <th class="col-amount" style="min-width: 120px">社保基数（元）</th>
-            <th class="col-amount" style="min-width: 120px">专项附加扣除（元）</th>
+            <th class="col-amount" style="min-width: 120px">公积金基数（元）</th>
+            <th
+              class="col-amount"
+              style="min-width: 120px"
+              title="员工在个人所得税 App 自己填报的每月扣除合计，这里只用于估算要代扣多少工资个税"
+            >专项附加扣除（元）</th>
             <th style="width: 140px; text-align: center">操作</th>
           </tr>
         </thead>
@@ -80,7 +117,7 @@ function handleArchive(emp: Employee) {
           <tr v-for="emp in employees" :key="emp.id">
             <td class="emp-name-cell">
               <span class="emp-name">{{ emp.name }}</span>
-              <NTag v-if="emp.is_owner" size="tiny" type="warning" :bordered="false" class="owner-tag">
+              <NTag v-if="emp.is_owner" size="tiny" type="info" :bordered="false" class="owner-tag">
                 业主
               </NTag>
             </td>
@@ -97,6 +134,17 @@ function handleArchive(emp: Employee) {
             <td class="col-amount num-cell">{{ formatMoney(emp.base_salary) }}</td>
             <td class="col-amount num-cell">{{ formatMoney(emp.social_security_base) }}</td>
             <td class="col-amount num-cell">
+              <span
+                v-if="emp.housing_fund_base == null"
+                class="hf-follow-text"
+                :title="`跟随社保基数：¥${formatMoney(emp.social_security_base)}`"
+              >同社保</span>
+              <NTag v-else-if="Number(emp.housing_fund_base) === 0" size="tiny" :bordered="false" type="default">
+                不缴 (0.00)
+              </NTag>
+              <template v-else>{{ formatMoney(emp.housing_fund_base) }}</template>
+            </td>
+            <td class="col-amount num-cell">
               {{ Number(emp.special_additional_deduction || 0) > 0 ? formatMoney(emp.special_additional_deduction || 0) : '—' }}
             </td>
             <td class="action-cell">
@@ -107,6 +155,13 @@ function handleArchive(emp: Employee) {
             </td>
           </tr>
         </tbody>
+        <tfoot>
+          <tr class="roster-totals-row">
+            <td colspan="3">合计 · {{ rosterStats.count }} 人</td>
+            <td class="col-amount num-cell">{{ formatMoney(rosterStats.baseTotal) }}</td>
+            <td colspan="4" />
+          </tr>
+        </tfoot>
       </table>
     </div>
 
@@ -131,10 +186,44 @@ function handleArchive(emp: Employee) {
   flex-direction: column;
 }
 
+.roster-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 16px;
+  padding: 12px 16px;
+  margin-bottom: 12px;
+  background: var(--solo-bg-card);
+  border: 1px solid var(--solo-border-light);
+  border-radius: var(--solo-radius-lg);
+}
+.summary-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.summary-label {
+  font-size: 12px;
+  color: var(--solo-text-secondary);
+}
+.summary-val {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--solo-text-primary);
+  font-variant-numeric: tabular-nums;
+}
+.summary-divider {
+  width: 1px;
+  height: 14px;
+  background: var(--solo-border-light);
+}
+
 .roster-toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   margin-bottom: 12px;
   gap: 12px;
 }
@@ -145,6 +234,13 @@ function handleArchive(emp: Employee) {
   display: flex;
   align-items: center;
   gap: 6px;
+}
+
+.toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 0 0 auto;
 }
 
 .table-container {
@@ -162,9 +258,9 @@ function handleArchive(emp: Employee) {
 }
 
 .roster-table th {
-  background: var(--solo-bg-hover, rgba(0, 0, 0, 0.02));
+  background: var(--solo-bg-soft);
   color: var(--solo-text-secondary);
-  font-weight: 500;
+  font-weight: 600;
   padding: 10px 14px;
   border-bottom: 1px solid var(--solo-border-light);
   white-space: nowrap;
@@ -181,7 +277,14 @@ function handleArchive(emp: Employee) {
 }
 
 .roster-table tbody tr:hover {
-  background: var(--solo-bg-hover, rgba(0, 0, 0, 0.015));
+  background: var(--solo-bg-soft);
+}
+
+.roster-totals-row td {
+  border-top: 1px solid var(--solo-border-light);
+  border-bottom: none;
+  font-weight: 600;
+  background: var(--solo-bg-soft);
 }
 
 .col-amount {
@@ -190,7 +293,8 @@ function handleArchive(emp: Employee) {
 }
 
 .num-cell {
-  font-family: 'Outfit', 'Inter', -apple-system, sans-serif;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  font-variant-numeric: tabular-nums;
 }
 
 .emp-name-cell {
@@ -205,6 +309,11 @@ function handleArchive(emp: Employee) {
 
 .owner-tag {
   font-weight: 600;
+}
+
+.hf-follow-text {
+  font-size: 12px;
+  color: var(--solo-text-muted);
 }
 
 .empty-roster {

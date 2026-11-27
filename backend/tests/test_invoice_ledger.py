@@ -19,6 +19,7 @@ from services.invoice_ledger_service import (
     backfill_invoices,
     invoice_summary,
     list_invoices,
+    list_invoices_with_attachments,
 )
 from services.invoice_service import import_invoices
 
@@ -736,3 +737,71 @@ async def test_link_invoice_to_expense_rebooks_payable_hang():
         assert pay_payload.get("billingStatus") == "has_invoice"
         assert pay_payload.get("linkedInvoiceEntryId") == new_voucher_id
         assert pay_payload.get("invoiceNumber") == "INV-LINK-1"
+
+
+@pytest.mark.asyncio
+async def test_classify_invoice_strips_own_company_name_and_uscc_before_llm(monkeypatch):
+    """发票文本分类发往 LLM 前必须剥离我方真实企业名与统一社会信用代码。"""
+    from services import invoice_service
+
+    captured_prompts: list[str] = []
+
+    def fake_chat(system_prompt, prompt, **kwargs):
+        captured_prompts.append(prompt)
+        return {"category": "办公费", "reason": "办公用品采购"}
+
+    monkeypatch.setattr(invoice_service, "safe_chat_text_json", fake_chat)
+
+    own_name = "芥子星辰（杭州）智能科技有限公司"
+    own_uscc = "91330106MA2K8X9912"
+
+    # 场景 1：进项票（我方为购买方）
+    res_exp = await invoice_service.classify_invoice(
+        {
+            "seller_name": "杭州办公用品批发行",
+            "buyer_name": own_name,
+            "item_name": "定制特殊物料礼盒",
+            "amount": "100.00",
+            "total_amount": "100.00",
+            "business_context": f"供 {own_name} 税号 {own_uscc} 日常使用",
+        },
+        company_name=own_name,
+    )
+    assert res_exp["direction"] == "expense"
+
+    # 场景 2：销项票（我方为销售方）
+    res_inc = await invoice_service.classify_invoice(
+        {
+            "seller_name": own_name,
+            "buyer_name": "外部客户甲",
+            "item_name": "定制项目开发交付款",
+            "amount": "5000.00",
+            "total_amount": "5000.00",
+        },
+        company_name=own_name,
+    )
+    assert res_inc["direction"] == "income"
+
+    assert len(captured_prompts) == 2
+    for prompt in captured_prompts:
+        assert own_name not in prompt
+        assert own_uscc not in prompt
+        assert "我方企业" in prompt
+
+
+
+async def test_list_invoices_with_attachments_exposes_verify_and_aggregates():
+    """台账列表（附件聚合版）必须同源输出 verifyStatus 与附件计数字段（A3）。
+
+    防的是：前端另起一套判断/前端没字段可用导致「原件」「查验」列无真相来源。
+    """
+    company_id = "c-ledger-agg"
+    await _setup_company(company_id)
+    await import_invoices(company_id, "owner-1", [_expense_row()], classify=False)
+
+    listing = await list_invoices_with_attachments(company_id)
+    item = listing["items"][0]
+    assert item["verifyStatus"] == "unverified"
+    assert item["verifiedAt"] == ""
+    assert item["attachmentCount"] == 0
+    assert item["hasOriginalXml"] is False

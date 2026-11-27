@@ -3,6 +3,7 @@
 import { computed } from 'vue'
 import { SoloDrawer } from '@/components/ui'
 import { getGuide, type GuideId } from '@/content/guides'
+import { useGuideEntry } from '@/composables/useGuideEntry'
 import GuideSteps from './GuideSteps.vue'
 
 /**
@@ -24,6 +25,7 @@ const emit = defineEmits<{
 }>()
 
 const guide = computed(() => getGuide(props.guideId))
+const { entry } = useGuideEntry(props.guideId)
 </script>
 
 <template>
@@ -46,6 +48,19 @@ const guide = computed(() => getGuide(props.guideId))
         <i class="ri-information-line" aria-hidden="true" />
         <span>{{ guide.notice }}</span>
       </div>
+
+      <!-- 官方办理入口：能直接跳过去的，就不让用户读完步骤再自己找网址 -->
+      <a
+        v-if="entry"
+        class="guide-sheet-entry"
+        :href="entry.url"
+        target="_blank"
+        rel="noopener"
+      >
+        <i class="ri-external-link-line" aria-hidden="true" />
+        <span class="guide-sheet-entry-label">{{ entry.label }}</span>
+        <span v-if="entry.hint" class="guide-sheet-entry-hint">{{ entry.hint }}</span>
+      </a>
 
       <GuideSteps :steps="guide.steps" dense />
     </template>
@@ -109,6 +124,35 @@ const guide = computed(() => getGuide(props.guideId))
   margin-top: 1px;
   color: var(--solo-primary, #1747b0);
   font-size: 14px;
+}
+
+.guide-sheet-entry {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin: 12px 0 4px;
+  padding: 7px 12px;
+  border-radius: 8px;
+  background: var(--solo-bg-blue-soft, #edf3ff);
+  color: var(--solo-primary, #1747b0);
+  font-size: 13px;
+  text-decoration: none;
+}
+
+.guide-sheet-entry:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.guide-sheet-entry-label {
+  font-weight: 600;
+}
+
+.guide-sheet-entry-hint {
+  color: var(--solo-text-secondary, #586474);
+  font-size: 12px;
+  font-weight: 400;
 }
 
 .guide-sheet-source {

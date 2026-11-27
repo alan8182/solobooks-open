@@ -31,11 +31,24 @@ export function usePayrollFlow(options: {
   const payrollSsPaid = ref(false)
   const payrollHfPaid = ref(false)
   const payrollTaxPaid = ref(false)
+  const payrollSsNotRequired = ref(false)
+  const payrollHfNotRequired = ref(false)
+  const payrollTaxNotRequired = ref(false)
   const employees = ref<any[]>([])
   const salarySheet = ref<any>(null)
   const showSalaryTable = ref(false)
   const payrollPaymentSuggestions = ref<any[]>([])
   const applyingSalaryStatementId = ref('')
+
+  function safeFloat(val: any): number {
+    if (val === null || val === undefined || val === '') return 0
+    const n = Number(val)
+    return Number.isFinite(n) ? n : 0
+  }
+
+  function round2(val: number): number {
+    return Math.round(val * 100) / 100
+  }
 
   // 工资按权责发生制：所属月必须计提；发放可延到次月，凭银行流水核销，
   // 社保/个税挂账同样作为负债结转，均不阻断本月结账。
@@ -49,26 +62,75 @@ export function usePayrollFlow(options: {
     employees.value.length > 0 && (!payrollAccrued.value || payrollPendingReview.value),
   )
 
-  const totalNetSalary = computed(() => {
-    try {
-      return employees.value.reduce((sum, e) => sum + e.net, 0)
-    } catch {
-      return 0
+  const totalNetSalary = computed(() =>
+    round2(employees.value.reduce((sum, e) => sum + safeFloat(e.net), 0)),
+  )
+  const totalCompanyCost = computed(() =>
+    round2(employees.value.reduce((sum, e) => sum + safeFloat(e.cost), 0)),
+  )
+
+  const housingFundDue = computed(() => {
+    const s = salarySheet.value
+    if (s?.housingFundDue !== undefined && s?.housingFundDue !== null && s.housingFundDue !== '') {
+      return round2(safeFloat(s.housingFundDue))
     }
-  })
-  const totalCompanyCost = computed(() => {
-    try {
-      return employees.value.reduce((sum, e) => sum + e.cost, 0)
-    } catch {
-      return 0
+    if (s?.personal_housing_fund_total !== undefined || s?.company_housing_fund_total !== undefined) {
+      return round2(safeFloat(s.personal_housing_fund_total) + safeFloat(s.company_housing_fund_total))
     }
+    return round2(
+      employees.value.reduce(
+        (sum, e) => sum + safeFloat(e.personalHousingFund) + safeFloat(e.companyHousingFund),
+        0,
+      ),
+    )
   })
 
-  function safeFloat(val: any): number {
-    if (val === null || val === undefined || val === '') return 0
-    const n = Number(val)
-    return Number.isFinite(n) ? n : 0
-  }
+  const socialSecurityDue = computed(() => {
+    const s = salarySheet.value
+    if (s?.socialSecurityDue !== undefined && s?.socialSecurityDue !== null && s.socialSecurityDue !== '') {
+      return round2(safeFloat(s.socialSecurityDue))
+    }
+    const hasSplit = employees.value.some(
+      (e) => e.personalSocialInsurance !== undefined || e.companySocialInsurance !== undefined,
+    )
+    if (hasSplit) {
+      return round2(
+        employees.value.reduce(
+          (sum, e) => sum + safeFloat(e.personalSocialInsurance) + safeFloat(e.companySocialInsurance),
+          0,
+        ),
+      )
+    }
+    const combined = employees.value.reduce(
+      (sum, e) => sum + safeFloat(e.personalSocial) + safeFloat(e.social),
+      0,
+    )
+    return round2(Math.max(combined - housingFundDue.value, 0))
+  })
+
+  const taxDue = computed(() => {
+    const s = salarySheet.value
+    if (s?.taxDue !== undefined && s?.taxDue !== null && s.taxDue !== '') {
+      return round2(safeFloat(s.taxDue))
+    }
+    return round2(employees.value.reduce((sum, e) => sum + safeFloat(e.personalTax), 0))
+  })
+
+  const pendingPayCount = computed(() => {
+    if (!employees.value.length || !payrollAccrued.value || payrollPendingReview.value) return 0
+    let count = 0
+    if (!payrollPaid.value) count += 1
+    if (payrollHasSocial.value && !payrollSsNotRequired.value && !payrollSsPaid.value) count += 1
+    if (payrollHasSocial.value && !payrollHfNotRequired.value && !payrollHfPaid.value) count += 1
+    if (payrollHasTax.value && !payrollTaxNotRequired.value && !payrollTaxPaid.value) count += 1
+    return count
+  })
+
+  const payrollAllSettled = computed(() =>
+    employees.value.length > 0 && payrollAccrued.value && !payrollPendingReview.value && pendingPayCount.value === 0,
+  )
+
+  const payrollCarryForward = computed(() => salarySheet.value?.carryForward ?? null)
 
   async function loadSalarySheet() {
     try {
@@ -76,12 +138,19 @@ export function usePayrollFlow(options: {
       const res: any = await apiClient.get(`/api/salary/sheets/${month.value}`)
       salarySheet.value = res
       employees.value = (res.records || []).map((r: any) => ({
+        id: r.id || r.employee_id || r.employee_name,
         name: r.employee_name,
         dept: r.department,
         base: r.base_salary,
         bonus: r.bonus,
+        allowance: r.allowance ?? 0,
+        deduction: r.deduction ?? 0,
         social: r.company_social_security,
         personalSocial: r.personal_social_security,
+        personalSocialInsurance: r.personal_social_insurance,
+        personalHousingFund: r.personal_housing_fund,
+        companySocialInsurance: r.company_social_insurance,
+        companyHousingFund: r.company_housing_fund,
         personalTax: r.personal_tax,
         net: r.net_salary,
         cost: r.total_cost,
@@ -91,13 +160,17 @@ export function usePayrollFlow(options: {
         // accrued/paid：计提凭证已入账；pending_review：计提凭证待审核（maker_checker）
         payrollAccrued.value = res.status === 'accrued' || res.status === 'paid'
         payrollPendingReview.value = res.status === 'pending_review'
-        payrollPaid.value = res.status === 'paid'
+        payrollPaid.value = res.status === 'paid' || res.paymentStatus === 'posted'
+        payrollSsNotRequired.value = res.ssPaymentStatus === 'not_required'
+        payrollHfNotRequired.value = res.hfPaymentStatus === 'not_required'
+        payrollTaxNotRequired.value = res.taxPaymentStatus === 'not_required'
         payrollSsPaid.value = ['posted', 'not_required'].includes(res.ssPaymentStatus)
         payrollHfPaid.value = ['posted', 'not_required'].includes(res.hfPaymentStatus)
         payrollTaxPaid.value = ['posted', 'not_required'].includes(res.taxPaymentStatus)
       }
     } catch (err: any) {
       console.error('[loadSalarySheet] Error occurred:', err)
+      salarySheet.value = null
       employees.value = []
       payrollAccrued.value = false
       payrollPaid.value = false
@@ -105,6 +178,9 @@ export function usePayrollFlow(options: {
       payrollSsPaid.value = false
       payrollHfPaid.value = false
       payrollTaxPaid.value = false
+      payrollSsNotRequired.value = false
+      payrollHfNotRequired.value = false
+      payrollTaxNotRequired.value = false
     }
   }
 
@@ -139,75 +215,43 @@ export function usePayrollFlow(options: {
     }
   }
 
-  async function handleAccruePayroll() {
+  async function runPayAction(
+    action: string,
+    successSuffix: string,
+    failMsg: string,
+    payDate?: string,
+  ) {
     loading.value = true
     try {
-      await apiClient.post(`/api/salary/sheets/${month.value}/accrue`)
+      await apiClient.post(
+        `/api/salary/sheets/${month.value}/${action}`,
+        payDate ? { payDate } : { payDate: null },
+      )
       await entryStore.fetchEntries()
-      message.success(`${month.value} 工资计提成功，已生成记账凭证！`)
+      message.success(`${month.value} ${successSuffix}`)
       await reloadAll()
     } catch (err: any) {
-      message.error(err.response?.data?.detail || '工资计提失败')
+      const detail = err.response?.data?.detail
+      message.error(typeof detail === 'string' ? detail : detail?.message || failMsg)
     } finally {
       loading.value = false
     }
   }
 
-  async function handlePayPayroll() {
-    loading.value = true
-    try {
-      await apiClient.post(`/api/salary/sheets/${month.value}/pay`)
-      await entryStore.fetchEntries()
-      message.success(`${month.value} 工资发放确认成功，已生成付款凭证！`)
-      await reloadAll()
-    } catch (err: any) {
-      message.error(err.response?.data?.detail || '工资发放失败')
-    } finally {
-      loading.value = false
-    }
-  }
+  const handleAccruePayroll = () =>
+    runPayAction('accrue', '工资计提成功，已生成记账凭证！', '工资计提失败')
 
-  async function handlePaySocial() {
-    loading.value = true
-    try {
-      await apiClient.post(`/api/salary/sheets/${month.value}/pay-social`)
-      await entryStore.fetchEntries()
-      message.success(`${month.value} 社保缴纳成功，已生成付款凭证！`)
-      await reloadAll()
-    } catch (err: any) {
-      message.error(err.response?.data?.detail || '社保缴纳失败')
-    } finally {
-      loading.value = false
-    }
-  }
+  const handlePayPayroll = (payDate?: string) =>
+    runPayAction('pay', '工资发放确认成功，已生成付款凭证！', '工资发放失败', payDate)
 
-  async function handlePayHousingFund() {
-    loading.value = true
-    try {
-      await apiClient.post(`/api/salary/sheets/${month.value}/pay-housing-fund`)
-      await entryStore.fetchEntries()
-      message.success(`${month.value} 公积金缴纳成功，已生成付款凭证！`)
-      await reloadAll()
-    } catch (err: any) {
-      message.error(err.response?.data?.detail || '公积金缴纳失败')
-    } finally {
-      loading.value = false
-    }
-  }
+  const handlePaySocial = (payDate?: string) =>
+    runPayAction('pay-social', '社保缴纳成功，已生成付款凭证！', '社保缴纳失败', payDate)
 
-  async function handlePayTax() {
-    loading.value = true
-    try {
-      await apiClient.post(`/api/salary/sheets/${month.value}/pay-tax`)
-      await entryStore.fetchEntries()
-      message.success(`${month.value} 个人所得税缴纳成功，已生成付款凭证！`)
-      await reloadAll()
-    } catch (err: any) {
-      message.error(err.response?.data?.detail || '个税缴纳失败')
-    } finally {
-      loading.value = false
-    }
-  }
+  const handlePayHousingFund = (payDate?: string) =>
+    runPayAction('pay-housing-fund', '公积金缴纳成功，已生成付款凭证！', '公积金缴纳失败', payDate)
+
+  const handlePayTax = (payDate?: string) =>
+    runPayAction('pay-tax', '个人所得税缴纳成功，已生成付款凭证！', '个税缴纳失败', payDate)
 
   return {
     payrollAccrued,
@@ -216,6 +260,9 @@ export function usePayrollFlow(options: {
     payrollSsPaid,
     payrollHfPaid,
     payrollTaxPaid,
+    payrollSsNotRequired,
+    payrollHfNotRequired,
+    payrollTaxNotRequired,
     employees,
     salarySheet,
     showSalaryTable,
@@ -226,6 +273,12 @@ export function usePayrollFlow(options: {
     hasBlockingPayroll,
     totalNetSalary,
     totalCompanyCost,
+    socialSecurityDue,
+    housingFundDue,
+    taxDue,
+    pendingPayCount,
+    payrollAllSettled,
+    payrollCarryForward,
     loadSalarySheet,
     loadPayrollPaymentSuggestions,
     handleApplySalaryPayment,

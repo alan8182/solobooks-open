@@ -30,6 +30,8 @@ describe('report center architecture and routing', () => {
     'chronological',
     'multi-column',
     'partner-balances',
+    'auxiliary-sub-ledger',
+    'auxiliary-combination',
   ]
 
   // 并入工作台前的旧地址，仍要被重定向兜住（首页快捷入口与报表下钻还在用）
@@ -39,6 +41,8 @@ describe('report center architecture and routing', () => {
     '/reports/chronological': 'chronological',
     '/reports/multi-column': 'multi-column',
     '/reports/partner-balances': 'partner-balances',
+    '/reports/auxiliary-sub-ledger': 'auxiliary-sub-ledger',
+    '/reports/auxiliary-combination': 'auxiliary-combination',
   }
 
   // 增值税与所得税申报辅助并入税务申报工作台（/tax-filing）的旧地址，同样保留重定向
@@ -60,8 +64,8 @@ describe('report center architecture and routing', () => {
     expect(new Set(allReportPaths).size).toBe(allReportPaths.length)
   })
 
-  it('routes all five ledger books through a single workspace entry', () => {
-    expect(ledgerBookKinds).toHaveLength(5)
+  it('routes all seven ledger books through a single workspace entry', () => {
+    expect(ledgerBookKinds).toHaveLength(7)
     const resolved = router.resolve('/ledger/books')
     expect(resolved.matched.length).toBeGreaterThan(0)
     // 单 path 单 name：KeepAlive 与页内标签都按 name 认，拆成子路由会各占一个壳

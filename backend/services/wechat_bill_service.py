@@ -14,16 +14,17 @@ from typing import Any, Dict, List, Set
 
 from services.database import get_conn
 from services.entry_service import save_entries_bulk
+from services.platform_bill_common import WECHAT_CLEARING_CODE
+from services.platform_bill_common import parse_money as _money
+from services.platform_bill_common import split_revenue_vat as _split_revenue_vat
 from services.vat_service import (
     VAT_PAYABLE_ACCOUNT,
     VAT_PAYABLE_ACCOUNT_NAME,
     get_vat_config_by_id,
     is_vat_sales_entry,
-    split_income_vat,
 )
-from core.money import ZERO, money
+from core.money import ZERO
 
-WECHAT_CLEARING_CODE = "1012001"
 WECHAT_CLEARING_NAME = "微信支付待结算"
 REVENUE_CODE = "5001"
 REVENUE_NAME = "主营业务收入"
@@ -35,13 +36,6 @@ def _strip_backtick(s: str) -> str:
     return s.lstrip("`").strip()
 
 
-def _money(value: Any) -> Decimal:
-    try:
-        return money(value or ZERO)
-    except (TypeError, ValueError):
-        return ZERO
-
-
 def _add_days(date_str: str, days: int) -> str:
     try:
         return (datetime.strptime(date_str[:10], "%Y-%m-%d") + timedelta(days=days)).strftime("%Y-%m-%d")
@@ -51,19 +45,6 @@ def _add_days(date_str: str, days: int) -> str:
 
 def _voucher(debit: List[Dict[str, Any]], credit: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {"debit": debit, "credit": credit}
-
-
-def _split_revenue_vat(gross: Decimal, vat_rate: Any) -> tuple[Decimal, Decimal]:
-    """按征收率对收入做价税分离，返回（不含税净额，增值税额）。
-
-    退款红冲（gross 为负）按绝对值拆分后镜像符号，保持与收入金额同号，
-    这样借贷两侧都能直接用 ``abs`` 落行；``split_income_vat`` 本身不接受负数。
-    """
-    if gross < ZERO:
-        net, tax = split_income_vat(-gross, vat_rate)
-        return money(-net), money(-tax)
-    net, tax = split_income_vat(gross, vat_rate)
-    return net, tax
 
 
 def _read_csv_row(line: str) -> List[str]:

@@ -26,6 +26,7 @@ COPY --from=build /app/dist /usr/share/nginx/html
 # 预渲染静态 HTML 覆盖同名文件（index.html 等）并补齐目录式路由（/ai-connect/index.html …）
 COPY web/prerender/ /usr/share/nginx/html/
 COPY deploy/nginx/default.conf /etc/nginx/conf.d/default.conf
+COPY deploy/nginx/security-headers.conf /etc/nginx/security-headers.conf
 
 EXPOSE 80
 

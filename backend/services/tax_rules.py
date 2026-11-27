@@ -91,6 +91,46 @@ TAX_RULES = {
         "riskTags": ["15%税前扣除限额"],
         "taxNote": "广告宣传费按销售收入15%限额扣除，超出部分可结转"
     },
+    "员工福利费": {
+        "vatRate": 0.00,
+        "vatExempt": True,
+        "vatType": "simplified",
+        "citDeductible": True,
+        "deductibilityLimit": 0.14,       # 工资薪金总额 14% 限额
+        "requiredBilling": "invoice",
+        "riskTags": ["14%工资基数限额扣除"],
+        "taxNote": "职工福利费不超过工资薪金总额14%的部分准予税前扣除"
+    },
+    "工会经费": {
+        "vatRate": 0.00,
+        "vatExempt": True,
+        "vatType": "simplified",
+        "citDeductible": True,
+        "deductibilityLimit": 0.02,       # 工资薪金总额 2% 限额
+        "requiredBilling": "invoice",
+        "riskTags": ["2%工资基数限额扣除"],
+        "taxNote": "拨缴的工会经费不超过工资薪金总额2%的部分准予税前扣除，需取得工会经费收入专用收据/合规凭证"
+    },
+    "职工教育经费": {
+        "vatRate": 0.06,
+        "vatExempt": False,
+        "vatType": "general",
+        "citDeductible": True,
+        "deductibilityLimit": 0.08,       # 企税 8%（个体户/个独 2.5%），超出可结转
+        "requiredBilling": "invoice",
+        "riskTags": ["8%工资基数限额（个体户2.5%）", "超出部分可结转"],
+        "taxNote": "职工教育经费企业不超过工资薪金总额8%（个体户/个独2.5%）的部分准予扣除，超出部分可结转以后年度"
+    },
+    "捐赠支出": {
+        "vatRate": 0.00,
+        "vatExempt": True,
+        "vatType": "simplified",
+        "citDeductible": True,
+        "deductibilityLimit": 0.12,       # 企税年度利润总额 12%（个体户/个独应纳税所得额 30%）
+        "requiredBilling": "invoice",
+        "riskTags": ["仅限公益性捐赠票据", "直接捐赠不得扣除"],
+        "taxNote": "公益性捐赠企业不超过年度利润总额12%（可结转3年）、个人经营所得不超过应纳税所得额30%的部分准予扣除，直接捐赠不得税前扣除"
+    },
     "其他支出": {
         "vatRate": 0.06,
         "vatExempt": False,

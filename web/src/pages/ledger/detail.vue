@@ -17,6 +17,8 @@ import type { Entry } from '@/api/types'
 import { getRdExpenseTypes, getRdProjects } from '@/api/rd'
 import type { RdExpenseTypeOption, RdProject } from '@/api/types'
 import { getLedgerAccounts, type LedgerAccountOption } from '@/api/ledger'
+import { assignEntryAuxiliary, getAuxiliaryOptions, type AuxiliaryItem } from '@/api/auxiliary'
+import { formatAuxiliaryLineText } from '@/utils/auxiliary'
 import {
   adjustEntryVoucherLines,
   approveEntry,
@@ -53,6 +55,7 @@ const posting = ref(false)
 const postingOptions = ref<PostingOptions | null>(null)
 const isPendingReview = computed(() => voucherStatus.value === 'pending_review')
 const needsSubmitReview = computed(() => !!postingOptions.value?.canSubmit && !postingOptions.value.canPost)
+const showManualPostAction = computed(() => needsSubmitReview.value || isPendingReview.value)
 const postingLabel = computed(() => needsSubmitReview.value ? '提交复核' : isPendingReview.value ? '复核并过账' : '确认过账')
 
 const returnTarget = computed(() => {
@@ -106,6 +109,11 @@ const settlementOriginalIds = computed<string[]>(() => entry.value?.originalEntr
 const settlementBankId = computed<string>(() => entry.value?.linkedStatementId || '')
 const isPosted = computed(() => voucherStatus.value === 'posted')
 const isReversed = computed(() => voucherStatus.value === 'reversed')
+const isReversalEntry = computed(() =>
+  String(entry.value?.entryType || (entry.value as any)?.entry_type || '') === 'reversal'
+  || Boolean((entry.value as any)?.isReversal)
+  || Boolean((entry.value as any)?.reversalOf),
+)
 
 const saving = ref(false)
 const rdProjects = ref<RdProject[]>([])
@@ -121,6 +129,70 @@ const editForm = ref({
   billingStatus: '',
   paymentDate: null as string | null,
 })
+
+const auxCatalog = ref<{
+  partners: AuxiliaryItem[]
+  departments: AuxiliaryItem[]
+  projects: AuxiliaryItem[]
+  employees: AuxiliaryItem[]
+}>({ partners: [], departments: [], projects: [], employees: [] })
+const auxLoaded = ref(false)
+const auxForm = ref<{
+  partner_id: string | null
+  department_id: string | null
+  project_id: string | null
+  employee_id: string | null
+}>({ partner_id: null, department_id: null, project_id: null, employee_id: null })
+const savedAux = ref({ ...auxForm.value })
+
+const auxPartnerOptions = computed(() =>
+  auxCatalog.value.partners.map((item) => ({ label: `${item.code} ${item.name}`, value: item.id })),
+)
+const auxDepartmentOptions = computed(() =>
+  auxCatalog.value.departments.map((item) => ({ label: item.name, value: item.id })),
+)
+const auxProjectOptions = computed(() =>
+  auxCatalog.value.projects.map((item) => ({ label: `${item.code} ${item.name}`, value: item.id })),
+)
+const auxEmployeeOptions = computed(() =>
+  auxCatalog.value.employees.map((item) => ({
+    label: item.department ? `${item.name} · ${item.department}` : item.name,
+    value: item.id,
+  })),
+)
+
+function syncAuxFromEntry(target: Entry | null) {
+  const lines = (target?.voucherLines || {}) as Record<string, any>
+  const allLines = [...(lines.debit || []), ...(lines.credit || [])]
+  const pick = (key: string) => {
+    const hit = allLines.find((line: any) => line?.auxiliary?.[key])
+    return hit ? String(hit.auxiliary[key]) : null
+  }
+  const initial = {
+    partner_id: pick('partner_id'),
+    department_id: pick('department_id'),
+    project_id: pick('project_id'),
+    employee_id: pick('employee_id'),
+  }
+  auxForm.value = { ...initial }
+  savedAux.value = { ...initial }
+}
+
+async function ensureAuxCatalog() {
+  if (auxLoaded.value) return
+  try {
+    const data = await getAuxiliaryOptions('', 100)
+    auxCatalog.value = {
+      partners: data.partners || [],
+      departments: data.departments || [],
+      projects: data.projects || [],
+      employees: data.employees || [],
+    }
+    auxLoaded.value = true
+  } catch {
+    // 加载失败不阻塞单据编辑
+  }
+}
 
 const directionOptions = [
   { label: '收入', value: 'income' },
@@ -500,13 +572,19 @@ async function loadEntry() {
     billingStatus: found.billingStatus || '',
     paymentDate: found.paymentDate || null,
   }
+  syncAuxFromEntry(found)
+  if (isPosted.value || isReversed.value || isReversalEntry.value) {
+    editing.value = false
+  } else if (editing.value) {
+    void ensureAuxCatalog()
+  }
   loading.value = false
 }
 onMounted(loadEntry)
 watch(() => route.params.id, loadEntry)
 
 function startEdit() {
-  if (!entry.value) return
+  if (!entry.value || isPosted.value || isReversed.value || isReversalEntry.value) return
   editForm.value = {
     title: entry.value.title || '',
     amount: entry.value.amount,
@@ -516,7 +594,9 @@ function startEdit() {
     billingStatus: entry.value.billingStatus || '',
     paymentDate: entry.value.paymentDate || null,
   }
+  syncAuxFromEntry(entry.value)
   editing.value = true
+  void ensureAuxCatalog()
   // 已经是员工垫付的旧数据：进编辑就先把名单拉好，别等用户再点一次
   if (payerKind.value === 'employee_personal') void payerEmployees.ensure()
 }
@@ -546,7 +626,27 @@ async function saveEdit(confirmOverwriteVoucher = false) {
       paymentDate: editForm.value.paymentDate || null,
       ...(confirmOverwriteVoucher ? { confirmRegenerateVoucher: true } : {}),
     })
-    entry.value = updated || entryStore.activeEntries.find((e) => e.id === entry.value?.id) || {
+    const auxChanged =
+      auxForm.value.partner_id !== savedAux.value.partner_id ||
+      auxForm.value.department_id !== savedAux.value.department_id ||
+      auxForm.value.project_id !== savedAux.value.project_id ||
+      auxForm.value.employee_id !== savedAux.value.employee_id
+    const hasAnyAux = Boolean(
+      auxForm.value.partner_id ||
+        auxForm.value.department_id ||
+        auxForm.value.project_id ||
+        auxForm.value.employee_id,
+    )
+    if ((auxChanged || hasAnyAux) && !isPosted.value && !isReversed.value) {
+      await assignEntryAuxiliary(entry.value.id, {
+        partner_id: auxForm.value.partner_id,
+        department_id: auxForm.value.department_id,
+        project_id: auxForm.value.project_id,
+        employee_id: auxForm.value.employee_id,
+      })
+      await entryStore.fetchEntries()
+    }
+    entry.value = entryStore.activeEntries.find((e) => e.id === entry.value?.id) || updated || {
       ...entry.value,
       title: editForm.value.title,
       amount: editForm.value.amount,
@@ -556,6 +656,7 @@ async function saveEdit(confirmOverwriteVoucher = false) {
       billingStatus: editForm.value.billingStatus,
       paymentDate: editForm.value.paymentDate || undefined,
     }
+    syncAuxFromEntry(entry.value)
     showOverwriteVoucherConfirm.value = false
     editing.value = false
     message.success('已保存')
@@ -657,11 +758,12 @@ async function deleteEntry() {
             <NTag v-if="isReversed" size="small" :bordered="false" round>已冲销</NTag>
             <template v-else-if="isPosted">
               <NTag size="small" type="info" :bordered="false" round>已过账</NTag>
-              <NButton size="small" type="warning" ghost @click="showReverseConfirm = true">冲销</NButton>
+              <NTag v-if="isReversalEntry" size="small" type="warning" :bordered="false" round>冲销凭证</NTag>
+              <NButton v-else size="small" type="warning" ghost @click="showReverseConfirm = true">冲销</NButton>
             </template>
             <template v-else>
-              <NTag size="small" type="warning">{{ isPendingReview ? '待复核' : '待过账' }}</NTag>
-              <NButton v-if="postingOptions?.canPost || postingOptions?.canApprove || postingOptions?.canSubmit" size="small" type="primary" @click="showPostConfirm = true">
+              <NTag size="small" type="warning">{{ isPendingReview ? '待复核' : '待关账封存' }}</NTag>
+              <NButton v-if="showManualPostAction && (postingOptions?.canApprove || postingOptions?.canSubmit)" size="small" type="primary" @click="showPostConfirm = true">
                 {{ postingLabel }}
               </NButton>
               <NButton v-if="!settlementBankId" size="small" @click="startEdit">编辑</NButton>
@@ -742,25 +844,25 @@ async function deleteEntry() {
             </NSpace>
           </div>
         </div>
+
+        <div v-if="settlementBankId" class="info-grid" style="margin-top: 16px;">
+          <div class="info-item span-2">
+            <span class="label">结算来源</span>
+            <span class="value">银行净额到账；原收款与手续费合并结算</span>
+          </div>
+          <div class="info-item">
+            <span class="label">银行流水</span>
+            <span class="value">{{ settlementBankId }}</span>
+          </div>
+          <div class="info-item" v-for="id in settlementOriginalIds" :key="id">
+            <span class="label">原收款 / 手续费</span>
+            <NButton text type="primary" @click="router.push(`/ledger/${id}`)">{{ entryStore.activeEntries.find(item => item.id === id)?.title || id }}</NButton>
+          </div>
+        </div>
       </template>
 
-      <div v-if="settlementBankId && !editing" class="info-grid" style="margin-top: 16px;">
-        <div class="info-item span-2">
-          <span class="label">结算来源</span>
-          <span class="value">银行净额到账；原收款与手续费合并结算</span>
-        </div>
-        <div class="info-item">
-          <span class="label">银行流水</span>
-          <span class="value">{{ settlementBankId }}</span>
-        </div>
-        <div class="info-item" v-for="id in settlementOriginalIds" :key="id">
-          <span class="label">原收款 / 手续费</span>
-          <NButton text type="primary" @click="router.push(`/ledger/${id}`)">{{ entryStore.activeEntries.find(item => item.id === id)?.title || id }}</NButton>
-        </div>
-      </div>
-
       <!-- Edit mode -->
-      <template v-else>
+      <template v-else-if="editing && !isPosted && !isReversed && !isReversalEntry">
         <div class="edit-section">
           <NForm class="edit-grid">
             <NFormItem label="摘要" class="span-2">
@@ -820,6 +922,20 @@ async function deleteEntry() {
             <NFormItem label="票据状态">
               <NSelect v-model:value="editForm.billingStatus" :options="billingOptions" clearable />
             </NFormItem>
+            <template v-if="!isPosted && !isReversed">
+              <NFormItem label="往来单位（辅助核算）">
+                <NSelect v-model:value="auxForm.partner_id" :options="auxPartnerOptions" clearable filterable placeholder="可选" />
+              </NFormItem>
+              <NFormItem label="部门（辅助核算）">
+                <NSelect v-model:value="auxForm.department_id" :options="auxDepartmentOptions" clearable filterable placeholder="可选" />
+              </NFormItem>
+              <NFormItem label="项目（辅助核算）">
+                <NSelect v-model:value="auxForm.project_id" :options="auxProjectOptions" clearable filterable placeholder="可选" />
+              </NFormItem>
+              <NFormItem label="职员（辅助核算）">
+                <NSelect v-model:value="auxForm.employee_id" :options="auxEmployeeOptions" clearable filterable placeholder="可选" />
+              </NFormItem>
+            </template>
           </NForm>
           <NSpace justify="end">
             <NButton @click="editing = false">取消</NButton>
@@ -862,12 +978,14 @@ async function deleteEntry() {
             </NTooltip>
           </div>
           <p class="guide-desc">
-            当前处于待处理原始单据阶段。核对上方摘要、分类与收支信息无误后，点击确认过账即可生成正式会计凭证。
+            {{ showManualPostAction
+              ? '当前凭证处于复核流程中，请提交复核或由有权限的复核人审核过账。'
+              : '当前处于未关账草稿阶段，可随时编辑或调整分录；月度关账时将自动生成正式凭证号并计入正式报表。' }}
           </p>
         </div>
         <div class="guide-actions">
           <NButton
-            v-if="postingOptions?.canPost || postingOptions?.canApprove || postingOptions?.canSubmit"
+            v-if="showManualPostAction && (postingOptions?.canApprove || postingOptions?.canSubmit)"
             type="primary"
             size="medium"
             @click="showPostConfirm = true"
@@ -1028,8 +1146,8 @@ async function deleteEntry() {
                     💡 小微企业免税政策：小规模纳税人季度销售额 ≤ 30 万元时，期末结账系统将自动生成免税凭证全额冲平转入收益，无需实际缴税。
                   </NTooltip>
                 </div>
-                <div v-if="line.auxiliary?.partner_name" class="line-aux">
-                  往来单位：{{ line.auxiliary.partner_name }}
+                <div v-if="formatAuxiliaryLineText(line.auxiliary)" class="line-aux">
+                  辅助：{{ formatAuxiliaryLineText(line.auxiliary) }}
                 </div>
               </td>
               <td>

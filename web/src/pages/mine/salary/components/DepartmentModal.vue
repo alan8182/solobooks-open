@@ -84,7 +84,7 @@ async function handleSave() {
     :show="show"
     preset="card"
     title="部门设置（本账套）"
-    style="width: min(560px, 92vw); border-radius: 14px"
+    style="width: min(560px, 92vw); border-radius: var(--solo-radius-lg)"
     @update:show="closeModal"
   >
     <p class="modal-hint">

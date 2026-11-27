@@ -10,13 +10,23 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from deps.auth import AuthContext, require_auth
+from models.schemas import StrictRequestModel
 from services.audit_service import log_action
-from services.invoice_ledger_service import backfill_invoices, invoice_summary, list_invoices
+from services.attachment_storage_service import AttachmentError, set_invoice_verify
+from services.invoice_ledger_service import (
+    backfill_invoices,
+    invoice_summary,
+    list_invoices_with_attachments,
+)
 
 router = APIRouter(prefix="/api/invoices", tags=["invoices"], dependencies=[Depends(require_auth)])
+
+
+class VerifyRequest(StrictRequestModel):
+    verified: bool = True
 
 
 @router.get("")
@@ -31,8 +41,8 @@ async def get_invoices(
     page_size: int = Query(20, ge=1, le=200),
     ctx: AuthContext = Depends(require_auth),
 ):
-    """发票台账：分页 + 期间/方向/关键字/状态过滤。"""
-    return await list_invoices(
+    """发票台账：分页 + 期间/方向/关键字/状态过滤（含附件聚合）。"""
+    return await list_invoices_with_attachments(
         ctx.company_id,
         month_from=month_from,
         month_to=month_to,
@@ -61,3 +71,17 @@ async def run_backfill(ctx: AuthContext = Depends(require_auth)):
     result = await backfill_invoices(ctx.company_id, force=True)
     await log_action(ctx.company_id, ctx.user_id, "backfill", "invoice", None, result)
     return result
+
+
+@router.patch("/{invoice_id}/verify")
+async def verify_invoice(
+    invoice_id: str,
+    payload: VerifyRequest,
+    ctx: AuthContext = Depends(require_auth),
+):
+    """查验状态标记：用户在电子税务局查验后的人工声明（财会〔2020〕6号第三条）。"""
+    try:
+        return await set_invoice_verify(ctx.company_id, ctx.user_id, invoice_id, verified=payload.verified)
+    except AttachmentError as exc:
+        status = exc.status_code if exc.status_code in (404,) else 400
+        raise HTTPException(status_code=status, detail=str(exc)) from exc

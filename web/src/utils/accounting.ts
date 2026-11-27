@@ -70,20 +70,34 @@ export const CHART_OF_ACCOUNTS: Record<string, string> = {
   '5051': '其他业务收入',
   '5111': '投资收益',
   '5301': '营业外收入',
+  '5301001': '营业外收入-非流动资产处置净收益',
+  '5301002': '营业外收入-政府补助',
+  '5301003': '营业外收入-捐赠收益',
+  '5301004': '营业外收入-盘盈收益',
   '5401001': '主营业务成本-人力',
   '5401002': '主营业务成本-生产',
   '5403': '税金及附加',
   '4301': '研发支出-费用化支出',
   '5601': '销售费用',
+  '5601009': '销售费用-展览费',
+  '5601010': '销售费用-商品维修费',
   '5601011': '销售费用-运输费',
+  '5601012': '销售费用-装卸费',
+  '5601013': '销售费用-包装费',
+  '5601014': '销售费用-保险费',
+  '5601015': '销售费用-广告费',
   '5601016': '销售费用-业务宣传费',
   '5602': '管理费用',
   '5602001': '管理人员职工薪酬',
   '5602002': '管理费用-业务招待费',
+  '5602003': '管理费用-修理费',
   '5602004': '管理费用-办公费',
   '5602005': '管理费用-水电费',
   '5602006': '管理费用-差旅费',
   '5602007': '管理费用-折旧费',
+  '5602009': '管理费用-开办费',
+  '5602010': '管理费用-研究费用',
+  '5602011': '管理费用-咨询费',
   '5602013': '管理费用-租赁费',
   '5602014': '管理费用-职工福利费',
   '5602015': '管理费用-信息技术服务费',
@@ -91,10 +105,23 @@ export const CHART_OF_ACCOUNTS: Record<string, string> = {
   '5602017': '管理费用-住房公积金',
   '5602999': '管理费用-其他',
   '5603': '财务费用',
+  '5603001': '财务费用-利息费用',
   '5603002': '财务费用-手续费',
-  '5603004': '现金折扣',
+  '5603003': '财务费用-汇兑损益',
+  '5603004': '财务费用-现金折扣',
   '5603005': '财务费用-利息收入',
   '5711': '营业外支出',
+  '5711001': '营业外支出-非流动资产处置净损失',
+  '5711002': '营业外支出-赞助支出',
+  '5711003': '营业外支出-捐赠支出',
+  '5711004': '营业外支出-盘亏损失',
+  '5711005': '营业外支出-坏账损失',
+  '5711006': '营业外支出-存货毁损报废损失',
+  '5711007': '营业外支出-无法收回的长期债券投资损失',
+  '5711008': '营业外支出-无法收回的长期股权投资损失',
+  '5711009': '营业外支出-自然灾害等不可抗力因素造成的损失',
+  '5711010': '营业外支出-税收滞纳金',
+  '5711011': '营业外支出-罚款支出',
   '5801': '所得税费用',
 }
 
@@ -120,23 +147,54 @@ const CATEGORY_DEBIT_MAP: Record<string, { code: string; name: string }> = {
   '房租物业': { code: '5602013', name: '管理费用-租赁费' },
   '租金物业': { code: '5602013', name: '管理费用-租赁费' },
   '信息技术服务费': { code: '5602015', name: '管理费用-信息技术服务费' },
+  '咨询费': { code: '5602011', name: '管理费用-咨询费' },
+  '修理费': { code: '5602003', name: '管理费用-修理费' },
+  '开办费': { code: '5602009', name: '管理费用-开办费' },
+  '研究费用': { code: '5602010', name: '管理费用-研究费用' },
   '运费及物流': { code: '5601011', name: '销售费用-运输费' },
   '水电通讯费': { code: '5602005', name: '管理费用-水电费' },
   '银行及金融手续费': { code: '5603002', name: '财务费用-手续费' },
+  '利息费用': { code: '5603001', name: '财务费用-利息费用' },
+  '汇兑损益': { code: '5603003', name: '财务费用-汇兑损益' },
+  '现金折扣': { code: '5603004', name: '财务费用-现金折扣' },
   '税费缴纳': { code: '2221026', name: '应交增值税（小规模纳税人专用）' },
   '预付账款': { code: '1123', name: '预付账款' },
   '推广费': { code: '5601016', name: '销售费用-业务宣传费' },
+  '广告费': { code: '5601015', name: '销售费用-广告费' },
+  '展览费': { code: '5601009', name: '销售费用-展览费' },
+  '商品维修费': { code: '5601010', name: '销售费用-商品维修费' },
+  '装卸费': { code: '5601012', name: '销售费用-装卸费' },
+  '包装费': { code: '5601013', name: '销售费用-包装费' },
+  '保险费': { code: '5601014', name: '销售费用-保险费' },
   '营业外支出': { code: '5711', name: '营业外支出' },
+  '罚款支出': { code: '5711011', name: '营业外支出-罚款支出' },
+  '税收滞纳金': { code: '5711010', name: '营业外支出-税收滞纳金' },
+  '捐赠支出': { code: '5711003', name: '营业外支出-捐赠支出' },
+  '赞助支出': { code: '5711002', name: '营业外支出-赞助支出' },
+  '非流动资产处置净损失': { code: '5711001', name: '营业外支出-非流动资产处置净损失' },
+  '盘亏损失': { code: '5711004', name: '营业外支出-盘亏损失' },
+  '坏账损失': { code: '5711005', name: '营业外支出-坏账损失' },
+  '存货毁损报废损失': { code: '5711006', name: '营业外支出-存货毁损报废损失' },
+  '长期债券投资损失': { code: '5711007', name: '营业外支出-无法收回的长期债券投资损失' },
+  '长期股权投资损失': { code: '5711008', name: '营业外支出-无法收回的长期股权投资损失' },
+  '自然灾害损失': { code: '5711009', name: '营业外支出-自然灾害等不可抗力因素造成的损失' },
   '所得税费用': { code: '5801', name: '所得税费用' },
   '其他支出': { code: '5602999', name: '管理费用-其他' },
   // 工资/社保走工资模块核销（与后端 account_mapper 221101/221102 对齐），不直接记费用
   '工资发放': { code: '221101', name: '应付职工薪酬-工资' },
   '社保公积金': { code: '221102', name: '应付职工薪酬-单位社保' },
+  '个税代缴': { code: '2221012', name: '应交税费-应交个人所得税' },
   '供应商付款': { code: '2202', name: '应付账款' },
   '员工垫付报销': { code: '2241', name: '其他应付款' },
   '主营业务收入': { code: '5001', name: '主营业务收入' },
+  '咨询服务收入': { code: '5001001', name: '主营业务收入-咨询服务' },
+  '技术服务收入': { code: '5001002', name: '主营业务收入-技术服务' },
   '其他业务收入': { code: '5051', name: '其他业务收入' },
   '营业外收入': { code: '5301', name: '营业外收入' },
+  '非流动资产处置净收益': { code: '5301001', name: '营业外收入-非流动资产处置净收益' },
+  '政府补助': { code: '5301002', name: '营业外收入-政府补助' },
+  '捐赠收益': { code: '5301003', name: '营业外收入-捐赠收益' },
+  '盘盈收益': { code: '5301004', name: '营业外收入-盘盈收益' },
   '利息收入': { code: '5603005', name: '财务费用-利息收入' },
   '折旧': { code: '5602007', name: '管理费用-折旧费' },
   '股东投入': { code: '3001', name: '实收资本' },
@@ -152,9 +210,21 @@ const CATEGORY_DEBIT_MAP: Record<string, { code: string; name: string }> = {
   '往来款': { code: '122199', name: '其他应收款-待收款项' },
 }
 
+export interface AccountMappingItem {
+  category: string
+  direction: string
+  accountCode: string
+  accountName: string
+  accountType?: string
+  group?: string
+  isAlias?: boolean
+  sortOrder?: number
+}
+
 // 权威映射（分类 → 科目）：从后端 /api/categories/account-mapping 加载，覆盖上面的兜底表。
 // 未加载或加载失败时回落到 CATEGORY_DEBIT_MAP，保证凭证预览不因网络问题中断。
 let _accountMapping: Record<string, { code: string; name: string }> | null = null
+let _accountMappingItems: AccountMappingItem[] = []
 
 // 分类模糊组（随 /account-mapping 同源下发）：银行流水层面不可判定、正确科目
 // 取决于账外事实的分类。组内候选需展开交用户选择，且禁止沉淀自动入账规则。
@@ -164,18 +234,25 @@ export function getAmbiguityGroup(category: string): string[] {
   return _ambiguityGroups[category] || []
 }
 
+export function getAccountMappingItems(): AccountMappingItem[] {
+  return _accountMappingItems
+}
+
 export async function loadAccountMapping(): Promise<void> {
   try {
     const res: any = await apiClient.get('/api/categories/account-mapping')
     const items = res?.items || res || []
     const map: Record<string, { code: string; name: string }> = {}
+    const validItems: AccountMappingItem[] = []
     for (const it of items) {
       if (it?.category && it?.accountCode) {
         map[it.category] = { code: it.accountCode, name: it.accountName || it.category }
+        validItems.push(it)
       }
     }
     if (Object.keys(map).length > 0) {
       _accountMapping = map
+      _accountMappingItems = validItems
     }
     if (res?.ambiguityGroups && typeof res.ambiguityGroups === 'object') {
       _ambiguityGroups = res.ambiguityGroups

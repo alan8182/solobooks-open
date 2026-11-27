@@ -34,7 +34,18 @@ export interface QuotaState {
   limitTokens: number | null
   bonusTokens: number
   usedTokens: number
+  /** 套餐本期剩余 + 充值点数余额（先套餐后点数，因此这就是可用总量） */
   remainingTokens: number | null
+  /** 购买的 AI 点数余额（永久有效，不随套餐周期重置；1 点 = 1 token） */
+  tokenBalance?: number
+  /** 新人首月体验包剩余点数（30 天有效，先于永久余额扣减） */
+  promoTokenBalance?: number
+  /** 新人首月体验包到期日（ISO 日期串）；null/undefined = 无有效特惠包 */
+  promoExpiresAt?: string | null
+  /** 当前账号是否有资格购买「新人首月 AI 体验包」 */
+  promoEligible?: boolean
+  /** 体验额度已用 ≥80% 或已耗尽（用于触发柔和升级提醒横幅） */
+  promoLowQuota?: boolean
   /** 付费套餐到期日（ISO 日期串）；null/undefined = 不适用（trial 或管理端调整） */
   planExpiresAt?: string | null
   /** 最多可创建的账套数；null = 不限（开源自部署或未来代账机构版） */

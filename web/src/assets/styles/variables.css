@@ -15,6 +15,19 @@
   --solo-bg-soft: #f1f4f8;
   --solo-bg-blue-soft: #edf3ff;
 
+  /* 仿真册/纸质文档（凭证册翻页阅读器）：暖象牙内页、牛皮封面、装订脊、桌面舞台与官方数电票版式红
+     （#800000 取自电子税务局 PDF 实测，只用于文档版式，不是 UI 语义色） */
+  --solo-paper: #faf6ee;
+  --solo-paper-back: #f0e8d8;
+  --solo-paper-edge: #dfd4be;
+  --solo-paper-cover: #e5d5b7;
+  --solo-paper-cover-spine: #3f342a;
+  --solo-book-desk: #1e242d;
+  --solo-book-desk-light: #2b3340;
+  --solo-doc-ink: #2c3e55;
+  --solo-doc-stamp: #b83227;
+  --solo-doc-red: #800000;
+
   /* Text colors
      muted 旧值 8a95a3 在页面底 #f6f7f9 上只有 2.84:1，而它承载日期、说明、
      副文案这类 11–12px 小字，全站不达 WCAG AA 4.5:1。现值 #636e7c 在本项目

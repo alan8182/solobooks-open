@@ -161,6 +161,32 @@ describe('mergeOpeningRows 保留原文件科目编码', () => {
     expect(merged.find((r) => r.account_code === '1001')?.originalCode).toBe('1001')
     expect(merged.find((r) => r.account_code === '1122')?.originalCode).toBe('1122001')
   })
+
+  it('按科目编码升序排列并将客商明细紧跟所属科目之后，不落到权益行末尾', () => {
+    const existing = [
+      row({ account_code: '1001', account_name: '库存现金' }),
+      row({ account_code: '1122', account_name: '应收账款' }),
+      row({ account_code: '2202', account_name: '应付账款' }),
+      row({ account_code: '3104006', account_name: '未分配利润', credit_balance: 5000 }),
+    ]
+    const incoming = [
+      row({ account_code: '1122', debit_balance: '1614.12', partner_name: '东方大地', originalCode: '1122010' }),
+      row({ account_code: '1122', debit_balance: '543.30', partner_name: '梧桐树', originalCode: '1122001' }),
+      row({ account_code: '2202', credit_balance: '2400.00', partner_name: '公瑾', originalCode: '2202002' }),
+    ]
+    const merged = mergeOpeningRows(existing, incoming)
+    expect(
+      merged.map((r) => `${r.account_code}:${r.partner_name || '-'}:${r.originalCode || '-'}`),
+    ).toEqual([
+      '1001:-:-',
+      '1122:-:-',
+      '1122:梧桐树:1122001',
+      '1122:东方大地:1122010',
+      '2202:-:-',
+      '2202:公瑾:2202002',
+      '3104006:-:-',
+    ])
+  })
 })
 
 describe('mergeYtdRows', () => {

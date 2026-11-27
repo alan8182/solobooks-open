@@ -109,7 +109,8 @@ export function isProfitLossCode(code: string): boolean {
  * 可挂客商的往来科目前缀——与后端 `core/chart_policy.PARTNER_ACCOUNT_PREFIXES` 同口径。
  * 后端用前缀匹配（1122001 也允许挂客商），前端曾经是精确 Set.has，两边漂移过。
  */
-const PARTNER_ACCOUNT_PREFIXES = ['1122', '1123', '2202', '2203', '1221', '2241']
+// 3001 实收资本按股东挂往来：期初导入里「实收资本-何静谷」这类子级名要能切出股东。
+const PARTNER_ACCOUNT_PREFIXES = ['1122', '1123', '2202', '2203', '1221', '2241', '3001']
 
 export function isPartnerAccountCode(code: string): boolean {
   const text = String(code || '').trim()
@@ -282,6 +283,34 @@ export function parseOpeningRows(
     if (name) nameMap.set(name, item)
   }
 
+  const GENERIC_LEAF_NAMES = new Set(['其他', '其他收入', '其他支出', '其他费用', '通用', '待处理'])
+  const uniqueSystemAccounts = Array.from(codeMap.values())
+
+  /**
+   * 同族末级精确同名兜底：
+   * 第三方软件常用 3 位子码（如 2221001005 应交税费-应交增值税-销项税额），
+   * 系统科目表是 2 位子码且名称常省去上级前缀（222100105 销项税额）。
+   * 仅当「同 4 位科目前缀」内存在唯一精确同名叶子（且非「其他」等泛称、非往来）
+   * 才自动落账；有歧义一律交由映射面板让用户确认。
+   */
+  function findUniqueFamilyLeafMatch(
+    rawCode: string,
+    rawName: string,
+  ): { account_code: string; account_name: string } | undefined {
+    const code = rawCode.trim()
+    const name = rawName.trim()
+    if (code.length < 4 || !name.includes('-') || isPartnerAccountCode(code)) return undefined
+    const leafName = name.split('-').pop()?.trim() || ''
+    if (!leafName || GENERIC_LEAF_NAMES.has(leafName)) return undefined
+    const family = code.slice(0, 4)
+    const candidates = uniqueSystemAccounts.filter(
+      acc =>
+        acc.account_code.slice(0, 4) === family
+        && (acc.account_name === leafName || acc.account_name.endsWith(`-${leafName}`)),
+    )
+    return candidates.length === 1 ? candidates[0] : undefined
+  }
+
   // ── 文件内父子科目层级去重 ──────────────────────────────────────────
   // 第三方软件导出的余额表常是「上级科目合计行 + 下级明细行」（如 1002 银行存款
   // 与 1002004 银行存款-招商银行…）。上级行金额 = 下级行之和，两层都入账会双重
@@ -432,6 +461,7 @@ export function parseOpeningRows(
     const prefixCode = code.includes('.') ? code.split('.')[0] : code.includes('-') ? code.split('-')[0] : ''
     if (prefixCode && codeMap.has(prefixCode)) return true
     if (name && nameMap.has(name)) return true
+    if (findUniqueFamilyLeafMatch(code, name)) return true
     return false
   }
 
@@ -640,6 +670,9 @@ export function parseOpeningRows(
       }
       if (!target && rawName) {
         target = nameMap.get(rawName)
+      }
+      if (!target) {
+        target = findUniqueFamilyLeafMatch(rawCode, rawName)
       }
     }
 

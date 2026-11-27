@@ -15,6 +15,7 @@ from services.wechat_bill_service import (
     list_wechat_bill_records,
 )
 from services.audit_service import log_action
+from services.setup_readiness_service import require_migration_opening_ready
 
 router = APIRouter(prefix="/api/wechat-bill", tags=["wechat-bill"], dependencies=[Depends(require_auth)])
 
@@ -32,6 +33,7 @@ class ImportRowsRequest(BaseModel):
 @router.post("/parse")
 async def parse_bill(file: UploadFile = File(...), ctx: AuthContext = Depends(require_auth)):
     """上传微信支付账单 CSV，返回解析预览（不入账）。"""
+    await require_migration_opening_ready(ctx.company_id)
     content = await file.read()
     return await parse_wechat_bill(content, company_id=ctx.company_id)
 
@@ -39,6 +41,7 @@ async def parse_bill(file: UploadFile = File(...), ctx: AuthContext = Depends(re
 @router.post("/import")
 async def import_bill(req: ImportRowsRequest, ctx: AuthContext = Depends(require_auth)):
     """将预览通过的行批量导入为记账条目（支持汇总记账与逐笔明细）。"""
+    await require_migration_opening_ready(ctx.company_id)
     try:
         if req.importMode == "summary" and req.summary:
             result = await import_wechat_bill_summary(

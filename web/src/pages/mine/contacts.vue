@@ -33,6 +33,7 @@ const form = ref({
   phone: '',
   address: '',
   mnemonic: '',
+  department: '',
 })
 
 const typeOptions = [
@@ -42,7 +43,9 @@ const typeOptions = [
   { label: '个人（股东/员工）', value: 'person' },
 ]
 
-const kindLabel = computed(() => ({ partner: '往来单位', department: '部门', project: '项目' })[kind.value])
+const kindLabel = computed(
+  () => ({ partner: '往来单位', department: '部门', project: '项目', employee: '职员' })[kind.value],
+)
 
 async function load() {
   loading.value = true
@@ -65,7 +68,7 @@ watch([kind, includeInactive], load)
 
 function openCreate() {
   editing.value = null
-  form.value = { name: '', code: '', type: 'both', taxId: '', contact: '', phone: '', address: '', mnemonic: '' }
+  form.value = { name: '', code: '', type: 'both', taxId: '', contact: '', phone: '', address: '', mnemonic: '', department: '' }
   showModal.value = true
 }
 
@@ -80,6 +83,7 @@ function openEdit(item: AuxiliaryItem) {
     phone: item.phone || '',
     address: item.address || '',
     mnemonic: item.mnemonic || '',
+    department: item.department || '',
   }
   showModal.value = true
 }
@@ -104,6 +108,8 @@ async function save() {
         address: form.value.address.trim(),
         mnemonic: form.value.mnemonic.trim(),
       })
+    } else if (kind.value === 'employee') {
+      payload.department = form.value.department.trim()
     }
     if (editing.value) {
       await updateAuxiliary(kind.value, editing.value.id, payload)
@@ -148,6 +154,13 @@ async function remove(item: AuxiliaryItem) {
   }
 }
 
+function viewSubLedger(item: AuxiliaryItem) {
+  router.push({
+    path: '/ledger/books',
+    query: { book: 'auxiliary-sub-ledger', kind: kind.value, itemId: item.id },
+  })
+}
+
 onMounted(load)
 </script>
 
@@ -155,13 +168,13 @@ onMounted(load)
   <div class="report-container">
     <div class="report-header">
       <div class="report-header-left">
-        <NButton text class="report-back-btn" @click="router.push('/reports')">
+        <NButton text class="report-back-btn" @click="router.push({ path: '/ledger/books', query: { book: 'partner-balances' } })">
           <template #icon><i class="ri-arrow-left-line" /></template>
-          返回报表中心
+          前往会计账簿
         </NButton>
         <div class="report-title-section">
-          <h2>往来单位与客商档案</h2>
-          <p class="report-subtitle">客户 / 供应商 / 部门 / 项目：凭证关联档案后，往来余额、应收账龄、部门项目费用才能按维度出表</p>
+          <h2>辅助核算档案</h2>
+          <p class="report-subtitle">往来单位 / 部门 / 项目 / 职员：凭证关联档案后，核算项目余额表、明细账与组合表才能按维度出表</p>
         </div>
       </div>
       <div class="report-header-right">
@@ -184,7 +197,13 @@ onMounted(load)
       <NTabPane name="partner" tab="往来单位" />
       <NTabPane name="department" tab="部门" />
       <NTabPane name="project" tab="项目" />
+      <NTabPane name="employee" tab="职员" />
     </NTabs>
+
+    <p v-if="kind === 'employee'" class="sync-hint">
+      <i class="ri-information-line" />
+      「职员」与薪酬管理员工名册同源同步：在此新增或停用将同步到工资表名册。
+    </p>
 
     <NCard :bordered="false" class="report-card">
       <div class="report-table-wrapper">
@@ -197,13 +216,15 @@ onMounted(load)
               <th v-if="kind === 'partner'" style="width: 200px;">税号</th>
               <th v-if="kind === 'partner'" style="width: 130px;">联系人</th>
               <th v-if="kind === 'partner'" style="width: 140px;">电话</th>
+              <th v-if="kind === 'employee'" style="width: 180px;">所属部门</th>
+              <th v-if="kind === 'employee'" style="width: 110px;">身份</th>
               <th style="width: 90px;">状态</th>
-              <th style="width: 170px; text-align: right;">操作</th>
+              <th style="width: 230px; text-align: right;">操作</th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="item in items" :key="item.id" :class="{ inactive: !item.isActive }">
-              <td class="mono">{{ item.code }}</td>
+              <td class="mono">{{ item.code || '—' }}</td>
               <td>{{ item.name }}</td>
               <td v-if="kind === 'partner'">
                 <NTag size="small" :bordered="false">
@@ -213,24 +234,30 @@ onMounted(load)
               <td v-if="kind === 'partner'" class="mono">{{ item.taxId || '—' }}</td>
               <td v-if="kind === 'partner'">{{ item.contact || '—' }}</td>
               <td v-if="kind === 'partner'">{{ item.phone || '—' }}</td>
+              <td v-if="kind === 'employee'">{{ item.department || '—' }}</td>
+              <td v-if="kind === 'employee'">
+                <NTag v-if="item.isOwner" size="small" type="info" :bordered="false">股东/负责人</NTag>
+                <span v-else>员工</span>
+              </td>
               <td>
                 <NTag size="small" :type="item.isActive ? 'success' : 'default'" :bordered="false">
                   {{ item.isActive ? '启用' : '停用' }}
                 </NTag>
               </td>
               <td class="actions">
+                <NButton size="tiny" text type="primary" @click="viewSubLedger(item)">查明细账</NButton>
                 <NButton size="tiny" text type="primary" @click="openEdit(item)">编辑</NButton>
                 <NButton size="tiny" text @click="toggleActive(item)">{{ item.isActive ? '停用' : '启用' }}</NButton>
                 <NButton size="tiny" text type="error" @click="remove(item)">删除</NButton>
               </td>
             </tr>
             <tr v-if="items.length === 0">
-              <td :colspan="kind === 'partner' ? 8 : 4" class="report-empty-cell is-component">
+              <td :colspan="kind === 'partner' ? 8 : kind === 'employee' ? 6 : 4" class="report-empty-cell is-component">
                 <SoloEmpty
                   variant="hint"
                   dense
                   :title="`还没有${kindLabel}档案`"
-                  description="新增后即可在凭证与导入流程中挂接。"
+                  description="新增后即可在记账与凭证流程中挂接。"
                 />
               </td>
             </tr>
@@ -242,7 +269,7 @@ onMounted(load)
     <NModal v-model:show="showModal" preset="card" :title="`${editing ? '编辑' : '新增'}${kindLabel}`" style="max-width: 520px;">
       <NForm label-placement="top">
         <NFormItem label="名称" required>
-          <NInput v-model:value="form.name" placeholder="如：杭州甲科技有限公司" maxlength="120" />
+          <NInput v-model:value="form.name" placeholder="如：杭州甲科技有限公司 / 张三" maxlength="120" />
         </NFormItem>
         <NFormItem label="编码">
           <NInput v-model:value="form.code" placeholder="留空自动生成" maxlength="40" />
@@ -261,6 +288,11 @@ onMounted(load)
           <NFormItem label="地址"><NInput v-model:value="form.address" maxlength="120" /></NFormItem>
           <NFormItem label="助记码">
             <NInput v-model:value="form.mnemonic" placeholder="留空按名称自动生成" maxlength="32" />
+          </NFormItem>
+        </template>
+        <template v-else-if="kind === 'employee'">
+          <NFormItem label="所属部门">
+            <NInput v-model:value="form.department" placeholder="如：研发部 / 市场部（可选）" maxlength="64" />
           </NFormItem>
         </template>
       </NForm>
@@ -283,9 +315,17 @@ onMounted(load)
   align-items: center;
   gap: 12px;
   padding: 10px 16px;
-  background: #ffffff;
-  border: 1px solid #e5e9ef;
+  background: var(--solo-bg-card);
+  border: 1px solid var(--solo-border);
   border-radius: 8px;
+}
+.sync-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 12px;
+  font-size: 12px;
+  color: var(--solo-text-muted);
 }
 .switch-label { font-size: 12px; color: var(--solo-text-muted); }
 .total-hint { margin-left: auto; font-size: 12px; color: var(--solo-text-muted); }

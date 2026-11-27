@@ -1,10 +1,11 @@
 <!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
-import { computed, reactive, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { accountingErrorText } from '@/utils/errors'
 import { NButton, NCheckbox, NInput, NModal, NSelect, NTag, useMessage } from 'naive-ui'
 import { approveAgentAction, rejectAgentAction, type AgentActionItem } from '@/api/agent'
 import { getBackfillTarget } from '@/api/accounting'
+import { getAuxiliaryOptions, type AuxiliaryOptions } from '@/api/auxiliary'
 import { useAuthStore } from '@/stores/auth'
 import { usePayeeEmployees } from '@/composables/usePayeeEmployees'
 import { guideStartDate } from '@/composables/startDateGuide'
@@ -80,11 +81,13 @@ const statusText = computed(() =>
 )
 
 // ── 主体建账信息确认卡 ──────────────────────────────────────────
+const BETA_RESTRICTED_ENTITY_TYPES = new Set(['个体工商户', '个人独资企业'])
+const rawEntityType = String(payload.value.type || '有限责任公司')
 const companyForm = reactive({
   onboardingType: String(payload.value.onboardingType || 'new'),
   name: String(payload.value.name || ''),
   taxId: String(payload.value.taxId || ''),
-  type: String(payload.value.type || '有限责任公司'),
+  type: local.status === 'pending' && BETA_RESTRICTED_ENTITY_TYPES.has(rawEntityType) ? '有限责任公司' : rawEntityType,
   taxpayerType: String(payload.value.taxpayerType || '小规模纳税人'),
   startDate: String(payload.value.startDate || ''),
   incorporationDate: String(payload.value.incorporationDate || ''),
@@ -98,9 +101,12 @@ const ONBOARDING_OPTIONS = [
 ]
 const ENTITY_TYPE_OPTIONS = [
   { label: '有限责任公司', value: '有限责任公司' },
-  { label: '个人独资企业', value: '个人独资企业' },
-  { label: '个体工商户', value: '个体工商户' },
+  { label: '个人独资企业（内测中）', value: '个人独资企业', disabled: true },
+  { label: '个体工商户（内测中）', value: '个体工商户', disabled: true },
 ]
+function openBetaContact() {
+  window.dispatchEvent(new CustomEvent('solo:open-beta-contact'))
+}
 const TAXPAYER_OPTIONS = [
   { label: '小规模纳税人', value: '小规模纳税人' },
   { label: '一般纳税人', value: '一般纳税人' },
@@ -219,6 +225,70 @@ const employeeLoading = employeeState.loading
 
 const employeeOptions = computed(() => employeeState.options(payer.employeeName))
 
+// ── 辅助核算（日常记一笔单卡可选挂接：往来单位 / 部门 / 项目 / 职员） ──
+const aux = reactive<{
+  partner_id: string | null
+  department_id: string | null
+  project_id: string | null
+  employee_id: string | null
+}>({
+  partner_id: (payload.value.partner_id as string) || null,
+  department_id: (payload.value.department_id as string) || null,
+  project_id: (payload.value.project_id as string) || null,
+  employee_id: (payload.value.employee_id as string) || null,
+})
+const showAuxFields = ref(
+  Boolean(aux.partner_id || aux.department_id || aux.project_id || aux.employee_id),
+)
+const auxLoaded = ref(false)
+const auxCatalog = ref<AuxiliaryOptions>({
+  partners: [],
+  departments: [],
+  projects: [],
+  employees: [],
+})
+
+async function ensureAuxCatalog() {
+  if (auxLoaded.value) return
+  try {
+    const data = await getAuxiliaryOptions('', 100)
+    auxCatalog.value = {
+      partners: data.partners || [],
+      departments: data.departments || [],
+      projects: data.projects || [],
+      employees: data.employees || [],
+    }
+    auxLoaded.value = true
+  } catch {
+    // 档案加载失败不阻塞确认记账
+  }
+}
+
+function toggleAuxFields() {
+  showAuxFields.value = !showAuxFields.value
+  if (showAuxFields.value) void ensureAuxCatalog()
+}
+
+if (showAuxFields.value && local.status === 'pending' && !isBatch.value && !isMatch.value && !isAccrual.value && !isCompanySetup.value) {
+  void ensureAuxCatalog()
+}
+
+const auxPartnerOptions = computed(() =>
+  auxCatalog.value.partners.map((item) => ({ label: `${item.code} ${item.name}`, value: item.id })),
+)
+const auxDepartmentOptions = computed(() =>
+  auxCatalog.value.departments.map((item) => ({ label: item.name, value: item.id })),
+)
+const auxProjectOptions = computed(() =>
+  auxCatalog.value.projects.map((item) => ({ label: `${item.code} ${item.name}`, value: item.id })),
+)
+const auxEmployeeOptions = computed(() =>
+  auxCatalog.value.employees.map((item) => ({
+    label: item.department ? `${item.name} · ${item.department}` : item.name,
+    value: item.id,
+  })),
+)
+
 function onPayerKindChange(kind: PayerKind) {
   if (kind === 'employee_personal') {
     void employeeState.ensure()
@@ -332,14 +402,17 @@ async function approveSingle() {
     message.warning('请选择垫付的员工，或改为老板垫付')
     return
   }
-  const edits: Record<string, { category?: string; payer?: string }> = {}
-  const edit: { category?: string; payer?: string } = {}
+  const edits: Record<string, Record<string, string>> = {}
+  const edit: Record<string, string> = {}
   if (singleEditedCategory.value && singleEditedCategory.value !== payload.value.category) {
     edit.category = singleEditedCategory.value
   }
   const nextPayer = joinPayer(payer.kind, payer.employeeName)
   if (nextPayer !== String(payload.value.payer || 'company_account')) {
     edit.payer = nextPayer
+  }
+  for (const key of ['partner_id', 'department_id', 'project_id', 'employee_id'] as const) {
+    if (aux[key]) edit[key] = aux[key]!
   }
   if (Object.keys(edit).length) edits['0'] = edit
   const opts = Object.keys(edits).length ? { edits } : {}
@@ -581,12 +654,17 @@ const approveText = computed(() => {
         </div>
         <div class="field">
           <span class="field-label">主体类型</span>
-          <NSelect
-            v-if="local.status === 'pending'"
-            v-model:value="companyForm.type"
-            :options="ENTITY_TYPE_OPTIONS"
-            size="tiny"
-          />
+          <template v-if="local.status === 'pending'">
+            <NSelect
+              v-model:value="companyForm.type"
+              :options="ENTITY_TYPE_OPTIONS"
+              size="tiny"
+            />
+            <div class="field-beta-hint">
+              个体户 / 个独内测中，
+              <button type="button" class="field-beta-link" @click="openBetaContact">加微信申请内测</button>
+            </div>
+          </template>
           <span v-else class="field-value">{{ companyForm.type }}</span>
         </div>
         <div class="field">
@@ -837,6 +915,19 @@ const approveText = computed(() => {
         <div class="field" v-if="payload.merchant">
           <span class="field-label">对方</span>
           <span class="field-value">{{ payload.merchant }}</span>
+        </div>
+      </div>
+
+      <div v-if="local.status === 'pending'" class="aux-section">
+        <button type="button" class="aux-toggle-btn" @click="toggleAuxFields">
+          <i :class="showAuxFields ? 'ri-arrow-up-s-line' : 'ri-price-tag-3-line'" />
+          <span>{{ showAuxFields ? '收起辅助核算' : '挂接辅助核算（往来 / 部门 / 项目 / 职员）' }}</span>
+        </button>
+        <div v-if="showAuxFields" class="aux-grid">
+          <NSelect v-model:value="aux.partner_id" :options="auxPartnerOptions" size="tiny" clearable filterable placeholder="往来单位（可选）" />
+          <NSelect v-model:value="aux.department_id" :options="auxDepartmentOptions" size="tiny" clearable filterable placeholder="部门（可选）" />
+          <NSelect v-model:value="aux.project_id" :options="auxProjectOptions" size="tiny" clearable filterable placeholder="项目（可选）" />
+          <NSelect v-model:value="aux.employee_id" :options="auxEmployeeOptions" size="tiny" clearable filterable placeholder="职员（可选）" />
         </div>
       </div>
     </template>
@@ -1141,5 +1232,43 @@ const approveText = computed(() => {
 
 .field-span-2 {
   grid-column: span 2;
+}
+.aux-section {
+  margin-top: 8px;
+}
+.aux-toggle-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 0;
+  border: none;
+  background: transparent;
+  font-size: 12px;
+  color: var(--solo-primary);
+  cursor: pointer;
+}
+.aux-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 8px;
+  margin-top: 6px;
+}
+.field-beta-hint {
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--solo-text-muted);
+}
+.field-beta-link {
+  display: inline;
+  padding: 0;
+  border: none;
+  background: transparent;
+  font-size: inherit;
+  color: var(--solo-primary);
+  cursor: pointer;
+}
+.field-beta-link:hover {
+  text-decoration: underline;
 }
 </style>

@@ -239,7 +239,7 @@ def _book_to_actual_findings(month: str, check: dict[str, Any]) -> list[dict[str
         "broken_link": "银行流水关联的凭证不存在",
         "duplicate_match": "同一凭证被多笔流水重复核销",
         "unposted_match": "已匹配凭证尚未过账",
-        "possible_duplicate_income": "银行到账可能重复记为微信收入",
+        "possible_duplicate_income": "银行到账可能重复记为平台收入",
         "missing_direction": "银行流水缺少收支方向",
         "missing_source": "银行流水缺少有效权威来源",
         "book_only": "银行存款分录未关联流水",

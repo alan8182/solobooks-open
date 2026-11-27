@@ -39,6 +39,20 @@ def _isolated_archive_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(backup_archive_service, "ARCHIVE_DIR", target)
 
 
+@pytest.fixture(autouse=True)
+def _isolated_attachments_dir(monkeypatch, tmp_path):
+    """发票原件附件一律写进临时目录（同 D-013 防再犯）。
+
+    attachment_storage_service 在调用时才解析模块常量 ATTACHMENTS_DIR，
+    monkeypatch 后上传/下载/作废测试均落在 tmp_path。
+    """
+    from services import attachment_storage_service
+
+    target = tmp_path / "attachments"
+    target.mkdir()
+    monkeypatch.setattr(attachment_storage_service, "ATTACHMENTS_DIR", target)
+
+
 @pytest.fixture
 def client():
     """FastAPI TestClient isolated from pytest-asyncio event loops."""

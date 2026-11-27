@@ -74,11 +74,13 @@ export interface ClosingNoticeRecord {
 export interface ClosingNotice {
   code: string
   name: string
-  severity: 'warning'
+  severity: 'warning' | 'info' | 'success'
   count: number
   amount?: string
   message?: string
   suggestedAction?: string
+  /** 工资超期未发放时，最早一期欠发工资所属月份（结账提示深链用） */
+  suggestedMonth?: string
   records?: ClosingNoticeRecord[]
 }
 
@@ -90,6 +92,7 @@ export interface ClosingReadinessItem {
   actionLabel: string
   step: number
   route?: string
+  waitingForPosting?: boolean
 }
 
 const COPY: Record<string, Omit<ClosingReadinessItem, 'status'>> = {
@@ -122,6 +125,9 @@ const COPY: Record<string, Omit<ClosingReadinessItem, 'status'>> = {
   },
   PAYROLL_ACCRUAL: {
     code: 'PAYROLL_ACCRUAL', title: '工资计提', detail: '本月工资已按权责发生制计提，发放可延至次月。', actionLabel: '去计提工资', step: 2, route: '/mine/salary',
+  },
+  PLATFORM_CLEARING_BALANCE: {
+    code: 'PLATFORM_CLEARING_BALANCE', title: '平台待结算核对', detail: '微信、支付宝待结算余额正常。', actionLabel: '去导入账单', step: 1,
   },
 }
 
@@ -179,6 +185,10 @@ function detailFor(check: PeriodCloseCheck, fallback: string): string {
     const message = String(check.message || '')
     if (message) return `${message}。`
   }
+  if (check.code === 'PLATFORM_CLEARING_BALANCE') {
+    const message = String(check.message || '')
+    if (message) return message.endsWith('。') ? message : `${message}。`
+  }
   const issues = check.issues as Array<{ message?: string }> | undefined
   if (issues?.length) return issues.map(issue => issue.message || '存在报表差异').join('；')
   return fallback
@@ -206,7 +216,12 @@ export function canBatchPostDrafts(checksData: PeriodCloseChecks | null | undefi
     if (check.status === 'passed' || (check.status === 'needs_review' && Number(check.blockedByPendingCount) > 0)) return true
     if (check.code === 'BOOK_TO_ACTUAL' && Number(check.unreconciledBankCount || 0) === 0) {
       const issues = (check.issues as any[]) || []
-      return issues.length === 0 || issues.every(issue => issue.type === 'unposted_match' && draftIds.has(String(issue.entryId)))
+      const projDiff = (check.balanceReconciliation as any)?.projected_book_difference
+      const projBalanced = projDiff === undefined || Math.abs(Number(projDiff)) <= 0.01
+      return issues.length === 0 || issues.every(issue =>
+        (issue.type === 'unposted_match' && draftIds.has(String(issue.entryId)))
+        || (issue.type === 'bank_balance_mismatch' && projBalanced)
+      )
     }
     return false
   })
@@ -214,6 +229,10 @@ export function canBatchPostDrafts(checksData: PeriodCloseChecks | null | undefi
 
 export function getClosingReadiness(checks: PeriodCloseChecks | null | undefined): ClosingReadinessItem[] {
   const batchPostable = canBatchPostDrafts(checks)
+  const voucherCheck = (checks?.checks || []).find(c => c.code === 'VOUCHER_TO_SOURCE')
+  const voucherUnposted = Number(voucherCheck?.autoPostAtCloseCount ?? voucherCheck?.draftCount ?? 0)
+    + Number(voucherCheck?.pendingReviewCount || 0)
+
   return (checks?.checks || []).map((check) => {
     const copy = COPY[check.code] || {
       code: check.code,
@@ -224,15 +243,31 @@ export function getClosingReadiness(checks: PeriodCloseChecks | null | undefined
     }
     let status = normalizeStatus(check)
     let detail = detailFor(check, copy.detail)
+    let waitingForPosting = false
 
     if (batchPostable) {
       if (check.code === 'VOUCHER_TO_SOURCE') {
         const count = Number(check.autoPostAtCloseCount ?? check.draftCount ?? 0)
         status = 'complete'
-        detail = `本月有 ${count} 笔凭证将在确认结账时自动批量过账。`
+        detail = `本月有 ${count} 笔草稿凭证将在关账时自动编号过账。`
       } else if (status === 'needs_review' || (status === 'blocked' && check.code === 'BOOK_TO_ACTUAL' && Number(check.unreconciledBankCount || 0) === 0)) {
         status = 'complete'
         detail = '已就绪（将在结账自动过账后一并核验归档）。'
+      }
+    } else if (voucherUnposted > 0) {
+      // 凭证尚未过账时，仅因未过账产生的下游挂起/余额差异归为「待过账后核验」，避免误报成真正错账。
+      if (check.code === 'BOOK_TO_ACTUAL' && Number(check.unreconciledBankCount || 0) === 0) {
+        const issues = (check.issues as any[]) || []
+        if (
+          issues.length > 0
+          && issues.every(issue => issue.type === 'unposted_match' || issue.type === 'bank_balance_mismatch')
+        ) {
+          status = 'incomplete'
+          detail = `尚有 ${voucherUnposted} 笔凭证未过账，过账后将自动完成银行流水与余额核对。`
+          waitingForPosting = true
+        }
+      } else if (status === 'incomplete' && Number(check.blockedByPendingCount || 0) > 0) {
+        waitingForPosting = true
       }
     }
 
@@ -240,6 +275,7 @@ export function getClosingReadiness(checks: PeriodCloseChecks | null | undefined
       ...copy,
       status,
       detail,
+      ...(waitingForPosting ? { waitingForPosting: true } : {}),
     }
   })
 }
@@ -265,6 +301,7 @@ export interface FiveCheckSummaryItem {
   label: string
   status: CloseCheckStatus
   detail: string
+  waitingForPosting?: boolean
 }
 
 export function summarizeFiveChecks(items: ClosingReadinessItem[]): FiveCheckSummaryItem[] {
@@ -275,15 +312,17 @@ export function summarizeFiveChecks(items: ClosingReadinessItem[]): FiveCheckSum
       label,
       status: item?.status ?? 'incomplete',
       detail: item?.detail ?? '本期未返回该项核验结果。',
+      ...(item?.waitingForPosting ? { waitingForPosting: true } : {}),
     }
   })
 }
 
-/** 五项之外、仍未完成的准备项数量（折旧、摊销、工资、关账顺序等）。 */
+/** 五项之外、仍未完成的准备项数量（折旧、摊销、工资、关账顺序等；不含仅等过账的连带项）。 */
 export function countOtherPendingReadiness(items: ClosingReadinessItem[]): number {
   return items.filter(
     item => !FIVE_CLOSING_CHECKS.some(def => def.code === item.code)
-      && !['complete', 'not_required'].includes(item.status),
+      && !['complete', 'not_required'].includes(item.status)
+      && !item.waitingForPosting,
   ).length
 }
 
@@ -291,7 +330,7 @@ export function countOtherPendingReadiness(items: ClosingReadinessItem[]): numbe
 
 export interface ClosingTaskAction {
   label: string
-  kind: 'run-closing' | 'vouchers' | 'match' | 'detail' | 'walkthrough' | 'balance-detail'
+  kind: 'run-closing' | 'vouchers' | 'match' | 'detail' | 'walkthrough' | 'balance-detail' | 'import-bill'
   statementId?: string
   route?: string
   /** detail 动作：切到该月份继续处理（关账顺序） */
@@ -321,6 +360,9 @@ const BOOK_MATCH_IGNORED_TYPES = new Set([
   'bank_balance_mismatch', 'statement_balance_mismatch', 'unposted_match',
 ])
 
+// 疑似重复收入的提示按平台点名（微信/支付宝口径不同，不能混说）
+const PLATFORM_INCOME_LABELS: Record<string, string> = { wechat: '微信', alipay: '支付宝' }
+
 export function deriveClosingTasks(checks: PeriodCloseChecks | null | undefined): ClosingTask[] {
   const allChecks = checks?.checks
   if (!allChecks || !Array.isArray(allChecks) || allChecks.length === 0) return []
@@ -347,22 +389,8 @@ export function deriveClosingTasks(checks: PeriodCloseChecks | null | undefined)
 
   const voucher = find('VOUCHER_TO_SOURCE')
   if (voucher) {
-    const draft = Number(voucher.autoPostAtCloseCount ?? voucher.draftCount ?? 0)
     const review = Number(voucher.pendingReviewCount || 0)
     const orphan = Number(voucher.orphanVoucherCount || 0)
-    if (draft > 0) {
-      const actions: ClosingTaskAction[] = []
-      if (canBatchPostDrafts(checks)) actions.push({ label: `自动过账 ${draft} 张并结账`, kind: 'run-closing' })
-      actions.push({ label: '逐笔过账', kind: 'walkthrough', route: '/vouchers' })
-      tasks.push({
-        id: 'post',
-        title: draft === 1 ? '有 1 张凭证还没过账' : `有 ${draft} 张凭证还没过账`,
-        count: draft,
-        affects: blockedNames,
-        actions,
-        severity: 'blocked',
-      })
-    }
     if (review > 0) {
       tasks.push({
         id: 'review',
@@ -426,9 +454,12 @@ export function deriveClosingTasks(checks: PeriodCloseChecks | null | undefined)
     }
     const duplicates = issues.filter(i => i.type === 'possible_duplicate_income')
     if (duplicates.length > 0) {
+      // 平台一致时点名（微信/支付宝），混合时统一说“平台”
+      const labels = new Set(duplicates.map(i => PLATFORM_INCOME_LABELS[String(i.platform || '')] || '平台'))
+      const platformLabel = labels.size === 1 ? [...labels][0] : '平台'
       tasks.push({
         id: 'duplicate',
-        title: `有 ${duplicates.length} 笔到账疑似与微信收入重复`,
+        title: `有 ${duplicates.length} 笔到账疑似与${platformLabel}收入重复`,
         affects: ['银行流水核对'],
         actions: [{ label: '去核对', kind: 'match' }],
         severity: 'needs_review',
@@ -440,9 +471,11 @@ export function deriveClosingTasks(checks: PeriodCloseChecks | null | undefined)
     const voucherCheckForBalance = find('VOUCHER_TO_SOURCE')
     const voucherUnposted = Number((voucherCheckForBalance as any)?.autoPostAtCloseCount ?? (voucherCheckForBalance as any)?.draftCount ?? 0)
       + Number((voucherCheckForBalance as any)?.pendingReviewCount || 0)
+    const projDiff = (bank.balanceReconciliation as any)?.projected_book_difference
+    const projBalanced = projDiff === undefined || Math.abs(Number(projDiff)) <= 0.01
     const balance = issues
       .filter(i => i.type === 'bank_balance_mismatch' || i.type === 'statement_balance_mismatch')
-      .filter(i => i.type === 'statement_balance_mismatch' || voucherUnposted <= 0)
+      .filter(i => i.type === 'statement_balance_mismatch' || voucherUnposted <= 0 || !projBalanced)
     if (balance.length > 0) {
       const difference = (balance[0] as any).difference
       tasks.push({
@@ -482,5 +515,109 @@ export function deriveClosingTasks(checks: PeriodCloseChecks | null | undefined)
     }
   }
 
+  const clearing = find('PLATFORM_CLEARING_BALANCE')
+  if (clearing && normalizeStatus(clearing) === 'blocked') {
+    const accounts = (clearing.accounts as Array<{ accountName?: string; balance?: string }>) || []
+    const first = accounts[0]
+    const title = accounts.length === 1 && first?.accountName && first?.balance
+      ? `${first.accountName}余额为负（¥${first.balance}）`
+      : accounts.length > 1
+        ? `有 ${accounts.length} 个平台待结算科目余额为负`
+        : String(clearing.name || '平台待结算科目余额为负')
+    tasks.push({
+      id: 'platform-clearing-negative',
+      title,
+      detail: String(clearing.message || '可能有平台提现已入银行，但当月微信/支付宝交易账单尚未导入。'),
+      affects: ['平台待结算核对'],
+      actions: [{ label: '去导入平台账单', kind: 'import-bill' }],
+      severity: 'blocked',
+    })
+  }
+
   return tasks
 }
+
+export interface ClosedMetricsSummary {
+  monthlyIncome: number
+  monthlyExpense: number
+  netProfit: number
+  interestIncome: number
+}
+
+interface IncomeStatementSummaryLike {
+  rows?: Array<{ key?: string; values?: { current?: number | string | null } }>
+  totals?: { netProfit?: { current?: number | string | null } }
+}
+
+const roundMoney2 = (value: number): number => {
+  const rounded = Math.round((value + Number.EPSILON) * 100) / 100
+  return Object.is(rounded, -0) ? 0 : rounded
+}
+
+/**
+ * 汇总结账完成页「本月收入 / 成本费用 / 本月净利润」。
+ * 银行存款利息收入在《小企业会计准则》下以负数冲减「财务费用」，此处将
+ * finance_expenses < 0 归入收入侧（同时负 investment_income 归入成本费用侧），
+ * 保持 收入 - 成本费用 = 净利润，消除「经营成本 -¥12.70」的反直觉展示。
+ */
+export function summarizeClosedIncomeStatement(
+  statement: IncomeStatementSummaryLike | null | undefined,
+): ClosedMetricsSummary {
+  const rows = Array.isArray(statement?.rows) ? statement.rows : []
+  const value = (key: string) => Number(rows.find(row => row.key === key)?.values?.current || 0)
+  const operatingRevenue = value('operating_revenue')
+  const nonoperatingIncome = value('nonoperating_income')
+  const investmentIncome = value('investment_income')
+  const financeExpenses = value('finance_expenses')
+  const netProfit = roundMoney2(Number(statement?.totals?.netProfit?.current || 0))
+  const interestIncome = financeExpenses < 0 ? roundMoney2(-financeExpenses) : 0
+  const monthlyIncome = roundMoney2(
+    operatingRevenue + nonoperatingIncome + Math.max(investmentIncome, 0) + interestIncome,
+  )
+  const monthlyExpense = roundMoney2(monthlyIncome - netProfit)
+  return {
+    monthlyIncome,
+    monthlyExpense,
+    netProfit,
+    interestIncome,
+  }
+}
+
+/** 仅支持导出补记台账的提示项白名单，避免预览/暂估等类型误触发补记导出接口 */
+export const EXPORTABLE_NOTICE_CODES: Readonly<Record<string, string>> = {
+  CROSS_PERIOD_PENDING: 'cross-period',
+  BACKFILL_IN_PERIOD: 'backfill',
+  VAT_PERIOD_MISMATCH: 'vat-period',
+}
+
+/** 返回提示项对应的导出 scope；非可导出类型返回 null */
+export function noticeExportScope(notice: Pick<ClosingNotice, 'code'>): string | null {
+  return EXPORTABLE_NOTICE_CODES[notice.code] ?? null
+}
+
+/** 映射结账前提示卡片的 NAlert 色调：小微免税利好预告统一用 success 浅绿 */
+export function noticeAlertType(notice: Pick<ClosingNotice, 'code' | 'severity'>): 'success' | 'info' | 'warning' {
+  if (notice.code === 'VAT_EXEMPTION_PREVIEW') return 'success'
+  if (notice.severity === 'success' || notice.severity === 'info') return notice.severity
+  return 'warning'
+}
+
+/** 格式化结账前提示标题，剔除启用前/免税预告中无信息量的笔数拼接 */
+export function formatClosingNoticeTitle(notice: Pick<ClosingNotice, 'code' | 'name' | 'count' | 'amount'>): string {
+  // 启用前的数据是「流水 N 条 + 工资表 N 份」，混算成「N 笔」会串味；具体构成由 message 说明，标题只报事项名。
+  if (notice.code === 'PRE_BOOK_START_ACTIVITY') return notice.name
+  if (notice.code === 'VAT_EXEMPTION_PREVIEW') {
+    return notice.amount ? `小微免税预告 · 预计减免增值税 ¥${notice.amount}` : '小微免税预告'
+  }
+  const amount = notice.amount ? ` · ¥${notice.amount}` : ''
+  return `${notice.name}（${notice.count} 笔${amount}）`
+}
+
+/** 判断提示项卡片是否需要渲染底部动作栏，无动作时不留空白行 */
+export function hasClosingNoticeActions(notice: Pick<ClosingNotice, 'code'>): boolean {
+  return Boolean(noticeExportScope(notice))
+    || notice.code === 'PRE_BOOK_START_ACTIVITY'
+    || notice.code === 'CROSS_PERIOD_PENDING'
+    || notice.code === 'SALARY_PAYABLE_OUTSTANDING'
+}
+

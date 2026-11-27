@@ -99,30 +99,61 @@ export function shouldClearSession(status: number | undefined, body: unknown): b
 let quotaNotifyApi: ReturnType<typeof createDiscreteApi>['notification'] | null = null
 let quotaToastAt = 0
 
-function notifyQuotaExceeded(): void {
+function notifyQuotaExceeded(errorData?: unknown): void {
   const now = Date.now()
   if (now - quotaToastAt < 3000) return // 批量调用（如导入逐行分类）只弹一次
   quotaToastAt = now
   if (!quotaNotifyApi) {
     quotaNotifyApi = createDiscreteApi(['notification']).notification
   }
+  const detail = (errorData as { detail?: { context?: { promoEligible?: unknown } } } | undefined)?.detail
+  const promoEligible = detail?.context?.promoEligible === true
   const handle = quotaNotifyApi.error({
-    title: '本月体验额度已用完',
-    content: '免费体验版每月 10 万 Token 已耗尽，升级云端标准版即可畅用并获注册会计师 1 对 1 旧账导入。',
+    title: '本期体验额度已用完',
+    content: promoEligible
+      ? '免费体验版当期 AI Token 额度已耗尽。新人可 ¥1 解锁 80 万 Token（30 天有效），或直接升级云端标准版（598 元/年）。'
+      : '免费体验版当期 AI Token 额度已耗尽，升级云端标准版即可畅用并获注册会计师 1 对 1 旧账导入。',
     duration: 8000,
     action: () =>
-      h(
-        NButton,
-        {
-          type: 'primary',
-          size: 'small',
-          onClick: () => {
-            handle.destroy()
-            window.location.assign('/mine/plan?plan=standard')
-          },
-        },
-        { default: () => '去升级套餐' },
-      ),
+      promoEligible
+        ? h('div', { style: 'display:flex;gap:8px;flex-wrap:wrap' }, [
+            h(
+              NButton,
+              {
+                type: 'primary',
+                size: 'small',
+                onClick: () => {
+                  handle.destroy()
+                  window.location.assign('/mine/plan?promo=first_month')
+                },
+              },
+              { default: () => '¥1 解锁 80 万' },
+            ),
+            h(
+              NButton,
+              {
+                size: 'small',
+                secondary: true,
+                onClick: () => {
+                  handle.destroy()
+                  window.location.assign('/mine/plan?plan=standard')
+                },
+              },
+              { default: () => '升级标准版 ¥598/年' },
+            ),
+          ])
+        : h(
+            NButton,
+            {
+              type: 'primary',
+              size: 'small',
+              onClick: () => {
+                handle.destroy()
+                window.location.assign('/mine/plan?plan=standard')
+              },
+            },
+            { default: () => '去升级套餐' },
+          ),
   })
 }
 
@@ -135,7 +166,7 @@ apiClient.interceptors.response.use(
       window.location.href = '/login'
     }
     if (error.response?.status === 402) {
-      notifyQuotaExceeded()
+      notifyQuotaExceeded(error.response?.data)
     }
     // 文件下载类请求（responseType: 'blob'）失败时响应体是 Blob，
     // 还原成 JSON 让调用方的 err.response.data.detail 能取到具体原因。

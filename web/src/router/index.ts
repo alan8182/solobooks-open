@@ -43,6 +43,19 @@ export const routes: RouteRecordRaw[] = [
     meta: { requiresAuth: false },
   },
   {
+    // 微信开放平台网站应用回调中转页：后端 callback 校验 state 后 302 到这里
+    //（URL 只有 status=ready，ticket 在 HttpOnly cookie 里）。
+    // 路径必须与后端 config.WECHAT_WEB_FRONTEND_CALLBACK_PATH 保持一致；
+    // /auth/wechat/callback 保留为别名，方便调试与旧链接。
+    // 必须是顶层公开路由：AppLayout 的 :pathMatch(.*)* 会把它吞成 404，
+    // 且回调到达时用户尚未登录，不能触发登录重定向。
+    path: '/wechat-login-callback',
+    alias: ['/auth/wechat/callback'],
+    name: 'WechatWebCallback',
+    component: () => import('@/pages/auth/wechat-callback.vue'),
+    meta: { requiresAuth: false },
+  },
+  {
     // 协议类公开页面：登录页与备案信息均可直达
     path: '/agreement',
     name: 'Agreement',
@@ -104,6 +117,11 @@ export const routes: RouteRecordRaw[] = [
         path: 'users',
         name: 'AdminUsers',
         component: () => import('@/pages/admin/AdminUsers.vue'),
+      },
+      {
+        path: 'orders',
+        name: 'AdminOrders',
+        component: () => import('@/pages/admin/AdminOrders.vue'),
       },
       {
         path: 'companies',
@@ -297,11 +315,23 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('@/pages/report/ar-aging.vue'),
       },
       {
-        // 核算项目余额表：按往来单位汇总往来科目，已并入账簿工作台「辅助账」
+        // 核算项目余额表：支持往来单位 / 部门 / 项目 / 职员四维度，已并入账簿工作台「辅助账」
         path: 'reports/partner-balances',
         name: 'PartnerBalances',
         meta: { workspace: ['accounting'] },
         redirect: (to) => ({ path: '/ledger/books', query: { ...to.query, book: 'partner-balances' } }),
+      },
+      {
+        path: 'reports/auxiliary-sub-ledger',
+        name: 'AuxiliarySubLedger',
+        meta: { workspace: ['accounting'] },
+        redirect: (to) => ({ path: '/ledger/books', query: { ...to.query, book: 'auxiliary-sub-ledger' } }),
+      },
+      {
+        path: 'reports/auxiliary-combination',
+        name: 'AuxiliaryCombination',
+        meta: { workspace: ['accounting'] },
+        redirect: (to) => ({ path: '/ledger/books', query: { ...to.query, book: 'auxiliary-combination' } }),
       },
       {
         // 垫付台账：按付款方归集老板/员工替公司垫的钱与未报余额
@@ -346,6 +376,13 @@ export const routes: RouteRecordRaw[] = [
         name: 'VoucherPrint',
         meta: { workspace: ['accounting'] },
         component: () => import('@/pages/voucher/print.vue'),
+      },
+      {
+        // 凭证册装订：按月封面+连续凭证+原件目录，签发定版（Phase 2 单据整理）
+        path: 'vouchers/book',
+        name: 'VoucherBook',
+        meta: { workspace: ['accounting'] },
+        component: () => import('@/pages/voucher/book.vue'),
       },
       {
         path: 'vouchers/:id',
@@ -438,11 +475,17 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('@/pages/mine/opening.vue'),
       },
       {
-        // 辅助核算档案（P0 WP2）：往来单位 / 部门 / 项目
+        // 辅助核算档案（P0 WP2 + 职员扩展）：往来单位 / 部门 / 项目 / 职员
         path: 'mine/contacts',
         name: 'AuxiliaryContacts',
         meta: { workspace: ['accounting'] },
         component: () => import('@/pages/mine/contacts.vue'),
+      },
+      {
+        path: 'mine/auxiliary',
+        name: 'AuxiliaryArchiveRedirect',
+        meta: { workspace: ['accounting'] },
+        redirect: '/mine/contacts',
       },
       {
         // 旧账导入合并至期初建账（Tab: legacy）
@@ -451,10 +494,9 @@ export const routes: RouteRecordRaw[] = [
         redirect: '/mine/opening?tab=legacy',
       },
       {
-        // 备份与归档（P0 WP5）
+        // 备份与归档（P0 WP5）：导出归档与查审计日志老板也要用，不再限会计视图
         path: 'mine/backup',
         name: 'BackupArchive',
-        meta: { workspace: ['accounting'] },
         component: () => import('@/pages/mine/backup.vue'),
       },
       {
@@ -467,6 +509,12 @@ export const routes: RouteRecordRaw[] = [
         path: 'mine/salary',
         name: 'Salary',
         component: () => import('@/pages/mine/salary.vue'),
+      },
+      {
+        path: 'tools',
+        name: 'Tools',
+        meta: { title: '财务工具箱' },
+        component: () => import('@/pages/tools/index.vue'),
       },
       {
         path: 'private-expenses',

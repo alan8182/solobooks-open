@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 from decimal import Decimal
 from urllib.parse import quote
 import base64
-from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile
 from pydantic import BaseModel, Field
 
 from deps.auth import AuthContext, require_auth
@@ -24,6 +24,7 @@ class EmployeeCreate(BaseModel):
     department: str = Field(..., min_length=1)
     base_salary: Decimal = Field(default=Decimal("0"), ge=0)
     social_security_base: Decimal = Field(default=Decimal("0"), ge=0)
+    housing_fund_base: Optional[Decimal] = Field(default=None, ge=0)
     # 业主/投资者标记：经营所得 B 表"业主工资不得扣除"调增的自动识别来源
     is_owner: bool = False
     # 入职日期（YYYY-MM-DD）：为空表示不限制，工资表只从入职当月起计入该员工
@@ -36,6 +37,7 @@ class EmployeeUpdate(BaseModel):
     department: Optional[str] = None
     base_salary: Optional[Decimal] = Field(default=None, ge=0)
     social_security_base: Optional[Decimal] = Field(default=None, ge=0)
+    housing_fund_base: Optional[Decimal] = Field(default=None, ge=0)
     is_active: Optional[int] = None
     is_owner: Optional[bool] = None
     hire_date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
@@ -86,18 +88,32 @@ async def add_employee(req: EmployeeCreate, ctx: AuthContext = Depends(require_a
         is_owner=req.is_owner,
         hire_date=req.hire_date,
         special_additional_deduction=req.special_additional_deduction,
+        housing_fund_base=req.housing_fund_base,
     )
 
 @router.put("/employees/{employee_id}")
-async def update_employee(employee_id: str, req: EmployeeUpdate, ctx: AuthContext = Depends(require_auth)):
-    """Update employee details."""
+async def update_employee(
+    employee_id: str,
+    req: EmployeeUpdate,
+    month: Optional[str] = None,
+    recalculate: bool = False,
+    ctx: AuthContext = Depends(require_auth),
+):
+    """Update employee details; optionally recalculate that employee's draft salary row."""
     updated = await service.update_employee(
         company_id=ctx.company_id,
         employee_id=employee_id,
-        updates=req.dict(exclude_unset=True)
+        updates=req.model_dump(exclude_unset=True)
     )
     if not updated:
         raise HTTPException(status_code=404, detail="Employee not found")
+    if recalculate and month:
+        await service.recalculate_draft_withholdings(
+            ctx.company_id,
+            month,
+            employee_ids=[employee_id],
+            ignore_non_draft=True,
+        )
     return updated
 
 @router.delete("/employees/{employee_id}")
@@ -114,6 +130,19 @@ async def get_sheet(month: str, ctx: AuthContext = Depends(require_auth)):
     if not len(month) == 7 or month[4] != "-":
         raise HTTPException(status_code=400, detail="Invalid month format, use YYYY-MM")
     return await service.get_or_create_salary_sheet(ctx.company_id, month)
+
+
+@router.post("/sheets/{month}/sync-previous")
+async def sync_sheet_from_previous(month: str, ctx: AuthContext = Depends(require_auth)):
+    """将草稿状态工资表重新同步为上月固定工资、社保公积金与最新花名册/个税。"""
+    if not len(month) == 7 or month[4] != "-":
+        raise HTTPException(status_code=400, detail="Invalid month format, use YYYY-MM")
+    try:
+        return await service.sync_draft_sheet_from_previous(
+            ctx.company_id, month, user_id=ctx.user_id
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 class PayrollRatesUpdate(BaseModel):
@@ -305,6 +334,38 @@ async def accrue_sheet(month: str, ctx: AuthContext = Depends(require_auth)):
     """Accrue salary sheet and generate double-entry voucher."""
     try:
         return await service.accrue_salary_sheet(ctx.company_id, ctx.user_id, month)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+class SheetUnaccrueRequest(BaseModel):
+    reason: str = Field(default="工资数据核对有误，冲销重算", min_length=1, max_length=200)
+    includePayments: bool = False
+
+
+@router.post("/sheets/{month}/unaccrue")
+async def unaccrue_sheet(
+    month: str,
+    request: Request,
+    req: Optional[SheetUnaccrueRequest] = None,
+    ctx: AuthContext = Depends(require_auth),
+):
+    """撤销工资表确认：冲销/删除计提凭证并退回草稿；可选连带冲销付款与解绑银行流水。"""
+    from uuid import uuid4
+
+    reason = (req.reason if req else "工资数据核对有误，冲销重算").strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="请填写撤销原因")
+    request_id = request.headers.get("X-Request-Id") or f"salary-unaccrue-{uuid4().hex}"
+    try:
+        return await service.unaccrue_salary_sheet(
+            ctx.company_id,
+            ctx.user_id,
+            month,
+            reason=reason,
+            request_id=request_id,
+            include_payments=bool(req.includePayments) if req else False,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

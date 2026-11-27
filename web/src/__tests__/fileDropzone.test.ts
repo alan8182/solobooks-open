@@ -72,4 +72,23 @@ describe('FileDropzone', () => {
     await wrapper.find('.uploader-zone').trigger('click')
     expect(spy).toHaveBeenCalled()
   })
+
+  it('supports multiple valid files and reports invalid ones individually when multiple=true', async () => {
+    const wrapper = mountDropzone({ multiple: true })
+    const input = wrapper.find('input[type="file"]')
+    expect((input.element as HTMLInputElement).multiple).toBe(true)
+
+    const sales = makeFile('销项开票表.xlsx')
+    const purchase = makeFile('进项收票表.xlsx')
+    await wrapper.find('.file-dropzone').trigger('drop', { dataTransfer: { files: [sales, purchase] } })
+
+    const emitted = wrapper.emitted('files')
+    expect(emitted).toHaveLength(1)
+    expect(emitted?.[0][0]).toEqual([sales, purchase])
+
+    const invalid = makeFile('说明.txt')
+    await wrapper.find('.file-dropzone').trigger('drop', { dataTransfer: { files: [invalid, purchase] } })
+    expect(String(wrapper.emitted('error')?.[0][0])).toContain('说明.txt')
+    expect(wrapper.emitted('files')?.[1][0]).toEqual([purchase])
+  })
 })

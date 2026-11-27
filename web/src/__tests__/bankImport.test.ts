@@ -4,6 +4,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
+import * as XLSX from 'xlsx'
 import {
   buildBankRows,
   bankColumnDescriptionRole,
@@ -11,6 +12,7 @@ import {
   formatBankDate,
   formatBankTime,
   parseMoney,
+  parseBankSheet,
   extractStatementCounterparty,
   isBankCounterpartySourceBlocked,
   normalizeBankReference,
@@ -138,6 +140,32 @@ describe('extractStatementCounterparty', () => {
     expect(
       extractStatementCounterparty('网银转账')
     ).toBe('')
+  })
+})
+
+describe('parseBankSheet 汇总行识别', () => {
+  it('摘要自由文本含「合计」的交易行不能当表尾丢弃', () => {
+    // 真实事故：-104.30「报销顺丰快递费」的其它摘要写成
+    // 「金额是合计可开的，部分是报销收入」，旧实现按子串命中「合计」整行丢掉，
+    // 导入仍报 11 条、0 条跳过，银行余额差 104.30 只能靠人工逐行核对。
+    const aoa = [
+      ['标题', '对账单'],
+      ['累计借金额', 18824.07, '', '累计借总笔数', 9],
+      ['记录条数', 12],
+      [],
+      ['账号', '交易日', '交易时间', '交易金额', '余额', '摘要', '其它摘要'],
+      ['571915926010106', '2026-10-12', '11:08:30', -9250, 18408.13, '26年9月工资', ''],
+      ['571915926010106', '2026-10-12', '11:08:33', -104.3, 18303.83, '报销顺丰快递费', '金额是合计可开的，部分是报销收入'],
+      ['571915926010106', '2026-10-12', '11:08:38', -434, 17869.83, '报销餐饮招待费（于）', ''],
+      ['合计', '', '', -9788.3, '', '', ''],
+    ]
+    const rows = parseBankSheet(XLSX.utils.aoa_to_sheet(aoa))
+
+    expect(rows).toHaveLength(3)
+    expect(rows[1]['摘要']).toBe('报销顺丰快递费')
+    expect(rows[1]['交易金额']).toBe(-104.3)
+    // 真正的表尾「合计」行仍要排除
+    expect(rows.some(row => String(row['账号']) === '合计')).toBe(false)
   })
 })
 

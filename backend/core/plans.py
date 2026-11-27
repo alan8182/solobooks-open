@@ -28,6 +28,8 @@ class PlanDef:
     period_type: str
     # 周期内 token 上限；None = 未设限
     token_quota: int | None
+    # 新用户注册首月（第 1 个自然月周期）token 上限；None = 与 token_quota 一致
+    first_month_token_quota: int | None = None
     # 年付售价（元，两位小数字符串）；None = 不在售卖目录（trial 体验版 / plus 历史编码）
     price_annual: str | None = None
     # 最多可创建的账套（公司）数；None = 不限（预留给未来代账机构版）
@@ -35,30 +37,53 @@ class PlanDef:
 
 
 PLAN_CATALOG: dict[str, PlanDef] = {
-    # 免费体验版：每月 10 万 token 体验额度，最多 3 个账套
+    # 免费体验版：新用户首月 20 万 token 体验（可 ¥1 购新人体验包扩容至 100 万），次月起每月 10 万 token，最多 3 个账套
     "trial": PlanDef(
         code="trial", name="免费体验版", period_type="monthly", token_quota=100_000,
-        max_companies=3,
+        first_month_token_quota=200_000, max_companies=3,
     ),
-    # 云端标准版（598元/年）：每年 500 万 token，最多 3 个账套
+    # 云端标准版（598元/年）：每年 1000 万 token，最多 3 个账套
     "standard": PlanDef(
-        code="standard", name="云端标准版", period_type="annual", token_quota=5_000_000,
+        code="standard", name="云端标准版", period_type="annual", token_quota=10_000_000,
         price_annual="598.00", max_companies=3,
     ),
-    # 人机双签版（2980元/年）：每年 500 万 token，最多 3 个账套
+    # 人机双签版（2980元/年）：每年 1000 万 token，最多 3 个账套
     "pro": PlanDef(
-        code="pro", name="人机双签版", period_type="annual", token_quota=5_000_000,
+        code="pro", name="人机双签版", period_type="annual", token_quota=10_000_000,
         price_annual="2980.00", max_companies=3,
     ),
     # 兼容历史 plus 编码
     "plus": PlanDef(
-        code="plus", name="订阅版", period_type="annual", token_quota=5_000_000,
+        code="plus", name="订阅版", period_type="annual", token_quota=10_000_000,
         max_companies=3,
     ),
 }
 
 # 新用户默认套餐
 DEFAULT_PLAN_CODE = "trial"
+
+# AI 点数充值（独立于订阅套餐）：1 元 = 10,000 点；1 点 = 1 token。
+# 充值余额永久有效，不随套餐周期重置；消耗顺序固定为「先套餐额度、后特惠余额、再永久余额」。
+# 价格唯一真相在此，下单只接受整数元，token 数由后端换算，前端不得传价。
+TOKEN_TOPUP_TOKENS_PER_YUAN = 10_000
+TOKEN_TOPUP_MIN_YUAN = 1
+TOKEN_TOPUP_MAX_YUAN = 10_000
+
+# 新人首月 AI 体验包（一次性限时特惠，唯一价格真相在此）：
+# ¥1.00（原价 ¥80.00）购 800,000 Token，自支付成功日起 30 天有效，每账号限购 1 次，
+# 仅限未曾订阅过年付的 trial 用户。
+FIRST_MONTH_PROMO_CODE = "first_month_promo"
+FIRST_MONTH_PROMO_NAME = "新人首月 AI 体验包"
+FIRST_MONTH_PROMO_PRICE_YUAN = "1.00"
+FIRST_MONTH_PROMO_ORIGINAL_YUAN = "80.00"
+FIRST_MONTH_PROMO_TOKENS = 800_000
+FIRST_MONTH_PROMO_VALID_DAYS = 30
+FIRST_MONTH_PROMO_LOW_QUOTA_RATIO = 0.8
+
+
+def token_topup_tokens(amount_yuan: int) -> int:
+    """整数元 → 到账点数（token）。校验范围由调用方按下单入口规则负责。"""
+    return int(amount_yuan) * TOKEN_TOPUP_TOKENS_PER_YUAN
 
 
 def get_plan(plan_code: str | None) -> PlanDef:

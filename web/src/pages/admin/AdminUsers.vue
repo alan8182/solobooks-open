@@ -44,18 +44,22 @@ const {
 const activeUser = ref<AdminUserItem | null>(null)
 const drawerVisible = ref(false)
 const savingPlan = ref(false)
+// 打开抽屉时的点数余额：仅当管理员真的改过才提交，避免覆盖期间用户自助充值
+const originalTokenBalance = ref(0)
 const planForm = ref<{
   planCode: PlanCode
   planAnchorAt: string
   quotaBonusTokens: number
+  tokenBalance: number
 }>({
   planCode: 'trial',
   planAnchorAt: '',
   quotaBonusTokens: 0,
+  tokenBalance: 0,
 })
 
 const PLAN_OPTIONS: { label: string; value: PlanCode }[] = [
-  { label: '免费体验版（¥0 · 月 10 万 Token）', value: 'trial' },
+  { label: '免费体验版（¥0 · 首月 20 万 / 次月起 10 万）', value: 'trial' },
   { label: '云端标准版（¥598/年）', value: 'standard' },
   { label: '人机双签版（¥2,980/年）', value: 'pro' },
   { label: '历史订阅版（plus）', value: 'plus' },
@@ -84,7 +88,9 @@ function openUserDrawer(user: AdminUserItem) {
     planCode: user.planCode || 'trial',
     planAnchorAt: user.planAnchorAt || '',
     quotaBonusTokens: user.quotaBonusTokens ?? 0,
+    tokenBalance: user.tokenBalance ?? 0,
   }
+  originalTokenBalance.value = user.tokenBalance ?? 0
   drawerVisible.value = true
 }
 
@@ -104,17 +110,24 @@ async function savePlanConfig() {
   }
   savingPlan.value = true
   try {
+    const nextTokenBalance = Math.max(0, Math.floor(Number(planForm.value.tokenBalance || 0)))
     const res = await patchAdminUser(activeUser.value.userId, {
       planCode: planForm.value.planCode,
       planAnchorAt: anchor,
       quotaBonusTokens: Math.max(0, Math.floor(Number(planForm.value.quotaBonusTokens || 0))),
+      // 未改动就不提交，避免把期间用户自助充值覆盖回旧值
+      ...(nextTokenBalance !== originalTokenBalance.value
+        ? { tokenBalance: nextTokenBalance }
+        : {}),
     })
+    originalTokenBalance.value = res.user.tokenBalance ?? 0
     activeUser.value = {
       ...activeUser.value,
       planCode: res.user.planCode,
       planName: res.user.planName,
       planAnchorAt: res.user.planAnchorAt,
       quotaBonusTokens: res.user.quotaBonusTokens,
+      tokenBalance: res.user.tokenBalance ?? 0,
     }
     message.success('套餐与额度已更新并实时生效')
     await load()
@@ -178,6 +191,13 @@ const columns: DataTableColumns<AdminUserItem> = [
         { tone: planTone(row.planCode), plain: row.planCode === 'trial', size: 'small' },
         { default: () => row.planName || row.planCode },
       ),
+  },
+  {
+    title: 'AI 点数余额',
+    key: 'tokenBalance',
+    width: 120,
+    align: 'right',
+    render: (row) => (row.tokenBalance ?? 0).toLocaleString('zh-CN'),
   },
   {
     title: '公司与角色',
@@ -390,6 +410,18 @@ const columns: DataTableColumns<AdminUserItem> = [
                   size="small"
                   :min="0"
                   :step="50000"
+                  style="width: 100%"
+                />
+              </div>
+            </div>
+            <div class="plan-row-2">
+              <div class="plan-field">
+                <label class="info-label">AI 点数余额（1 点 = 1 token，人工调整自动留流水）</label>
+                <NInputNumber
+                  v-model:value="planForm.tokenBalance"
+                  size="small"
+                  :min="0"
+                  :step="10000"
                   style="width: 100%"
                 />
               </div>

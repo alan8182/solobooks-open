@@ -1,21 +1,34 @@
 ﻿<!-- Copyright (c) 2026 芥子星辰（杭州）智能科技有限公司. Licensed under the SoloBooks License v2.0. -->
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { NButton, NModal } from 'naive-ui'
 
 const show = ref(false)
+const OPEN_BETA_CONTACT_EVENT = 'solo:open-beta-contact'
+
+function onOpenBetaContact() {
+  show.value = true
+}
+
+onMounted(() => {
+  window.addEventListener(OPEN_BETA_CONTACT_EVENT, onOpenBetaContact)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener(OPEN_BETA_CONTACT_EVENT, onOpenBetaContact)
+})
 </script>
 
 <template>
   <button
     type="button"
     class="beta-contact-fab no-print"
-    aria-label="查看内测群联系方式"
+    aria-label="查看公测群联系方式"
     @click="show = true"
   >
     <span class="beta-dot" />
     <span class="beta-copy">
-      <strong>内测中</strong>
+      <strong>公测中</strong>
       <small>加群反馈</small>
     </span>
   </button>
@@ -23,22 +36,22 @@ const show = ref(false)
   <NModal
     v-model:show="show"
     preset="card"
-    title="梭罗记账 · 内测群"
+    title="梭罗记账 · 公测群"
     class="beta-contact-modal"
     :style="{ width: '420px', maxWidth: '92vw', borderRadius: '20px' }"
   >
     <div class="beta-contact-body">
       <p class="beta-lead">
-        当前是内测版本，遇到问题不用自己扛。
+        当前是公测版本，遇到问题不用自己扛。
       </p>
       <p class="beta-desc">
-        扫码加我微信，<strong>备注「记账」</strong>，我会拉你进内测群。
+        扫码加我微信，<strong>备注「记账」</strong>，我会拉你进公测群。
         群里有会计师和工程师，记账、报税、折旧、摊销问题都可以直接问。
       </p>
       <div class="beta-qr-wrap">
         <img
           src="/wechat-beta-qr.png"
-          alt="微信内测群二维码"
+          alt="微信公测群二维码"
           class="beta-qr"
         />
       </div>

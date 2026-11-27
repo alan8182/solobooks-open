@@ -26,6 +26,7 @@ SALARY_MONEY_FIELDS = {
     "company_social_insurance", "company_housing_fund",
     "net_salary", "total_cost", "special_additional_deduction",
 }
+NULLABLE_SALARY_MONEY_FIELDS = {"housing_fund_base"}
 
 # 凭证来源指纹：计提/发放/缴社保/缴个税各一个，崩溃重试时凭指纹找回已建凭证，
 # 避免"凭证已入账但工资表状态未更新"场景下重复入账（两段式写入的恢复机制）。
@@ -199,10 +200,15 @@ async def _bump_generation(conn, sheet: Dict[str, Any], column: str) -> None:
     sheet[column] = next_value
 
 
-def _housing_fund_amounts(base: Any, rates: Optional[dict[str, Decimal]] = None) -> tuple[Decimal, Decimal]:
+def _housing_fund_amounts(
+    base: Any,
+    rates: Optional[dict[str, Decimal]] = None,
+    *,
+    housing_fund_base: Any = None,
+) -> tuple[Decimal, Decimal]:
     """按账套费率算 (个人公积金, 单位公积金)。"""
     rates = rates or default_payroll_rates()
-    base_amount = _clamp_ss_base(money(base, allow_negative=False))
+    base_amount = _effective_housing_fund_base(base, housing_fund_base)
     return (
         money(base_amount * rates["housingPersonal"]),
         money(base_amount * rates["housingCompany"]),
@@ -429,7 +435,9 @@ async def save_payroll_rates(company_id: str, updates: dict[str, Any]) -> dict[s
         if not isinstance(payload, dict):
             payload = {}
 
-        current = _merge_payroll_rates(payload.get("payrollRates"))
+        current = _merge_payroll_rates(
+            payload.get("payrollRates"), defaults=default_payroll_rates(payload)
+        )
         merged = dict(current)
         for key in PAYROLL_RATE_KEYS:
             if updates.get(key) is None:
@@ -525,11 +533,18 @@ async def parse_tax_rates_screenshot(
     }
 
 
-async def recalculate_draft_withholdings(company_id: str, month: str) -> Dict[str, Any]:
-    """按账套费率重算某月草稿工资表的社保公积金两列并回写实发/成本。
+async def recalculate_draft_withholdings(
+    company_id: str,
+    month: str,
+    *,
+    employee_ids: Optional[list[str]] = None,
+    ignore_non_draft: bool = False,
+) -> Dict[str, Any]:
+    """按账套费率或员工最新缴费基数重算草稿工资表的社保公积金两列并回写实发/成本。
 
-    改了比例但工资表里存的还是旧数时，「缴公积金」凭证金额仍然是错的。
+    改了比例或员工基数但工资表里存的还是旧数时，「缴公积金/缴社保」凭证金额仍然是错的。
     已计提/已发放的月份一律不动（凭证已入账，要改必须先冲销计提）。
+    传入 employee_ids 时仅重算指定员工行，同时跨全表所有行汇总新的公积金合计数。
     """
     await _ensure_db_ready()
     conn = await get_conn()
@@ -540,26 +555,48 @@ async def recalculate_draft_withholdings(company_id: str, month: str) -> Dict[st
         )
         row = await cursor.fetchone()
         if not row:
+            if ignore_non_draft:
+                return {}
             raise ValueError("该月工资表不存在")
         sheet = await _sync_sheet_lifecycle(conn, dict(row))
         if str(sheet.get("status") or "draft") != "draft":
+            if ignore_non_draft:
+                return await get_or_create_salary_sheet(company_id, month)
             raise ValueError("已计提的工资表不能按新比例重算，请先冲销计提凭证")
 
         rates = await load_payroll_rates(conn, company_id)
         cursor = await conn.execute(
-            "SELECT sr.id, sr.base_salary, sr.bonus, sr.allowance, sr.deduction, "
-            "sr.personal_tax, e.social_security_base "
+            "SELECT sr.id, sr.employee_id, sr.base_salary, sr.bonus, sr.allowance, sr.deduction, "
+            "sr.personal_tax, sr.personal_housing_fund, sr.company_housing_fund, "
+            "e.social_security_base, e.housing_fund_base "
             "FROM salary_records sr JOIN employees e ON e.id = sr.employee_id "
             "WHERE sr.sheet_id = ?",
             (sheet["id"],),
         )
         records = [dict(r) for r in await cursor.fetchall()]
+        target_emp_ids = {str(eid) for eid in employee_ids} if employee_ids else None
         now = _now_iso()
         tot_p_hf = ZERO
         tot_c_hf = ZERO
         for record in records:
+            if target_emp_ids is not None and str(record["employee_id"]) not in target_emp_ids:
+                if record.get("personal_housing_fund") is not None and record.get("company_housing_fund") is not None:
+                    tot_p_hf = money(tot_p_hf + money(record["personal_housing_fund"], allow_negative=False))
+                    tot_c_hf = money(tot_c_hf + money(record["company_housing_fund"], allow_negative=False))
+                else:
+                    _, p_hf, _, c_hf = calculate_initial_withholdings(
+                        record["social_security_base"],
+                        rates,
+                        housing_fund_base=record.get("housing_fund_base"),
+                    )
+                    tot_p_hf = money(tot_p_hf + p_hf)
+                    tot_c_hf = money(tot_c_hf + c_hf)
+                continue
+
             p_si, p_hf, c_si, c_hf = calculate_initial_withholdings(
-                record["social_security_base"], rates
+                record["social_security_base"],
+                rates,
+                housing_fund_base=record.get("housing_fund_base"),
             )
             pers_ss = money(p_si + p_hf)
             comp_ss = money(c_si + c_hf)
@@ -593,17 +630,22 @@ async def recalculate_draft_withholdings(company_id: str, month: str) -> Dict[st
 
 
 def _expected_withholding(
-    base: Decimal, rates: dict[str, Decimal], *, company: bool = False
+    base: Decimal,
+    rates: dict[str, Decimal],
+    *,
+    company: bool = False,
+    housing_fund_base: Optional[Decimal] = None,
 ) -> tuple[Decimal, Decimal]:
     """按账套费率算 (社保, 公积金) 期望额，用于把合并列拆回社保与公积金。"""
+    hf_base = base if housing_fund_base is None else money(housing_fund_base, allow_negative=False)
     if company:
         return (
             money(base * rates["socialCompany"]),
-            money(base * rates["housingCompany"]),
+            money(hf_base * rates["housingCompany"]),
         )
     return (
         money(base * rates["socialPersonal"]),
-        money(base * rates["housingPersonal"]),
+        money(hf_base * rates["housingPersonal"]),
     )
 
 
@@ -648,16 +690,19 @@ async def _per_employee_housing_fund_parts(
 
     rates = await load_payroll_rates(conn, str(sheet["company_id"]))
     employee_ids = sorted({str(r["employee_id"]) for r in records})
-    bases: dict[str, Any] = {}
+    emp_bases: dict[str, tuple[Any, Any]] = {}
     if employee_ids:
         placeholders = ", ".join("?" for _ in employee_ids)
         rows = await (
             await conn.execute(
-                f"SELECT id, social_security_base FROM employees WHERE company_id = ? AND id IN ({placeholders})",
+                f"SELECT id, social_security_base, housing_fund_base FROM employees WHERE company_id = ? AND id IN ({placeholders})",
                 [sheet["company_id"], *employee_ids]
             )
         ).fetchall()
-        bases = {str(row["id"]): row["social_security_base"] for row in rows}
+        emp_bases = {
+            str(row["id"]): (row["social_security_base"], row["housing_fund_base"])
+            for row in rows
+        }
 
     parts: list[tuple[Decimal, Decimal]] = []
     personal_hf = ZERO
@@ -673,12 +718,18 @@ async def _per_employee_housing_fund_parts(
             if company_part > c_tot:
                 company_part = c_tot
         else:
-            base = _clamp_ss_base(money(bases.get(str(record["employee_id"]), ZERO), allow_negative=False))
-            ss_personal, hf_personal = _expected_withholding(base, rates)
+            ss_raw, hf_raw = emp_bases.get(str(record["employee_id"]), (ZERO, None))
+            ss_base = _clamp_ss_base(money(ss_raw or ZERO, allow_negative=False))
+            hf_base = _effective_housing_fund_base(ss_raw or ZERO, hf_raw)
+            ss_personal, hf_personal = _expected_withholding(
+                ss_base, rates, housing_fund_base=hf_base
+            )
             _, personal_part = _split_withheld(
                 money(record["personal_social_security"]), ss_personal, hf_personal
             )
-            ss_company, hf_company = _expected_withholding(base, rates, company=True)
+            ss_company, hf_company = _expected_withholding(
+                ss_base, rates, company=True, housing_fund_base=hf_base
+            )
             _, company_part = _split_withheld(
                 money(record["company_social_security"]), ss_company, hf_company
             )
@@ -785,6 +836,166 @@ async def _sync_sheet_lifecycle(conn, sheet: Dict[str, Any]) -> Dict[str, Any]:
     return sheet
 
 
+async def _compute_carry_forward_meta(
+    conn,
+    company_id: str,
+    month: str,
+    records: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """对比上期最近一期工资表，生成延续来源与差异摘要（供向导无变化确认与草稿提示）。"""
+    cursor_prev = await conn.execute(
+        "SELECT id, month FROM salary_sheets WHERE company_id = ? AND month < ? ORDER BY month DESC LIMIT 1",
+        (company_id, month),
+    )
+    prev_sheet_row = await cursor_prev.fetchone()
+    if not prev_sheet_row:
+        return {
+            "hasPreviousSheet": False,
+            "sourceMonth": None,
+            "isIdenticalToPrevious": False,
+            "changeReasons": [],
+        }
+
+    cursor_pr = await conn.execute(
+        "SELECT employee_id, employee_name, base_salary, bonus, allowance, deduction, "
+        "personal_social_security, personal_tax, company_social_security, net_salary, total_cost "
+        "FROM salary_records WHERE sheet_id = ?",
+        (prev_sheet_row["id"],),
+    )
+    prev_recs = [dict(r) for r in await cursor_pr.fetchall()]
+
+    cur_by_emp = {str(r["employee_id"]): r for r in records}
+    prev_by_emp = {str(r["employee_id"]): r for r in prev_recs}
+
+    def _rec_gross(r: Dict[str, Any]) -> Decimal:
+        return money(
+            money(r.get("base_salary") or ZERO)
+            + money(r.get("bonus") or ZERO)
+            + money(r.get("allowance") or ZERO)
+            - money(r.get("deduction") or ZERO)
+        )
+
+    def _signature(r: Dict[str, Any]) -> tuple[Decimal, ...]:
+        return (
+            money(r.get("base_salary") or ZERO),
+            money(r.get("bonus") or ZERO),
+            money(r.get("allowance") or ZERO),
+            money(r.get("deduction") or ZERO),
+            money(r.get("personal_social_security") or ZERO),
+            money(r.get("company_social_security") or ZERO),
+            money(r.get("personal_tax") or ZERO),
+            money(r.get("net_salary") or ZERO),
+            money(r.get("total_cost") or ZERO),
+        )
+
+    same_employees = set(cur_by_emp.keys()) == set(prev_by_emp.keys())
+    is_identical = (
+        bool(records)
+        and same_employees
+        and len(records) == len(prev_recs)
+        and all(_signature(cur_by_emp[eid]) == _signature(prev_by_emp[eid]) for eid in cur_by_emp)
+    )
+
+    prev_gross = money(sum((_rec_gross(r) for r in prev_recs), ZERO))
+    prev_net = money(sum((money(r.get("net_salary") or ZERO) for r in prev_recs), ZERO))
+    prev_cost = money(sum((money(r.get("total_cost") or ZERO) for r in prev_recs), ZERO))
+
+    cur_bonus = money(sum((money(r.get("bonus") or ZERO) for r in records), ZERO))
+    prev_bonus = money(sum((money(r.get("bonus") or ZERO) for r in prev_recs), ZERO))
+    cur_deduction = money(sum((money(r.get("deduction") or ZERO) for r in records), ZERO))
+    prev_deduction = money(sum((money(r.get("deduction") or ZERO) for r in prev_recs), ZERO))
+    cur_tax = money(sum((money(r.get("personal_tax") or ZERO) for r in records), ZERO))
+    prev_tax = money(sum((money(r.get("personal_tax") or ZERO) for r in prev_recs), ZERO))
+    tax_diff = money(cur_tax - prev_tax)
+
+    cleared_bonus = prev_bonus if (prev_bonus > ZERO and cur_bonus == ZERO) else ZERO
+    cleared_deduction = prev_deduction if (prev_deduction > ZERO and cur_deduction == ZERO) else ZERO
+
+    reasons: list[str] = []
+    if not is_identical:
+        if cleared_bonus > ZERO:
+            reasons.append(f"上月一次性奖金 ¥{cleared_bonus:,.2f} 已自动清零")
+        if cleared_deduction > ZERO:
+            reasons.append(f"上月考勤扣款 ¥{cleared_deduction:,.2f} 已自动清零")
+
+        added_names = [
+            str(cur_by_emp[eid].get("employee_name") or "")
+            for eid in cur_by_emp if eid not in prev_by_emp
+        ]
+        removed_names = [
+            str(prev_by_emp[eid].get("employee_name") or "")
+            for eid in prev_by_emp if eid not in cur_by_emp
+        ]
+        if added_names:
+            suffix = f" 等{len(added_names)}人" if len(added_names) > 3 else ""
+            reasons.append(f"新增员工：{'、'.join(added_names[:3])}{suffix}")
+        if removed_names:
+            suffix = f" 等{len(removed_names)}人" if len(removed_names) > 3 else ""
+            reasons.append(f"减少员工：{'、'.join(removed_names[:3])}{suffix}")
+
+        common_ids = [eid for eid in cur_by_emp if eid in prev_by_emp]
+        if common_ids:
+            base_diff = money(sum(
+                (money(cur_by_emp[eid].get("base_salary") or ZERO) - money(prev_by_emp[eid].get("base_salary") or ZERO)
+                 for eid in common_ids),
+                ZERO,
+            ))
+            if base_diff != ZERO:
+                sign = "+" if base_diff > ZERO else "-"
+                reasons.append(f"基本工资较上月 {sign}¥{abs(base_diff):,.2f}")
+
+            allow_diff = money(sum(
+                (money(cur_by_emp[eid].get("allowance") or ZERO) - money(prev_by_emp[eid].get("allowance") or ZERO)
+                 for eid in common_ids),
+                ZERO,
+            ))
+            if allow_diff != ZERO:
+                sign = "+" if allow_diff > ZERO else "-"
+                reasons.append(f"固定津贴较上月 {sign}¥{abs(allow_diff):,.2f}")
+
+            ss_diff = money(sum(
+                (
+                    money(cur_by_emp[eid].get("personal_social_security") or ZERO)
+                    + money(cur_by_emp[eid].get("company_social_security") or ZERO)
+                    - money(prev_by_emp[eid].get("personal_social_security") or ZERO)
+                    - money(prev_by_emp[eid].get("company_social_security") or ZERO)
+                    for eid in common_ids
+                ),
+                ZERO,
+            ))
+            if ss_diff != ZERO:
+                sign = "+" if ss_diff > ZERO else "-"
+                reasons.append(f"五险一金较上月 {sign}¥{abs(ss_diff):,.2f}")
+
+        if cleared_bonus == ZERO and cur_bonus != prev_bonus:
+            bdiff = money(cur_bonus - prev_bonus)
+            sign = "+" if bdiff > ZERO else "-"
+            reasons.append(f"奖金较上月 {sign}¥{abs(bdiff):,.2f}")
+        if cleared_deduction == ZERO and cur_deduction != prev_deduction:
+            ddiff = money(cur_deduction - prev_deduction)
+            sign = "+" if ddiff > ZERO else "-"
+            reasons.append(f"考勤扣款较上月 {sign}¥{abs(ddiff):,.2f}")
+
+        if tax_diff != ZERO:
+            sign = "+" if tax_diff > ZERO else "-"
+            reasons.append(f"累计预扣个税较上月 {sign}¥{abs(tax_diff):,.2f}")
+
+    return {
+        "hasPreviousSheet": True,
+        "sourceMonth": str(prev_sheet_row["month"]),
+        "isIdenticalToPrevious": is_identical,
+        "prevHeadcount": len(prev_recs),
+        "prevTotalGross": money_text(prev_gross),
+        "prevTotalNet": money_text(prev_net),
+        "prevTotalCost": money_text(prev_cost),
+        "clearedBonusTotal": money_text(cleared_bonus),
+        "clearedDeductionTotal": money_text(cleared_deduction),
+        "headcountDiff": len(records) - len(prev_recs),
+        "taxDiff": money_text(tax_diff),
+        "changeReasons": reasons,
+    }
+
+
 async def _enrich_salary_sheet(conn, sheet: Dict[str, Any]) -> Dict[str, Any]:
     records = list(sheet.get("records") or [])
     statuses = sheet.get("voucherStatuses") or await _entry_statuses(
@@ -853,14 +1064,23 @@ async def _enrich_salary_sheet(conn, sheet: Dict[str, Any]) -> Dict[str, Any]:
         r["company_housing_fund"] = money_text(c_hf_part)
         r["company_social_insurance"] = money_text(money(c_ss - c_hf_part))
 
+    sheet["carryForward"] = await _compute_carry_forward_meta(
+        conn, str(sheet["company_id"]), str(sheet["month"]), records
+    )
+
     return sheet
 
 
 def _serialize_money_fields(row: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        key: money_text(value) if key in SALARY_MONEY_FIELDS else value
-        for key, value in row.items()
-    }
+    out: Dict[str, Any] = {}
+    for key, value in row.items():
+        if key in NULLABLE_SALARY_MONEY_FIELDS:
+            out[key] = money_text(value) if value is not None else None
+        elif key in SALARY_MONEY_FIELDS:
+            out[key] = money_text(value)
+        else:
+            out[key] = value
+    return out
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -895,10 +1115,12 @@ async def _ensure_schema() -> None:
             "CREATE TABLE IF NOT EXISTS employees ("
             "  id TEXT PRIMARY KEY,"
             "  company_id TEXT NOT NULL,"
+            "  code TEXT NOT NULL DEFAULT '',"
             "  name TEXT NOT NULL,"
             "  department TEXT NOT NULL,"
             "  base_salary NUMERIC(20,2) NOT NULL DEFAULT 0.0,"
             "  social_security_base NUMERIC(20,2) NOT NULL DEFAULT 0.0,"
+            "  housing_fund_base NUMERIC(20,2),"
             "  is_owner INTEGER NOT NULL DEFAULT 0,"
             "  hire_date TEXT,"
             "  is_active INTEGER NOT NULL DEFAULT 1,"
@@ -963,6 +1185,8 @@ async def _ensure_schema() -> None:
             # 月度专项附加扣除合计（子女教育/继续教育/房贷/租金/赡养老人/婴幼儿照护）：
             # 个税累计预扣试算的输入，2026-10-23 补丁
             ("employees", "special_additional_deduction", "NUMERIC(20,2) NOT NULL DEFAULT 0.0"),
+            ("employees", "code", "TEXT NOT NULL DEFAULT ''"),
+            ("employees", "housing_fund_base", "NUMERIC(20,2)"),
             ("salary_records", "personal_housing_fund", "NUMERIC(20,2)"),
             ("salary_records", "company_housing_fund", "NUMERIC(20,2)"),
         ):
@@ -1185,7 +1409,8 @@ async def create_employee(company_id: str, name: str, department: str,
                           base_salary: Any, social_security_base: Any,
                           is_owner: bool = False,
                           hire_date: Any = None,
-                          special_additional_deduction: Any = ZERO) -> Dict[str, Any]:
+                          special_additional_deduction: Any = ZERO,
+                          housing_fund_base: Any = None) -> Dict[str, Any]:
     await _ensure_db_ready()
     conn = await get_conn()
     try:
@@ -1193,19 +1418,21 @@ async def create_employee(company_id: str, name: str, department: str,
         now = _now_iso()
         base_salary = money(base_salary, allow_negative=False)
         social_security_base = money(social_security_base, allow_negative=False)
+        hf_base = money(housing_fund_base, allow_negative=False) if housing_fund_base is not None else None
         hire_date = _normalize_hire_date(hire_date)
         special = money(special_additional_deduction, allow_negative=False)
         # 新部门直接落进账套字典，用户不必先去「部门设置」登记
         await _ensure_department_registered(conn, company_id, department)
         await conn.execute(
-            "INSERT INTO employees (id, company_id, name, department, base_salary, social_security_base, is_owner, hire_date, special_additional_deduction, is_active, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
-            (eid, company_id, name, department, base_salary, social_security_base, 1 if is_owner else 0, hire_date, special, now, now),
+            "INSERT INTO employees (id, company_id, name, department, base_salary, social_security_base, housing_fund_base, is_owner, hire_date, special_additional_deduction, is_active, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+            (eid, company_id, name, department, base_salary, social_security_base, hf_base, 1 if is_owner else 0, hire_date, special, now, now),
         )
         await conn.commit()
         return {
             "id": eid, "company_id": company_id, "name": name, "department": department,
             "base_salary": money_text(base_salary), "social_security_base": money_text(social_security_base),
+            "housing_fund_base": money_text(hf_base) if hf_base is not None else None,
             "is_owner": 1 if is_owner else 0, "hire_date": hire_date,
             "special_additional_deduction": money_text(special),
             "is_active": 1, "created_at": now, "updated_at": now
@@ -1220,17 +1447,26 @@ async def update_employee(company_id: str, employee_id: str, updates: Dict[str, 
         fields = []
         values = []
         for key in (
-            "name", "department", "base_salary", "social_security_base",
+            "name", "department", "base_salary", "social_security_base", "housing_fund_base",
             "is_active", "is_owner", "hire_date", "special_additional_deduction",
         ):
-            if key in updates:
-                fields.append(f"{key} = ?")
-                if key in {"base_salary", "social_security_base", "special_additional_deduction"}:
-                    values.append(money(updates[key], allow_negative=False))
-                elif key == "hire_date":
-                    values.append(_normalize_hire_date(updates[key]))
-                else:
-                    values.append(updates[key])
+            if key not in updates:
+                continue
+            value = updates[key]
+            if key in {"is_owner", "is_active"}:
+                if value is None:
+                    continue
+                coerced: Any = 1 if value else 0
+            elif key == "housing_fund_base":
+                coerced = money(value, allow_negative=False) if value is not None else None
+            elif key in {"base_salary", "social_security_base", "special_additional_deduction"}:
+                coerced = money(value, allow_negative=False)
+            elif key == "hire_date":
+                coerced = _normalize_hire_date(value)
+            else:
+                coerced = value
+            fields.append(f"{key} = ?")
+            values.append(coerced)
         if not fields:
             return None
         if "department" in updates:
@@ -1273,7 +1509,7 @@ async def social_insurance_month_summary(company_id: str, year: int) -> Dict[str
     返回 ``{month: {"personal", "company", "ssPaid"}}``，只含社保净额 > 0 的月份。
 
     只认计提凭证已过账的工资表：打开工资页就会按员工档案预填一张草稿（档案社保基数
-    默认 4000），草稿和档案都不能说明真有人交社保；计提被冲销后同样不再算。
+    有默认值），草稿和档案都不能说明真有人交社保；计提被冲销后同样不再算。
     工资表的社保列是「社保公积金」合并口径，这里按计提凭证同一套比例拆分（缓存列优先），
     纯公积金月份不算。纯读不回写（_housing_fund_totals 会回写缓存列，这里不走它）。
     """
@@ -1370,33 +1606,63 @@ def _clamp_ss_base(base_amount: Decimal) -> Decimal:
     return base_amount
 
 
+def _effective_housing_fund_base(
+    social_security_base: Any, housing_fund_base: Any = None
+) -> Decimal:
+    """公积金缴费基数：显式配置时直接取该基数（0=停缴），未配置（None）才跟随社保基数。
+
+    显式配置的公积金基数不走社保下限限幅（地方公积金下限常低于社平 60%）。
+    """
+    if housing_fund_base is not None:
+        return money(housing_fund_base, allow_negative=False)
+    return _clamp_ss_base(money(social_security_base, allow_negative=False))
+
+
 def calculate_initial_withholdings(
-    base: Any, rates: Optional[dict[str, Decimal]] = None
+    base: Any,
+    rates: Optional[dict[str, Decimal]] = None,
+    *,
+    housing_fund_base: Any = None,
 ) -> tuple[Decimal, Decimal, Decimal, Decimal]:
     """计算个人社保、个人公积金、单位社保、单位公积金四项初始金额。
 
-    基数按 SOCIAL_SECURITY_BASE_MIN/MAX 限幅（0 表示不限制）。
+    社保基数按 SOCIAL_SECURITY_BASE_MIN/MAX 限幅（0 表示不限制）；
+    公积金基数在未显式指定（housing_fund_base is None）时跟随限幅后的社保基数，显式指定时按其独立计算。
     返回 (个人社保, 个人公积金, 单位社保, 单位公积金)。
     """
     rates = rates or default_payroll_rates()
-    base_amount = _clamp_ss_base(money(base, allow_negative=False))
-    personal_social = money(base_amount * rates["socialPersonal"])
-    personal_hf = money(base_amount * rates["housingPersonal"])
-    company_social = money(base_amount * rates["socialCompany"])
-    company_hf = money(base_amount * rates["housingCompany"])
+    ss_base = _clamp_ss_base(money(base, allow_negative=False))
+    hf_base = _effective_housing_fund_base(base, housing_fund_base)
+    personal_social = money(ss_base * rates["socialPersonal"])
+    personal_hf = money(hf_base * rates["housingPersonal"])
+    company_social = money(ss_base * rates["socialCompany"])
+    company_hf = money(hf_base * rates["housingCompany"])
     return personal_social, personal_hf, company_social, company_hf
 
 
 def calculate_initial_social_security(
-    base: Any, rates: Optional[dict[str, Decimal]] = None
+    base: Any,
+    rates: Optional[dict[str, Decimal]] = None,
+    *,
+    housing_fund_base: Any = None,
 ) -> tuple[Decimal, Decimal]:
     """计算社保公积金草稿金额（费率优先取账套档案，缺省回落 config 杭州口径）。
 
     个人 = 社保（养老+医疗+失业）+ 公积金；单位 = 社保（养老+医疗+失业+工伤）+ 公积金。
     返回 (个人合计, 单位合计)，保持既有调用兼容。
     """
-    p_si, p_hf, c_si, c_hf = calculate_initial_withholdings(base, rates)
+    p_si, p_hf, c_si, c_hf = calculate_initial_withholdings(
+        base, rates, housing_fund_base=housing_fund_base
+    )
     return money(p_si + p_hf), money(c_si + c_hf)
+
+
+def _is_roster_updated_after_prev(
+    emp: Dict[str, Any], prev_r: Optional[Dict[str, Any]]
+) -> bool:
+    if not prev_r:
+        return False
+    return str(emp.get("updated_at") or "") > str(prev_r.get("updated_at") or "")
 
 
 def _carry_forward_or_init_record(
@@ -1409,33 +1675,47 @@ def _carry_forward_or_init_record(
     Optional[Decimal], Optional[Decimal], Decimal, Decimal,
     Decimal, Decimal,
 ]:
-    """计算单员工资明细：优先自动延续上一期历史工资数据，无历史记录时走花名册初始值。
+    """计算单员工资明细：自动带出上一期固定工资与社保公积金，一次性的奖金/扣款默认清零。
 
-    # ponytail: 自动继承上一个历史自然月的工资薪金、津贴、扣款、回填社保公积金与个税明细；
-    # 上限是员工规模较大时为 O(N) 字典查找，小微企业百人以内单月开表耗时 < 1ms。未来若支持跨年税率与调基规则，在此扩展校验。
+    规则：
+    1. 基本工资始终以花名册最新值为准；
+    2. 固定津贴（allowance）沿用上期；奖金（bonus）与考勤扣款（deduction）新月默认清零；
+    3. 花名册在上一期工资记录之后被修改过（如调薪/调基），按新基数重算五险一金，
+       否则沿用上期实际回填的个人/单位社保与公积金明细；
+    4. 无历史记录的新员工按花名册初始值计算。
     """
     if prev_r:
-        base_sal = money(prev_r.get("base_salary") or emp.get("base_salary") or ZERO)
-        bonus = money(prev_r.get("bonus") or ZERO)
+        roster_updated = _is_roster_updated_after_prev(emp, prev_r)
+        base_sal = money(emp.get("base_salary") or prev_r.get("base_salary") or ZERO)
+        bonus = ZERO
         allowance = money(prev_r.get("allowance") or ZERO)
-        deduction = money(prev_r.get("deduction") or ZERO)
-        pers_ss = money(prev_r.get("personal_social_security") or ZERO)
-        comp_ss = money(prev_r.get("company_social_security") or ZERO)
+        deduction = ZERO
         pers_tax = money(prev_r.get("personal_tax") or ZERO)
 
-        if prev_r.get("personal_housing_fund") is not None:
-            pers_hf = money(prev_r["personal_housing_fund"])
-            pers_si = money(pers_ss - pers_hf) if pers_ss >= pers_hf else ZERO
+        if roster_updated:
+            ss_base = emp.get("social_security_base") or ZERO
+            hf_base = emp.get("housing_fund_base")
+            pers_si, pers_hf, comp_si, comp_hf = calculate_initial_withholdings(
+                ss_base, rates, housing_fund_base=hf_base
+            )
+            pers_ss = money(pers_si + pers_hf)
+            comp_ss = money(comp_si + comp_hf)
         else:
-            pers_hf = None
-            pers_si = pers_ss
+            pers_ss = money(prev_r.get("personal_social_security") or ZERO)
+            comp_ss = money(prev_r.get("company_social_security") or ZERO)
+            if prev_r.get("personal_housing_fund") is not None:
+                pers_hf = money(prev_r["personal_housing_fund"])
+                pers_si = money(pers_ss - pers_hf) if pers_ss >= pers_hf else ZERO
+            else:
+                pers_hf = None
+                pers_si = pers_ss
 
-        if prev_r.get("company_housing_fund") is not None:
-            comp_hf = money(prev_r["company_housing_fund"])
-            comp_si = money(comp_ss - comp_hf) if comp_ss >= comp_hf else ZERO
-        else:
-            comp_hf = None
-            comp_si = comp_ss
+            if prev_r.get("company_housing_fund") is not None:
+                comp_hf = money(prev_r["company_housing_fund"])
+                comp_si = money(comp_ss - comp_hf) if comp_ss >= comp_hf else ZERO
+            else:
+                comp_hf = None
+                comp_si = comp_ss
 
         gross = money(base_sal + bonus + allowance - deduction)
         net_sal = money(gross - pers_ss - pers_tax)
@@ -1447,7 +1727,10 @@ def _carry_forward_or_init_record(
         deduction = ZERO
         pers_tax = ZERO
         ss_base = emp.get("social_security_base") or ZERO
-        pers_si, pers_hf, comp_si, comp_hf = calculate_initial_withholdings(ss_base, rates)
+        hf_base = emp.get("housing_fund_base")
+        pers_si, pers_hf, comp_si, comp_hf = calculate_initial_withholdings(
+            ss_base, rates, housing_fund_base=hf_base
+        )
         pers_ss = money(pers_si + pers_hf)
         comp_ss = money(comp_si + comp_hf)
         gross = base_sal
@@ -1460,6 +1743,153 @@ def _carry_forward_or_init_record(
         pers_hf, comp_hf, pers_si, comp_si,
         net_sal, tot_cost,
     )
+
+
+def _needs_carry_forward_iit_recalc(
+    emp: Dict[str, Any], prev_r: Optional[Dict[str, Any]]
+) -> bool:
+    """判断跨月延续时是否需要重算该员工当月累计预扣个税。"""
+    if not prev_r:
+        return False
+    return (
+        money(prev_r.get("personal_tax") or ZERO) > ZERO
+        or money(prev_r.get("bonus") or ZERO) > ZERO
+        or money(prev_r.get("deduction") or ZERO) > ZERO
+        or _is_roster_updated_after_prev(emp, prev_r)
+    )
+
+
+async def _apply_auto_iit_and_carry_rd_allocations(
+    company_id: str,
+    month: str,
+    sheet_id: str,
+    prev_month: Optional[str],
+    iit_items: list[Dict[str, Any]],
+    active_employee_ids: list[str],
+    *,
+    user_id: Optional[str] = None,
+    force_replace_rd: bool = False,
+) -> None:
+    """在新月草稿落库且释放外层 aiosqlite 连接后，重算个税并延续上月有效研发工时分配。"""
+    if iit_items:
+        tax_by_emp: Dict[str, Decimal] = {}
+        try:
+            from services.salary_iit_service import preview_sheet_individual_income_tax
+
+            iit_res = await preview_sheet_individual_income_tax(company_id, month, iit_items)
+            tax_by_emp = {
+                str(item["employeeId"]): money(item.get("taxDue") or ZERO, allow_negative=False)
+                for item in (iit_res.get("items") or [])
+                if item.get("employeeId")
+            }
+        except ValueError:
+            tax_by_emp = {}
+
+        if tax_by_emp:
+            conn = await get_conn()
+            try:
+                cursor_recs = await conn.execute(
+                    "SELECT id, employee_id, base_salary, bonus, allowance, deduction, "
+                    "personal_social_security FROM salary_records WHERE sheet_id = ?",
+                    (sheet_id,),
+                )
+                rec_rows = [dict(r) for r in await cursor_recs.fetchall()]
+                now = _now_iso()
+                changed = False
+                for row in rec_rows:
+                    eid = str(row["employee_id"])
+                    if eid not in tax_by_emp:
+                        continue
+                    pers_tax = tax_by_emp[eid]
+                    gross = money(
+                        money(row["base_salary"])
+                        + money(row["bonus"])
+                        + money(row["allowance"])
+                        - money(row["deduction"])
+                    )
+                    net_sal = money(gross - money(row["personal_social_security"]) - pers_tax)
+                    await conn.execute(
+                        "UPDATE salary_records SET personal_tax = ?, net_salary = ?, updated_at = ? "
+                        "WHERE id = ? AND sheet_id = ?",
+                        (pers_tax, net_sal, now, row["id"], sheet_id),
+                    )
+                    changed = True
+                if changed:
+                    await conn.commit()
+            finally:
+                await conn.close()
+
+    if prev_month and active_employee_ids:
+        from uuid import uuid4
+        from sqlalchemy import delete, select
+        from db.models import RdProject, RdSalaryAllocation
+        from db.session import session_scope
+        from services.rd_allocation_service import _month_range
+
+        month_start, month_end = _month_range(month)
+        active_set = set(active_employee_ids)
+        async with session_scope() as session:
+            existing_rows = (
+                await session.execute(
+                    select(RdSalaryAllocation.id).where(
+                        RdSalaryAllocation.company_id == company_id,
+                        RdSalaryAllocation.month == month,
+                    )
+                )
+            ).scalars().all()
+            if force_replace_rd and existing_rows:
+                await session.execute(
+                    delete(RdSalaryAllocation).where(
+                        RdSalaryAllocation.company_id == company_id,
+                        RdSalaryAllocation.month == month,
+                    )
+                )
+                existing_rows = []
+            if not existing_rows:
+                prev_allocs = (
+                    await session.execute(
+                        select(RdSalaryAllocation).where(
+                            RdSalaryAllocation.company_id == company_id,
+                            RdSalaryAllocation.month == prev_month,
+                            RdSalaryAllocation.employee_id.in_(active_set),
+                        )
+                    )
+                ).scalars().all()
+                if prev_allocs:
+                    proj_ids = {a.project_id for a in prev_allocs}
+                    projects = (
+                        await session.execute(
+                            select(RdProject).where(
+                                RdProject.company_id == company_id,
+                                RdProject.id.in_(proj_ids),
+                            )
+                        )
+                    ).scalars().all()
+                    valid_projects = {
+                        p.id
+                        for p in projects
+                        if p.status in {"active", "completed"}
+                        and p.start_date <= month_end
+                        and (not p.end_date or p.end_date >= month_start)
+                    }
+                    now_dt = datetime.now(timezone.utc)
+                    for alloc in prev_allocs:
+                        if alloc.project_id not in valid_projects:
+                            continue
+                        session.add(
+                            RdSalaryAllocation(
+                                id=str(uuid4()),
+                                company_id=company_id,
+                                month=month,
+                                employee_id=alloc.employee_id,
+                                project_id=alloc.project_id,
+                                allocation_rate=alloc.allocation_rate,
+                                allocation_basis=alloc.allocation_basis,
+                                created_by=user_id or alloc.created_by or "system",
+                                created_at=now_dt,
+                                updated_at=now_dt,
+                            )
+                        )
 
 
 async def _sync_draft_sheet(conn, sheet: Dict[str, Any]) -> Dict[str, Any]:
@@ -1555,6 +1985,17 @@ async def _sync_draft_sheet(conn, sheet: Dict[str, Any]) -> Dict[str, Any]:
     return sheet
 
 
+async def _load_existing_sheet_dict(conn, sheet_row: Any) -> Dict[str, Any]:
+    sheet = dict(sheet_row)
+    cursor_recs = await conn.execute(
+        "SELECT * FROM salary_records WHERE sheet_id = ?",
+        (sheet["id"],),
+    )
+    recs = await cursor_recs.fetchall()
+    sheet["records"] = [_serialize_money_fields(dict(r)) for r in recs]
+    return sheet
+
+
 async def get_or_create_salary_sheet(company_id: str, month: str) -> Dict[str, Any]:
     await _ensure_db_ready()
     conn = await get_conn()
@@ -1567,25 +2008,19 @@ async def get_or_create_salary_sheet(company_id: str, month: str) -> Dict[str, A
         sheet_row = await cursor.fetchone()
 
         if sheet_row:
-            sheet = dict(sheet_row)
-            cursor_recs = await conn.execute(
-                "SELECT * FROM salary_records WHERE sheet_id = ?",
-                (sheet["id"],),
-            )
-            recs = await cursor_recs.fetchall()
-            sheet["records"] = [_serialize_money_fields(dict(r)) for r in recs]
+            sheet = await _load_existing_sheet_dict(conn, sheet_row)
             sheet = await _sync_draft_sheet(conn, sheet)
             return await _enrich_salary_sheet(conn, sheet)
-            
+
         # If not, create a new draft sheet
         sheet_id = f"sht-{_uid()}"
         now = _now_iso()
-        
+
         await conn.execute(
             "INSERT INTO salary_sheets (id, company_id, month, status, created_at, updated_at) VALUES (?, ?, ?, 'draft', ?, ?)",
             (sheet_id, company_id, month, now, now),
         )
-        
+
         # Load all active employees hired in or before this month
         cursor_emp = await conn.execute(
             "SELECT * FROM employees WHERE company_id = ? AND is_active = 1",
@@ -1602,6 +2037,7 @@ async def get_or_create_salary_sheet(company_id: str, month: str) -> Dict[str, A
             (company_id, month),
         )
         prev_sheet_row = await cursor_prev_sheet.fetchone()
+        prev_month = str(prev_sheet_row["month"]) if prev_sheet_row else None
         prev_records_by_emp: Dict[str, Dict[str, Any]] = {}
         if prev_sheet_row:
             cursor_prev_recs = await conn.execute(
@@ -1612,11 +2048,15 @@ async def get_or_create_salary_sheet(company_id: str, month: str) -> Dict[str, A
                 prev_records_by_emp[str(r["employee_id"])] = dict(r)
 
         records = []
+        iit_items: list[Dict[str, Any]] = []
+        active_employee_ids: list[str] = []
         rates = await load_payroll_rates(conn, company_id)
         tot_p_hf = ZERO
         tot_c_hf = ZERO
         for emp in employees:
-            prev_r = prev_records_by_emp.get(str(emp["id"]))
+            emp_id = str(emp["id"])
+            active_employee_ids.append(emp_id)
+            prev_r = prev_records_by_emp.get(emp_id)
             (
                 base_sal, bonus, allowance, deduction,
                 pers_ss, comp_ss, pers_tax, gross,
@@ -1627,7 +2067,13 @@ async def get_or_create_salary_sheet(company_id: str, month: str) -> Dict[str, A
                 tot_p_hf = money(tot_p_hf + pers_hf)
             if comp_hf is not None:
                 tot_c_hf = money(tot_c_hf + comp_hf)
-            
+            if _needs_carry_forward_iit_recalc(emp, prev_r):
+                iit_items.append({
+                    "employeeId": emp_id,
+                    "gross": max(gross, ZERO),
+                    "withheld": max(pers_ss, ZERO),
+                })
+
             rec_id = f"srec-{_uid()}"
             await conn.execute(
                 "INSERT INTO salary_records (id, sheet_id, employee_id, employee_name, base_salary, bonus, allowance, deduction, personal_social_security, personal_tax, company_social_security, net_salary, total_cost, personal_housing_fund, company_housing_fund, created_at, updated_at) "
@@ -1643,12 +2089,33 @@ async def get_or_create_salary_sheet(company_id: str, month: str) -> Dict[str, A
                 "personal_social_insurance": money_text(pers_si), "company_social_insurance": money_text(comp_si),
                 "net_salary": money_text(net_sal), "total_cost": money_text(tot_cost), "created_at": now, "updated_at": now
             })
-            
+
         await conn.execute(
             "UPDATE salary_sheets SET personal_housing_fund_total = ?, company_housing_fund_total = ?, updated_at = ? WHERE id = ?",
             (tot_p_hf, tot_c_hf, now, sheet_id),
         )
         await conn.commit()
+
+        if iit_items or (prev_month and active_employee_ids):
+            await conn.close()
+            conn = None
+            await _apply_auto_iit_and_carry_rd_allocations(
+                company_id,
+                month,
+                sheet_id,
+                prev_month,
+                iit_items,
+                active_employee_ids,
+                force_replace_rd=False,
+            )
+            conn = await get_conn()
+            cursor_reloaded = await conn.execute(
+                "SELECT * FROM salary_sheets WHERE id = ?", (sheet_id,)
+            )
+            reloaded_row = await cursor_reloaded.fetchone()
+            sheet = await _load_existing_sheet_dict(conn, reloaded_row)
+            return await _enrich_salary_sheet(conn, sheet)
+
         sheet = {
             "id": sheet_id, "company_id": company_id, "month": month, "status": "draft",
             "accrual_voucher_id": None, "payment_voucher_id": None,
@@ -1660,7 +2127,144 @@ async def get_or_create_salary_sheet(company_id: str, month: str) -> Dict[str, A
         }
         return await _enrich_salary_sheet(conn, sheet)
     finally:
+        if conn is not None:
+            await conn.close()
+
+
+async def sync_draft_sheet_from_previous(
+    company_id: str,
+    month: str,
+    *,
+    user_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """将草稿状态工资表重新同步为「最新花名册 + 上月固定工资与社保 + 累计预扣个税 + 研发工时」。"""
+    await _ensure_db_ready()
+    conn = await get_conn()
+    try:
+        cursor = await conn.execute(
+            "SELECT * FROM salary_sheets WHERE company_id = ? AND month = ?",
+            (company_id, month),
+        )
+        sheet_row = await cursor.fetchone()
+        if not sheet_row:
+            raise ValueError("该月工资表不存在")
+        sheet = await _sync_sheet_lifecycle(conn, dict(sheet_row))
+        if str(sheet.get("status") or "draft") != "draft":
+            raise ValueError("仅草稿状态的工资表支持重新同步上月数据")
+        sheet_id = str(sheet["id"])
+
+        cursor_prev = await conn.execute(
+            "SELECT id, month FROM salary_sheets WHERE company_id = ? AND month < ? ORDER BY month DESC LIMIT 1",
+            (company_id, month),
+        )
+        prev_sheet_row = await cursor_prev.fetchone()
+        if not prev_sheet_row:
+            raise ValueError("暂无上月工资表可同步")
+        prev_month = str(prev_sheet_row["month"])
+
+        cursor_prev_recs = await conn.execute(
+            "SELECT * FROM salary_records WHERE sheet_id = ?",
+            (prev_sheet_row["id"],),
+        )
+        prev_records_by_emp = {
+            str(r["employee_id"]): dict(r) for r in await cursor_prev_recs.fetchall()
+        }
+
+        cursor_emp = await conn.execute(
+            "SELECT * FROM employees WHERE company_id = ? AND is_active = 1",
+            (company_id,),
+        )
+        employees = [
+            dict(emp) for emp in await cursor_emp.fetchall()
+            if _employed_in_month(dict(emp), month)
+        ]
+
+        cursor_existing = await conn.execute(
+            "SELECT id, employee_id FROM salary_records WHERE sheet_id = ?",
+            (sheet_id,),
+        )
+        existing_by_emp = {
+            str(r["employee_id"]): dict(r) for r in await cursor_existing.fetchall()
+        }
+        active_emp_ids = [str(e["id"]) for e in employees]
+        active_set = set(active_emp_ids)
+        for eid in list(existing_by_emp.keys()):
+            if eid not in active_set:
+                await conn.execute(
+                    "DELETE FROM salary_records WHERE sheet_id = ? AND employee_id = ?",
+                    (sheet_id, eid),
+                )
+
+        rates = await load_payroll_rates(conn, company_id)
+        now = _now_iso()
+        tot_p_hf = ZERO
+        tot_c_hf = ZERO
+        iit_items: list[Dict[str, Any]] = []
+
+        for emp in employees:
+            emp_id = str(emp["id"])
+            prev_r = prev_records_by_emp.get(emp_id)
+            (
+                base_sal, bonus, allowance, deduction,
+                pers_ss, comp_ss, pers_tax, gross,
+                pers_hf, comp_hf, _pers_si, _comp_si,
+                net_sal, tot_cost,
+            ) = _carry_forward_or_init_record(emp, prev_r, rates)
+            if pers_hf is not None:
+                tot_p_hf = money(tot_p_hf + pers_hf)
+            if comp_hf is not None:
+                tot_c_hf = money(tot_c_hf + comp_hf)
+            if _needs_carry_forward_iit_recalc(emp, prev_r) or money(gross - pers_ss) > Decimal("5000"):
+                iit_items.append({
+                    "employeeId": emp_id,
+                    "gross": max(gross, ZERO),
+                    "withheld": max(pers_ss, ZERO),
+                })
+
+            existing = existing_by_emp.get(emp_id)
+            if existing:
+                await conn.execute(
+                    "UPDATE salary_records SET employee_name = ?, base_salary = ?, bonus = ?, allowance = ?, deduction = ?, "
+                    "personal_social_security = ?, personal_tax = ?, company_social_security = ?, net_salary = ?, total_cost = ?, "
+                    "personal_housing_fund = ?, company_housing_fund = ?, updated_at = ? "
+                    "WHERE id = ? AND sheet_id = ?",
+                    (
+                        emp["name"], base_sal, bonus, allowance, deduction,
+                        pers_ss, pers_tax, comp_ss, net_sal, tot_cost,
+                        pers_hf, comp_hf, now, existing["id"], sheet_id,
+                    ),
+                )
+            else:
+                rec_id = f"srec-{_uid()}"
+                await conn.execute(
+                    "INSERT INTO salary_records (id, sheet_id, employee_id, employee_name, base_salary, bonus, allowance, deduction, personal_social_security, personal_tax, company_social_security, net_salary, total_cost, personal_housing_fund, company_housing_fund, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (rec_id, sheet_id, emp_id, emp["name"], base_sal, bonus, allowance, deduction, pers_ss, pers_tax, comp_ss, net_sal, tot_cost, pers_hf, comp_hf, now, now),
+                )
+
+        await conn.execute(
+            "UPDATE salary_sheets SET personal_housing_fund_total = ?, company_housing_fund_total = ?, updated_at = ? WHERE id = ?",
+            (tot_p_hf, tot_c_hf, now, sheet_id),
+        )
+        await conn.commit()
         await conn.close()
+        conn = None
+
+        await _apply_auto_iit_and_carry_rd_allocations(
+            company_id,
+            month,
+            sheet_id,
+            prev_month,
+            iit_items,
+            active_emp_ids,
+            user_id=user_id,
+            force_replace_rd=True,
+        )
+    finally:
+        if conn is not None:
+            await conn.close()
+
+    return await get_or_create_salary_sheet(company_id, month)
 
 async def update_salary_records(company_id: str, month: str, records: List[Dict[str, Any]]) -> Dict[str, Any]:
     await _ensure_db_ready()
@@ -2026,6 +2630,226 @@ async def accrue_salary_sheet(company_id: str, user_id: str, month: str) -> Dict
         return await _enrich_salary_sheet(conn, sheet)
     finally:
         await conn.close()
+
+
+async def unaccrue_salary_sheet(
+    company_id: str,
+    user_id: str,
+    month: str,
+    *,
+    reason: str = "工资数据核对有误，冲销重算",
+    request_id: str = "",
+    include_payments: bool = False,
+) -> Dict[str, Any]:
+    """撤销工资表确认 / 冲销计提凭证并退回草稿，以便修改后重新计提。
+
+    合规约束：
+    - 已过账凭证调用 reverse_journal 生成红字冲销凭证并留档，显式指定
+      reversal_date=entry.occurred_on，确保已关账期间严格报错拦截（PERIOD_CLOSED），
+      不会静默跨期到次月。
+    - 未过账待复核（pending_review / draft）凭证调用 delete_draft 删除。
+    - 默认存在已生效（posted / pending_review）的工资发放、社保、公积金或个税凭证时
+      阻断撤回；当 include_payments=True 时，在单事务内先安全解绑对应银行流水对账，
+      再按逆序原子红冲全部付款凭证与计提凭证。
+    - 严格分三段开关 SQLite 连接（conn -> session_scope -> conn），避免双连接锁库。
+    """
+    await _ensure_db_ready()
+    clean_reason = (reason or "").strip()
+
+    # Phase 1: 校验状态、下游凭证，必要时幂等返回
+    downstream_slots = (
+        ("tax_paid_voucher_id", "tax", "个税缴纳"),
+        ("hf_paid_voucher_id", "hf", "公积金缴纳"),
+        ("ss_paid_voucher_id", "ss", "社保缴纳"),
+        ("payment_voucher_id", "payment", "工资发放"),
+    )
+    conn = await get_conn()
+    try:
+        cursor = await conn.execute(
+            "SELECT * FROM salary_sheets WHERE company_id = ? AND month = ?",
+            (company_id, month),
+        )
+        sheet_row = await cursor.fetchone()
+        if not sheet_row:
+            raise ValueError("工资表不存在")
+        sheet = await _sync_sheet_lifecycle(conn, dict(sheet_row))
+
+        voucher_statuses = sheet.get("voucherStatuses") or {}
+        active_downstream: list[tuple[str, str, str]] = [
+            (kind, str(sheet[col]), label)
+            for col, kind, label in downstream_slots
+            if sheet.get(col) and voucher_statuses.get(str(sheet[col])) in ACTIVE_VOUCHER_STATUSES
+        ]
+        if active_downstream and not include_payments:
+            labels = "、".join(label for _, _, label in reversed(active_downstream))
+            raise ValueError(
+                f"本月已存在有效的「{labels}」凭证，"
+                "请先冲销对应付款凭证或勾选连带冲销后再撤销工资表确认"
+            )
+
+        accrual_id = str(sheet.get("accrual_voucher_id") or "")
+        if sheet["status"] == "draft" and not accrual_id and not active_downstream:
+            cursor_recs = await conn.execute(
+                "SELECT * FROM salary_records WHERE sheet_id = ?", (sheet["id"],)
+            )
+            recs = await cursor_recs.fetchall()
+            sheet["records"] = [_serialize_money_fields(dict(rec)) for rec in recs]
+            sheet.pop("voucherStatuses", None)
+            enriched = await _enrich_salary_sheet(conn, sheet)
+            enriched["reversalVoucherId"] = None
+            enriched["reversedVoucherIds"] = []
+            enriched["unmatchedStatementCount"] = 0
+            enriched["alreadyDraft"] = True
+            return enriched
+
+        if not accrual_id and not active_downstream:
+            raise ValueError("未找到该月工资计提凭证，无法撤销确认")
+        if not clean_reason:
+            raise ValueError("请填写撤销原因")
+
+        targets: list[tuple[str, str]] = [
+            (kind, vid) for kind, vid, _ in active_downstream
+        ]
+        if accrual_id:
+            targets.append(("accrual", accrual_id))
+    finally:
+        await conn.close()
+
+    # Phase 2: 在单个 SQLAlchemy 事务中原子解绑银行对账并逆序冲销/删除凭证
+    payment_ids = [vid for kind, vid in targets if kind != "accrual"]
+    if payment_ids:
+        from services.bank_service import _ensure_schema as _ensure_bank_schema
+
+        await _ensure_bank_schema()
+
+    from sqlalchemy import bindparam, text
+    from db.session import session_scope
+    from services.accounting_core_service import delete_draft, get_journal, reverse_journal
+    from services.bank_settlement_service import confirm_statement_match
+
+    req_id = request_id or f"salary-unaccrue-{_uid()}"
+    accrual_reversal_id: Optional[str] = None
+    reversed_voucher_ids: list[str] = []
+    matched_statement_ids: list[str] = []
+
+    async with session_scope() as session:
+        if payment_ids:
+            target_id_set = {vid for _, vid in targets}
+            m_rows = (
+                await session.execute(
+                    text(
+                        "SELECT DISTINCT statement_id FROM bank_statement_matches "
+                        "WHERE company_id = :cid AND entry_id IN :eids"
+                    ).bindparams(bindparam("eids", expanding=True)),
+                    {"cid": company_id, "eids": payment_ids},
+                )
+            ).fetchall()
+            s_rows = (
+                await session.execute(
+                    text(
+                        "SELECT DISTINCT id FROM bank_statements "
+                        "WHERE company_id = :cid AND matched_entry_id IN :eids"
+                    ).bindparams(bindparam("eids", expanding=True)),
+                    {"cid": company_id, "eids": payment_ids},
+                )
+            ).fetchall()
+            matched_statement_ids = list(
+                dict.fromkeys(
+                    [str(r[0]) for r in m_rows if r[0]]
+                    + [str(r[0]) for r in s_rows if r[0]]
+                )
+            )
+            for sid in matched_statement_ids:
+                other_rows = (
+                    await session.execute(
+                        text(
+                            "SELECT entry_id FROM bank_statement_matches "
+                            "WHERE company_id = :cid AND statement_id = :sid"
+                        ),
+                        {"cid": company_id, "sid": sid},
+                    )
+                ).fetchall()
+                stmt_row = (
+                    await session.execute(
+                        text(
+                            "SELECT matched_entry_id FROM bank_statements "
+                            "WHERE company_id = :cid AND id = :sid"
+                        ),
+                        {"cid": company_id, "sid": sid},
+                    )
+                ).first()
+                associated_ids = {str(r[0]) for r in other_rows if r[0]}
+                if stmt_row and stmt_row[0]:
+                    associated_ids.add(str(stmt_row[0]))
+                foreign_ids = associated_ids - target_id_set - {f"bank-settlement-{sid}"}
+                if foreign_ids:
+                    raise ValueError(
+                        "该月付款凭证与其他账目合并关联在同一笔银行流水上，"
+                        "请先到银行对账页解除关联后再撤销"
+                    )
+                await confirm_statement_match(
+                    session,
+                    company_id=company_id,
+                    user_id=user_id,
+                    statement_id=sid,
+                    entry_ids=[],
+                    request_id=f"{req_id}-unmatch-{sid}",
+                )
+
+        for kind, vid in targets:
+            entry = await get_journal(session, vid, company_id=company_id, lock=True)
+            if entry.entry_type == "reversal":
+                raise ValueError("不允许对冲销凭证再次冲销")
+            if entry.status == "posted":
+                reversal = await reverse_journal(
+                    session,
+                    vid,
+                    company_id=company_id,
+                    user_id=user_id,
+                    request_id=f"{req_id}-{kind}",
+                    reason=clean_reason,
+                    reversal_date=entry.occurred_on,
+                )
+                reversed_voucher_ids.append(reversal.id)
+                if kind == "accrual":
+                    accrual_reversal_id = reversal.id
+            elif entry.status in {"draft", "pending_review"}:
+                await delete_draft(
+                    session,
+                    vid,
+                    company_id=company_id,
+                    user_id=user_id,
+                    request_id=f"{req_id}-{kind}",
+                )
+            elif entry.status == "reversed":
+                continue
+
+    # Phase 3: 重同步工资表生命周期（清空凭证引用、推进 generation、退回草稿）
+    conn = await get_conn()
+    try:
+        cursor = await conn.execute(
+            "SELECT * FROM salary_sheets WHERE company_id = ? AND month = ?",
+            (company_id, month),
+        )
+        sheet_row = await cursor.fetchone()
+        if not sheet_row:
+            raise ValueError("工资表不存在")
+        sheet = await _sync_sheet_lifecycle(conn, dict(sheet_row))
+        cursor_recs = await conn.execute(
+            "SELECT * FROM salary_records WHERE sheet_id = ?", (sheet["id"],)
+        )
+        recs = await cursor_recs.fetchall()
+        sheet["records"] = [_serialize_money_fields(dict(rec)) for rec in recs]
+        sheet.pop("voucherStatuses", None)
+        enriched = await _enrich_salary_sheet(conn, sheet)
+        enriched["reversalVoucherId"] = accrual_reversal_id
+        enriched["reversedVoucherIds"] = reversed_voucher_ids
+        enriched["unmatchedStatementCount"] = len(matched_statement_ids)
+        enriched["alreadyDraft"] = False
+        return enriched
+    finally:
+        await conn.close()
+
 
 async def pay_salary_sheet(company_id: str, user_id: str, month: str, *, pay_date: Optional[str] = None) -> Dict[str, Any]:
     """Create salary payment double-entry voucher and update sheet status.

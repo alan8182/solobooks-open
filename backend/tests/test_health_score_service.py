@@ -103,10 +103,60 @@ def test_empty_and_boundaries():
     assert res_loss["levelCode"] in ("fair", "poor")
 
 
+def test_reconciled_invoice_number_and_salary_depreciation_exemptions():
+    """已对账但携带 invoiceNumber 的支出应计为有票；工资折旧与手续费不触发无票扣分。"""
+    entries = [
+        {"id": "inc-1", "direction": "income", "amount": 20000, "category": "主营业务收入", "billingStatus": "reconciled", "invoiceNumber": "265100000001"},
+        {"id": "exp-rent", "direction": "expense", "amount": 2000, "category": "房租物业", "billingStatus": "reconciled", "invoiceNumber": "265100000002"},
+        {"id": "exp-fee", "direction": "expense", "amount": 20, "category": "银行及金融手续费", "billingStatus": "reconciled"},
+        {"id": "sal-accrual", "direction": "expense", "amount": 8350, "category": "人力成本", "title": "计提工资", "sourceType": "salary_accrual", "billingStatus": "no_invoice"},
+        {"id": "sal-pay", "direction": "expense", "amount": 5375, "category": "人力成本", "sourceType": "salary_pay", "billingStatus": "reconciled"},
+        {"id": "sal-ss", "direction": "expense", "amount": 1775, "category": "人力成本", "sourceType": "salary_social", "billingStatus": "reconciled"},
+        {"id": "sal-hf", "direction": "expense", "amount": 1200, "category": "人力成本", "sourceType": "salary_housing_fund", "billingStatus": "reconciled"},
+        {"id": "asset-dep", "direction": "expense", "amount": 443.33, "category": "固定资产折旧", "sourceType": "fixed_asset_depreciation", "billingStatus": "none"},
+    ]
+    result = calculate_health_score(
+        entries,
+        target_month="2026-06",
+        checks={"canClose": True, "checks": {"trial_balance": True, "period_status": True}},
+        todos=[],
+    )
+    metrics = {m["label"]: m["value"] for m in result["keyMetrics"]}
+    assert metrics["发票合规率"] == "100%"
+    # 工资发放/社保/公积金清偿不重复计入当期费用（净收支 20000 - (2000 + 20 + 8350 + 443.33) = +9186.67）
+    assert metrics["当月净收支"] == "+¥9,186.67"
+    assert result["dimensions"]["发票合规度"] == 100
+    assert result["penalties"] == []
+    assert result["totalScore"] >= 85
+
+
+def test_period_close_checks_list_shape_does_not_crash():
+    """period_close_checks 返回列表结构的 checks 且 canClose=False 时不得抛 AttributeError。"""
+    entries = [
+        {"id": "inc-1", "direction": "income", "amount": 20000, "category": "主营业务收入", "billingStatus": "has_invoice"},
+        {"id": "exp-1", "direction": "expense", "amount": 2000, "category": "房租物业", "billingStatus": "has_invoice"},
+    ]
+    checks = {
+        "canClose": False,
+        "checks": [
+            {"code": "VOUCHER_TO_SOURCE", "status": "blocking"},
+            {"code": "LEDGER_TO_LEDGER", "status": "passed"},
+            {"code": "BOOK_TO_ACTUAL", "status": "blocking"},
+            {"code": "PERIOD_ORDER", "status": "blocking"},
+        ],
+    }
+    result = calculate_health_score(entries, target_month="2026-11", checks=checks, todos=[])
+    assert 0 <= result["totalScore"] <= 100
+    assert result["dimensions"]["账务完整性"] == 60
+    assert len([p for p in result["penalties"] if p["dimensionCode"] == "integrity"]) == 2
+
+
 if __name__ == "__main__":
     test_clean_healthy_entries()
     test_unbilled_expenses_penalty()
     test_tax_risk_tags()
     test_close_checks_failure()
     test_empty_and_boundaries()
+    test_reconciled_invoice_number_and_salary_depreciation_exemptions()
+    test_period_close_checks_list_shape_does_not_crash()
     print("ALL HEALTH SCORE ENGINE UNIT TESTS PASSED!")

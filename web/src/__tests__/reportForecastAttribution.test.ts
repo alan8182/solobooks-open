@@ -181,28 +181,28 @@ describe('ReportPage Cash Forecast & Variance Attribution UI', () => {
 
     const text = wrapper.text()
 
-    // 验证新定位文案全面替换为“AI 财务官”，且不存在旧“AI CFO”
-    expect(text).toContain('AI 财务官')
+    // 验证“AI 经营诊断”保留且不存在旧“AI CFO”
+    expect(text).toContain('AI 经营诊断')
     expect(text).not.toContain('AI CFO')
 
     // 验证轻量罗盘卡片指标与无双重货币符号 ¥¥
-    expect(text).toContain('资金安全跑道与现金预测')
-    expect(text).toContain('安全跑道 (Runway)')
+    expect(text).toContain('现金流预测')
+    expect(text).toContain('可支撑月数')
     expect(text).toContain('6.5 个月')
     expect(text).toContain('健康：资金充裕')
     expect(text).not.toContain('¥¥')
 
     // 点击进入资金推演抽屉
-    const forecastCard = wrapper.findAll('.compass-card').find(c => c.text().includes('资金安全跑道与现金预测'))
+    const forecastCard = wrapper.findAll('.compass-card').find(c => c.text().includes('现金流预测'))
     expect(forecastCard).toBeDefined()
     await forecastCard!.trigger('click')
     await flushPromises()
 
     const drawerText = wrapper.text()
     expect(drawerText).not.toContain('¥¥')
-    expect(drawerText).toContain('当前可用资金 (1001/1002)')
+    expect(drawerText).toContain('当前可用资金')
     expect(drawerText).toContain('250,000.00')
-    expect(drawerText).toContain('预测期内最低余额')
+    expect(drawerText).toContain('预测最低余额')
     expect(drawerText).toContain('210,000.00')
 
     // 验证逾期催收客户
@@ -232,12 +232,12 @@ describe('ReportPage Cash Forecast & Variance Attribution UI', () => {
     const text = wrapper.text()
 
     // 验证罗盘看板卡片与无双重货币符号
-    expect(text).toContain('利润去向分析与利现对齐')
+    expect(text).toContain('利润与现金对齐')
     expect(text).toContain('部分利润未变现')
     expect(text).not.toContain('¥¥')
 
     // 点击进入利现归因抽屉
-    const attributionCard = wrapper.findAll('.compass-card').find(c => c.text().includes('利润去向分析与利现对齐'))
+    const attributionCard = wrapper.findAll('.compass-card').find(c => c.text().includes('利润与现金对齐'))
     expect(attributionCard).toBeDefined()
     await attributionCard!.trigger('click')
     await flushPromises()
@@ -246,7 +246,7 @@ describe('ReportPage Cash Forecast & Variance Attribution UI', () => {
     expect(drawerText).not.toContain('¥¥')
 
     // 验证利现桥与归因抽屉内容
-    expect(drawerText).toContain('利润与现金调节桥 (Profit-to-Cash Bridge)')
+    expect(drawerText).toContain('利润与现金调节桥')
     expect(drawerText).toContain('账面净利润')
     expect(drawerText).toContain('非付现折旧与摊销')
     expect(drawerText).toContain('客户欠款变动 (应收占用)')
@@ -285,7 +285,7 @@ describe('ReportPage Cash Forecast & Variance Attribution UI', () => {
     await flushPromises()
 
     // 点击进入资金推演抽屉
-    const forecastCard = wrapper.findAll('.compass-card').find(c => c.text().includes('资金安全跑道与现金预测'))
+    const forecastCard = wrapper.findAll('.compass-card').find(c => c.text().includes('现金流预测'))
     expect(forecastCard).toBeDefined()
     await forecastCard!.trigger('click')
     await flushPromises()

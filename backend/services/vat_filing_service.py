@@ -122,6 +122,14 @@ def build_small_scale_vat_assist(
     source_items: list[dict[str, Any]] = []
     missing_invoice_count = 0
     inferred_category_count = 0
+    # 新版填表式申报要按「开票 / 未开票」拆分：未开票收入填附列资料（一）附1
+    # （未开具发票销售情况明细），正数填第2列、负数冲减填第4列并补被冲减属期。
+    # 这里只按老板已确认的 billingStatus=no_invoice 归类；未确认的销售仍走
+    # blockingIssues 拦截，不能默认当成未开票收入申报。
+    invoiced_sales = ZERO
+    uninvoiced_positive_sales = ZERO
+    uninvoiced_negative_sales = ZERO
+    negative_sales = ZERO
 
     # 期末损益结转是汇总分录：借记收入科目把本期销售转平，按科目净额算销售额
     # 会恒等于 0。结转凭证与其反结账红字一并退出销售口径。
@@ -158,6 +166,15 @@ def build_small_scale_vat_assist(
             not invoice_type or not invoice_number
         ):
             missing_invoice_count += 1
+        if billing_status == "no_invoice":
+            if net_revenue > ZERO:
+                uninvoiced_positive_sales += net_revenue
+            elif net_revenue < ZERO:
+                uninvoiced_negative_sales += net_revenue
+        elif (invoice_type and invoice_number) or billing_status in {"issued", "has_invoice"}:
+            invoiced_sales += net_revenue
+        if net_revenue < ZERO:
+            negative_sales += net_revenue
         if bucket == "goods_labor":
             goods_sales += net_revenue
         else:
@@ -248,6 +265,13 @@ def build_small_scale_vat_assist(
         "goodsLaborSales": goods_sales,
         "serviceSales": service_sales,
         "totalSales": total_sales,
+        # 填表式申报拆分口径：已确认开票 + 未开票 <= totalSales，
+        # 差额是尚未确认开票状态的销售（会进入 blockingIssues，不允许直接申报）。
+        "invoicedSales": _d2(invoiced_sales),
+        "uninvoicedSales": _d2(uninvoiced_positive_sales + uninvoiced_negative_sales),
+        "uninvoicedPositiveSales": _d2(uninvoiced_positive_sales),
+        "uninvoicedNegativeSales": _d2(uninvoiced_negative_sales),
+        "negativeSales": _d2(negative_sales),
         "taxableBase": taxable_base,
         "vatBeforeRelief": vat_before_relief,
         "vatReduction": vat_reduction,

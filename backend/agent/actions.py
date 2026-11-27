@@ -561,12 +561,15 @@ async def _approve_voucher_items(
         statement_id = str(raw.get("statementId") or "").strip()
         if not statement_id:
             continue
-        invalid_edit_keys = sorted(set(edit_map.get(index) or {}) - {"category"})
+        invalid_edit_keys = sorted(
+            set(edit_map.get(index) or {})
+            - {"category", "partner_id", "department_id", "project_id", "employee_id"}
+        )
         if invalid_edit_keys:
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    "银行流水凭证只能修改分类，金额、日期、摘要、方向和对方面由"
+                    "银行流水凭证只能修改分类或辅助核算，金额、日期、摘要、方向和对方面由"
                     f"原始流水决定；不允许修改：{', '.join(invalid_edit_keys)}"
                 ),
             )
@@ -703,6 +706,16 @@ async def _book_voucher_payload(
         voucher = get_voucher_hint(direction, category, payload.get("amount"), payer=payer, vat_rate=vat_config.rate)
     else:
         voucher = get_voucher_hint(direction, category, payload.get("amount"), payer=payer)
+    from services.auxiliary_service import attach_auxiliary_to_voucher
+
+    auxiliary_ids = {
+        "partner_id": raw.get("partner_id") or raw.get("partnerId"),
+        "department_id": raw.get("department_id") or raw.get("departmentId"),
+        "project_id": raw.get("project_id") or raw.get("projectId"),
+        "employee_id": raw.get("employee_id") or raw.get("employeeId"),
+    }
+    voucher = attach_auxiliary_to_voucher(voucher, auxiliary_ids)
+
     payload.update(
         {
             "id": new_id(),

@@ -104,6 +104,8 @@ export interface AdminUserItem {
   planName: string
   planAnchorAt: string
   quotaBonusTokens: number
+  /** 充值购买的 AI 点数余额（1 点 = 1 token，永久有效）；存量用户可能缺省 */
+  tokenBalance?: number
   companyCount: number
   roles: string[]
   createdAt: string
@@ -133,6 +135,7 @@ export async function patchAdminUser(
     planCode?: PlanCode
     planAnchorAt?: string | null
     quotaBonusTokens?: number
+    tokenBalance?: number
   },
 ): Promise<{ user: AdminUserItem; changed: string[] }> {
   return (await apiClient.patch(`/api/admin/users/${userId}`, payload)) as {
@@ -269,4 +272,95 @@ export interface CleanupStatsItem {
 
 export async function fetchCleanupStats(): Promise<{ items: CleanupStatsItem[] }> {
   return (await apiClient.get('/api/admin/cleanup/stats')) as { items: CleanupStatsItem[] }
+}
+
+// ── 订单管理 + 全额退款（/console/orders）────────────────────────
+
+export type AdminOrderStatus = 'created' | 'paid' | 'activated' | 'closed' | 'failed'
+
+export interface AdminOrderRefund {
+  outRequestNo: string
+  status: 'submitted' | 'success' | 'failed'
+  refundAmount: string
+  reason: string
+  operatorUserId: string
+  gatewayCode: string | null
+  gatewaySubCode: string | null
+  gatewayMsg: string | null
+  refundedAt: string | null
+  createdAt: string | null
+}
+
+export interface AdminOrderItem {
+  orderNo: string
+  userId: string
+  planCode: string
+  /** 订单类型：plan 套餐订阅 / token_topup AI 点数充值 / first_month_promo 新人首月体验包 */
+  orderType?: 'plan' | 'token_topup' | 'first_month_promo'
+  /** 充值到账点数（1 点 = 1 token）；套餐订单为 null */
+  tokenAmount?: number | null
+  subject: string
+  amount: string
+  status: AdminOrderStatus
+  /** 支付渠道（存量数据为 alipay） */
+  channel?: 'alipay' | 'wechat'
+  tradeNo: string | null
+  paidAt: string | null
+  activatedAt: string | null
+  expiresAt: string | null
+  createdAt: string | null
+  /** 最新一条退款记录（无退款为 null；详细历史在详情接口） */
+  refund: AdminOrderRefund | null
+}
+
+export interface AdminOrderListResponse {
+  items: AdminOrderItem[]
+  total: number
+  page: number
+  pageSize: number
+}
+
+export interface AdminNotifyLogItem {
+  tradeStatus: string
+  signVerified: boolean
+  result: string
+  createdAt: string | null
+}
+
+export interface AdminOrderDetail extends AdminOrderItem {
+  buyerLogonId: string | null
+  refunds: AdminOrderRefund[]
+  notifyLogs: AdminNotifyLogItem[]
+}
+
+export interface AdminGatewayTrade {
+  [key: string]: unknown
+}
+
+export async function fetchAdminOrders(params: {
+  query?: string
+  status?: string
+  page: number
+  pageSize: number
+}): Promise<AdminOrderListResponse> {
+  return (await apiClient.get('/api/admin/billing/orders', { params })) as AdminOrderListResponse
+}
+
+export async function fetchAdminOrder(orderNo: string): Promise<AdminOrderDetail> {
+  return (await apiClient.get(`/api/admin/billing/orders/${orderNo}`)) as AdminOrderDetail
+}
+
+export async function refundAdminOrder(orderNo: string, reason: string): Promise<AdminOrderDetail> {
+  return (await apiClient.post(`/api/admin/billing/orders/${orderNo}/refund`, {
+    reason,
+  })) as AdminOrderDetail
+}
+
+export async function queryAdminOrder(
+  orderNo: string,
+): Promise<{ orderNo: string; gatewayTrade: AdminGatewayTrade | null }> {
+  return (await apiClient.post(`/api/admin/billing/orders/${orderNo}/query`)) as {
+    orderNo: string
+    gatewayTrade: AdminGatewayTrade | null
+  }
 }

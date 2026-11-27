@@ -71,7 +71,7 @@ describe('task inbox aggregation', () => {
             code: 'VOUCHER_TO_SOURCE',
             name: '凭证与来源检查',
             status: 'blocking',
-            draftCount: 2,
+            orphanVoucherCount: 2,
           },
         ],
       },

@@ -27,8 +27,12 @@ from services.audit_service import log_action
 from core.errors import AccountingError
 from core.money import ZERO, money, money_text
 from services.json_utils import json_dumps
-
-WECHAT_CLEARING_CODE = "1012001"
+from services.platform_bill_common import (
+    ALIPAY_CLEARING_CODE,
+    LEGACY_PLATFORM_CLEARING_CODE,
+    PLATFORM_CLEARING_CODES,
+    WECHAT_CLEARING_CODE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,12 +51,19 @@ _EXPLICIT_IT_SERVICE_RE = re.compile(
 )
 _PREPAYMENT_RE = re.compile(r"预付|预缴|定金|保证金|押金")
 _PROCUREMENT_RE = re.compile(r"货款|材料款|采购款|商品尾款|采购订单|采购合同|应付账款")
-_BANK_FEE_RE = re.compile(r"手续费|转账费|账户管理费|短信费")
+_BANK_FEE_RE = re.compile(
+    r"手续费|转账费|账户管理费|短信费|企业银行各项费用|网上企业银行服务费|网银服务费|"
+    r"对公中间业务|小额账户管理费|电子回单费|工本费|密码器|U盾",
+    re.I,
+)
 _COUNTERPARTY_IT_INDUSTRY_RE = re.compile(
     r"人工智能|信息技术|软件开发|软件服务|软件科技|云计算|数据服务|数据科技|网络科技|互联网科技",
     re.I,
 )
 _REFUND_RE = re.compile(r"退款|退回|冲正|撤销", re.I)
+_PENALTY_EXPENSE_RE = re.compile(
+    r"罚款|罚金|滞纳金|行政处罚|(?:税务|税局|个税|申报|逾期)[^，。；\n]{0,12}罚"
+)
 _RULE_PURPOSE_TRAILING_NUMBER_RE = re.compile(r"(?<!\d)\d{4,}(?!\d)")
 
 _RULE_SCHEMA_COLUMNS = {
@@ -79,6 +90,7 @@ _RULE_DIRECTIONAL_REVIEW_CATEGORIES = {
     "研发支出-费用化支出",
     "工资发放",
     "社保公积金",
+    "个税代缴",
     "微信支付结算",
     "支付宝结算",
     "平台提现结算",
@@ -92,6 +104,17 @@ SALARY_PAYMENT_KEYWORDS = (
 PAYROLL_LIABILITY_KEYWORDS = (
     "社保", "社会保险", "公积金", "住房公积金", "社保公积金",
 )
+# 财税库行/金库通用扣款通道：摘要「税费社保」只是通道名，不代表险种。
+# 社保费自 2020 年起由税务代收，税款、社保、个税、罚款、滞纳金在流水上同形。
+_TAX_CHANNEL_RE = re.compile(r"税费|税款|财税库行|税库|金库|国库|税务")
+# 只有出现明确险种/公积金表述，才足以把流水判给工资模块核销
+_EXPLICIT_PAYROLL_LIABILITY_RE = re.compile(
+    r"社会保险|社保费|社保缴纳|社保公积金|公积金|医疗保险|养老保险|失业保险|工伤保险|生育保险|社保中心"
+)
+# 只认明确的个税字样：「税款」「税务」属于通用通道词，留给税费模糊组让用户拍板
+PAYROLL_TAX_KEYWORDS = (
+    "个人所得税", "个税",
+)
 
 
 def is_salary_payment_description(description: str) -> bool:
@@ -99,9 +122,28 @@ def is_salary_payment_description(description: str) -> bool:
     return any(keyword in text for keyword in SALARY_PAYMENT_KEYWORDS)
 
 
+def is_ambiguous_tax_channel_description(description: str) -> bool:
+    """摘要是否只是财税库行通用通道（如「税费社保」），无法区分税款/社保/罚款。"""
+    text = str(description or "")
+    return bool(_TAX_CHANNEL_RE.search(text)) and not _EXPLICIT_PAYROLL_LIABILITY_RE.search(text)
+
+
 def is_payroll_liability_description(description: str) -> bool:
     text = str(description or "")
-    return any(keyword in text for keyword in PAYROLL_LIABILITY_KEYWORDS)
+    if not any(keyword in text for keyword in PAYROLL_LIABILITY_KEYWORDS):
+        return False
+    # 2026-10 真实误判：「税费社保 (对方: 金库杭州市余杭区支库)」-200 实为个税
+    # 逾期申报罚款，只因摘要含「社保」二字就被短路成 221102 社保公积金，
+    # 还提示「需工资模块核销」。通道词必须有明确险种/公积金表述才归工资模块。
+    if is_ambiguous_tax_channel_description(text):
+        return False
+    return True
+
+
+def is_payroll_tax_description(description: str) -> bool:
+    """摘要是否明确指向代扣个税（「税款」「税单号」这类通用通道词不算）。"""
+    text = str(description or "")
+    return any(keyword in text for keyword in PAYROLL_TAX_KEYWORDS)
 
 
 def _clean_description_value(value: Any) -> str:
@@ -149,20 +191,42 @@ _NON_RULE_CATEGORIES = {
     "研发支出-费用化支出",
     "工资发放",
     "社保公积金",
+    "个税代缴",
     "微信支付结算",
     "支付宝结算",
     "平台提现结算",
     # 退款对冲是上下文相关的（跟具体哪笔付款配对），沉淀成对手方规则
     # 会把以后真正的收入也吞掉
     "往来退款",
+    # 一次性税务罚款与滞纳金属于偶发非经营支出，禁止沉淀为「金库 XX 支库」等对手方常驻规则
+    "罚款支出",
+    "税收滞纳金",
 }
 
 
 def extract_statement_counterparty(description: str) -> str:
-    """Extract counterparty name from statement description like '... (对方: xxx)'."""
+    """Extract counterparty name from statement description like '... (对方: xxx)'.
+
+    银行导出既有半角也有全角括号，个别行把户名写在「对方户名：X」里；三种都要认，
+    否则同名单位会被拆成多张往来档案。
+    """
     text = str(description or "").strip()
-    match = re.search(r"\(对方\s*[:：]\s*(.+?)\)\s*$", text)
-    return match.group(1).strip() if match else ""
+    match = re.search(r"[(（]对方\s*[:：]\s*(.+?)[)）]\s*$", text)
+    if match:
+        return match.group(1).strip()
+    match = re.search(r"对方户名\s*[:：]\s*([^\s|｜,，;；)）]+)", text)
+    if match:
+        return match.group(1).strip()
+    # 招行等导出把户名放进业务摘要末尾括号：「转入-项目尾款(杭州白鹭文化传媒有限公司)」。
+    # 末尾括号里还可能是「(个人客户)」「(5元)」这类说明，只有明显是单位/姓名才取。
+    match = re.search(r"[（(]\s*([^()（）]{2,40}?)\s*[)）]\s*$", text)
+    if match:
+        from services.auxiliary_service import counterparty_is_confident
+
+        candidate = match.group(1).strip()
+        if counterparty_is_confident(candidate):
+            return candidate
+    return ""
 
 
 def extract_statement_rule_pattern(description: str) -> str:
@@ -207,6 +271,8 @@ def extract_statement_purpose_key(description: str) -> str:
         return "银行手续费"
     if is_payroll_liability_description(text):
         return "社保公积金"
+    if is_payroll_tax_description(text):
+        return "个税代缴"
     if is_salary_payment_description(text):
         return "工资"
 
@@ -771,6 +837,9 @@ async def _load_reversed_entry_ids(company_id: str) -> set:
 
 def _fallback_classification_for_statement(stmt: Dict[str, Any], confidence: float = 0.3) -> Dict[str, Any]:
     stmt_amount = safe_money(stmt.get("amount"))
+    if stmt_amount < ZERO and is_ambiguous_tax_channel_description(str(stmt.get("description") or "")):
+        # 通道词兜底也给出税费模糊组，别退化成「其他支出」让用户无从选起
+        return _tax_channel_classification(stmt)
     is_income = stmt_amount > ZERO
     return {
         "direction": "income" if is_income else "expense",
@@ -875,6 +944,14 @@ def guard_statement_classification(
         return classification
     category = str(classification.get("category") or "").strip()
     description = str(stmt.get("description") or "")
+    # 财税库行通道词不能仅凭「社保」二字判社保：模型偶发归社保时改回税费模糊组
+    # （只对支出方向生效，收入侧「税务退费」等不能翻成支出）
+    if (
+        category == "社保公积金"
+        and safe_money(stmt.get("amount")) < ZERO
+        and is_ambiguous_tax_channel_description(description)
+    ):
+        return _tax_channel_classification(stmt)
     needs_confirmation = _needs_business_purpose_confirmation(stmt)
     industry = _counterparty_it_industry_evidence(stmt) if needs_confirmation else ""
     if category == "供应商付款" and not _PROCUREMENT_RE.search(description):
@@ -1008,12 +1085,75 @@ def _entry_bank_effect_from_payload(payload: Dict[str, Any]) -> Decimal:
     return amount
 
 
+def _platform_clearing_effect(voucher: Dict[str, Any]) -> Decimal:
+    """凭证对平台待结算科目的净影响（借正贷负）。
+
+    微信、支付宝的资金路径相同：先挂各自待结算科目，提现再转银行存款。
+    单条凭证只应命中一个平台科目；求和是为了兼容拆分到同一科目的多行。
+    """
+    return money(sum((
+        _account_effect_from_voucher(voucher, code) for code in PLATFORM_CLEARING_CODES
+    ), ZERO))
+
+
+PLATFORM_CLEARING_INFO: Dict[str, Dict[str, str]] = {
+    WECHAT_CLEARING_CODE: {
+        "platform": "wechat", "clearingCode": WECHAT_CLEARING_CODE,
+        "label": "微信支付", "clearingName": "微信支付待结算",
+        "category": "微信支付结算", "reconciliationType": "wechat_settlement",
+        "titlePrefix": "微信支付净额结算",
+    },
+    ALIPAY_CLEARING_CODE: {
+        "platform": "alipay", "clearingCode": ALIPAY_CLEARING_CODE,
+        "label": "支付宝", "clearingName": "支付宝待结算",
+        "category": "支付宝结算", "reconciliationType": "alipay_settlement",
+        "titlePrefix": "支付宝净额结算",
+    },
+    LEGACY_PLATFORM_CLEARING_CODE: {
+        "platform": "platform", "clearingCode": LEGACY_PLATFORM_CLEARING_CODE,
+        "label": "平台", "clearingName": "其他货币资金",
+        "category": "平台提现结算", "reconciliationType": "platform_settlement",
+        "titlePrefix": "平台净额结算",
+    },
+}
+
+
+def _platform_clearing_code(voucher: Dict[str, Any]) -> str:
+    for code in PLATFORM_CLEARING_CODES:
+        if _account_effect_from_voucher(voucher, code) != ZERO:
+            return code
+    return ""
+
+
+def platform_clearing_codes_for_payloads(payloads: List[Dict[str, Any]]) -> set[str]:
+    """一组待核销凭证实际命中的平台清算科目集合（空集 = 无平台待结算影响）。"""
+    codes = {_platform_clearing_code(payload.get("voucherLines") or {}) for payload in payloads}
+    codes.discard("")
+    return codes
+
+
+def platform_clearing_code_for_payloads(payloads: List[Dict[str, Any]]) -> str:
+    """单一平台清算科目；混合平台返回空串由调用方拒绝。"""
+    codes = platform_clearing_codes_for_payloads(payloads)
+    return next(iter(codes)) if len(codes) == 1 else ""
+
+
+def platform_clearing_info(statement: Dict[str, Any], payloads: List[Dict[str, Any]]) -> Dict[str, str]:
+    """清算科目优先取凭证事实；凭证缺失时按流水摘要兜底（存量数据修复用）。"""
+    code = platform_clearing_code_for_payloads(payloads)
+    if code not in PLATFORM_CLEARING_INFO:
+        description = str(statement.get("description") or "")
+        code = ALIPAY_CLEARING_CODE if re.search(r"支付宝|Alipay|蚂蚁金服", description, re.I) else WECHAT_CLEARING_CODE
+    return PLATFORM_CLEARING_INFO[code]
+
+
 def _entry_group_reconciliation_effect(payload: Dict[str, Any]) -> Decimal:
     """Return the cash/settlement effect used when grouping entries to one statement.
 
-    WeChat merchant transactions accrue through the WeChat clearing account (1012001) before
-    the net receipt reaches the bank, so a gross receipt plus its fee must be
-    reconciled from the clearing-account net effect.
+    Platform merchant transactions accrue through their clearing account
+    (1012001 微信 / 1012002 支付宝 / 1012 历史) before the net receipt reaches
+    the bank, so a gross receipt plus its fee must be reconciled from the
+    clearing-account net effect.
     """
     voucher = payload.get("voucherLines") or {}
     if not voucher:
@@ -1021,7 +1161,7 @@ def _entry_group_reconciliation_effect(payload: Dict[str, Any]) -> Decimal:
     bank_effect = _bank_effect_from_voucher(voucher)
     if bank_effect != ZERO:
         return bank_effect
-    settlement_effect = _account_effect_from_voucher(voucher, WECHAT_CLEARING_CODE)
+    settlement_effect = _platform_clearing_effect(voucher)
     if settlement_effect != ZERO:
         return settlement_effect
     return bank_effect
@@ -1067,16 +1207,29 @@ def build_group_reconciliation_check(
     statement_amount: Any,
     payloads: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Validate one bank statement against the aggregate bank effect of many entries."""
+    """Validate one bank statement against the aggregate bank effect of many entries.
+
+    组内只要有任何凭证真正动了银行存款（1002），整组就按银行影响对账：平台结算链
+    （收入计提/手续费挂 1012001 待结算，结算凭证借 1002 贷 1012001）里，挂账凭证的
+    清算户影响已被结算凭证吸收，再按清算净额计入会双重计数——2026-11 生产案例：
+    [结算凭证 58.47 + 收入计提 59.00 + 手续费 -0.53] 被算成 116.94，结账向导
+    「高风险对账问题」据此误锁关账。清算户净额只在该组没有任何 1002 影响
+    （银行到账直接对到计提/手续费凭证）时才作为对账口径（毛收入 - 手续费 = 到账净额）。
+    """
     statement_amount = safe_money(statement_amount)
-    direct_bank_effect = money(sum((
+    bank_effect = money(sum((
         _entry_bank_effect_from_payload(payload)
         for payload in payloads
     ), ZERO))
-    entry_bank_effect = direct_bank_effect if direct_bank_effect != ZERO else money(sum((
-        _account_effect_from_voucher(payload.get("voucherLines") or {}, WECHAT_CLEARING_CODE)
-        for payload in payloads
-    ), ZERO))
+    if bank_effect != ZERO:
+        entry_bank_effect = bank_effect
+        per_entry_effect = _entry_bank_effect_from_payload
+    else:
+        entry_bank_effect = money(sum((
+            _entry_group_reconciliation_effect(payload)
+            for payload in payloads
+        ), ZERO))
+        per_entry_effect = _entry_group_reconciliation_effect
     difference = _amount_difference(statement_amount, entry_bank_effect)
     direction_matches = (
         abs(statement_amount) <= RECONCILIATION_AMOUNT_TOLERANCE
@@ -1094,7 +1247,7 @@ def build_group_reconciliation_check(
             {
                 "entryId": str(payload.get("id") or ""),
                 "title": str(payload.get("title") or ""),
-                "bankEffect": money(_entry_group_reconciliation_effect(payload)),
+                "bankEffect": money(per_entry_effect(payload)),
             }
             for payload in payloads
         ],
@@ -1116,9 +1269,10 @@ def diagnose_matched_statement_effect(
         return None
 
     settlement_effect = money(sum((
-        _account_effect_from_voucher(payload.get("voucherLines") or {}, WECHAT_CLEARING_CODE)
+        _platform_clearing_effect(payload.get("voucherLines") or {})
         for payload in payloads
     ), ZERO))
+    clearing_info = platform_clearing_info(statement, payloads)
     entry_ids = [str(payload.get("id") or "") for payload in payloads if payload.get("id")]
     titles = [str(payload.get("title") or "") for payload in payloads if payload.get("title")]
 
@@ -1133,11 +1287,11 @@ def diagnose_matched_statement_effect(
         and abs(settlement_effect - statement_amount) <= RECONCILIATION_AMOUNT_TOLERANCE
     ):
         issue_type = "missing_settlement_voucher"
-        reason = "缺少微信支付待结算转入银行存款的结算凭证"
+        reason = f"缺少{clearing_info['label']}待结算转入银行存款的结算凭证"
         repairable = True
         repair_label = "生成结算凭证"
         repair_description = (
-            f"生成银行存款与微信支付待结算之间的 {abs(statement_amount):.2f} 元结算凭证"
+            f"生成银行存款与{clearing_info['clearingName']}之间的 {abs(statement_amount):.2f} 元结算凭证"
         )
     elif abs(bank_effect + statement_amount) <= RECONCILIATION_AMOUNT_TOLERANCE:
         auto_entry = len(payloads) == 1 and (
@@ -2006,6 +2160,72 @@ def _has_text_similarity(desc: str, title: str) -> bool:
     return False
 
 
+_COUNTERPARTY_PATTERN = re.compile(r"[(（]对方[:：]\s*([^)）]+)[)）]")
+
+
+def statement_counterparty(description: str) -> str:
+    """流水描述里的结构化对手方：「… (对方: xxx)」中的 xxx；无则空串。"""
+    match = _COUNTERPARTY_PATTERN.search(description or "")
+    return match.group(1).strip() if match else ""
+
+
+def _affinity_clean(text: str) -> str:
+    return re.sub(r"[^\w\u4e00-\u9fa5]", "", text or "")
+
+
+def _han_set(text: str) -> set:
+    return set(re.findall(r"[\u4e00-\u9fa5]", text or ""))
+
+
+def entry_seller_name(entry: Dict) -> str:
+    """发票类候选的销方名：标题「发票-」前缀之后的部分（导入即以此生成标题）。"""
+    title = str(entry.get("title") or "")
+    if "发票-" in title:
+        return title.rsplit("发票-", 1)[1].strip()
+    return ""
+
+
+def _entry_invoice_counterparty(entry: Dict) -> str:
+    """销项发票（收款）核对购方，进项发票（支出）核对销方。"""
+    if str(entry.get("direction") or "expense") == "income":
+        return str(entry.get("buyer_name") or entry.get("buyerName") or "").strip()
+    return entry_seller_name(entry)
+
+
+def seller_affinity(stmt_desc: str, entry: Dict) -> bool:
+    """发票对手方（进项取销方、销项取购方）与流水是否相关——金额+日期之外的第三道证据。
+
+    任一满足即相关：
+    - 流水「对方」与发票对手方互相包含（≥2 字：「王翼」＝「王翼」、
+      「deepseek调用服务费」的对方就是销方全称）
+    - 去掉对方段后的描述与发票对手方有足够汉字交集。报销场景（描述含「报销/垫付」）
+      商户名常只有 2 字品牌（百度/智谱），阈值放宽到 2；非报销场景保持 ≥3，
+      否则「杭州」这类地名交集会把社保金库配到科技公司发票上
+    - 清洗后整段互相包含（≥6 字）
+
+    只有金额和日期接近、对手方毫无关系的配对（社保金库 vs 科技公司
+    发票）不构成相关，调用方应降置信或改为人工核实，而不是当建议推。
+    非发票类候选（或缺失购方名的销项发票）无从判断对手方，返回 True 走原有规则。
+    """
+    seller = _affinity_clean(_entry_invoice_counterparty(entry))
+    if not seller:
+        return True
+    desc = str(stmt_desc or "")
+    counterparty = _affinity_clean(statement_counterparty(desc))
+    if len(counterparty) >= 2 and (
+        counterparty == seller or counterparty in seller or seller in counterparty
+    ):
+        return True
+    desc_body = _affinity_clean(_COUNTERPARTY_PATTERN.sub("", desc))
+    is_reimbursement = "报销" in desc_body or "垫付" in desc_body
+    threshold = 2 if is_reimbursement else 3
+    if len(_han_set(desc_body) & _han_set(seller)) >= threshold:
+        return True
+    if len(desc_body) >= 6 and (desc_body in seller or seller in desc_body):
+        return True
+    return False
+
+
 def _build_match_candidates(
     rows: List[Any],
     already_matched_ids,
@@ -2049,6 +2269,12 @@ def _build_match_candidates(
                 and not is_invoice_pending
             ):
                 continue
+            if (
+                is_advancement
+                and abs(bank_effect) < RECONCILIATION_AMOUNT_TOLERANCE
+                and str(payload.get("billingStatus") or "") == "reconciled"
+            ):
+                continue
 
             orig_amount = (
                 safe_money(payload.get("amount"))
@@ -2073,7 +2299,16 @@ def _build_match_candidates(
                 "amount": abs(orig_amount),
                 "direction": direction,
                 "category": payload.get("category", ""),
+                "categorySource": str(payload.get("categorySource") or ""),
+                "categoryReason": str(payload.get("categoryReason") or ""),
+                "item_name": str(payload.get("item_name") or ""),
                 "occurDate": str(payload.get("occurDate", ""))[:10],
+                "source": payload.get("source", ""),
+                "merchant": payload.get("merchant", ""),
+                "buyer_name": str(payload.get("buyer_name") or payload.get("buyerName") or ""),
+                "payer": str(payer or ""),
+                "isAdvancement": bool(is_advancement and abs(bank_effect) < RECONCILIATION_AMOUNT_TOLERANCE),
+                "isPendingInvoice": bool(is_invoice_pending and abs(bank_effect) < RECONCILIATION_AMOUNT_TOLERANCE),
             })
         except (json.JSONDecodeError, TypeError, ValueError):
             continue
@@ -2372,15 +2607,17 @@ async def repair_matched_statement_effect(
         if repair_type == "missing_settlement_voucher":
             repair_entry_id = f"bank-settlement-{statement_id}"
             amount = abs(statement_amount)
+            clearing_info = platform_clearing_info(statement, payloads)
+            clearing_code = clearing_info["clearingCode"]
             if statement_amount > 0:
                 voucher_lines = {
                     "debit": [{"accountCode": "1002", "accountName": "银行存款", "amount": amount}],
-                    "credit": [{"accountCode": WECHAT_CLEARING_CODE, "accountName": "微信支付待结算", "amount": amount}],
+                    "credit": [{"accountCode": clearing_code, "accountName": clearing_info["clearingName"], "amount": amount}],
                 }
                 direction = "income"
             else:
                 voucher_lines = {
-                    "debit": [{"accountCode": WECHAT_CLEARING_CODE, "accountName": "微信支付待结算", "amount": amount}],
+                    "debit": [{"accountCode": clearing_code, "accountName": clearing_info["clearingName"], "amount": amount}],
                     "credit": [{"accountCode": "1002", "accountName": "银行存款", "amount": amount}],
                 }
                 direction = "expense"
@@ -2390,15 +2627,15 @@ async def repair_matched_statement_effect(
                 "company_id": company_id,
                 "userId": user_id,
                 "user_id": user_id,
-                "title": f"微信支付结算到账-{transaction_date}",
+                "title": f"{clearing_info['label']}结算到账-{transaction_date}",
                 "amount": amount,
                 "direction": direction,
-                "category": "微信支付结算",
+                "category": clearing_info["category"],
                 "occurDate": transaction_date,
                 "paymentDate": transaction_date,
                 "billingStatus": "reconciled",
                 "source": "bank_reconciliation_repair",
-                "reconciliationType": "wechat_settlement",
+                "reconciliationType": clearing_info["reconciliationType"],
                 "linkedStatementId": statement_id,
                 "voucherLines": voucher_lines,
                 "created_at": now,
@@ -2606,12 +2843,28 @@ async def get_statement_ids(company_id: str) -> List[str]:
         await conn.close()
 
 
-async def get_wechat_settlement_candidates(
-    company_id: str, statement: Dict[str, Any],
+# 银行摘要 → 平台账单来源与订单号字段。提现到账先挂各自待结算科目，
+# 候选匹配只在该平台的账单凭证里找原收入/手续费，不能跨平台混配。
+_PLATFORM_CANDIDATE_RULES = (
+    ("alipay", re.compile(r"支付宝|Alipay|蚂蚁金服", re.I), "alipay_bill", "platform_order_no"),
+    ("wechat", re.compile(r"微信|财付通|WeChat|Tenpay", re.I), "wechat_bill", "wechat_order_no"),
+)
+_PLATFORM_WITHDRAWAL_RULES = {"wechat_withdrawal", "alipay_withdrawal"}
+
+
+async def get_platform_settlement_candidates(
+    company_id: str, statement: Dict[str, Any], platform: str = "",
 ) -> List[List[Dict[str, Any]]]:
     """Read complete order/day groups; a candidate is never an automatic match."""
-    if not re.search(r"微信|财付通|WeChat|Tenpay", str(statement.get("description") or ""), re.I):
+    description = str(statement.get("description") or "")
+    rule = next((item for item in _PLATFORM_CANDIDATE_RULES if item[0] == platform), None)
+    if rule is None:
+        rule = next((item for item in _PLATFORM_CANDIDATE_RULES if item[1].search(description)), None)
+    # 显式传入平台时也要核对摘要：调用方（快捷规则）已判定，但兼容入口不能
+    # 把“其他客户收款”配到微信/支付宝账单上。
+    if rule is None or not rule[1].search(description):
         return []
+    _, _, source, order_field = rule
     try:
         statement_date = date.fromisoformat(str(statement.get("transaction_date") or "")[:10])
     except ValueError:
@@ -2621,10 +2874,10 @@ async def get_wechat_settlement_candidates(
     try:
         rows = await (await conn.execute(
             "SELECT id, payload FROM entries WHERE company_id = ? "
-            "AND json_extract(payload, '$.source') = 'wechat_bill' "
+            "AND json_extract(payload, '$.source') = ? "
             "AND json_extract(payload, '$.occurDate') >= ? "
             "AND json_extract(payload, '$.occurDate') < ? ORDER BY id",
-            (company_id, (statement_date - timedelta(days=5)).isoformat(),
+            (company_id, source, (statement_date - timedelta(days=5)).isoformat(),
              (statement_date + timedelta(days=1)).isoformat()),
         )).fetchall()
     finally:
@@ -2640,7 +2893,7 @@ async def get_wechat_settlement_candidates(
         if not isinstance(payload, dict):
             continue
         payload = {**payload, "id": str(row["id"])}
-        key = (str(payload.get("occurDate") or "")[:10], str(payload.get("wechat_order_no") or ""))
+        key = (str(payload.get("occurDate") or "")[:10], str(payload.get(order_field) or ""))
         orders.setdefault(key, []).append(payload)
         if (payload["id"] in matched_ids or payload.get("billingStatus") == "reconciled"
                 or payload.get("is_archive_only") or payload.get("isArchiveOnly")):
@@ -2668,6 +2921,13 @@ async def get_wechat_settlement_candidates(
             seen.add(ids)
             candidates.append(entries)
     return candidates
+
+
+async def get_wechat_settlement_candidates(
+    company_id: str, statement: Dict[str, Any],
+) -> List[List[Dict[str, Any]]]:
+    """兼容旧调用：只查微信账单候选。新代码用 get_platform_settlement_candidates。"""
+    return await get_platform_settlement_candidates(company_id, statement, "wechat")
 
 
 _REFUND_KW_PATTERN = re.compile(r"退款|退回|退还")
@@ -2744,6 +3004,7 @@ def _refund_pair_suggestion(stmt: Dict[str, Any], pair: Dict[str, Any]) -> Dict[
         )
     return {
         "statementId": stmt["id"],
+        "pairedStatementId": other["id"],
         "statement": {
             "date": stmt["transaction_date"],
             "description": stmt["description"],
@@ -2849,10 +3110,35 @@ async def ai_suggest_matches(
             and _entry_not_after_statement(e.get("occurDate"), stmt.get("transaction_date"))
         ]
         rule_match = _try_rule_match(stmt, available_entries)
+        multi_match = None if (rule_match and rule_match.get("type") == "match") else _try_multi_invoice_match(stmt, available_entries)
+        if multi_match:
+            ids = multi_match["entry_ids"]
+            matched_group = multi_match["entries"]
+            used_suggested_entry_ids.update(ids)
+            suggestions.append({
+                "statementId": stmt["id"],
+                "statement": {
+                    "date": stmt["transaction_date"],
+                    "description": stmt["description"],
+                    "amount": stmt["amount"],
+                    "balance": stmt["balance"],
+                },
+                "type": "match",
+                "matchedEntryId": ids[0],
+                "matchedEntryIds": ids,
+                "matchedEntry": matched_group[0],
+                "matchedEntries": matched_group,
+                "confidence": multi_match["confidence"],
+                "rule": multi_match["rule"],
+                "reason": multi_match["reason"],
+                "amountDifference": multi_match.get("amount_difference", 0),
+            })
+            continue
         if rule_match:
             if rule_match.get("type") == "match":
                 used_suggested_entry_ids.add(rule_match["entry_id"])
-            suggestions.append({
+            mismatch = bool(rule_match.get("counterparty_mismatch"))
+            sug_item: Dict[str, Any] = {
                 "statementId": stmt["id"],
                 "statement": {
                     "date": stmt["transaction_date"],
@@ -2866,7 +3152,11 @@ async def ai_suggest_matches(
                 "confidence": rule_match["confidence"],
                 "reason": rule_match["reason"],
                 "amountDifference": rule_match.get("amount_difference", 0),
-            })
+            }
+            if mismatch:
+                sug_item["counterpartyMismatch"] = True
+                sug_item["requiresReview"] = True
+            suggestions.append(sug_item)
             continue
 
         # C. 企业记忆规则（用户确认过的规则压过系统关键词启发式——否则
@@ -2935,7 +3225,7 @@ async def ai_suggest_matches(
 
         # A. 系统关键词快规则（已收窄：退款/验证类不再误中平台结算）
         fast_rule = identify_explicit_it_service_rule(stmt) or identify_statement_fast_rule(stmt)
-        if fast_rule and fast_rule["rule"] != "wechat_withdrawal":
+        if fast_rule and fast_rule["rule"] not in _PLATFORM_WITHDRAWAL_RULES:
             suggestions.append({
                 "statementId": stmt["id"],
                 "statement": {
@@ -2960,17 +3250,19 @@ async def ai_suggest_matches(
             })
             continue
 
-        if fast_rule and fast_rule["rule"] == "wechat_withdrawal":
+        if fast_rule and fast_rule["rule"] in _PLATFORM_WITHDRAWAL_RULES:
+            platform = "alipay" if fast_rule["rule"] == "alipay_withdrawal" else "wechat"
+            platform_label = "支付宝" if platform == "alipay" else "微信"
             matched_group = None
             try:
-                settlement_candidates = await get_wechat_settlement_candidates(company_id, stmt)
+                settlement_candidates = await get_platform_settlement_candidates(company_id, stmt, platform)
                 available_groups = [group for group in settlement_candidates
                                     if len(group) <= 500
                                     and not any(entry["id"] in used_suggested_entry_ids for entry in group)]
                 if len(available_groups) == 1:
                     matched_group = available_groups[0]
             except Exception:
-                logger.exception("get_wechat_settlement_candidates failed for %s", stmt.get("id"))
+                logger.exception("get_platform_settlement_candidates failed for %s", stmt.get("id"))
 
             if matched_group:
                 ids = [entry["id"] for entry in matched_group]
@@ -2982,8 +3274,8 @@ async def ai_suggest_matches(
                     "type": "match", "matchedEntryId": ids[0], "matchedEntryIds": ids,
                     "matchedEntry": matched_group[0], "matchedEntries": matched_group,
                     "confidence": 0.95,
-                    "rule": "wechat_detail_match",
-                    "reason": "微信原账目净额与到账金额一致，可一键合并对账",
+                    "rule": f"{platform}_detail_match",
+                    "reason": f"{platform_label}原账目净额与到账金额一致，可一键合并对账",
                 })
             else:
                 # 汇总记账模式或无订单明细时：直接走资金划转（借:1002 贷:1012001）
@@ -3009,6 +3301,24 @@ async def ai_suggest_matches(
                         "reason": fast_rule["reason"],
                     },
                 })
+            continue
+
+        stmt_amount_val = safe_money(stmt["amount"])
+        if stmt_amount_val < ZERO and is_payroll_liability_description(str(stmt.get("description") or "")):
+            suggestions.append(_build_payroll_classification_suggestion(stmt, "liability"))
+            continue
+        if stmt_amount_val < ZERO and is_payroll_tax_description(str(stmt.get("description") or "")):
+            suggestions.append(_build_payroll_classification_suggestion(stmt, "tax"))
+            continue
+        if stmt_amount_val < ZERO and is_salary_payment_description(str(stmt.get("description") or "")):
+            suggestions.append(_build_payroll_classification_suggestion(stmt, "salary"))
+            continue
+        # 财税库行通道（「税费社保」）归税费缴纳模糊组：不猜社保/个税/罚款。
+        # 放在工资/个税关键词之后：摘要若明确写了「工资」「个人所得税」仍先走工资模块。
+        # 金额与已计提工资表精确一致时，_enrich_payroll_settlement_suggestions
+        # 会在后面把它纠正为工资模块核销，自动化不丢。
+        if stmt_amount_val < ZERO and is_ambiguous_tax_channel_description(str(stmt.get("description") or "")):
+            suggestions.append(_build_tax_channel_suggestion(stmt))
             continue
 
         need_ai_statements.append(stmt)
@@ -3144,6 +3454,10 @@ async def ai_suggest_matches(
             else:
                 suggestions.append(res)
 
+    await _enrich_payroll_settlement_suggestions(company_id, suggestions)
+    await _enrich_advance_payable_suggestions(company_id, suggestions)
+    await _enrich_invoice_reimbursement_suggestions(company_id, suggestions)
+    _mark_fallback_category_matches(suggestions)
     await _record_company_category_rule_hits(company_id, recorded_rule_hits)
     return suggestions
 
@@ -3180,6 +3494,17 @@ def _try_rule_match(stmt: Dict, entries: List[Dict]) -> Optional[Dict]:
         entry_amount = abs(safe_money(entry.get("amount")))
         amount_diff = abs(stmt_abs - entry_amount)
 
+        # 发票销方 ↔ 流水对手方守门：金额+日期吻合但销方与「对方」毫无关系时
+        # （社保金库扣款 vs 科技公司发票），金额巧合不构成配对证据——
+        # 降置信并在理由里写明，让人工核实而不是当成高置信建议推。
+        if entry.get("source") == "invoice_import":
+            affine = seller_affinity(str(stmt.get("description", "")), entry)
+            party_label = "购方" if entry_dir == "income" else "销方"
+            affinity_note = "" if affine else f"；流水对方与发票{party_label}不一致，请人工核实"
+        else:
+            affine = True
+            affinity_note = ""
+
         if stmt_date is not None:
             try:
                 entry_date = datetime.strptime(str(entry.get("occurDate", ""))[:10], "%Y-%m-%d")
@@ -3193,13 +3518,17 @@ def _try_rule_match(stmt: Dict, entries: List[Dict]) -> Optional[Dict]:
                 score = date_diff
                 if score < best_score:
                     best_score = score
+                    confidence = max(0.95, 1.0 - date_diff * 0.01)
+                    if not affine:
+                        confidence = min(confidence, 0.60)
                     best = {
                         "entry_id": entry["id"],
                         "entry": entry,
                         "type": "match",
                         "amount_difference": ZERO,
-                        "confidence": max(0.95, 1.0 - date_diff * 0.01),
-                        "reason": f"金额完全匹配，日期相差{date_diff}天（高置信）",
+                        "confidence": confidence,
+                        "counterparty_mismatch": not affine,
+                        "reason": f"金额完全匹配，日期相差{date_diff}天（高置信）{affinity_note}",
                     }
 
             # Tier 2: exact amount + within 30 days
@@ -3207,13 +3536,17 @@ def _try_rule_match(stmt: Dict, entries: List[Dict]) -> Optional[Dict]:
                 score = 100 + date_diff
                 if score < best_score:
                     best_score = score
+                    confidence = max(0.75, 0.90 - date_diff * 0.005)
+                    if not affine:
+                        confidence = min(confidence, 0.60)
                     best = {
                         "entry_id": entry["id"],
                         "entry": entry,
                         "type": "match",
                         "amount_difference": ZERO,
-                        "confidence": max(0.75, 0.90 - date_diff * 0.005),
-                        "reason": f"金额完全匹配，日期相差{date_diff}天（发票与付款日期差，中置信）",
+                        "confidence": confidence,
+                        "counterparty_mismatch": not affine,
+                        "reason": f"金额完全匹配，日期相差{date_diff}天（发票与付款日期差，中置信）{affinity_note}",
                     }
 
             # Tier 3: close amount within 5% + within 10 days
@@ -3229,7 +3562,8 @@ def _try_rule_match(stmt: Dict, entries: List[Dict]) -> Optional[Dict]:
                             "type": "difference",
                             "amount_difference": money(amount_diff),
                             "confidence": 0.65,
-                            "reason": f"金额接近（差额{amount_diff:.2f}元），日期相差{date_diff}天（低置信，建议人工核实）",
+                            "counterparty_mismatch": not affine,
+                            "reason": f"金额接近（差额{amount_diff:.2f}元），日期相差{date_diff}天（低置信，建议人工核实）{affinity_note}",
                         }
         else:
             # ponytail: 无日期时仅按金额精确匹配，置信度降为 0.8
@@ -3237,16 +3571,222 @@ def _try_rule_match(stmt: Dict, entries: List[Dict]) -> Optional[Dict]:
                 score = 500
                 if score < best_score:
                     best_score = score
+                    confidence = 0.80
+                    if not affine:
+                        confidence = min(confidence, 0.60)
                     best = {
                         "entry_id": entry["id"],
                         "entry": entry,
                         "type": "match",
                         "amount_difference": ZERO,
-                        "confidence": 0.80,
-                        "reason": "金额完全匹配（流水无日期，建议人工核实）",
+                        "confidence": confidence,
+                        "counterparty_mismatch": not affine,
+                        "reason": f"金额完全匹配（流水无日期，建议人工核实）{affinity_note}",
                     }
 
     return best
+
+
+def _try_multi_invoice_match(stmt: Dict, entries: List[Dict]) -> Optional[Dict]:
+    """为大额/汇总付款流水寻找唯一的 1:N 同池子集和报销匹配（精确到分，±1 分容差）。
+
+    设计守门：
+    - 仅作用于付款流出且金额 >= 1 元；
+    - 严格分池（按单一垫付人 `adv:{payer}` 或待付款发票 `pending_invoice`），绝不混池；
+    - 仅纳入流水日及之前 60 天内、单笔金额小于流水的候选，每池最多前 20 笔；
+    - 子集大小 2..8；全池恰好仅存 1 组唯一解才推「合并配对」，存在多解或无解均放弃。
+    """
+    stmt_amount = safe_money(stmt.get("amount"))
+    if stmt_amount >= ZERO:
+        return None
+    stmt_abs = abs(stmt_amount)
+    if stmt_abs < Decimal("1.00"):
+        return None
+
+    stmt_date = None
+    raw_stmt_date = str(stmt.get("transaction_date") or "").strip()[:10]
+    if raw_stmt_date:
+        try:
+            stmt_date = datetime.strptime(raw_stmt_date, "%Y-%m-%d")
+        except (ValueError, IndexError):
+            stmt_date = None
+
+    pools: Dict[str, List[tuple[int, int, Dict]]] = {}
+    for entry in entries:
+        if entry.get("direction", "expense") != "expense":
+            continue
+        amt = abs(safe_money(entry.get("amount")))
+        if amt <= ZERO or amt >= stmt_abs:
+            continue
+        amt_cents = int((amt * 100).to_integral_value())
+        if amt_cents <= 0:
+            continue
+
+        day_diff = 0
+        if stmt_date is not None:
+            raw_entry_date = str(entry.get("occurDate") or "").strip()[:10]
+            try:
+                entry_date = datetime.strptime(raw_entry_date, "%Y-%m-%d")
+            except (ValueError, IndexError, TypeError):
+                continue
+            day_diff = (stmt_date - entry_date).days
+            if day_diff < 0 or day_diff > 60:
+                continue
+
+        if entry.get("isAdvancement"):
+            payer_key = str(entry.get("payer") or "").strip() or "personal"
+            pool_key = f"adv:{payer_key}"
+        elif entry.get("isPendingInvoice") or entry.get("source") == "invoice_import":
+            pool_key = "pending_invoice"
+        else:
+            continue
+        pools.setdefault(pool_key, []).append((day_diff, amt_cents, entry))
+
+    target_cents = int((stmt_abs * 100).to_integral_value())
+    tol_cents = 1
+    solutions: List[tuple[str, List[Dict]]] = []
+
+    for pool_key, raw_items in pools.items():
+        if len(raw_items) < 2:
+            continue
+        raw_items.sort(key=lambda item: (item[0], -item[1], str(item[2].get("id") or "")))
+        capped = [(amt_c, entry) for _, amt_c, entry in raw_items[:20]]
+        # 按金额降序搜索，配合后缀和剪枝快速收敛
+        capped.sort(key=lambda item: (-item[0], str(item[1].get("id") or "")))
+        n = len(capped)
+        suffix_sum = [0] * (n + 1)
+        for i in range(n - 1, -1, -1):
+            suffix_sum[i] = suffix_sum[i + 1] + capped[i][0]
+        if suffix_sum[0] < target_cents - tol_cents:
+            continue
+
+        chosen: List[Dict] = []
+
+        def dfs(idx: int, cur_sum: int) -> bool:
+            if len(chosen) >= 2 and abs(cur_sum - target_cents) <= tol_cents:
+                solutions.append((pool_key, list(chosen)))
+                return len(solutions) > 1
+            if idx >= n or len(chosen) >= 8:
+                return False
+            if cur_sum > target_cents + tol_cents:
+                return False
+            if cur_sum + suffix_sum[idx] < target_cents - tol_cents:
+                return False
+
+            amt_c, entry = capped[idx]
+            if cur_sum + amt_c <= target_cents + tol_cents:
+                chosen.append(entry)
+                if dfs(idx + 1, cur_sum + amt_c):
+                    chosen.pop()
+                    return True
+                chosen.pop()
+            if dfs(idx + 1, cur_sum):
+                return True
+            return False
+
+        if dfs(0, 0) or len(solutions) > 1:
+            return None
+
+    if len(solutions) != 1:
+        return None
+
+    pool_key, matched_items = solutions[0]
+    matched_items = sorted(
+        matched_items,
+        key=lambda e: (str(e.get("occurDate") or ""), str(e.get("id") or "")),
+    )
+    total_amt = money(sum((abs(safe_money(item.get("amount"))) for item in matched_items), ZERO))
+    diff = abs(stmt_abs - total_amt)
+    if pool_key == "adv:boss_personal":
+        pool_label = "老板垫付"
+    elif pool_key.startswith("adv:employee_personal:"):
+        pool_label = f"员工({pool_key.split(':', 2)[2]})垫付"
+    elif pool_key.startswith("adv:"):
+        pool_label = "个人垫付"
+    else:
+        pool_label = "待付款发票"
+
+    return {
+        "entries": matched_items,
+        "entry_ids": [item["id"] for item in matched_items],
+        "type": "match",
+        "rule": "reimbursement_multi_match",
+        "amount_difference": ZERO if diff == ZERO else money(diff),
+        "confidence": 0.90,
+        "reason": f"合并报销匹配 {len(matched_items)} 笔{pool_label}，合计 ¥{total_amt:.2f} 与流水一致",
+    }
+
+
+def _normalize_statement_classification(classification: Dict[str, Any]) -> Dict[str, Any]:
+    """统一分类别名，按科目映射补齐缺失科目代码/名称及薪酬标记。"""
+    result = dict(classification)
+    category = str(result.get("category") or "").strip()
+    alias_reset = category == "税费支出"
+    if alias_reset:
+        category = "税费缴纳"
+        result["category"] = category
+    info = lookup_account(category) if category else None
+    if info:
+        if alias_reset or not str(result.get("accountCode") or "").strip():
+            result["accountCode"] = info["accountCode"]
+        if alias_reset or not str(result.get("accountName") or "").strip():
+            result["accountName"] = info["accountName"]
+    if category == "社保公积金":
+        result["requiresSalarySettlement"] = True
+        result["requiresPayrollLiability"] = True
+    elif category == "个税代缴":
+        result["requiresSalarySettlement"] = True
+    elif category == "工资发放":
+        result["requiresSalarySettlement"] = True
+    return result
+
+
+def _context_fallback_classification(stmt: Dict[str, Any], context: str) -> Dict[str, Any]:
+    """有用户补充说明但 LLM 不可用时，按说明关键词生成兜底草稿。"""
+    stmt_amount = safe_money(stmt.get("amount"))
+    if stmt_amount < ZERO and context:
+        if "滞纳金" in context:
+            return {
+                "direction": "expense",
+                "category": "税收滞纳金",
+                "accountCode": "5711010",
+                "accountName": "营业外支出-税收滞纳金",
+                "title": "税收滞纳金",
+                "confidence": 0.95,
+                "reason": "用户补充说明表明该支出为税收滞纳金，计入营业外支出-税收滞纳金（企业所得税不得税前扣除）",
+            }
+        if _PENALTY_EXPENSE_RE.search(context):
+            return {
+                "direction": "expense",
+                "category": "罚款支出",
+                "accountCode": "5711011",
+                "accountName": "营业外支出-罚款支出",
+                "title": "税务/行政罚款支出",
+                "confidence": 0.95,
+                "reason": "用户补充说明表明该支出为罚款/行政处罚，计入营业外支出-罚款支出（企业所得税不得税前扣除）",
+            }
+        if "研发" in context:
+            return {
+                "direction": "expense",
+                "category": "研发支出-费用化支出",
+                "accountCode": "4301",
+                "accountName": "研发支出-费用化支出",
+                "title": "研发相关支出",
+                "confidence": 0.9,
+                "reason": "用户补充说明表明该支出用于研发，应优先按研发支出处理",
+            }
+        explicit_it_rule = identify_explicit_it_service_rule(stmt, context)
+        if explicit_it_rule:
+            return {
+                "direction": "expense",
+                "category": explicit_it_rule["category"],
+                "accountCode": "5602015",
+                "accountName": "管理费用-信息技术服务费",
+                "title": explicit_it_rule["title"],
+                "confidence": 0.95,
+                "reason": f"用户补充说明明确包含信息技术服务用途：{context}",
+            }
+    return _fallback_classification_for_statement(stmt)
 
 
 async def classify_single_statement(
@@ -3270,61 +3810,57 @@ async def classify_single_statement(
     finally:
         await conn.close()
 
+    stmt_amount = safe_money(stmt["amount"])
     context = (business_context or "").strip()
-    if safe_money(stmt["amount"]) < ZERO and is_payroll_liability_description(stmt["description"]):
-        return {
-            "direction": "expense",
-            "category": "社保公积金",
-            "accountCode": "221102",
-            "accountName": "应付职工薪酬-单位社保",
-            "title": "社保公积金缴纳",
-            "confidence": 0.95,
-            "requiresSalarySettlement": True,
-            "requiresPayrollLiability": True,
-            "reason": "识别为社保/公积金缴纳：已计提时应在工资模块按流水核销应付职工薪酬，不能直接记费用",
-        }
-    if safe_money(stmt["amount"]) < ZERO and is_salary_payment_description(stmt["description"]):
-        return {
-            "direction": "expense",
-            "category": "工资发放",
-            "accountCode": "221101",
-            "accountName": "应付职工薪酬-工资",
-            "title": "工资发放",
-            "confidence": 0.95,
-            "requiresSalarySettlement": True,
-            "reason": "识别为工资发放：工资费用应在所属月计提，此处只核销应付职工薪酬，请到工资模块按流水确认发放",
-        }
-    if safe_money(stmt["amount"]) < ZERO and "研发" in context:
-        return {
-            "direction": "expense",
-            "category": "研发支出-费用化支出",
-            "accountCode": "4301",
-            "accountName": "研发支出-费用化支出",
-            "title": "研发相关支出",
-            "confidence": 0.9,
-            "reason": "用户补充说明表明该支出用于研发，应优先按研发支出处理",
-        }
-    if context:
-        explicit_it_rule = identify_explicit_it_service_rule(stmt, context)
-        if explicit_it_rule:
-            return {
-                "direction": "expense",
-                "category": explicit_it_rule["category"],
-                "title": explicit_it_rule["title"],
-                "confidence": 0.95,
-                "reason": f"用户补充说明明确包含信息技术服务用途：{context}",
-            }
 
     if not context:
+        if stmt_amount < ZERO and is_payroll_liability_description(stmt["description"]):
+            return {
+                "direction": "expense",
+                "category": "社保公积金",
+                "accountCode": "221102",
+                "accountName": "应付职工薪酬-单位社保",
+                "title": "社保公积金缴纳",
+                "confidence": 0.95,
+                "requiresSalarySettlement": True,
+                "requiresPayrollLiability": True,
+                "reason": "识别为社保/公积金缴纳：已计提时应在工资模块按流水核销应付职工薪酬，不能直接记费用",
+            }
+        if stmt_amount < ZERO and is_payroll_tax_description(stmt["description"]):
+            return {
+                "direction": "expense",
+                "category": "个税代缴",
+                "accountCode": "2221012",
+                "accountName": "应交税费-应交个人所得税",
+                "title": "个税缴纳",
+                "confidence": 0.95,
+                "requiresSalarySettlement": True,
+                "reason": "识别为个税代缴：应在工资模块按流水核销应交个人所得税，不能记所得税费用",
+            }
+        if stmt_amount < ZERO and is_salary_payment_description(stmt["description"]):
+            return {
+                "direction": "expense",
+                "category": "工资发放",
+                "accountCode": "221101",
+                "accountName": "应付职工薪酬-工资",
+                "title": "工资发放",
+                "confidence": 0.95,
+                "requiresSalarySettlement": True,
+                "reason": "识别为工资发放：工资费用应在所属月计提，此处只核销应付职工薪酬，请到工资模块按流水确认发放",
+            }
+        if stmt_amount < ZERO and is_ambiguous_tax_channel_description(stmt["description"]):
+            # 无业务说明时也只给税费模糊组，交用户在候选里拍板；补充说明后走 LLM
+            return _normalize_statement_classification(_tax_channel_classification(stmt))
         fast_rule = identify_explicit_it_service_rule(stmt) or identify_statement_fast_rule(stmt)
         if fast_rule:
-            return {
-                "direction": "income" if safe_money(stmt["amount"]) > ZERO else "expense",
+            return _normalize_statement_classification({
+                "direction": "income" if stmt_amount > ZERO else "expense",
                 "category": fast_rule["category"],
                 "title": fast_rule["title"],
                 "confidence": fast_rule["confidence"],
                 "reason": fast_rule["reason"],
-            }
+            })
+
     classify_msg = f"""银行流水：
 - 日期：{stmt['transaction_date']}
 - 摘要：{stmt['description']}
@@ -3339,12 +3875,7 @@ async def classify_single_statement(
     classify_result = await asyncio.to_thread(
         safe_chat_text_json,
         BANK_CLASSIFY_PROMPT, classify_msg,
-        fallback={"direction": "expense" if stmt["amount"] < 0 else "income",
-                  "category": "其他支出" if stmt["amount"] < 0 else "其他业务收入",
-                  "accountCode": "5602999" if stmt["amount"] < 0 else "5051",
-                  "accountName": "管理费用-其他" if stmt["amount"] < 0 else "其他业务收入",
-                  "title": stmt["description"],
-                  "confidence": 0.3, "reason": "无法自动分类"},
+        fallback=_context_fallback_classification(stmt, context),
         max_retries=1,
         retry_on_parse=True,
         temperature=0,
@@ -3353,7 +3884,9 @@ async def classify_single_statement(
         company_id=company_id,
     )
     classify_result = _ensure_classification_direction(stmt, classify_result)
-    return guard_statement_classification(stmt, classify_result, context)
+    return _normalize_statement_classification(
+        guard_statement_classification(stmt, classify_result, context)
+    )
 
 
 async def apply_statement_match(
@@ -3378,25 +3911,1282 @@ async def apply_statement_match(
         statement_id=statement_id, entry_ids=entry_ids, request_id=request_id or _now_iso())
 
 
+_SALARY_PAYMENT_CATEGORIES = {"工资", "工资支出", "工资发放", "职工薪酬", "薪资", "薪酬"}
+_SALARY_PAYMENT_CODES = {"5602001", "221101"}
+_PAYROLL_LIABILITY_CATEGORIES = {"社保公积金", "社保", "公积金", "住房公积金"}
+_PAYROLL_LIABILITY_CODES = {"221102", "221104", "221105", "5602016", "5602017"}
+_PAYROLL_TAX_CATEGORIES = {"个税代缴", "个人所得税"}
+_PAYROLL_TAX_CODES = {"2221012"}
+
+
+def _has_explicit_non_payroll_override(entry_data: Dict[str, Any], keyword_checker) -> bool:
+    """用户补充了明确非工资/社保的业务说明时，允许按用户选择的非工资科目确认。"""
+    remark = str(entry_data.get("remark") or "").strip()
+    return "业务说明：" in remark and not keyword_checker(remark)
+
+
 def _looks_like_salary_payment(entry_data: Dict[str, Any], description: str) -> bool:
     """工资流水不得在银行页直接记费用，否则与工资计提重复。"""
+    category = str(entry_data.get("category") or "").strip()
+    account_code = str(entry_data.get("accountCode") or "").strip()
+    if category in _SALARY_PAYMENT_CATEGORIES or account_code in _SALARY_PAYMENT_CODES:
+        return True
     if is_salary_payment_description(description):
+        if category and _has_explicit_non_payroll_override(entry_data, is_salary_payment_description):
+            return False
         return True
-    category = str(entry_data.get("category") or "")
-    if category in {"工资", "工资支出", "工资发放", "职工薪酬", "薪资", "薪酬"}:
-        return True
-    account_code = str(entry_data.get("accountCode") or "")
-    return account_code in {"5602001", "221101"}
+    return False
 
 
 def _looks_like_payroll_liability(entry_data: Dict[str, Any], description: str) -> bool:
     """社保/公积金流水必须走工资模块核销，不能直接记费用导致重复列支。"""
+    category = str(entry_data.get("category") or "").strip()
+    account_code = str(entry_data.get("accountCode") or "").strip()
+    if category in _PAYROLL_LIABILITY_CATEGORIES or account_code in _PAYROLL_LIABILITY_CODES:
+        return True
     if is_payroll_liability_description(description):
+        # 银行摘要常写为「税费社保」，实际可能缴税或税务罚款，用户改选其他科目或填写业务说明时放行
+        if category and ("税" in description or _has_explicit_non_payroll_override(entry_data, is_payroll_liability_description)):
+            return False
         return True
-    category = str(entry_data.get("category") or "")
-    if category in {"社保公积金", "社保", "公积金", "住房公积金"}:
+    return False
+
+
+def _looks_like_payroll_tax(entry_data: Dict[str, Any]) -> bool:
+    """个税代缴必须走工资模块核销 2221012，不能记所得税费用/税费缴纳。"""
+    category = str(entry_data.get("category") or "").strip()
+    account_code = str(entry_data.get("accountCode") or "").strip()
+    return category in _PAYROLL_TAX_CATEGORIES or account_code in _PAYROLL_TAX_CODES
+
+
+_OPENING_PAYROLL_ACCOUNT_NAMES: Dict[str, str] = {
+    "221101": "应付职工薪酬-工资",
+    "221102": "应付职工薪酬-单位社保",
+    "221104": "应付职工薪酬-代扣社保公积金",
+    "221105": "应付职工薪酬-住房公积金",
+    "2221012": "应交税费-应交个人所得税",
+}
+
+
+def _extract_payroll_month_hint(description: str, stmt_date_str: str) -> str:
+    """从银行摘要提取工资归属月（如「26年9月工资」→ 2026-09），缺失时回落到流水上月。"""
+    text_val = str(description or "")
+    m_cn = re.search(r"(?:20)?(\d{2})\s*年\s*(\d{1,2})\s*月", text_val)
+    if m_cn:
+        year = 2000 + int(m_cn.group(1))
+        month = int(m_cn.group(2))
+        if 1 <= month <= 12:
+            return f"{year:04d}-{month:02d}"
+    m_iso = re.search(r"(20\d{2})[-/.年](\d{1,2})", text_val)
+    if m_iso:
+        year = int(m_iso.group(1))
+        month = int(m_iso.group(2))
+        if 1 <= month <= 12:
+            return f"{year:04d}-{month:02d}"
+    try:
+        dt = date.fromisoformat(str(stmt_date_str or "")[:10])
+    except ValueError:
+        return ""
+    if dt.day <= 24:
+        prev_year = dt.year - 1 if dt.month == 1 else dt.year
+        prev_month = 12 if dt.month == 1 else dt.month - 1
+        return f"{prev_year:04d}-{prev_month:02d}"
+    return f"{dt.year:04d}-{dt.month:02d}"
+
+
+def _tax_channel_classification(stmt: Dict[str, Any]) -> Dict[str, Any]:
+    """财税库行通道扣款：只给『税费缴纳』并交用户拍板，不猜社保/个税/罚款。
+
+    税费缴纳在 ``category_service.AMBIGUITY_GROUPS`` 里，前端会展开
+    社保公积金 / 个税代缴 / 罚款支出 / 税收滞纳金 / 所得税费用 候选。
+    """
+    info = lookup_account("税费缴纳") or {}
+    date_str = str(stmt.get("transaction_date") or "")[:10]
+    return {
+        "direction": "expense",
+        "category": "税费缴纳",
+        "accountCode": str(info.get("accountCode") or "2221026"),
+        "accountName": str(info.get("accountName") or "应交增值税（小规模纳税人专用）"),
+        "title": f"税费缴纳-{date_str}" if date_str else "税费缴纳",
+        "confidence": 0.5,
+        "requiresConfirmation": True,
+        "requiresReview": True,
+        "reason": (
+            "摘要走财税库行通用扣款通道（税费/社保/罚款在流水上同形），"
+            "无法区分正常税款、社保、个税或税务罚款；"
+            "请点选实际分类（税务罚款选罚款支出，逾期缴税加收的滞纳金选税收滞纳金）"
+        ),
+    }
+
+
+def _build_tax_channel_suggestion(stmt: Dict[str, Any]) -> Dict[str, Any]:
+    classification = _tax_channel_classification(stmt)
+    return {
+        "statementId": stmt["id"],
+        "statement": {
+            "date": stmt["transaction_date"],
+            "description": stmt["description"],
+            "amount": stmt["amount"],
+            "balance": stmt["balance"],
+        },
+        "type": "new",
+        "confidence": classification["confidence"],
+        "reason": classification["reason"],
+        "suggestedEntry": classification,
+    }
+
+
+def _build_payroll_classification_suggestion(stmt: Dict[str, Any], kind: str) -> Dict[str, Any]:
+    """为工资发放或社保公积金扣款流水生成标准分类建议。"""
+    abs_amount = abs(safe_money(stmt.get("amount")))
+    desc = str(stmt.get("description") or "")
+    date_str = str(stmt.get("transaction_date") or "")[:10]
+    if kind == "tax":
+        reason = "识别为个税代缴：个税属于代扣员工税款，应在工资模块按流水核销应交个人所得税，不能记所得税费用或税费缴纳"
+        return {
+            "statementId": stmt["id"],
+            "statement": {
+                "date": stmt["transaction_date"],
+                "description": stmt["description"],
+                "amount": stmt["amount"],
+                "balance": stmt["balance"],
+            },
+            "type": "new",
+            "confidence": 0.95,
+            "reason": reason,
+            "suggestedEntry": {
+                "direction": "expense",
+                "category": "个税代缴",
+                "accountCode": "2221012",
+                "accountName": _OPENING_PAYROLL_ACCOUNT_NAMES["2221012"],
+                "title": "个税缴纳",
+                "amount": abs_amount,
+                "occurDate": date_str,
+                "confidence": 0.95,
+                "requiresSalarySettlement": True,
+                "reason": reason,
+            },
+        }
+    if kind == "liability":
+        is_hf = "公积金" in desc and "社保" not in desc
+        account_code = "221105" if is_hf else "221102"
+        account_name = _OPENING_PAYROLL_ACCOUNT_NAMES[account_code]
+        reason = "识别为社保/公积金缴纳：已计提时应在工资模块按流水核销应付职工薪酬，不能直接记费用"
+        return {
+            "statementId": stmt["id"],
+            "statement": {
+                "date": stmt["transaction_date"],
+                "description": stmt["description"],
+                "amount": stmt["amount"],
+                "balance": stmt["balance"],
+            },
+            "type": "new",
+            "confidence": 0.95,
+            "reason": reason,
+            "suggestedEntry": {
+                "direction": "expense",
+                "category": "社保公积金",
+                "accountCode": account_code,
+                "accountName": account_name,
+                "title": "社保公积金缴纳",
+                "amount": abs_amount,
+                "occurDate": date_str,
+                "confidence": 0.95,
+                "requiresSalarySettlement": True,
+                "requiresPayrollLiability": True,
+                "reason": reason,
+            },
+        }
+    reason = "识别为工资发放：工资费用应在所属月计提，此处只核销应付职工薪酬，请到工资模块按流水确认发放"
+    return {
+        "statementId": stmt["id"],
+        "statement": {
+            "date": stmt["transaction_date"],
+            "description": stmt["description"],
+            "amount": stmt["amount"],
+            "balance": stmt["balance"],
+        },
+        "type": "new",
+        "confidence": 0.95,
+        "reason": reason,
+        "suggestedEntry": {
+            "direction": "expense",
+            "category": "工资发放",
+            "accountCode": "221101",
+            "accountName": _OPENING_PAYROLL_ACCOUNT_NAMES["221101"],
+            "title": "工资发放",
+            "amount": abs_amount,
+            "occurDate": date_str,
+            "confidence": 0.95,
+            "requiresSalarySettlement": True,
+            "reason": reason,
+        },
+    }
+
+
+def _public_opening_payroll_ctx(ctx: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if ctx is None:
+        return None
+    return {k: v for k, v in ctx.items() if k != "debitAllocations"}
+
+
+async def _evaluate_opening_payroll_settlement(
+    session: AsyncSession,
+    company_id: str,
+    stmt: Dict[str, Any],
+    kind: str,
+) -> Dict[str, Any]:
+    """评估开账首月发放前期工资/社保公积金/个税时，对应应付科目期初贷方可用余额。"""
+    from sqlalchemy import func, select
+    from db.models import Company, JournalEntry, JournalLine, SourceTransaction
+    from services.accounting_core_service import book_start_date
+    from services.opening_balance_service import get_opening_balances
+
+    desc = str(stmt.get("description") or "")
+    abs_amount = abs(money(stmt.get("amount") or ZERO))
+    if kind == "salary":
+        target_codes: tuple[str, ...] = ("221101",)
+    elif kind == "tax":
+        target_codes = ("2221012",)
+    elif "公积金" in desc:
+        target_codes = ("221105", "221104", "221101", "221102")
+    else:
+        target_codes = ("221102", "221104", "221101", "221105")
+    primary_code = target_codes[0]
+    primary_name = _OPENING_PAYROLL_ACCOUNT_NAMES[primary_code]
+
+    try:
+        stmt_date = date.fromisoformat(str(stmt.get("transaction_date") or "")[:10])
+    except ValueError:
+        return {
+            "eligible": False,
+            "canSettle": False,
+            "reason": "invalid_date",
+            "bookStartDate": "",
+            "accountCode": primary_code,
+            "accountName": primary_name,
+            "availableOpeningCredit": "0.00",
+            "primaryAvailableCredit": "0.00",
+            "remainingOpeningCredit": "0.00",
+            "requiredAmount": money_text(abs_amount),
+            "allocations": [],
+            "debitAllocations": [],
+        }
+
+    company = await session.get(Company, company_id)
+    start_date = book_start_date(company) if company is not None else None
+    if start_date is None or stmt_date < start_date:
+        return {
+            "eligible": False,
+            "canSettle": False,
+            "reason": "not_after_book_start",
+            "bookStartDate": start_date.isoformat() if start_date else "",
+            "accountCode": primary_code,
+            "accountName": primary_name,
+            "availableOpeningCredit": "0.00",
+            "primaryAvailableCredit": "0.00",
+            "remainingOpeningCredit": "0.00",
+            "requiredAmount": money_text(abs_amount),
+            "allocations": [],
+            "debitAllocations": [],
+        }
+
+    opening_items = await get_opening_balances(company_id, stmt_date.year, session=session)
+    names_by_code = dict(_OPENING_PAYROLL_ACCOUNT_NAMES)
+    opening_by_code: Dict[str, Decimal] = {code: ZERO for code in target_codes}
+    for item in opening_items:
+        code = str(item.get("account_code") or "")
+        if code in opening_by_code:
+            net_credit = max(
+                money(item.get("credit_balance") or ZERO) - money(item.get("debit_balance") or ZERO),
+                ZERO,
+            )
+            opening_by_code[code] = net_credit
+            if item.get("account_name"):
+                names_by_code[code] = str(item["account_name"])
+    primary_name = names_by_code.get(primary_code, primary_name)
+
+    settled_rows = (
+        await session.execute(
+            select(JournalLine.account_code, func.coalesce(func.sum(JournalLine.amount), 0))
+            .join(JournalEntry, JournalLine.journal_entry_id == JournalEntry.id)
+            .join(SourceTransaction, JournalEntry.source_transaction_id == SourceTransaction.id)
+            .where(
+                JournalEntry.company_id == company_id,
+                JournalEntry.status.in_(("draft", "pending_review", "posted")),
+                JournalEntry.occurred_on >= date(stmt_date.year, 1, 1),
+                JournalEntry.occurred_on <= date(stmt_date.year, 12, 31),
+                SourceTransaction.source_type == "opening_payroll_settlement",
+                JournalLine.company_id == company_id,
+                JournalLine.direction == "debit",
+                JournalLine.account_code.in_(target_codes),
+            )
+            .group_by(JournalLine.account_code)
+        )
+    ).all()
+    settled_by_code: Dict[str, Decimal] = {
+        str(code): money(total or ZERO) for code, total in settled_rows
+    }
+
+    available_by_code: Dict[str, Decimal] = {}
+    available_total = ZERO
+    for code in target_codes:
+        avail = max(opening_by_code[code] - settled_by_code.get(code, ZERO), ZERO)
+        available_by_code[code] = avail
+        available_total = money(available_total + avail)
+
+    is_opening_month = stmt_date.year == start_date.year and stmt_date.month == start_date.month
+    eligible = is_opening_month or available_total > ZERO
+    can_settle = eligible and abs_amount > ZERO and available_total >= abs_amount
+
+    debit_allocations: list[Dict[str, Any]] = []
+    if can_settle:
+        remaining = abs_amount
+        for code in target_codes:
+            if remaining <= ZERO:
+                break
+            avail = available_by_code[code]
+            take = min(avail, remaining)
+            if take > ZERO:
+                debit_allocations.append({
+                    "accountCode": code,
+                    "accountName": names_by_code.get(code, _OPENING_PAYROLL_ACCOUNT_NAMES[code]),
+                    "amount": money(take),
+                })
+                remaining = money(remaining - take)
+
+    if debit_allocations:
+        primary_code = debit_allocations[0]["accountCode"]
+        primary_name = debit_allocations[0]["accountName"]
+
+    allocations = [
+        {
+            "accountCode": item["accountCode"],
+            "accountName": item["accountName"],
+            "amount": money_text(item["amount"]),
+        }
+        for item in debit_allocations
+    ]
+    primary_available = available_by_code.get(primary_code, ZERO)
+    if can_settle and len(debit_allocations) == 1:
+        remaining_after = max(primary_available - debit_allocations[0]["amount"], ZERO)
+    elif can_settle:
+        remaining_after = max(available_total - abs_amount, ZERO)
+    else:
+        remaining_after = available_total
+
+    return {
+        "eligible": eligible,
+        "canSettle": can_settle,
+        "reason": "" if can_settle else ("opening_balance_insufficient" if eligible else "outside_opening_period"),
+        "bookStartDate": start_date.isoformat(),
+        "accountCode": primary_code,
+        "accountName": primary_name,
+        "availableOpeningCredit": money_text(available_total),
+        "primaryAvailableCredit": money_text(primary_available),
+        "remainingOpeningCredit": money_text(remaining_after),
+        "requiredAmount": money_text(abs_amount),
+        "allocations": allocations,
+        "debitAllocations": debit_allocations,
+    }
+
+
+def _payroll_kind_label(kind: str) -> str:
+    if kind == "tax":
+        return "个税"
+    if kind == "salary":
+        return "工资"
+    return "社保公积金"
+
+
+_TAX_AMBIGUITY_CATEGORIES = {"税费缴纳", "罚款支出", "税收滞纳金", "所得税费用"}
+
+
+def _build_opening_payroll_settlement(
+    kind: str,
+    opening_ctx: Optional[Dict[str, Any]],
+    stmt_meta: Dict[str, Any],
+) -> tuple[Dict[str, Any], str, bool]:
+    """构造工资/社保/个税在无匹配工资表时的期初冲销或工资模块引导上下文。"""
+    if opening_ctx and opening_ctx.get("canSettle"):
+        pub = _public_opening_payroll_ctx(opening_ctx) or {}
+        settlement = {
+            "mode": "opening_balance",
+            "kind": kind,
+            **pub,
+        }
+        allocs = opening_ctx.get("allocations") or []
+        if len(allocs) > 1:
+            parts = " + ".join(
+                f"「{a['accountCode']} {a['accountName']}」¥{a['amount']}"
+                for a in allocs
+            )
+            reason = (
+                f"建账启用日（{opening_ctx['bookStartDate']}）前遗留应付，"
+                f"将合并冲销期初贷方余额：{parts}，不重复计入本月费用"
+            )
+        elif opening_ctx.get("remainingOpeningCredit") != "0.00":
+            avail_str = opening_ctx.get("primaryAvailableCredit") or opening_ctx["availableOpeningCredit"]
+            rem_str = opening_ctx["remainingOpeningCredit"]
+            suffix = (
+                f"（当前可用 ¥{avail_str}，冲销后剩余 ¥{rem_str} 可用于后续冲抵未单独拆分的个人代扣社保/公积金）"
+                if kind == "salary"
+                else f"（当前可用 ¥{avail_str}，冲销后剩余 ¥{rem_str}）"
+            )
+            reason = (
+                f"建账启用日（{opening_ctx['bookStartDate']}）前遗留应付，"
+                f"将冲销「{opening_ctx['accountCode']} {opening_ctx['accountName']}」期初贷方余额 "
+                f"¥{opening_ctx['requiredAmount']}{suffix}，不重复计入本月费用"
+            )
+        else:
+            reason = (
+                f"建账启用日（{opening_ctx['bookStartDate']}）前遗留应付，"
+                f"将直接冲销「{opening_ctx['accountCode']} {opening_ctx['accountName']}」期初贷方余额 "
+                f"¥{opening_ctx['requiredAmount']}（冲销后该科目期初余额清零），不重复计入本月费用"
+            )
+        return settlement, reason, False
+
+    if opening_ctx and opening_ctx.get("eligible"):
+        pub = _public_opening_payroll_ctx(opening_ctx) or {}
+        settlement = {
+            "mode": "opening_balance_missing",
+            "kind": kind,
+            **pub,
+        }
+        reason = (
+            f"开账首月发放前期{_payroll_kind_label(kind)}需冲销"
+            f"「{opening_ctx['accountCode']} {opening_ctx['accountName']}」期初贷方余额，"
+            f"当前可用 ¥{opening_ctx['availableOpeningCredit']}（需 ¥{opening_ctx['requiredAmount']}），请先到「期初设置」补录"
+        )
+        return settlement, reason, True
+
+    suggested_month = _extract_payroll_month_hint(
+        str(stmt_meta.get("description") or ""),
+        str(stmt_meta.get("date") or ""),
+    )
+    settlement = {
+        "mode": "salary_module_required",
+        "kind": kind,
+        "suggestedMonth": suggested_month,
+    }
+    target_label = _payroll_kind_label(kind)
+    reason = (
+        f"未找到金额完全匹配的已计提{target_label}记录，请前往工资模块核对或计提后再核销（若非{target_label}支出请点「改分类」）"
+    )
+    return settlement, reason, True
+
+
+async def _enrich_payroll_settlement_suggestions(
+    company_id: str,
+    suggestions: List[Dict[str, Any]],
+) -> None:
+    """为工资/社保/个税类流水建议补充原地核销或期初冲销上下文，消除「点了必报 409」的死按钮。"""
+    payroll_items: list[tuple[Dict[str, Any], str]] = []
+    tax_ambiguity_items: list[Dict[str, Any]] = []
+    for sug in suggestions:
+        if sug.get("type") != "new":
+            continue
+        stmt_meta = sug.get("statement") or {}
+        if safe_money(stmt_meta.get("amount")) >= ZERO:
+            continue
+        entry_meta = sug.get("suggestedEntry") or {}
+        desc = str(stmt_meta.get("description") or "")
+        cat = str(entry_meta.get("category") or "").strip()
+        if _looks_like_payroll_tax(entry_meta):
+            payroll_items.append((sug, "tax"))
+        elif _looks_like_payroll_liability(entry_meta, desc):
+            payroll_items.append((sug, "liability"))
+        elif _looks_like_salary_payment(entry_meta, desc):
+            payroll_items.append((sug, "salary"))
+        elif cat in _TAX_AMBIGUITY_CATEGORIES:
+            # 税务通道/税费多义组扣款（社保费自 2020 年起由税务代收，摘要与增值税缴款同形）：
+            # 1) 金额命中已计提工资表应缴额时直接纠偏为工资模块核销；
+            # 2) 未命中时预评估期初应付余额附在 payrollLiabilitySettlement / payrollTaxSettlement，
+            #    不改默认分类，供用户在前端点选「社保公积金 / 个税代缴」后一键冲销期初或引导补录。
+            tax_ambiguity_items.append(sug)
+
+    if not payroll_items and not tax_ambiguity_items:
+        return
+
+    import services.salary_service as salary_service
+
+    salary_res = await salary_service.list_salary_payment_suggestions(company_id)
+    liability_res = await salary_service.list_payroll_liability_payment_suggestions(company_id)
+    salary_by_stmt = {
+        str((item.get("statement") or {}).get("id") or ""): item
+        for item in (salary_res.get("suggestions") or [])
+    }
+    liability_by_stmt = {
+        str((item.get("statement") or {}).get("id") or ""): item
+        for item in (liability_res.get("suggestions") or [])
+    }
+
+    need_opening_eval: list[tuple[Dict[str, Any], str]] = []
+    for sug, kind in payroll_items:
+        stmt_id = str(sug.get("statementId") or "")
+        stmt_meta = sug.get("statement") or {}
+        entry_meta = sug.setdefault("suggestedEntry", {})
+        hit = salary_by_stmt.get(stmt_id) if kind == "salary" else liability_by_stmt.get(stmt_id)
+        if hit and kind in ("tax", "liability"):
+            hit_kind = str(hit.get("kind") or "")
+            if (kind == "tax") != (hit_kind == "tax"):
+                hit = None
+        if hit:
+            if kind == "salary":
+                settlement = {
+                    "mode": "salary_sheet",
+                    "kind": "salary",
+                    "month": hit.get("month") or "",
+                    "label": "工资发放",
+                    "amount": hit.get("netSalary") or "",
+                }
+                reason = f"已匹配 {settlement['month']} 工资表实发金额 ¥{settlement['amount']}，点击即可核销并生成发放凭证"
+            else:
+                settlement = {
+                    "mode": "salary_sheet",
+                    "kind": hit.get("kind") or ("tax" if kind == "tax" else "social_security"),
+                    "month": hit.get("month") or "",
+                    "label": hit.get("label") or _payroll_kind_label(kind),
+                    "amount": hit.get("amount") or "",
+                }
+                reason = f"已匹配 {settlement['month']} {settlement['label']}应付金额 ¥{settlement['amount']}，点击即可核销并生成付款凭证"
+            sug["payrollSettlement"] = settlement
+            sug["requiresReview"] = False
+            sug["reason"] = reason
+            entry_meta["reason"] = reason
+            entry_meta["requiresSalarySettlement"] = True
+        else:
+            need_opening_eval.append((sug, kind))
+
+    # 税务通道流水：金额命中已计提应缴额时，把候选从「税类多选」纠正为工资模块核销。
+    # 顺序在工资类流水之后，互不重叠（_TAX_AMBIGUITY_CATEGORIES 不在 payroll 集合里）。
+    pending_tax_items: list[Dict[str, Any]] = []
+    for sug in tax_ambiguity_items:
+        stmt_id = str(sug.get("statementId") or "")
+        entry_meta = sug.setdefault("suggestedEntry", {})
+        cat = str(entry_meta.get("category") or "").strip()
+        hit = liability_by_stmt.get(stmt_id) if cat == "税费缴纳" else None
+        if not hit:
+            pending_tax_items.append(sug)
+            continue
+        hit_kind = str(hit.get("kind") or "")
+        if hit_kind == "housing_fund":
+            category, code = "社保公积金", "221105"
+        elif hit_kind == "tax":
+            category, code = "个税代缴", "2221012"
+        else:
+            category, code = "社保公积金", "221102"
+        settlement = {
+            "mode": "salary_sheet",
+            "kind": hit_kind or "social_security",
+            "month": hit.get("month") or "",
+            "label": hit.get("label") or _payroll_kind_label("tax" if hit_kind == "tax" else "liability"),
+            "amount": hit.get("amount") or "",
+        }
+        reason = (
+            f"摘要走税务通道无法区分险种，但金额与 {settlement['month']} "
+            f"{settlement['label']}应缴额 ¥{settlement['amount']} 精确一致，点击即可按工资表核销"
+        )
+        sug["payrollSettlement"] = settlement
+        sug["requiresReview"] = False
+        sug["reason"] = reason
+        entry_meta.update({
+            "category": category,
+            "accountCode": code,
+            "accountName": _OPENING_PAYROLL_ACCOUNT_NAMES[code],
+            "requiresSalarySettlement": True,
+            "reason": reason,
+        })
+
+    if not need_opening_eval and not pending_tax_items:
+        return
+
+    opening_results: Dict[str, Optional[Dict[str, Any]]] = {}
+    tax_opening_results: Dict[str, tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]] = {}
+    try:
+        from db.session import session_scope
+
+        async with session_scope() as session:
+            for sug, kind in need_opening_eval:
+                stmt_id = str(sug.get("statementId") or "")
+                stmt_meta = sug.get("statement") or {}
+                stmt_proxy = {
+                    "transaction_date": stmt_meta.get("date") or "",
+                    "description": stmt_meta.get("description") or "",
+                    "amount": stmt_meta.get("amount") or 0,
+                }
+                opening_results[stmt_id] = await _evaluate_opening_payroll_settlement(
+                    session, company_id, stmt_proxy, kind
+                )
+            for sug in pending_tax_items:
+                stmt_id = str(sug.get("statementId") or "")
+                stmt_meta = sug.get("statement") or {}
+                stmt_proxy = {
+                    "transaction_date": stmt_meta.get("date") or "",
+                    "description": stmt_meta.get("description") or "",
+                    "amount": stmt_meta.get("amount") or 0,
+                }
+                liab_ctx = await _evaluate_opening_payroll_settlement(
+                    session, company_id, stmt_proxy, "liability"
+                )
+                tax_ctx = await _evaluate_opening_payroll_settlement(
+                    session, company_id, stmt_proxy, "tax"
+                )
+                tax_opening_results[stmt_id] = (liab_ctx, tax_ctx)
+    except Exception:
+        logger.warning("评估期初应付工资可用余额失败，回落到工资表引导 company=%s", company_id, exc_info=True)
+
+    for sug, kind in need_opening_eval:
+        stmt_id = str(sug.get("statementId") or "")
+        stmt_meta = sug.get("statement") or {}
+        entry_meta = sug.setdefault("suggestedEntry", {})
+        opening_ctx = opening_results.get(stmt_id)
+        settlement, reason, requires_review = _build_opening_payroll_settlement(
+            kind, opening_ctx, stmt_meta
+        )
+        sug["payrollSettlement"] = settlement
+        sug["requiresReview"] = requires_review
+        sug["reason"] = reason
+        entry_meta["reason"] = reason
+        entry_meta["requiresSalarySettlement"] = True
+        if opening_ctx and (opening_ctx.get("canSettle") or opening_ctx.get("eligible")):
+            entry_meta["accountCode"] = opening_ctx["accountCode"]
+            entry_meta["accountName"] = opening_ctx["accountName"]
+
+    for sug in pending_tax_items:
+        stmt_id = str(sug.get("statementId") or "")
+        stmt_meta = sug.get("statement") or {}
+        liab_ctx, tax_ctx = tax_opening_results.get(stmt_id, (None, None))
+        liab_settlement, liab_reason, _ = _build_opening_payroll_settlement(
+            "liability", liab_ctx, stmt_meta
+        )
+        tax_settlement, tax_reason, _ = _build_opening_payroll_settlement(
+            "tax", tax_ctx, stmt_meta
+        )
+        sug["payrollLiabilitySettlement"] = {**liab_settlement, "reason": liab_reason}
+        sug["payrollTaxSettlement"] = {**tax_settlement, "reason": tax_reason}
+
+
+def _person_name_key(value: Any) -> str:
+    """往来人姓名归一：只去空白，不改字序——同名不同字的两个人不能合并。"""
+    return re.sub(r"\s+", "", str(value or ""))
+
+
+async def _person_payable_balances(company_id: str) -> Dict[str, Dict[str, Any]]:
+    """按往来人汇总 2241 其他应付款的可用贷方余额与来源。
+
+    ``journal_entries`` 同时取 posted 与 reversed：被冲销原凭证的明细仍在，冲销凭证
+    已经以反方向入账，两者相加才是当前真实余额。期初已入账的 2241 也天然包含在内，
+    这正是「建账前已入账、建账后才付款」场景需要的证据。
+
+    老板不需要看明细账，但需要知道「这笔欠款是哪来的」：sources 给出构成余额的
+    凭证（期初显示「建账时带入」），kind=opening 表示余额仍是未动过的建账带入数。
+    """
+    raw: Dict[str, Dict[str, Any]] = {}
+    try:
+        from db.session import session_scope
+
+        async with session_scope() as session:
+            result = await session.execute(
+                text(
+                    "SELECT l.direction AS direction, l.amount AS amount, l.auxiliary AS auxiliary, "
+                    "e.id AS entry_id, e.entry_type AS entry_type, e.voucher_no AS voucher_no, "
+                    "e.occurred_on AS occurred_on, e.summary AS summary "
+                    "FROM journal_lines l "
+                    "JOIN journal_entries e ON e.id = l.journal_entry_id "
+                    "WHERE e.company_id = :company_id "
+                    "AND e.status IN ('posted', 'reversed') "
+                    "AND l.account_code LIKE '2241%'"
+                ),
+                {"company_id": company_id},
+            )
+            rows = result.fetchall()
+    except Exception:
+        logger.warning("汇总个人其他应付款余额失败 company=%s", company_id, exc_info=True)
+        return {}
+
+    for row in rows:
+        auxiliary = row.auxiliary
+        if isinstance(auxiliary, str):
+            try:
+                auxiliary = json.loads(auxiliary) if auxiliary else {}
+            except (TypeError, ValueError):
+                auxiliary = {}
+        if not isinstance(auxiliary, dict):
+            continue
+        name = str(auxiliary.get("partner_name") or auxiliary.get("employee_name") or "").strip()
+        key = _person_name_key(name)
+        if not key:
+            continue
+        amount = money(row.amount or ZERO)
+        is_credit = str(row.direction or "").lower() == "credit"
+        entry = raw.setdefault(key, {
+            "name": name,
+            "credit": ZERO,
+            "debit": ZERO,
+            "opening_credit": ZERO,
+            "sources": {},
+        })
+        if is_credit:
+            entry["credit"] = money(entry["credit"] + amount)
+            if str(row.entry_type or "") == "opening":
+                entry["opening_credit"] = money(entry["opening_credit"] + amount)
+            source = entry["sources"].setdefault(
+                str(row.entry_id),
+                {
+                    "entryId": str(row.entry_id),
+                    "voucherRef": str(row.voucher_no or row.entry_id or ""),
+                    "date": row.occurred_on.isoformat() if hasattr(row.occurred_on, "isoformat") else str(row.occurred_on or ""),
+                    "entryType": str(row.entry_type or ""),
+                    "amount": ZERO,
+                },
+            )
+            source["amount"] = money(source["amount"] + amount)
+        else:
+            entry["debit"] = money(entry["debit"] + amount)
+
+    balances: Dict[str, Dict[str, Any]] = {}
+    for key, entry in raw.items():
+        available = money(entry["credit"] - entry["debit"])
+        opening_kind = (
+            entry["opening_credit"] > ZERO
+            and entry["debit"] == ZERO
+            and money(entry["credit"]) == money(entry["opening_credit"])
+        )
+        positive_sources = [s for s in entry["sources"].values() if s["amount"] > ZERO]
+        positive_sources.sort(key=lambda s: s["date"], reverse=True)
+        if opening_kind:
+            positive_sources.sort(key=lambda s: s["entryType"] != "opening")
+        sources = [
+            {**source, "label": "建账时带入" if source["entryType"] == "opening" else "账上垫付"}
+            for source in positive_sources[:3]
+        ]
+        balances[key] = {
+            "name": entry["name"],
+            "available": available,
+            "kind": "opening" if opening_kind else "booked",
+            "sources": sources,
+        }
+    return balances
+
+
+_ADVANCE_PAYABLE_CATEGORIES = {
+    "员工报销",
+    "员工垫付报销",
+    "股东垫付报销",
+    "其他应收款",
+    "其他应付款",
+    "往来款",
+}
+_ADVANCE_PAYABLE_DESC_RE = re.compile(r"报销|垫付")
+
+
+def _match_payable_person(description: str, balances: Dict[str, Dict[str, Any]]) -> str:
+    """从摘要里认出已有垫付余额的人：优先「对方:」字段，其次按姓名包含匹配。"""
+    counterparty = _person_name_key(extract_statement_counterparty(description))
+    if counterparty:
+        # 摘要明确写了对方：只认精确同名，绝不再拿姓名去猜——「杭州杨云飞科技」
+        # 不能因为包含「杨云飞」就冲减到个人应付。
+        return counterparty if counterparty in balances else ""
+    text_key = _person_name_key(description)
+    hits = [key for key in balances if len(key) >= 2 and key in text_key]
+    if not hits:
+        return ""
+    # 姓名互为子串时取最长（「杨云飞」优先于「云飞」）；仍并列则放弃，宁可不出建议。
+    hits.sort(key=len, reverse=True)
+    if len(hits) > 1 and len(hits[0]) == len(hits[1]):
+        return ""
+    return hits[0]
+
+
+async def _enrich_advance_payable_suggestions(
+    company_id: str,
+    suggestions: List[Dict[str, Any]],
+) -> None:
+    """垫付报销流水：账上已有本人 2241 余额时，把建议从「记其他应收款」纠正为冲减应付。
+
+    只在有实据时改：摘要能认出往来人、该人 2241 贷方余额为正且足以覆盖本笔付款、金额
+    不超过余额。没有余额证据的报销仍走原建议，交给用户确认——不能凭「报销」二字就把
+    一笔新费用直接冲成负债。
+    """
+    candidates: list[tuple[Dict[str, Any], str]] = []
+    for sug in suggestions:
+        if sug.get("type") != "new" or sug.get("payrollSettlement"):
+            continue
+        stmt_meta = sug.get("statement") or {}
+        amount = safe_money(stmt_meta.get("amount"))
+        if amount >= ZERO:
+            continue
+        desc = str(stmt_meta.get("description") or "")
+        category = str((sug.get("suggestedEntry") or {}).get("category") or "").strip()
+        if category not in _ADVANCE_PAYABLE_CATEGORIES and not _ADVANCE_PAYABLE_DESC_RE.search(desc):
+            continue
+        candidates.append((sug, desc))
+
+    if not candidates:
+        return
+
+    balances = await _person_payable_balances(company_id)
+    if not balances:
+        return
+
+    for sug, desc in candidates:
+        person_key = _match_payable_person(desc, balances)
+        if not person_key:
+            continue
+        hit = balances[person_key]
+        available = money(hit["available"])
+        amount = abs(safe_money((sug.get("statement") or {}).get("amount")))
+        # 余额只够覆盖部分付款时不自动改分类：多出的部分会被记成负债借方，需要用户决定。
+        if amount <= ZERO or amount > available:
+            continue
+
+        person = str(hit["name"] or "").strip()
+        entry_meta = sug.setdefault("suggestedEntry", {})
+        # 「不是还旧账，是这次新支出」要按 AI 原建议落费用：先留底再改分类。
+        original = {
+            "direction": entry_meta.get("direction"),
+            "category": entry_meta.get("category"),
+            "accountCode": entry_meta.get("accountCode"),
+            "accountName": entry_meta.get("accountName"),
+            "title": entry_meta.get("title"),
+        }
+        # 已是股东/员工垫付分类就保留原标签（同一 2241 科目，别把股东改叫员工）；
+        # 其他分类（员工报销、其他应收款、办公费等）统一纠正为员工垫付报销。
+        category = str(entry_meta.get("category") or "").strip()
+        if category not in ("员工垫付报销", "股东垫付报销"):
+            category = "员工垫付报销"
+        entry_meta.update({
+            "direction": "owner_transfer",
+            "category": category,
+            "accountCode": "2241",
+            "accountName": "其他应付款",
+            "counterparty": person,
+        })
+        reason = (
+            f"「{person}」其他应付款已有垫付余额 ¥{money_text(available)}，"
+            f"本笔为垫付报销付款，冲减「2241 其他应付款-{person}」而非重复计入费用"
+        )
+        entry_meta["reason"] = reason
+        sug["advancePayable"] = {
+            "counterparty": person,
+            "accountCode": "2241",
+            "accountName": "其他应付款",
+            "available": money_text(available),
+            "kind": hit.get("kind") or "booked",
+            "sources": hit.get("sources") or [],
+            "original": original,
+        }
+        sug["reason"] = reason
+        sug["rule"] = "advance_payable"
+        # 改的是入账科目（资产→负债），必须逐笔确认，且不能沉淀成自动规则。
+        sug["requiresReview"] = True
+        hit["available"] = money(available - amount)
+
+
+async def _enrich_invoice_reimbursement_suggestions(
+    company_id: str,
+    suggestions: List[Dict[str, Any]],
+) -> None:
+    """当月发票草稿（默认 company_account）遇上付给个人的报销/垫付流水时，引导两步入账。
+
+    防止「收票挂账 + 公户报销个人」被规则匹配压成 1 笔直付凭证：
+    1) 仅处理单笔 match、付款流出（amount < 0）、来源为 invoice_import 支出且仍为草稿、
+       当前 payer 为空或 company_account 的建议；
+    2) 结合流水对方与销方不一致、摘要含报销/垫付或对方命中在职员工，标出
+       ``invoiceReimbursement`` 与 ``counterpartyMismatch``，并强制 ``requiresReview=True``。
+    """
+    from services.auxiliary_service import counterparty_partner_type
+
+    candidates: list[tuple[Dict[str, Any], str, Dict[str, Any], Dict[str, Any]]] = []
+    for sug in suggestions:
+        if sug.get("type") != "match":
+            continue
+        raw_ids = sug.get("matchedEntryIds") or [sug.get("matchedEntryId")]
+        ids = [str(item).strip() for item in raw_ids if str(item or "").strip()]
+        if len(ids) != 1:
+            continue
+        stmt_meta = sug.get("statement") or {}
+        if safe_money(stmt_meta.get("amount")) >= ZERO:
+            continue
+        entry = sug.get("matchedEntry") or {}
+        if str(entry.get("source") or "") != "invoice_import":
+            continue
+        if str(entry.get("direction") or "expense") != "expense":
+            continue
+        payer = str(entry.get("payer") or "").strip()
+        if payer not in ("", "company_account"):
+            continue
+        candidates.append((sug, ids[0], stmt_meta, entry))
+
+    if not candidates:
+        return
+
+    entry_ids = list({eid for _, eid, _, _ in candidates})
+    journal_statuses: dict[str, str] = {}
+    emp_map: dict[str, bool] = {}
+
+    try:
+        from sqlalchemy import select
+        from db.models import Employee, JournalEntry
+        from db.session import session_scope
+
+        async with session_scope() as session:
+            j_rows = (
+                await session.execute(
+                    select(JournalEntry.id, JournalEntry.status).where(
+                        JournalEntry.company_id == company_id,
+                        JournalEntry.id.in_(entry_ids),
+                    )
+                )
+            ).all()
+            journal_statuses = {str(row[0]): str(row[1] or "") for row in j_rows}
+
+            e_rows = (
+                await session.execute(
+                    select(Employee.name, Employee.is_owner).where(
+                        Employee.company_id == company_id,
+                        Employee.is_active == 1,
+                    )
+                )
+            ).all()
+            for emp_name, is_owner in e_rows:
+                clean_name = str(emp_name or "").strip()
+                if clean_name:
+                    emp_map[clean_name] = bool(is_owner)
+    except Exception:
+        # SQLite legacy test fixtures may not have journal_entries/employees initialized.
+        pass
+
+    for sug, entry_id, stmt_meta, entry in candidates:
+        desc = str(stmt_meta.get("description") or "")
+        counterparty = extract_statement_counterparty(desc)
+        seller_raw = str(entry.get("merchant") or entry_seller_name(entry) or "").strip()
+        seller_clean = _affinity_clean(seller_raw)
+        cp_clean = _affinity_clean(counterparty)
+
+        if len(cp_clean) >= 2 and seller_clean:
+            cp_differs_from_seller = (
+                cp_clean != seller_clean
+                and cp_clean not in seller_clean
+                and seller_clean not in cp_clean
+            )
+        else:
+            cp_differs_from_seller = bool(sug.get("counterpartyMismatch")) or not seller_affinity(desc, entry)
+
+        if not cp_differs_from_seller:
+            continue
+
+        sug["counterpartyMismatch"] = True
+        sug["requiresReview"] = True
+
+        status = journal_statuses.get(entry_id, "")
+        if status and status not in ("draft", "pending_review"):
+            continue
+
+        has_reim_kw = bool(_ADVANCE_PAYABLE_DESC_RE.search(desc))
+        is_known_emp = bool(counterparty and counterparty in emp_map)
+        is_person_cp = bool(counterparty and counterparty_partner_type(counterparty) == "person")
+
+        if not (is_known_emp or (has_reim_kw and (not counterparty or is_person_cp))):
+            continue
+
+        if is_known_emp and not emp_map[counterparty]:
+            suggested_payer = f"employee_personal:{counterparty}"
+            payer_label = f"员工垫付（{counterparty}）"
+        else:
+            suggested_payer = "boss_personal"
+            payer_label = "老板垫付"
+
+        seller_label = seller_raw or str(entry.get("title") or "")
+        sug["invoiceReimbursement"] = {
+            "counterparty": counterparty,
+            "sellerName": seller_label,
+            "suggestedPayer": suggested_payer,
+            "payerLabel": payer_label,
+            "entryId": entry_id,
+        }
+        sug["reason"] = (
+            f"付款对象为「{counterparty or '个人'}」（报销/垫付），发票销方为「{seller_label}」，"
+            f"建议按「{payer_label}」分两步入账（保留垫付发票并生成报销还款凭证）"
+        )
+
+
+_FALLBACK_INVOICE_CATEGORIES = ("", "其他支出", "管理费用-其他")
+
+
+def _is_fallback_invoice_entry(entry: Dict[str, Any]) -> bool:
+    """判断配对候选是否仍处于发票导入兜底科目，需由用户确认具体用途后再核销。"""
+    if not isinstance(entry, dict):
+        return False
+    if str(entry.get("source") or "") != "invoice_import":
+        return False
+    if str(entry.get("direction") or "expense") != "expense":
+        return False
+    if str(entry.get("categorySource") or "").strip() == "fallback":
         return True
-    return str(entry_data.get("accountCode") or "") in {"221102", "221104", "221105"}
+    return str(entry.get("category") or "").strip() in _FALLBACK_INVOICE_CATEGORIES
+
+
+def _mark_fallback_category_matches(suggestions: List[Dict[str, Any]]) -> None:
+    """拦截归入兜底科目的已配对发票，避免在结账对账中被静默批量核销。"""
+    for sug in suggestions:
+        if sug.get("type") != "match":
+            continue
+        matched_entries = sug.get("matchedEntries")
+        if not isinstance(matched_entries, list) or not matched_entries:
+            single = sug.get("matchedEntry")
+            matched_entries = [single] if isinstance(single, dict) else []
+        if any(_is_fallback_invoice_entry(entry) for entry in matched_entries):
+            sug["fallbackCategory"] = True
+            sug["requiresReview"] = True
+
+
+async def _handle_payroll_guard_in_confirm(
+    *,
+    kind: str,
+    req: Any,
+    session: Optional[AsyncSession],
+    company_id: str,
+    user_id: str,
+    stmt: Any,
+    entry_data: Dict[str, Any],
+    salary_service: Any,
+    respond: Any,
+    sync_core: Any,
+) -> Dict[str, Any]:
+    """处理银行确认入口命中工资/社保流水：满足开账期初条件且显式请求时冲销期初负债，否则返回 409 指引。"""
+    from services.accounting_core_service import assert_bank_reconciliable
+    from services.entry_service import save_entry
+
+    if kind == "tax":
+        res = await salary_service.list_payroll_liability_payment_suggestions(company_id)
+        code = "PAYROLL_TAX_REQUIRES_PAYROLL"
+        default_msg = "识别为个税代缴，不能在银行页直接记费用。请到工资模块按流水确认缴纳，系统会生成应交个人所得税（2221012）核销凭证。"
+        default_title = "个税缴纳（冲销期初）"
+        category = "个税代缴"
+    elif kind == "liability":
+        res = await salary_service.list_payroll_liability_payment_suggestions(company_id)
+        code = "PAYROLL_LIABILITY_REQUIRES_PAYROLL"
+        default_msg = "识别为社保/公积金缴纳，不能在银行页直接记费用。请到工资模块按流水确认缴纳，系统会生成应付职工薪酬核销凭证。"
+        default_title = "社保公积金缴纳（冲销期初）"
+        category = "社保公积金"
+    else:
+        res = await salary_service.list_salary_payment_suggestions(company_id)
+        code = "SALARY_REQUIRES_PAYROLL"
+        default_msg = "识别为工资发放，不能在银行页直接记费用。请到工资模块先计提，再按流水确认发放，系统会生成应付职工薪酬核销凭证。"
+        default_title = "工资发放（冲销期初）"
+        category = "工资发放"
+
+    matched_sheet_ids = {
+        str((item.get("statement") or {}).get("id") or "")
+        for item in (res.get("suggestions") or [])
+        if kind != "tax" or str(item.get("kind") or "") == "tax"
+    }
+    matched_sheet_hit = str(req.statement_id) in matched_sheet_ids
+
+    opening_ctx: Optional[Dict[str, Any]] = None
+    if isinstance(session, AsyncSession):
+        opening_ctx = await _evaluate_opening_payroll_settlement(
+            session, company_id, dict(stmt), kind
+        )
+
+    if (
+        bool(getattr(req, "settleOpeningPayroll", False))
+        and not matched_sheet_hit
+        and opening_ctx
+        and opening_ctx.get("canSettle")
+    ):
+        stmt_date = str(stmt["transaction_date"][:10])
+        abs_amount = abs(money(stmt["amount"] or ZERO))
+        entry_id = f"bank-{req.statement_id}"
+        debit_allocations = opening_ctx["debitAllocations"]
+        first_alloc = debit_allocations[0]
+        alloc_summary = " + ".join(
+            f"{a['accountCode']} ¥{money_text(a['amount'])}" for a in debit_allocations
+        )
+        remark = (
+            f"冲销期初应付余额（{alloc_summary}，开账日 {opening_ctx['bookStartDate']} 前遗留）"
+            if len(debit_allocations) > 1
+            else f"冲销期初应付余额（开账日 {opening_ctx['bookStartDate']} 前遗留）"
+        )
+        settled_entry = {
+            **entry_data,
+            "id": entry_id,
+            "source": "opening_payroll_settlement",
+            "sourceType": "opening_payroll_settlement",
+            "direction": "expense",
+            "category": category,
+            "accountCode": first_alloc["accountCode"],
+            "accountName": first_alloc["accountName"],
+            "payer": "company_account",
+            "billingStatus": "reconciled",
+            "occurDate": stmt_date,
+            "paymentDate": stmt_date,
+            "amount": abs_amount,
+            "title": str(entry_data.get("title") or "").strip() or default_title,
+            "remark": remark,
+            "voucherLines": {
+                "debit": debit_allocations,
+                "credit": [{"accountCode": "1002", "accountName": "银行存款", "amount": abs_amount}],
+            },
+        }
+        await save_entry(
+            settled_entry,
+            user_id=user_id,
+            company_id=company_id,
+            trusted_voucher=True,
+            allow_backfill=bool(req.allowBackfill),
+            backfill_reason=req.backfillReason,
+        )
+        await assert_bank_reconciliable(session, company_id=company_id, entry_ids=[entry_id])
+
+        conn = await get_conn()
+        try:
+            await conn.execute(
+                "INSERT OR IGNORE INTO bank_statement_matches "
+                "(statement_id, company_id, entry_id, previous_billing_status, previous_payment_date, created_at) "
+                "VALUES (?, ?, ?, NULL, NULL, ?)",
+                (req.statement_id, company_id, entry_id, datetime.now(timezone.utc).isoformat()),
+            )
+            await conn.execute(
+                "UPDATE bank_statements SET matched_entry_id = ? WHERE id = ? AND company_id = ?",
+                (entry_id, req.statement_id, company_id),
+            )
+            await conn.commit()
+        finally:
+            await conn.close()
+
+        await log_action(
+            company_id,
+            user_id,
+            "create",
+            "entry",
+            entry_id,
+            {
+                "source": "opening_payroll_settlement",
+                "title": settled_entry["title"],
+                "accountCode": first_alloc["accountCode"],
+                "accountCodes": [a["accountCode"] for a in debit_allocations],
+            },
+        )
+        await sync_core(stmt, [entry_id])
+        return await respond({
+            "status": "created",
+            "entryId": entry_id,
+            "settledOpeningPayroll": True,
+        })
+
+    message = default_msg
+    if opening_ctx and opening_ctx.get("eligible") and not opening_ctx.get("canSettle"):
+        kind_label = _payroll_kind_label(kind)
+        message = (
+            f"开账首月发放前期{kind_label}需冲销「{opening_ctx['accountCode']} {opening_ctx['accountName']}」期初贷方余额，"
+            f"当前可用 ¥{opening_ctx['availableOpeningCredit']}（需 ¥{opening_ctx['requiredAmount']}）。"
+            f"请先到「我的 → 期初设置」补录贷方期初余额。"
+        )
+    detail: Dict[str, Any] = {
+        "code": code,
+        "message": message,
+        "suggestions": res.get("suggestions", []),
+    }
+    if opening_ctx is not None:
+        detail["openingPayroll"] = _public_opening_payroll_ctx(opening_ctx)
+    raise HTTPException(status_code=409, detail=detail)
+
+
+async def _load_reim_payload_fallback(
+    conn: Any, company_id: str, entry_id: str,
+) -> Optional[Dict[str, Any]]:
+    """读取 entries 表的 payload；若隔离测例中 save_entry 写入了 session_scope，则回退读取。"""
+    cursor = await conn.execute(
+        "SELECT payload FROM entries WHERE id = ? AND company_id = ?",
+        (entry_id, company_id),
+    )
+    row = await cursor.fetchone()
+    if row is not None:
+        raw = row["payload"]
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+        return parsed if isinstance(parsed, dict) else None
+    if not entry_id.startswith("reim-"):
+        return None
+    from db.models import JournalEntry
+    from db.session import session_scope
+    from services.accounting_core_service import serialize_journal
+
+    async with session_scope() as session:
+        journal = await session.get(JournalEntry, entry_id)
+        if not journal or journal.company_id != company_id:
+            return None
+        return await serialize_journal(session, journal)
+
+
+async def _delete_reim_entry_fallback(
+    conn: Any, company_id: str, user_id: str, entry_id: str,
+) -> None:
+    """删除未过账的 reim-* 衍生条目（同步清理投影与 session_scope 草稿）。"""
+    await conn.execute(
+        "DELETE FROM entries WHERE id = ? AND company_id = ?",
+        (entry_id, company_id),
+    )
+    from sqlalchemy import delete as sa_delete
+    from db.models import JournalEntry, JournalLine, ReconciliationLink
+    from db.session import session_scope
+    from services.accounting_core_service import delete_draft
+
+    async with session_scope() as session:
+        journal = await session.get(JournalEntry, entry_id)
+        if journal and journal.company_id == company_id and journal.status in {"draft", "pending_review"}:
+            await session.execute(sa_delete(ReconciliationLink).where(
+                ReconciliationLink.company_id == company_id,
+                ReconciliationLink.journal_entry_id == entry_id,
+            ))
+            await delete_draft(
+                session, entry_id, company_id=company_id, user_id=user_id, request_id=f"unmatch-{entry_id}",
+            )
+            await session.execute(sa_delete(JournalLine).where(JournalLine.journal_entry_id == entry_id))
+
+
+async def _restore_entry_status_sqlite(
+    conn: Any,
+    *,
+    company_id: str,
+    entry_id: str,
+    payload: Any,
+    previous_status: Optional[str],
+    previous_payment_date: Optional[str],
+) -> None:
+    """回滚单笔条目的 billingStatus 与 paymentDate（保留 Postgres 方言兼容性）。"""
+    current_status = payload.get("billingStatus") if isinstance(payload, dict) else None
+    if previous_status is None and current_status != "reconciled":
+        previous_status = current_status
+    if previous_status is None and isinstance(payload, dict):
+        if payload.get("source") == "invoice_import" or payload.get("invoiceNumber"):
+            previous_status = "has_invoice"
+    if previous_status:
+        await conn.execute(
+            "UPDATE entries SET payload = json_set(payload, '$.billingStatus', ?) "
+            "WHERE id = ? AND company_id = ?",
+            (previous_status, entry_id, company_id),
+        )
+    else:
+        await conn.execute(
+            "UPDATE entries SET payload = json_remove(payload, '$.billingStatus') "
+            "WHERE id = ? AND company_id = ?",
+            (entry_id, company_id),
+        )
+    if previous_payment_date:
+        await conn.execute(
+            "UPDATE entries SET payload = json_set(payload, '$.paymentDate', ?) "
+            "WHERE id = ? AND company_id = ?",
+            (previous_payment_date, entry_id, company_id),
+        )
+    else:
+        await conn.execute(
+            "UPDATE entries SET payload = json_remove(payload, '$.paymentDate') "
+            "WHERE id = ? AND company_id = ?",
+            (entry_id, company_id),
+        )
 
 
 async def confirm_suggestion_flow(
@@ -3440,23 +5230,38 @@ async def confirm_suggestion_flow(
                 if entry_id != f"bank-settlement-{req.statement_id}"]) > 500:
             raise HTTPException(status_code=400, detail="一次最多合并 500 笔账目记录")
 
+        reim_payer = str(getattr(req, "reimbursementPayer", None) or "").strip()
+        if reim_payer:
+            valid_reim_payer = (
+                reim_payer in {"boss_personal", "employee_personal"}
+                or (reim_payer.startswith("employee_personal:") and bool(reim_payer.split(":", 1)[1].strip()))
+            )
+            if not valid_reim_payer:
+                raise HTTPException(status_code=400, detail="无效的个人垫付人类型")
+            if not requested_ids:
+                raise HTTPException(status_code=400, detail="请先选择要按垫付报销核销的单据")
+
         if isinstance(session, AsyncSession):
-            from sqlalchemy import select
+            from sqlalchemy import select, text
 
             from db.models import JournalEntry, LegacyEntryProjection
+            from db.session import session_scope
+            from services.accounting_core_service import update_draft
             from services.bank_settlement_service import confirm_statement_match
             # 批量两次查询替代逐条 get_journal+serialize_journal（500 笔上限时原为
             # 千级串行查询）。判定所需的 payer 可能来自投影回填（与 serialize_journal
             # 同优先级：metadata 打底、投影覆盖），voucherLines 仅存于 metadata。
             personal = False
             payloads: Dict[str, Dict[str, Any]] = {}
+            entry_statuses: Dict[str, str] = {}
             for row in (await session.execute(
-                select(JournalEntry.id, JournalEntry.metadata_json).where(
+                select(JournalEntry.id, JournalEntry.metadata_json, JournalEntry.status).where(
                     JournalEntry.company_id == company_id,
                     JournalEntry.id.in_(requested_ids),
                 )
             )).all():
                 payloads[row[0]] = dict(row[1] or {})
+                entry_statuses[row[0]] = str(row[2] or "")
             for row in (await session.execute(
                 select(LegacyEntryProjection.id, LegacyEntryProjection.payload).where(
                     LegacyEntryProjection.company_id == company_id,
@@ -3469,6 +5274,50 @@ async def confirm_suggestion_flow(
                     legacy = {}
                 if isinstance(legacy, dict) and legacy.get("payer") is not None and row[0] in payloads:
                     payloads[row[0]]["payer"] = legacy["payer"]
+
+            if reim_payer:
+                missing_core = [eid for eid in requested_ids if eid not in payloads]
+                if missing_core:
+                    raise HTTPException(status_code=404, detail={"message": "账目记录不存在", "entryIds": missing_core})
+                stmt_row = (await session.execute(
+                    text("SELECT amount FROM bank_statements WHERE id = :sid AND company_id = :cid"),
+                    {"sid": req.statement_id, "cid": company_id},
+                )).fetchone()
+                if not stmt_row:
+                    raise HTTPException(status_code=404, detail="流水不存在")
+                stmt_amt = money(stmt_row[0] or ZERO)
+                if stmt_amt >= ZERO:
+                    raise HTTPException(status_code=400, detail="垫付报销流水必须为付款流出")
+                total_adv = money(sum((abs(money(payloads[eid].get("amount") or ZERO)) for eid in requested_ids), ZERO))
+                if abs(abs(stmt_amt) - total_adv) > money("0.05"):
+                    raise HTTPException(status_code=400, detail="金额不一致，请核对垫付合计金额与打款金额")
+
+                req_id = (request.headers.get("X-Request-ID") if request else None) or str(uuid4())
+                need_convert = [
+                    eid for eid in requested_ids
+                    if str(payloads[eid].get("payer") or "").strip() != reim_payer
+                ]
+                for eid in need_convert:
+                    if entry_statuses.get(eid) not in {"draft", "pending_review"}:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="原凭证已过账，不能原地改为个人垫付，请先红冲重记或单独处理",
+                        )
+                if need_convert:
+                    async with session_scope() as convert_session:
+                        for eid in need_convert:
+                            await update_draft(
+                                convert_session,
+                                eid,
+                                {"payer": reim_payer},
+                                company_id=company_id,
+                                user_id=user_id,
+                                request_id=req_id,
+                            )
+                    for eid in need_convert:
+                        payloads[eid]["payer"] = reim_payer
+                        payloads[eid].pop("voucherLines", None)
+
             for payload in payloads.values():
                 payer = str(payload.get("payer") or "")
                 if (payer in {"boss_personal", "employee_personal"} or payer.startswith("employee_personal:")) and \
@@ -3481,7 +5330,8 @@ async def confirm_suggestion_flow(
                     request_id=(request.headers.get("X-Request-ID") if request else None) or str(uuid4()),
                     auto_post=bool(req.auto_post),
                     allow_backfill=bool(req.allowBackfill),
-                    backfill_reason=req.backfillReason))
+                    backfill_reason=req.backfillReason,
+                    reverse_posted_bank_entries=bool(getattr(req, "reversePostedBankEntries", False))))
 
         conn = await get_conn()
         try:
@@ -3540,14 +5390,9 @@ async def confirm_suggestion_flow(
                     if still_matched:
                         continue
 
-                    cursor = await conn.execute(
-                        "SELECT payload FROM entries WHERE id = ? AND company_id = ?",
-                        (entry_id, company_id),
-                    )
-                    entry_row = await cursor.fetchone()
-                    if not entry_row:
+                    payload = await _load_reim_payload_fallback(conn, company_id, entry_id)
+                    if payload is None:
                         continue
-                    payload = json.loads(entry_row["payload"]) if isinstance(entry_row["payload"], str) else entry_row["payload"]
                     if (
                         isinstance(payload, dict)
                         and payload.get("source") == "bank_reconciliation_repair"
@@ -3558,44 +5403,102 @@ async def confirm_suggestion_flow(
                             (entry_id, company_id),
                         )
                         continue
-                    previous_status = previous_statuses.get(entry_id)
-                    current_status = payload.get("billingStatus") if isinstance(payload, dict) else None
-                    if previous_status is None and current_status != "reconciled":
-                        previous_status = current_status
-                    if previous_status is None and isinstance(payload, dict):
-                        if payload.get("source") == "invoice_import" or payload.get("invoiceNumber"):
-                            previous_status = "has_invoice"
-                    if previous_status:
-                        await conn.execute(
-                            "UPDATE entries SET payload = json_set(payload, '$.billingStatus', ?) "
-                            "WHERE id = ? AND company_id = ?",
-                            (previous_status, entry_id, company_id),
-                        )
-                    else:
-                        await conn.execute(
-                            "UPDATE entries SET payload = json_remove(payload, '$.billingStatus') "
-                            "WHERE id = ? AND company_id = ?",
-                            (entry_id, company_id),
-                        )
-                    previous_payment_date = previous_payment_dates.get(entry_id)
-                    if previous_payment_date:
-                        await conn.execute(
-                            "UPDATE entries SET payload = json_set(payload, '$.paymentDate', ?) "
-                            "WHERE id = ? AND company_id = ?",
-                            (previous_payment_date, entry_id, company_id),
-                        )
-                    else:
-                        await conn.execute(
-                            "UPDATE entries SET payload = json_remove(payload, '$.paymentDate') "
-                            "WHERE id = ? AND company_id = ?",
-                            (entry_id, company_id),
-                        )
+                    is_reim = entry_id.startswith(f"reim-{req.statement_id}-") or bool(
+                        isinstance(payload, dict) and payload.get("reimbursedEntryIds")
+                    )
+                    if is_reim:
+                        raw_orig_ids = payload.get("reimbursedEntryIds") if isinstance(payload, dict) else None
+                        if isinstance(raw_orig_ids, list) and raw_orig_ids:
+                            orig_ids = [str(item).strip() for item in raw_orig_ids if str(item).strip()]
+                        elif entry_id.startswith(f"reim-{req.statement_id}-") and not entry_id.endswith("-batch"):
+                            orig_ids = [entry_id.removeprefix(f"reim-{req.statement_id}-")]
+                        else:
+                            orig_ids = []
+                        saved_states = payload.get("reimbursedEntryStates") if isinstance(payload, dict) else {}
+                        await _delete_reim_entry_fallback(conn, company_id, user_id, entry_id)
+                        for orig_id in orig_ids:
+                            cursor = await conn.execute(
+                                "SELECT 1 FROM bank_statement_matches "
+                                "WHERE company_id = ? AND entry_id = ? AND statement_id != ? LIMIT 1",
+                                (company_id, orig_id, req.statement_id),
+                            )
+                            orig_matched = await cursor.fetchone()
+                            if not orig_matched:
+                                cursor = await conn.execute(
+                                    "SELECT 1 FROM bank_statements "
+                                    "WHERE company_id = ? AND matched_entry_id = ? AND id != ? LIMIT 1",
+                                    (company_id, orig_id, req.statement_id),
+                                )
+                                orig_matched = await cursor.fetchone()
+                            if orig_matched:
+                                continue
+                            cursor = await conn.execute(
+                                "SELECT payload FROM entries WHERE id = ? AND company_id = ?",
+                                (orig_id, company_id),
+                            )
+                            orig_row = await cursor.fetchone()
+                            if not orig_row:
+                                continue
+                            orig_payload = json.loads(orig_row["payload"]) if isinstance(orig_row["payload"], str) else orig_row["payload"]
+                            prev_state = saved_states.get(orig_id) if isinstance(saved_states, dict) else None
+                            prev_st = prev_state.get("billingStatus") if isinstance(prev_state, dict) else None
+                            prev_pd = prev_state.get("paymentDate") if isinstance(prev_state, dict) else None
+                            await _restore_entry_status_sqlite(
+                                conn,
+                                company_id=company_id,
+                                entry_id=orig_id,
+                                payload=orig_payload,
+                                previous_status=prev_st,
+                                previous_payment_date=prev_pd,
+                            )
+                        continue
+                    await _restore_entry_status_sqlite(
+                        conn,
+                        company_id=company_id,
+                        entry_id=entry_id,
+                        payload=payload,
+                        previous_status=previous_statuses.get(entry_id),
+                        previous_payment_date=previous_payment_dates.get(entry_id),
+                    )
                 await conn.commit()
                 await sync_core(stmt, [])
                 return await respond({"status": "unmatched", "entryId": None, "entryIds": existing_ids})
 
+            idempotent_reim_id: Optional[str] = None
             if existing_ids and set(existing_ids) != set(requested_ids):
-                raise HTTPException(status_code=409, detail="该流水已匹配其他账目记录")
+                # 同一批个人垫付幂等重试：已生成的 reim-{stmt_id}-batch / reim-{stmt_id}-{entry_id}
+                # 记录着本次的原始垫付 ID 集合时，允许幂等重入而不是抛 409。
+                if len(existing_ids) == 1 and existing_ids[0].startswith(f"reim-{req.statement_id}-"):
+                    reim_payload = await _load_reim_payload_fallback(conn, company_id, existing_ids[0])
+                    recorded_ids = (
+                        reim_payload.get("reimbursedEntryIds")
+                        if isinstance(reim_payload, dict)
+                        else None
+                    )
+                    expected_single = (
+                        len(requested_ids) == 1
+                        and existing_ids[0] == f"reim-{req.statement_id}-{requested_ids[0]}"
+                    )
+                    if expected_single or (
+                        isinstance(recorded_ids, list) and set(map(str, recorded_ids)) == set(requested_ids)
+                    ):
+                        idempotent_reim_id = existing_ids[0]
+                if not idempotent_reim_id:
+                    raise HTTPException(status_code=409, detail="该流水已匹配其他账目记录")
+
+            placeholders = ",".join("?" for _ in requested_ids)
+            if idempotent_reim_id:
+                await conn.execute(
+                    f"UPDATE entries SET payload = json_set(payload, '$.billingStatus', 'reconciled') "
+                    f"WHERE company_id = ? AND id IN ({placeholders})",
+                    (company_id, *requested_ids),
+                )
+                await conn.commit()
+                await sync_core(stmt, [idempotent_reim_id])
+                res_idem: Dict[str, Any] = {"status": "already_matched", "entryId": idempotent_reim_id}
+                if len(requested_ids) > 1:
+                    res_idem["reimbursedEntryIds"] = list(requested_ids)
+                return await respond(res_idem)
 
             placeholders = ",".join("?" for _ in requested_ids)
             cursor = await conn.execute(
@@ -3629,32 +5532,91 @@ async def confirm_suggestion_flow(
             if conflict:
                 raise HTTPException(status_code=409, detail="其中一笔账目已匹配其他银行流水")
 
-            advancement_payloads = []
-            for payload in payloads:
+            stmt_amount = money(stmt["amount"] or ZERO)
+            if reim_payer:
+                if stmt_amount >= ZERO:
+                    raise HTTPException(status_code=400, detail="垫付报销流水必须为付款流出")
+                if any(p.get("billingStatus") == "reconciled" for p in payloads):
+                    raise HTTPException(status_code=409, detail="其中一笔垫付账目已报销核销")
+                total_reim_amount = money(sum((abs(money(p.get("amount") or ZERO)) for p in payloads), ZERO))
+                if abs(abs(stmt_amount) - total_reim_amount) > money("0.05"):
+                    raise HTTPException(status_code=400, detail="金额不一致，请核对垫付合计金额与打款金额")
+                for entry_id, payload in zip(requested_ids, payloads):
+                    if str(payload.get("payer") or "").strip() == reim_payer:
+                        continue
+                    v_status = str(payload.get("voucherStatus") or payload.get("status") or "").strip()
+                    if v_status and v_status not in ("draft", "pending_review"):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="原凭证已过账，不能原地改为个人垫付，请先红冲重记或单独处理",
+                        )
+                    payload["payer"] = reim_payer
+                    await conn.execute(
+                        "UPDATE entries SET payload = json_set(payload, '$.payer', ?) WHERE company_id = ? AND id = ?",
+                        (reim_payer, company_id, entry_id),
+                    )
+
+            advancement_items = []
+            for entry_id, payload in zip(requested_ids, payloads):
                 payer = str(payload.get("payer") or "")
                 voucher = payload.get("voucherLines") or {}
                 bank_effect = _bank_effect_from_voucher(voucher) if voucher else ZERO
                 is_personal_payer = payer in ("boss_personal", "employee_personal") or payer.startswith("employee_personal:")
                 if is_personal_payer and abs(bank_effect) < money("0.01"):
-                    advancement_payloads.append(payload)
-            if advancement_payloads and len(payloads) > 1:
-                raise HTTPException(status_code=400, detail="垫付报销暂不支持与其他条目合并对账")
+                    advancement_items.append((entry_id, payload, payer))
+            if advancement_items and len(advancement_items) != len(payloads):
+                raise HTTPException(status_code=400, detail="个人垫付报销暂不支持与非垫付条目合并对账")
 
-            stmt_amount = money(stmt["amount"] or ZERO)
-            if advancement_payloads:
-                payload = advancement_payloads[0]
-                entry_id = requested_ids[0]
-                payer = str(payload.get("payer") or "")
+            if advancement_items:
+                distinct_payers = {p for _, _, p in advancement_items}
+                if len(distinct_payers) > 1:
+                    raise HTTPException(status_code=400, detail="多笔垫付合并报销仅支持同一垫付人，请按垫付人分别核销")
+                if any(p.get("billingStatus") == "reconciled" for _, p, _ in advancement_items):
+                    raise HTTPException(status_code=409, detail="其中一笔垫付账目已报销核销")
                 if stmt_amount >= 0:
                     raise HTTPException(status_code=400, detail="垫付报销流水必须为付款流出")
-                if abs(abs(stmt_amount) - money(payload.get("amount") or ZERO)) > money("0.05"):
-                    raise HTTPException(status_code=400, detail="金额不一致，请核对垫付金额与打款金额")
+                total_adv_amount = money(sum((abs(money(p.get("amount") or ZERO)) for _, p, _ in advancement_items), ZERO))
+                if abs(abs(stmt_amount) - total_adv_amount) > money("0.05"):
+                    raise HTTPException(status_code=400, detail="金额不一致，请核对垫付合计金额与打款金额")
 
-                reim_entry_id = f"reim-{req.statement_id}-{entry_id}"
+                payer = next(iter(distinct_payers))
+                is_batch = len(advancement_items) > 1
+                reim_entry_id = (
+                    f"reim-{req.statement_id}-batch"
+                    if is_batch
+                    else f"reim-{req.statement_id}-{requested_ids[0]}"
+                )
+                occupied_reim = False
+                if isinstance(session, AsyncSession):
+                    occupied_reim = await session.get(JournalEntry, reim_entry_id) is not None
+                else:
+                    try:
+                        cur_reim = await conn.execute(
+                            "SELECT 1 FROM journal_entries WHERE id = ? AND company_id = ?",
+                            (reim_entry_id, company_id),
+                        )
+                        occupied_reim = await cur_reim.fetchone() is not None
+                    except Exception:
+                        occupied_reim = False
+                if occupied_reim:
+                    reim_entry_id = f"{reim_entry_id}-{uuid4().hex[:6]}"
+                first_title = advancement_items[0][1].get("title", "")
+                reim_title = (
+                    f"合并报销垫付款-{first_title}等{len(advancement_items)}笔"
+                    if is_batch
+                    else f"报销垫付款-{first_title}"
+                )
                 reim_category = "股东垫付报销" if payer == "boss_personal" else "员工垫付报销"
+                reimbursed_states = {
+                    eid: {
+                        "billingStatus": p.get("billingStatus"),
+                        "paymentDate": p.get("paymentDate"),
+                    }
+                    for eid, p, _ in advancement_items
+                }
                 reim_data = {
                     "id": reim_entry_id,
-                    "title": f"报销垫付款-{payload.get('title', '')}",
+                    "title": reim_title,
                     "amount": abs(stmt_amount),
                     "direction": "owner_transfer",
                     "category": reim_category,
@@ -3663,6 +5625,8 @@ async def confirm_suggestion_flow(
                     "occurDate": str(stmt["transaction_date"][:10]),
                     "paymentDate": str(stmt["transaction_date"][:10]),
                     "source": "bank_import",
+                    "reimbursedEntryIds": list(requested_ids),
+                    "reimbursedEntryStates": reimbursed_states,
                 }
                 await save_entry(reim_data, user_id=user_id, company_id=company_id)
                 if isinstance(session, AsyncSession):
@@ -3679,13 +5643,16 @@ async def confirm_suggestion_flow(
                     (reim_entry_id, req.statement_id, company_id),
                 )
                 await conn.execute(
-                    "UPDATE entries SET payload = json_set(payload, '$.billingStatus', 'reconciled') "
-                    "WHERE id = ? AND company_id = ?",
-                    (entry_id, company_id),
+                    f"UPDATE entries SET payload = json_set(payload, '$.billingStatus', 'reconciled', '$.paymentDate', ?) "
+                    f"WHERE company_id = ? AND id IN ({placeholders})",
+                    (str(stmt["transaction_date"][:10]), company_id, *requested_ids),
                 )
                 await conn.commit()
                 await sync_core(stmt, [reim_entry_id])
-                return await respond({"status": "matched", "entryId": reim_entry_id})
+                res_body: Dict[str, Any] = {"status": "matched", "entryId": reim_entry_id}
+                if is_batch:
+                    res_body["reimbursedEntryIds"] = list(requested_ids)
+                return await respond(res_body)
 
             check = build_group_reconciliation_check(stmt_amount, payloads)
             if not check["directionMatches"]:
@@ -3786,30 +5753,54 @@ async def confirm_suggestion_flow(
         # 社保缴纳流水走第一分支时 NameError 500）
         import services.salary_service as salary_service
 
+        if money(stmt["amount"] or ZERO) < ZERO and _looks_like_payroll_tax(entry_data):
+            return await _handle_payroll_guard_in_confirm(
+                kind="tax",
+                req=req,
+                session=session,
+                company_id=company_id,
+                user_id=user_id,
+                stmt=stmt,
+                entry_data=entry_data,
+                salary_service=salary_service,
+                respond=respond,
+                sync_core=sync_core,
+            )
+
         if money(stmt["amount"] or ZERO) < ZERO and _looks_like_payroll_liability(entry_data, str(stmt["description"] or "")):
-            liability = await salary_service.list_payroll_liability_payment_suggestions(company_id)
-            raise HTTPException(status_code=409, detail={
-                "code": "PAYROLL_LIABILITY_REQUIRES_PAYROLL",
-                "message": "识别为社保/公积金缴纳，不能在银行页直接记费用。请到工资模块按流水确认缴纳，系统会生成应付职工薪酬核销凭证。",
-                "suggestions": liability.get("suggestions", []),
-            })
+            return await _handle_payroll_guard_in_confirm(
+                kind="liability",
+                req=req,
+                session=session,
+                company_id=company_id,
+                user_id=user_id,
+                stmt=stmt,
+                entry_data=entry_data,
+                salary_service=salary_service,
+                respond=respond,
+                sync_core=sync_core,
+            )
 
         if money(stmt["amount"] or ZERO) < ZERO and _looks_like_salary_payment(entry_data, str(stmt["description"] or "")):
-            import services.salary_service as salary_service
-
-            payroll = await salary_service.list_salary_payment_suggestions(company_id)
-            raise HTTPException(status_code=409, detail={
-                "code": "SALARY_REQUIRES_PAYROLL",
-                "message": "识别为工资发放，不能在银行页直接记费用。请到工资模块先计提，再按流水确认发放，系统会生成应付职工薪酬核销凭证。",
-                "suggestions": payroll.get("suggestions", []),
-            })
+            return await _handle_payroll_guard_in_confirm(
+                kind="salary",
+                req=req,
+                session=session,
+                company_id=company_id,
+                user_id=user_id,
+                stmt=stmt,
+                entry_data=entry_data,
+                salary_service=salary_service,
+                respond=respond,
+                sync_core=sync_core,
+            )
 
         if entry_data.get("category") not in ("微信支付结算", "支付宝结算", "平台提现结算"):
-            settlement_candidates = await get_wechat_settlement_candidates(company_id, dict(stmt))
+            settlement_candidates = await get_platform_settlement_candidates(company_id, dict(stmt))
             if settlement_candidates:
                 raise HTTPException(status_code=409, detail={
                     "code": "EXISTING_WECHAT_ENTRIES",
-                    "message": "该微信结算已有收入及手续费账目，请合并核销原账目，不能再次记为收入或支出",
+                    "message": "该平台结算已有收入及手续费账目，请合并核销原账目，不能再次记为收入或支出",
                     "candidateEntryGroups": [[entry["id"] for entry in group] for group in settlement_candidates],
                 })
 
@@ -3842,7 +5833,32 @@ async def confirm_suggestion_flow(
             if stmt_amount < 0:
                 raise HTTPException(status_code=400, detail="付款流水只能记为支出或资本/往来")
 
+        # 交易对手是银行流水里最可靠的身份信息：往来科目（应收/应付/其他应收付/
+        # 实收资本）要靠它挂到具体单位，否则账龄表和股东实缴只能看到一个总数。
+        counterparty = extract_statement_counterparty(str(stmt["description"] or ""))
+        if counterparty and not str(entry_data.get("counterparty") or "").strip():
+            entry_data["counterparty"] = counterparty
+
         entry_id = f"bank-{req.statement_id}"
+        occupied_row = None
+        conn = await get_conn()
+        try:
+            try:
+                cursor = await conn.execute(
+                    "SELECT status FROM journal_entries WHERE id = ? AND company_id = ?",
+                    (entry_id, company_id),
+                )
+                occupied_row = await cursor.fetchone()
+            except Exception:
+                # 单测/legacy 夹具可能没有权威 journal 表：按未占用处理，交由后续路径校验
+                occupied_row = None
+        finally:
+            await conn.close()
+        if occupied_row is not None and str(occupied_row["status"] or "") not in {"draft", "pending_review"}:
+            # 确定性 id 已被已过账/已冲销凭证占用：save_entry 对已存在凭证只返回不报错，
+            # 复用会把冲销凭证重新挂回流水并谎报「created」（2026-11-23 事故）。
+            # 重新认可入账必须落一笔新凭证。
+            entry_id = f"bank-{req.statement_id}-{uuid4().hex[:8]}"
         entry_data["id"] = entry_id
         entry_data["source"] = "bank_import"
         entry_data["payer"] = entry_data.get("payer", "company_account")

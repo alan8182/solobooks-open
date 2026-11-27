@@ -20,6 +20,7 @@ from models.schemas import (
     d2,
 )
 from services.accounting_core_service import ensure_tenant, get_journal, serialize_journal
+from services.attachment_storage_service import attachment_counts_by_entries
 from services.ledger_book_service import build_ledger_book
 
 
@@ -35,11 +36,14 @@ async def generate_voucher(
     """Return persisted vouchers; never regenerate accounting lines from client data."""
     await ensure_tenant(session, ctx.company_id, ctx.user_id)
     vouchers: list[VoucherDraft] = []
-    seen: set[str] = set()
+    seen: list[str] = []
     for entry_id in req.entryIds:
         if not entry_id or entry_id in seen:
             continue
-        seen.add(entry_id)
+        seen.append(entry_id)
+    # 附单据数来自真实附件（发票→active 附件），不再用 billingStatus 推导假数（A3）
+    attachment_counts = await attachment_counts_by_entries(ctx.company_id, seen)
+    for entry_id in seen:
         entry = await get_journal(session, entry_id, company_id=ctx.company_id)
         payload = await serialize_journal(session, entry, api_money=False)
         hint = payload["voucherLines"]
@@ -50,7 +54,7 @@ async def generate_voucher(
                 summary=entry.summary,
                 debitEntries=[VoucherEntry(**line) for line in hint["debit"]],
                 creditEntries=[VoucherEntry(**line) for line in hint["credit"]],
-                attachmentCount=1 if payload.get("billingStatus") in ("has_invoice", "has_receipt") else 0,
+                attachmentCount=attachment_counts.get(entry_id, 0),
             )
         )
     return VoucherGenerateResponse(vouchers=vouchers)

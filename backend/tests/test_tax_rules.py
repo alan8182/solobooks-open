@@ -25,6 +25,12 @@ class TestLookupTax:
         assert rules["deductibilityLimit"] == 0.6
         assert "60%限额扣除" in rules["riskTags"]
 
+    def test_payroll_and_donation_limits(self):
+        assert lookup_tax("员工福利费", "expense")["deductibilityLimit"] == 0.14
+        assert lookup_tax("工会经费", "expense")["deductibilityLimit"] == 0.02
+        assert lookup_tax("职工教育经费", "expense")["deductibilityLimit"] == 0.08
+        assert lookup_tax("捐赠支出", "expense")["deductibilityLimit"] == 0.12
+
     def test_income_returns_rules(self):
         rules = lookup_tax("主营业务收入", "income")
         assert rules["vatRate"] == 0.06

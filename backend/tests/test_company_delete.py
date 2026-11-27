@@ -272,6 +272,52 @@ async def test_purge_clears_other_members_current_company():
         assert member.current_company_id == ""
 
 
+def _issue_delete_token(company_id: str, user_id: str = "test_user_001") -> str:
+    """按真实链路签发 delete_company 二次认证令牌（单次使用）。"""
+    import asyncio
+
+    from db.session import session_scope
+    from services.accounting_core_service import issue_step_up_token
+
+    async def _run() -> str:
+        async with session_scope() as session:
+            return await issue_step_up_token(
+                session,
+                company_id=company_id,
+                user_id=user_id,
+                action="delete_company",
+            )
+
+    return asyncio.run(_run())
+
+
+def test_delete_api_rejects_name_only_without_step_up(client, auth_headers):
+    """回归：永久删除不再只凭主体名称，缺短信二次认证必须 403 且数据不动。"""
+    import asyncio
+
+    async def _run() -> None:
+        await _ensure_schema()
+        await _ensure_fallback_access()
+        await _seed_company("c-del-nostep", "缺二次认证主体", owner="test_user_001")
+
+    asyncio.run(_run())
+
+    resp = client.request(
+        "DELETE",
+        "/api/auth/companies/c-del-nostep",
+        json={"confirmName": "缺二次认证主体"},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 403
+
+    import asyncio as _asyncio
+
+    async def _still_there() -> int:
+        return await _count("company_members", "c-del-nostep")
+
+    assert _asyncio.run(_still_there()) == 1
+
+
 def test_delete_api_requires_exact_name(client, auth_headers):
     """HTTP 接线：错误名称 400，正确名称 200。"""
     import asyncio
@@ -303,7 +349,10 @@ def test_delete_api_requires_exact_name(client, auth_headers):
     bad = client.request(
         "DELETE",
         "/api/auth/companies/c-del-api",
-        json={"confirmName": "错名"},
+        json={
+            "confirmName": "错名",
+            "stepUpToken": _issue_delete_token("c-del-api"),
+        },
         headers=auth_headers,
     )
     assert bad.status_code == 400
@@ -311,7 +360,10 @@ def test_delete_api_requires_exact_name(client, auth_headers):
     ok = client.request(
         "DELETE",
         "/api/auth/companies/c-del-api",
-        json={"confirmName": "接口删除主体"},
+        json={
+            "confirmName": "接口删除主体",
+            "stepUpToken": _issue_delete_token("c-del-api"),
+        },
         headers=auth_headers,
     )
     assert ok.status_code == 200
@@ -332,11 +384,42 @@ def test_delete_api_tolerates_stored_name_whitespace(client, auth_headers):
     ok = client.request(
         "DELETE",
         "/api/auth/companies/c-del-ws",
-        json={"confirmName": "空格主体名"},
+        json={
+            "confirmName": "空格主体名",
+            "stepUpToken": _issue_delete_token("c-del-ws"),
+        },
         headers=auth_headers,
     )
     assert ok.status_code == 200
     assert ok.json()["companyName"] == "空格主体名"
+
+
+def test_purge_url_normalizes_to_asyncpg():
+    """专用连接串允许沿用迁移脚本的 psycopg/postgres 写法，运行时统一转 asyncpg。"""
+    from services.company_delete_service import _normalize_purge_url
+
+    assert _normalize_purge_url("postgresql+psycopg://u:p@h:5432/db") == (
+        "postgresql+asyncpg://u:p@h:5432/db"
+    )
+    assert _normalize_purge_url("postgresql://u:p@h/db") == "postgresql+asyncpg://u:p@h/db"
+    assert _normalize_purge_url("postgres://u:p@h/db") == "postgresql+asyncpg://u:p@h/db"
+    assert _normalize_purge_url("postgresql+asyncpg://u:p@h/db") == "postgresql+asyncpg://u:p@h/db"
+
+    with pytest.raises(ValueError):
+        _normalize_purge_url("")
+
+
+@pytest.mark.asyncio
+async def test_purge_fails_closed_without_owner_connection(monkeypatch):
+    """PG 上未配置属主连接时必须明确拒绝，不能回落到应用角色硬删。"""
+    import services.company_delete_service as svc
+
+    monkeypatch.setattr(svc, "_is_postgres", lambda: True)
+    monkeypatch.setattr(svc, "TENANT_PURGE_DATABASE_URL", "")
+
+    with pytest.raises(svc.CompanyDeleteError) as exc:
+        await svc.purge_company("u-del", "c-del-no-owner-url", "任意名称")
+    assert "TENANT_PURGE_DATABASE_URL" in str(exc.value)
 
 
 def test_reconciliation_links_are_purged_before_journal_entries():

@@ -316,6 +316,10 @@ const categoryEntries = computed(() => {
     .map(([name, amount]) => ({ name, amount }))
 })
 
+const categoryChartHeight = computed(() =>
+  Math.min(180, Math.max(96, categoryEntries.value.length * 28 + 20)),
+)
+
 const chartOption = computed(() => {
   const entries = categoryEntries.value
   return {
@@ -847,10 +851,10 @@ watch([attributionMode, representativeMonth], () => {
         <h2>{{ viewStore.isBoss ? '经营概览' : '报表中心' }}</h2>
         <p class="subtitle">
           <template v-if="viewStore.isBoss">
-            企业实时收支、手头现钱与往来账款——看懂利润与现金流底牌，建立老板财务直觉
+            企业实时收支、手头现钱与往来账款
           </template>
           <template v-else>
-            随时掌握企业真实收支、账上资金与税费状况，输出经得起审计与融资尽调的标准报表
+            随时掌握企业真实收支、账上资金与税费状况
           </template>
         </p>
       </div>
@@ -904,22 +908,16 @@ watch([attributionMode, representativeMonth], () => {
           <div class="cockpit-item">
             <span class="cockpit-label">{{ periodScopeName }}{{ viewStore.isBoss ? '收入' : '营业收入' }}</span>
             <div class="cockpit-val income">{{ report ? formatMoney(report.monthIncome) : '—' }}</div>
-            <span class="cockpit-sub">
-              {{ viewStore.isBoss ? '客户打款、已开票与待确认入账' : '含已开票与经营收款' }}
-            </span>
           </div>
 
           <div class="cockpit-item">
             <span class="cockpit-label">{{ periodScopeName }}{{ viewStore.isBoss ? '支出' : '总支出' }}</span>
             <div class="cockpit-val expense">{{ report ? formatMoney(report.monthExpense) : '—' }}</div>
-            <span class="cockpit-sub">
-              {{ viewStore.isBoss ? '采购付款、房租水电与日常开支' : '采购、房租、人工与费用' }}
-            </span>
           </div>
 
           <div class="cockpit-item main-profit-item">
             <div class="label-with-tag">
-              <span class="cockpit-label">{{ periodScopeName }}{{ viewStore.isBoss ? '净赚 (落袋利润)' : '净赚 (利润)' }}</span>
+              <span class="cockpit-label">{{ periodScopeName }}{{ viewStore.isBoss ? '净赚' : '净利润' }}</span>
               <span v-if="profitMargin !== null" class="margin-tag" :class="Number(profitMargin) >= 0 ? 'pos' : 'neg'">
                 净利率 {{ profitMargin }}%
               </span>
@@ -930,9 +928,6 @@ watch([attributionMode, representativeMonth], () => {
             >
               {{ report ? (report.netProfit >= 0 ? '+' : '') + formatMoney(report.netProfit) : '—' }}
             </div>
-            <span class="cockpit-sub">
-              {{ viewStore.isBoss ? '扣除全部支出与税费后剩余利润' : '扣除全部成本与税费后净收益' }}
-            </span>
           </div>
 
           <div class="cockpit-item">
@@ -1010,12 +1005,12 @@ watch([attributionMode, representativeMonth], () => {
           </template>
         </div>
 
-        <!-- AI 财务官 经营简评（手动触发） -->
-        <div class="ai-summary-box">
+        <!-- AI 经营诊断（生成后展开正文；未生成时并入分类标题右侧或轻量单行触发） -->
+        <div v-if="aiSummary" class="ai-summary-box">
           <div class="ai-summary-header">
             <div class="summary-badge">
               <i class="ri-line-chart-line" />
-              <span>AI 经营诊断与建议</span>
+              <span>AI 经营诊断</span>
             </div>
             <NButton
               size="tiny"
@@ -1025,21 +1020,47 @@ watch([attributionMode, representativeMonth], () => {
               @click="fetchDiagnosis"
             >
               <template #icon>
-                <i :class="aiSummary ? 'ri-refresh-line' : 'ri-file-chart-line'" />
+                <i class="ri-refresh-line" />
               </template>
-              {{ aiSummary ? '重新诊断' : '生成诊断建议' }}
+              重新诊断
             </NButton>
           </div>
-          <p v-if="aiSummary" class="summary-text">{{ aiSummary }}</p>
-          <p v-else class="summary-hint">
-            基于本期收支、净利润与支出结构，由 AI 财务官分析经营健康度并给出改善建议。
-          </p>
+          <p class="summary-text">{{ aiSummary }}</p>
         </div>
 
         <!-- 分类支出占比 -->
         <div v-if="categoryEntries.length > 0" class="category-section">
-          <div class="section-label">{{ viewStore.isBoss ? '钱花哪儿了（支出分类）' : '支出结构拆解' }}</div>
-          <VChart :option="chartOption" autoresize style="height: 200px" />
+          <div class="category-section-head">
+            <div class="section-label">{{ viewStore.isBoss ? '钱花哪儿了（支出分类）' : '支出结构拆解' }}</div>
+            <NButton
+              v-if="!aiSummary"
+              size="tiny"
+              secondary
+              type="primary"
+              :loading="aiLoading"
+              @click="fetchDiagnosis"
+            >
+              <template #icon>
+                <i class="ri-line-chart-line" />
+              </template>
+              AI 经营诊断
+            </NButton>
+          </div>
+          <VChart :option="chartOption" autoresize :style="{ height: `${categoryChartHeight}px` }" />
+        </div>
+        <div v-else-if="!aiSummary" class="ai-inline-trigger">
+          <NButton
+            size="tiny"
+            secondary
+            type="primary"
+            :loading="aiLoading"
+            @click="fetchDiagnosis"
+          >
+            <template #icon>
+              <i class="ri-line-chart-line" />
+            </template>
+            AI 经营诊断
+          </NButton>
         </div>
       </NCard>
     </NSpin>
@@ -1059,10 +1080,7 @@ watch([attributionMode, representativeMonth], () => {
             <div class="compass-icon-wrap primary">
               <i class="ri-funds-box-line" />
             </div>
-            <div class="compass-title-block">
-              <span class="compass-card-title">资金安全跑道与现金预测</span>
-              <span class="compass-card-subtitle">动态推演未来 30~90 天资金水位 · 预判断流风险</span>
-            </div>
+            <span class="compass-card-title">现金流预测</span>
           </div>
           <div class="compass-badge">
             <NTag v-if="forecastData?.isDeficitProjected" type="error" size="small">
@@ -1077,34 +1095,37 @@ watch([attributionMode, representativeMonth], () => {
           </div>
         </div>
 
-        <div class="compass-body">
-          <div class="compass-stat-group">
-            <div class="compass-stat-item">
-              <span class="stat-label">安全跑道 (Runway)</span>
-              <span class="stat-num text-primary">
-                {{ forecastData?.runwayMonths !== null && forecastData?.runwayMonths !== undefined ? `${forecastData.runwayMonths} 个月` : '测算中...' }}
-              </span>
-            </div>
-            <div class="compass-stat-item">
-              <span class="stat-label">预测最低可用资金</span>
-              <span class="stat-num" :class="forecastData && forecastData.minBalance < (forecastData.safetyThreshold || 0) ? 'text-danger' : ''">
-                {{ forecastData ? formatMoney(forecastData.minBalance) : '¥0.00' }}
-              </span>
-            </div>
+        <div class="compass-stat-group">
+          <div class="compass-stat-item">
+            <span class="stat-label">可支撑月数</span>
+            <span class="stat-num text-primary">
+              {{
+                forecastData?.runwayMonths !== null && forecastData?.runwayMonths !== undefined
+                  ? (forecastData.runwayMonths >= 60 ? '60+ 个月' : `${forecastData.runwayMonths} 个月`)
+                  : '测算中...'
+              }}
+            </span>
           </div>
-          <p class="compass-summary-line">
-            <template v-if="forecastData?.minBalanceDate">
-              预计 {{ forecastData.minBalanceDate }} 最低探底，安全储备线 {{ formatMoney(forecastData.safetyThreshold || 0) }}
-            </template>
-            <template v-else>
-              已综合未结应收按期回款、应付支出与月度刚性开销
-            </template>
-          </p>
+          <div class="compass-stat-item">
+            <span class="stat-label">预计最低资金</span>
+            <span class="stat-num" :class="forecastData && forecastData.minBalance < (forecastData.safetyThreshold || 0) ? 'text-danger' : ''">
+              {{ forecastData ? formatMoney(forecastData.minBalance) : '¥0.00' }}
+            </span>
+          </div>
         </div>
 
         <div class="compass-footer">
-          <span class="footer-link-text">查看走势推演与压力测试</span>
-          <i class="ri-arrow-right-line" />
+          <p class="compass-summary-line">
+            <template v-if="forecastData?.minBalanceDate">
+              预计 {{ forecastData.minBalanceDate }} 最低探底 · 安全线 {{ formatMoney(forecastData.safetyThreshold || 0) }}
+            </template>
+            <template v-else>
+              已综合未结应收、应付支出与月度固定开销
+            </template>
+          </p>
+          <span class="footer-link-text">
+            走势推演 <i class="ri-arrow-right-line" />
+          </span>
         </div>
       </div>
 
@@ -1121,10 +1142,7 @@ watch([attributionMode, representativeMonth], () => {
             <div class="compass-icon-wrap indigo">
               <i class="ri-bubble-chart-line" />
             </div>
-            <div class="compass-title-block">
-              <span class="compass-card-title">利润去向分析与利现对齐</span>
-              <span class="compass-card-subtitle">回答“为什么账面赚钱但手里没现钱”</span>
-            </div>
+            <span class="compass-card-title">利润与现金对齐</span>
           </div>
           <div class="compass-badge">
             <NTag v-if="attributionStatus" :type="attributionStatus.type" size="small">
@@ -1133,29 +1151,28 @@ watch([attributionMode, representativeMonth], () => {
           </div>
         </div>
 
-        <div class="compass-body">
-          <div class="compass-stat-group">
-            <div class="compass-stat-item">
-              <span class="stat-label">实际现钱净变动</span>
-              <span class="stat-num" :class="attributionData && attributionData.netCashFlow >= 0 ? 'text-primary' : 'text-danger'">
-                {{ attributionData ? (attributionData.netCashFlow >= 0 ? `+${formatMoney(attributionData.netCashFlow)}` : formatMoney(attributionData.netCashFlow)) : '测算中...' }}
-              </span>
-            </div>
-            <div class="compass-stat-item">
-              <span class="stat-label">账面落袋净利润</span>
-              <span class="stat-num" :class="attributionData && attributionData.netProfit < 0 ? 'text-danger' : 'text-primary'">
-                {{ attributionData ? (attributionData.netProfit >= 0 ? `+${formatMoney(attributionData.netProfit)}` : formatMoney(attributionData.netProfit)) : '¥0.00' }}
-              </span>
-            </div>
+        <div class="compass-stat-group">
+          <div class="compass-stat-item">
+            <span class="stat-label">实际现金变动</span>
+            <span class="stat-num" :class="attributionData && attributionData.netCashFlow >= 0 ? 'text-primary' : 'text-danger'">
+              {{ attributionData ? (attributionData.netCashFlow >= 0 ? `+${formatMoney(attributionData.netCashFlow)}` : formatMoney(attributionData.netCashFlow)) : '测算中...' }}
+            </span>
           </div>
-          <p class="compass-summary-line text-truncate" :title="attributionCardSummary">
-            {{ attributionCardSummary }}
-          </p>
+          <div class="compass-stat-item">
+            <span class="stat-label">账面净利润</span>
+            <span class="stat-num" :class="attributionData && attributionData.netProfit < 0 ? 'text-danger' : 'text-primary'">
+              {{ attributionData ? (attributionData.netProfit >= 0 ? `+${formatMoney(attributionData.netProfit)}` : formatMoney(attributionData.netProfit)) : '¥0.00' }}
+            </span>
+          </div>
         </div>
 
         <div class="compass-footer">
-          <span class="footer-link-text">查看调节明细与驱动因素</span>
-          <i class="ri-arrow-right-line" />
+          <p class="compass-summary-line text-truncate" :title="attributionCardSummary">
+            {{ attributionCardSummary }}
+          </p>
+          <span class="footer-link-text">
+            查看明细 <i class="ri-arrow-right-line" />
+          </span>
         </div>
       </div>
     </div>
@@ -1262,29 +1279,22 @@ watch([attributionMode, representativeMonth], () => {
       </section>
 
       <section v-if="viewStore.isBoss" class="boss-accounting-link">
-        <div>
-          <strong>需要查看法定报表、账簿或做账底稿？</strong>
-          <p>老板视角看现金进出与真利润，会计视角看权责发生制与法定三表。同一套账自由切换，随时备查审计与融资尽调底稿。</p>
-        </div>
+        <span>需要查看法定报表、账簿或做账底稿？</span>
         <NButton size="small" secondary type="primary" @click="viewStore.setMode('accounting')">
           切换到会计视图
         </NButton>
       </section>
     </div>
 
-    <!-- 资金安全跑道与现金预测抽屉 -->
+    <!-- 现金流预测抽屉 -->
     <SoloDrawer
       v-model:show="showForecastDrawer"
-      title="资金安全跑道与现金预测"
+      title="现金流预测"
       :width="760"
     >
-      <div class="drawer-section-intro">
-        结合未结清应收（1122）、应付（2202）及月度刚性开销，动态推演未来 30~90 天现金流动走势，评估资金断流风险。
-      </div>
-
       <div class="drawer-controls-bar">
         <div class="control-item">
-          <span class="control-label">推演周期：</span>
+          <span class="control-label">周期：</span>
           <NRadioGroup v-model:value="forecastHorizon" size="small">
             <NRadioButton :value="30">30天</NRadioButton>
             <NRadioButton :value="60">60天</NRadioButton>
@@ -1292,11 +1302,11 @@ watch([attributionMode, representativeMonth], () => {
           </NRadioGroup>
         </div>
         <div class="control-item">
-          <span class="control-label">推演情景：</span>
+          <span class="control-label">情景：</span>
           <NRadioGroup v-model:value="forecastScenario" size="small">
-            <NRadioButton value="neutral">中性推演</NRadioButton>
-            <NRadioButton value="optimistic">乐观加速</NRadioButton>
-            <NRadioButton value="pessimistic">悲观延期</NRadioButton>
+            <NRadioButton value="neutral">中性</NRadioButton>
+            <NRadioButton value="optimistic">乐观</NRadioButton>
+            <NRadioButton value="pessimistic">悲观</NRadioButton>
           </NRadioGroup>
         </div>
         <NButton size="small" secondary @click="openConfigDrawer">
@@ -1310,48 +1320,55 @@ watch([attributionMode, representativeMonth], () => {
           <!-- 核心指标摘要 -->
           <div class="forecast-metrics-grid">
             <div class="forecast-metric-item">
-              <div class="metric-label">当前可用资金 (1001/1002)</div>
+              <div class="metric-label">当前可用资金</div>
               <div class="metric-val text-primary">{{ formatMoney(forecastData.currentCash) }}</div>
               <div class="metric-sub">实时活期与现金总和</div>
             </div>
             <div class="forecast-metric-item">
-              <div class="metric-label">预测期内最低余额</div>
+              <div class="metric-label">预测最低余额</div>
               <div class="metric-val" :class="forecastData.minBalance < (forecastData.safetyThreshold || 0) ? 'text-danger' : 'text-primary'">
                 {{ formatMoney(forecastData.minBalance) }}
               </div>
               <div class="metric-sub">
-                {{ forecastData.minBalanceDate ? `预计出现在 ${forecastData.minBalanceDate}` : '资金平稳' }}
+                {{ forecastData.minBalanceDate ? `预计 ${forecastData.minBalanceDate}` : '资金平稳' }}
               </div>
             </div>
             <div class="forecast-metric-item">
-              <div class="metric-label">资金安全跑道 (Runway)</div>
+              <div class="metric-label">可支撑月数</div>
               <div class="metric-val text-indigo">
-                {{ forecastData.runwayMonths !== null ? `${forecastData.runwayMonths} 个月` : '充裕 (>24月)' }}
+                {{
+                  forecastData.runwayMonths !== null
+                    ? (forecastData.runwayMonths >= 60 ? '60+ 个月' : `${forecastData.runwayMonths} 个月`)
+                    : '60+ 个月'
+                }}
               </div>
-              <div class="metric-sub">按月均开支测算支撑时长</div>
+              <div class="metric-sub">按月均开支测算</div>
             </div>
             <div class="forecast-metric-item">
-              <div class="metric-label">资金水位风险评估</div>
+              <div class="metric-label">水位风险</div>
               <div class="metric-status">
-                <NTag v-if="forecastData.isDeficitProjected" type="error" size="small">高危：预计资金赤字</NTag>
+                <NTag v-if="forecastData.isDeficitProjected" type="error" size="small">高危：预计赤字</NTag>
                 <NTag v-else-if="forecastData.minBalance < (forecastData.safetyThreshold || 0)" type="warning" size="small">预警：触及安全线</NTag>
                 <NTag v-else type="success" size="small">健康：资金充裕</NTag>
               </div>
               <div class="metric-sub">
-                安全储备线: {{ formatMoney(forecastData.safetyThreshold || 0) }}
+                安全线 {{ formatMoney(forecastData.safetyThreshold || 0) }}
               </div>
             </div>
           </div>
 
-          <!-- 预警与建议提示条 -->
-          <div v-if="forecastData.scenarioSummary" class="forecast-insights-box">
+          <!-- 预警与高危提示条（仅在触及安全线或赤字时高亮提醒） -->
+          <div
+            v-if="forecastData.scenarioSummary && (forecastData.isDeficitProjected || forecastData.minBalance < (forecastData.safetyThreshold || 0))"
+            class="forecast-insights-box"
+          >
             <div
               class="insight-item"
-              :class="forecastData.isDeficitProjected ? 'insight-danger' : (forecastData.minBalance < (forecastData.safetyThreshold || 0) ? 'insight-warning' : 'insight-info')"
+              :class="forecastData.isDeficitProjected ? 'insight-danger' : 'insight-warning'"
             >
-              <i :class="forecastData.isDeficitProjected ? 'ri-alarm-warning-line' : (forecastData.minBalance < (forecastData.safetyThreshold || 0) ? 'ri-error-warning-line' : 'ri-information-line')" />
+              <i :class="forecastData.isDeficitProjected ? 'ri-alarm-warning-line' : 'ri-error-warning-line'" />
               <div class="insight-body">
-                <span class="insight-title">{{ forecastData.scenario === 'pessimistic' ? '悲观推演简报' : (forecastData.scenario === 'optimistic' ? '乐观推演简报' : '基准推演简报') }}</span>
+                <span class="insight-title">{{ forecastData.scenario === 'pessimistic' ? '悲观推演预警' : (forecastData.scenario === 'optimistic' ? '乐观推演预警' : '资金水位预警') }}</span>
                 <span class="insight-desc">{{ forecastData.scenarioSummary }}</span>
               </div>
             </div>
@@ -1360,10 +1377,9 @@ watch([attributionMode, representativeMonth], () => {
           <!-- ECharts 折线图 -->
           <div class="forecast-chart-wrap">
             <div class="chart-caption">
-              <span>资金水位推演走势（每日预计可用余额）</span>
-              <span class="caption-tip">已综合未结应收按期回款、应付支出与历史刚性开销</span>
+              <span>资金水位走势（每日预计可用余额）</span>
             </div>
-            <VChart :option="forecastChartOption" autoresize style="height: 240px; width: 100%;" />
+            <VChart :option="forecastChartOption" autoresize style="height: 220px; width: 100%;" />
           </div>
 
           <!-- 待收催收排期 -->
@@ -1371,14 +1387,13 @@ watch([attributionMode, representativeMonth], () => {
             <div class="schedule-head">
               <div class="schedule-head-title">
                 <i class="ri-alarm-warning-line text-warning" />
-                <span>待催收客户账款 (逾期优先)</span>
+                <span>待催收客户账款</span>
               </div>
-              <span class="head-count">共 {{ forecastData.overdueReceivables?.length || 0 }} 笔</span>
+              <span class="head-count">
+                {{ forecastData.overdueReceivables?.length ? `共 ${forecastData.overdueReceivables.length} 笔（逾期优先）` : '暂无待催收账款' }}
+              </span>
             </div>
-            <div v-if="!forecastData.overdueReceivables || forecastData.overdueReceivables.length === 0" class="schedule-empty">
-              暂无待催收账款，客户款项均在正常信用期内
-            </div>
-            <div v-else class="schedule-list">
+            <div v-if="forecastData.overdueReceivables && forecastData.overdueReceivables.length > 0" class="schedule-list">
               <div
                 v-for="(item, idx) in forecastData.overdueReceivables"
                 :key="idx"
@@ -1461,16 +1476,12 @@ watch([attributionMode, representativeMonth], () => {
       </NSpin>
     </SoloDrawer>
 
-    <!-- 利润去向分析与利现对齐抽屉 -->
+    <!-- 利润与现金对齐抽屉 -->
     <SoloDrawer
       v-model:show="showAttributionDrawer"
-      title="利润去向分析与利现对齐"
+      title="利润与现金对齐"
       :width="760"
     >
-      <div class="drawer-section-intro">
-        对比基准期剖析收入/费用驱动因素，精准对齐账面净利润与现金净增减，穿透钱压在哪里。
-      </div>
-
       <div class="drawer-controls-bar">
         <div class="control-item">
           <span class="control-label">对比口径：</span>
@@ -1485,11 +1496,11 @@ watch([attributionMode, representativeMonth], () => {
         <div v-if="attributionData" class="attribution-content">
           <!-- 左右双栏：左侧利现差额桥，右侧驱动因子分解 -->
           <div class="attribution-grid">
-            <!-- 左侧：利现差额桥 Profit-to-Cash Bridge -->
+            <!-- 左侧：利现差额桥 -->
             <div class="bridge-panel">
               <div class="panel-title">
                 <i class="ri-git-commit-line" />
-                <span>利润与现金调节桥 (Profit-to-Cash Bridge)</span>
+                <span>利润与现金调节桥</span>
               </div>
               <p class="bridge-desc">{{ attributionData.plainSummary }}</p>
 
@@ -1512,8 +1523,10 @@ watch([attributionMode, representativeMonth], () => {
                       v-else-if="step.type === 'sub'"
                       class="step-op minus"
                     >-</span>
-                    <span>{{ step.name }}</span>
-                    <span v-if="step.note" class="caption-tip">({{ step.note }})</span>
+                    <div class="step-label-text">
+                      <span class="step-name">{{ step.name }}</span>
+                      <span v-if="step.note" class="step-note">{{ step.note }}</span>
+                    </div>
                   </div>
                   <div
                     class="step-val"
@@ -1558,7 +1571,7 @@ watch([attributionMode, representativeMonth], () => {
                     </div>
                   </div>
                 </div>
-                <div v-else class="anomalies-empty">
+                <div v-else class="driver-empty-neutral">
                   <span>暂无收入主要波动因子</span>
                 </div>
               </div>
@@ -1865,6 +1878,7 @@ watch([attributionMode, representativeMonth], () => {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  min-width: 0;
 }
 
 .cockpit-item.main-profit-item {
@@ -1874,7 +1888,7 @@ watch([attributionMode, representativeMonth], () => {
 .label-with-tag {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 
 .margin-tag {
@@ -1883,6 +1897,8 @@ watch([attributionMode, representativeMonth], () => {
   padding: 1px 7px;
   border-radius: var(--solo-radius-pill, 999px);
   line-height: 1.4;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .margin-tag.pos {
@@ -1899,6 +1915,7 @@ watch([attributionMode, representativeMonth], () => {
   font-size: 12px;
   color: var(--solo-text-muted, #636e7c);
   font-weight: 500;
+  white-space: nowrap;
 }
 
 .cockpit-val {
@@ -1925,17 +1942,18 @@ watch([attributionMode, representativeMonth], () => {
   align-items: center;
   justify-content: space-between;
   margin-top: 16px;
-  padding: 12px 18px;
+  padding: 12px 16px;
   background: var(--solo-surface-soft, #F1F4F8);
   border-radius: var(--solo-radius-md, 8px);
-  gap: 16px;
+  gap: 12px;
 }
 
 .position-item {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   flex: 1;
+  min-width: 0;
 }
 
 .position-icon-wrap {
@@ -1969,6 +1987,7 @@ watch([attributionMode, representativeMonth], () => {
   display: flex;
   flex-direction: column;
   gap: 1px;
+  flex: 1;
   min-width: 0;
 }
 
@@ -2040,27 +2059,40 @@ watch([attributionMode, representativeMonth], () => {
 }
 
 .category-section {
-  margin-top: 16px;
+  margin-top: 14px;
+}
+
+.category-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+
+.ai-inline-trigger {
+  margin-top: 12px;
+  display: flex;
+  justify-content: flex-end;
 }
 
 .section-label {
   font-size: 13px;
   font-weight: 650;
   color: var(--solo-text-secondary, #586474);
-  margin-bottom: 4px;
 }
 
 /* 报表三大板块 */
 .report-sections {
   display: flex;
   flex-direction: column;
-  gap: 22px;
+  gap: 16px;
 }
 
 .report-section {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
 }
 
 .boss-accounting-link {
@@ -2068,10 +2100,12 @@ watch([attributionMode, representativeMonth], () => {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 14px 16px;
+  padding: 10px 14px;
   border: 1px solid var(--solo-border, #DDE3EA);
   border-radius: var(--solo-radius, 8px);
   background: var(--solo-bg-soft, #F1F4F8);
+  font-size: 13px;
+  color: var(--solo-text-secondary, #586474);
 }
 
 .boss-accounting-link strong {
@@ -2209,12 +2243,12 @@ watch([attributionMode, representativeMonth], () => {
   background: var(--solo-surface, #FFFFFF);
   border: 1px solid var(--solo-border, #DDE3EA);
   border-radius: var(--solo-radius-lg, 12px);
-  padding: 14px 16px;
+  padding: 10px 14px;
   cursor: pointer;
   transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 12px;
   box-shadow: 0 1px 2px rgba(24, 34, 48, 0.04);
 }
 
@@ -2232,15 +2266,15 @@ watch([attributionMode, representativeMonth], () => {
 }
 
 .card-icon {
-  width: 42px;
-  height: 42px;
+  width: 36px;
+  height: 36px;
   border-radius: var(--solo-radius-md, 8px);
   background: var(--solo-primary-soft, #EDF3FF);
   color: var(--solo-primary, #1747b0);
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 20px;
+  font-size: 18px;
   flex-shrink: 0;
   transition: all 0.2s ease;
 }
@@ -2396,14 +2430,15 @@ watch([attributionMode, representativeMonth], () => {
   background: var(--solo-surface, #ffffff);
   border: 1px solid var(--solo-border-color, #dde3ea);
   border-radius: 12px;
-  padding: 18px 20px;
+  padding: 16px 18px;
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  gap: 14px;
+  gap: 12px;
   cursor: pointer;
   transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02);
+  min-width: 0;
 }
 
 .compass-card:hover {
@@ -2415,7 +2450,7 @@ watch([attributionMode, representativeMonth], () => {
 .compass-header {
   display: flex;
   justify-content: space-between;
-  align-items: flex-start;
+  align-items: center;
   gap: 12px;
 }
 
@@ -2509,21 +2544,32 @@ watch([attributionMode, representativeMonth], () => {
   font-size: 12px;
   color: var(--solo-text-muted, #636e7c);
   line-height: 1.4;
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .compass-footer {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 2px;
+}
+
+.footer-link-text {
+  display: inline-flex;
+  align-items: center;
   gap: 4px;
   font-size: 12px;
   font-weight: 600;
   color: var(--solo-primary, #1747b0);
-  padding-top: 10px;
-  border-top: 1px dashed var(--solo-border-light, #edf0f4);
+  flex-shrink: 0;
 }
 
-.compass-card:hover .compass-footer {
+.compass-card:hover .footer-link-text {
   color: var(--solo-primary-hover, #2b66e2);
 }
 
@@ -2559,6 +2605,7 @@ watch([attributionMode, representativeMonth], () => {
   font-size: 12px;
   color: var(--solo-text-secondary, #586474);
   font-weight: 500;
+  white-space: nowrap;
 }
 
 /* 预测卡片内容 */
@@ -2813,8 +2860,9 @@ watch([attributionMode, representativeMonth], () => {
 .bridge-step-row {
   display: flex;
   justify-content: space-between;
-  align-items: center;
-  padding: 8px 10px;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 9px 12px;
   background: var(--solo-bg-card);
   border: 1px solid var(--solo-border-light);
   border-radius: var(--solo-radius-sm);
@@ -2836,9 +2884,29 @@ watch([attributionMode, representativeMonth], () => {
 
 .step-label {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 6px;
   color: var(--solo-text-primary);
+  flex: 1;
+  min-width: 0;
+}
+
+.step-label-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.step-name {
+  line-height: 1.35;
+}
+
+.step-note {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--solo-text-muted);
+  line-height: 1.35;
 }
 
 .step-op {
@@ -2847,6 +2915,8 @@ watch([attributionMode, representativeMonth], () => {
   justify-content: center;
   width: 16px;
   height: 16px;
+  margin-top: 1px;
+  flex-shrink: 0;
   border-radius: 50%;
   font-size: 11px;
   font-weight: 700;
@@ -2864,6 +2934,10 @@ watch([attributionMode, representativeMonth], () => {
 
 .step-val {
   font-weight: 600;
+  white-space: nowrap;
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.35;
 }
 
 .drivers-panel {
@@ -2964,6 +3038,15 @@ watch([attributionMode, representativeMonth], () => {
   border-radius: var(--solo-radius-sm);
   font-size: 12px;
   color: var(--solo-income);
+}
+
+.driver-empty-neutral {
+  padding: 10px;
+  background: var(--solo-bg-soft);
+  border: 1px solid var(--solo-border-light);
+  border-radius: var(--solo-radius-sm);
+  font-size: 12px;
+  color: var(--solo-text-muted);
 }
 
 /* 抽屉样式 */

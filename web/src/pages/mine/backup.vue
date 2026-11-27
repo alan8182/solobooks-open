@@ -3,9 +3,11 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { NAlert, NButton, NCard, NFormItem, NInput, NSelect, NSpin, NTab, NTabs, NTag, useMessage } from 'naive-ui'
-import { createArchive, downloadBackupRecord, getBackupRecords } from '@/api/backup'
+import { createArchive, createLedgerPdfArchive, downloadBackupRecord, getBackupRecords } from '@/api/backup'
 import type { BackupRecordItem } from '@/api/backup'
 import { formatDateTime } from '@/utils/format'
+import { saveBlobFile } from '@/utils/export'
+import { reportErrorToast } from '@/utils/errorPresenter'
 import { SoloEmpty } from '@/components/ui'
 import AuditLogTab from '@/pages/mine/audit-log.vue'
 
@@ -37,7 +39,7 @@ function handleTabChange(tab: string) {
 const subtitle = computed(() =>
   activeTab.value === 'audit'
     ? '系统关键操作行为留痕追溯，记录创建、过账、结账等动作与变更明细'
-    : '一键导出全账套归档 Excel（含封面与数据指纹），可直接交会计或审计；历史归档可随时重新下载',
+    : '一键导出全账套归档 Excel 或带封面目录的连续电子账簿 PDF，历史归档可随时重新下载',
 )
 
 const currentYear = new Date().getFullYear()
@@ -45,6 +47,7 @@ const yearOptions = [0, 1, 2].map((offset) => ({ label: `${currentYear - offset}
 const year = ref(currentYear)
 const months = ref('1-12')
 const generating = ref(false)
+const generatingPdf = ref(false)
 const loading = ref(false)
 const records = ref<BackupRecordItem[]>([])
 
@@ -73,12 +76,7 @@ async function generate() {
   generating.value = true
   try {
     const blob = await createArchive(year.value, months.value.trim() || undefined)
-    const url = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = url
-    link.download = `归档_${year.value}_${(months.value || '全年').replace('-', '至')}.xlsx`
-    link.click()
-    URL.revokeObjectURL(url)
+    saveBlobFile(blob, `归档_${year.value}_${(months.value || '全年').replace('-', '至')}.xlsx`)
     message.success('归档工作簿已生成并开始下载')
     await load()
   } catch (error: unknown) {
@@ -89,11 +87,58 @@ async function generate() {
   }
 }
 
+function resolveLedgerPdfTarget() {
+  const raw = months.value.trim()
+  const singleMatch = /^(\d{1,2})(?:-(\d{1,2}))?$/.exec(raw)
+  if (singleMatch) {
+    const start = Number(singleMatch[1])
+    const end = singleMatch[2] ? Number(singleMatch[2]) : start
+    if (start >= 1 && start <= 12 && start === end) {
+      const mm = String(start).padStart(2, '0')
+      return {
+        year: year.value,
+        month: `${year.value}-${mm}`,
+        scope: 'month' as const,
+        filename: `电子账簿_${year.value}-${mm}.pdf`,
+      }
+    }
+  }
+  return {
+    year: year.value,
+    scope: 'year' as const,
+    filename: `电子账簿_${year.value}年度.pdf`,
+  }
+}
+
+async function generateLedgerPdf() {
+  if (generatingPdf.value) return
+  generatingPdf.value = true
+  const target = resolveLedgerPdfTarget()
+  try {
+    const blob = await createLedgerPdfArchive({
+      year: target.year,
+      month: target.month,
+      scope: target.scope,
+    })
+    saveBlobFile(blob, target.filename)
+    message.success('电子账簿 PDF 归档已生成并开始下载')
+    await load()
+  } catch (error: unknown) {
+    reportErrorToast(message, error, '生成电子账簿 PDF 归档失败')
+  } finally {
+    generatingPdf.value = false
+  }
+}
+
 async function reDownload(record: BackupRecordItem) {
   try {
     await downloadBackupRecord(record.id, record.fileName)
-  } catch {
-    message.error('文件已失效，请重新生成')
+  } catch (err: any) {
+    message.error(
+      err?.response?.status === 409
+        ? '归档文件校验失败（sha256 不符），请从备份恢复后重试'
+        : '文件已失效，请重新生成',
+    )
     await load()
   }
 }
@@ -134,15 +179,19 @@ onMounted(load)
           </NFormItem>
           <NButton type="primary" :loading="generating" @click="generate">
             <template #icon><i class="ri-download-cloud-2-line" /></template>
-            生成并下载归档
+            生成 Excel 归档
           </NButton>
-          <span class="generate-hint">{{ scopeHint }} · 一次最多 24 个月</span>
+          <NButton secondary :loading="generatingPdf" @click="generateLedgerPdf">
+            <template #icon><i class="ri-file-pdf-2-line" /></template>
+            生成电子账簿 PDF 归档
+          </NButton>
+          <span class="generate-hint">{{ scopeHint }} · 单月填如 10，全年填 1-12</span>
         </div>
       </NCard>
 
       <NAlert type="info" :bordered="false" class="mb-4">
-        归档簿包含：封面（主体/期间/生成时间/数据指纹）、科目余额表、凭证清单、明细账、进销项发票台账、固定资产、工资表、三大报表。
-        数据指纹由「期间 + 凭证张数 + 借贷合计」计算，用于核对导出的就是系统里的账。
+        Excel 归档包含：封面（数据指纹）、科目余额表、凭证清单、明细账、进销项发票台账、固定资产、工资表、三大报表。
+        电子账簿 PDF 归档包含：封面、可点击跳转目录、PDF 书签、科目余额表、总账/明细账/日记账/序时账与编制签章页（已签发自动输出无水印正式版）。
       </NAlert>
 
       <NCard :bordered="false" class="report-card">
@@ -166,7 +215,17 @@ onMounted(load)
             <tbody>
               <tr v-for="record in records" :key="record.id">
                 <td>{{ record.createdAt ? formatDateTime(record.createdAt) : '—' }}</td>
-                <td>{{ record.periodFrom }} ~ {{ record.periodTo }}</td>
+                <td>
+                  {{ record.periodFrom }} ~ {{ record.periodTo }}
+                  <NTag
+                    size="tiny"
+                    :bordered="false"
+                    :type="record.fileFormat === 'pdf' ? 'info' : 'default'"
+                    style="margin-left: 6px;"
+                  >
+                    {{ record.fileFormat === 'pdf' ? 'PDF' : 'Excel' }}
+                  </NTag>
+                </td>
                 <td class="amount-cell">{{ record.voucherCount }}</td>
                 <td class="amount-cell">{{ formatSize(record.sizeBytes) }}</td>
                 <td class="mono">{{ record.fingerprint }}</td>

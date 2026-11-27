@@ -4,10 +4,12 @@
  */
 
 import apiClient from './client'
+import { saveBlobFile } from '@/utils/download'
 
 export interface BackupRecordItem {
   id: string
   fileName: string
+  fileFormat?: 'xlsx' | 'pdf'
   scope: string
   periodFrom: string
   periodTo: string
@@ -32,15 +34,28 @@ export async function createArchive(year: number, months?: string): Promise<Blob
   }) as unknown as Promise<Blob>
 }
 
+export async function createLedgerPdfArchive(params: {
+  year: number
+  month?: string
+  scope?: 'month' | 'year'
+  snapshotId?: string
+}): Promise<Blob> {
+  return apiClient.post('/api/backup/ledger-pdf', null, {
+    params: {
+      year: params.year,
+      ...(params.month ? { month: params.month } : {}),
+      scope: params.scope || 'year',
+      ...(params.snapshotId ? { snapshot_id: params.snapshotId } : {}),
+    },
+    responseType: 'blob',
+    timeout: 120000,
+  }) as unknown as Promise<Blob>
+}
+
 export async function downloadBackupRecord(id: string, fileName: string): Promise<void> {
   const blob = await apiClient.get(`/api/backup/records/${id}/download`, {
     responseType: 'blob',
     timeout: 120000,
   })
-  const url = URL.createObjectURL(blob as unknown as Blob)
-  const link = document.createElement('a')
-  link.href = url
-  link.download = fileName
-  link.click()
-  URL.revokeObjectURL(url)
+  saveBlobFile(blob as unknown as Blob, fileName)
 }

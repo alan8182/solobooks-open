@@ -49,6 +49,13 @@ POLICY_SEARCH_DOMAINS = tuple(
 POLICY_SEARCH_TIMEOUT_S = float(os.getenv("POLICY_SEARCH_TIMEOUT_S", "15"))
 POLICY_SEARCH_OFF = os.getenv("POLICY_SEARCH_OFF", "0").strip().lower() in ("1", "true", "yes", "on")
 
+# 主体永久删除专用连接：必须是数据库属主角色（不可变触发器只对属主放行）。
+# 未配置时删除入口失败关闭，不降级到应用角色；日常业务连接始终是应用角色。
+TENANT_PURGE_DATABASE_URL = (
+    os.getenv("TENANT_PURGE_DATABASE_URL", "").strip()
+    or os.getenv("MIGRATION_DATABASE_URL", "").strip()
+)
+
 # 服务配置
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8001"))
@@ -61,6 +68,24 @@ CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1
 # 微信小程序登录配置（个人开发者主体：仅用于 code2session 获取 openid）
 WECHAT_APPID = os.getenv("WECHAT_APPID", "").strip()
 WECHAT_SECRET = os.getenv("WECHAT_SECRET", "").strip()
+
+# ── 微信开放平台网站应用扫码登录（与小程序登录、微信支付相互独立）──────────
+# 网站应用 APPID 不能用于微信支付；支付仍走 WECHAT_PAY_APP_ID。
+WECHAT_WEB_APPID = os.getenv("WECHAT_WEB_APPID", "").strip()
+WECHAT_WEB_SECRET = os.getenv("WECHAT_WEB_SECRET", "").strip()
+# 微信 OAuth 回调：必须落在开放平台「授权回调域」之下（生产 solobooks.cn）
+WECHAT_WEB_REDIRECT_URI = f"{APP_PUBLIC_URL}/api/auth/wechat/web/callback"
+# state cookie 与一次性 ticket 有效期（秒）
+WECHAT_WEB_STATE_TTL_SECONDS = int(os.getenv("WECHAT_WEB_STATE_TTL_SECONDS", "600"))
+WECHAT_WEB_TICKET_TTL_SECONDS = int(os.getenv("WECHAT_WEB_TICKET_TTL_SECONDS", "600"))
+# 后端回调 302 到的前端路由（ticket 走 HttpOnly cookie，不进 URL）
+WECHAT_WEB_FRONTEND_CALLBACK_PATH = "/wechat-login-callback"
+
+
+def wechat_web_login_enabled() -> bool:
+    """网站应用 APPID + AppSecret 齐全时扫码登录可用。"""
+    return bool(WECHAT_WEB_APPID and WECHAT_WEB_SECRET)
+
 
 # JWT 配置
 # 生产环境必须显式配置高强度随机串（deploy/docker-compose.yml 已强制 :?）；
@@ -151,6 +176,42 @@ ALIPAY_ORDER_TIMEOUT = os.getenv("ALIPAY_ORDER_TIMEOUT", "2h")
 def alipay_enabled() -> bool:
     """APP_ID/应用私钥/支付宝公钥齐全时支付链路可用。"""
     return bool(ALIPAY_APP_ID and ALIPAY_PRIVATE_KEY and ALIPAY_PUBLIC_KEY)
+
+
+# ── 微信支付 APIv3（Native 扫码收款，第二支付渠道；商户号与支付宝同一主体）──
+# 协议薄层自实现（services/wechat_pay_client.py，仿 alipay_client 惯例，无官方 SDK）。
+# 商户配置与 visanote 项目同商户号，变量名口径一致便于直接拷贝 .env 值。
+WECHAT_PAY_MCH_ID = os.getenv("WECHAT_PAY_MCH_ID", "").strip()
+WECHAT_PAY_APP_ID = os.getenv("WECHAT_PAY_APP_ID", "").strip()
+# APIv3 密钥：32 位原始串或 64 位 hex（wechat_pay_client._resolve_api_v3_key 归一化）
+WECHAT_PAY_API_V3_KEY = os.getenv("WECHAT_PAY_API_V3_KEY", "").strip()
+# 商户 API 证书序列号（下载的 apiclient_cert.pem 内 certificate_serial_no）
+WECHAT_PAY_SERIAL_NO = os.getenv("WECHAT_PAY_SERIAL_NO", "").strip()
+# 商户私钥：apiclient_key.pem 全文（\n 转义成单行）或单行 base64，client 内归一化
+WECHAT_PAY_PRIVATE_KEY = os.getenv("WECHAT_PAY_PRIVATE_KEY", "").strip()
+# 微信支付公钥模式（新版商户平台默认）：公钥 PEM + 公钥编号 PUB_KEY_ID_…。
+# 未配置时回退平台证书模式（运行时拉 /v3/certificates，内存缓存 1h，不落盘）
+WECHAT_PAY_PUBLIC_KEY = os.getenv("WECHAT_PAY_PUBLIC_KEY", "").strip()
+WECHAT_PAY_PUBLIC_KEY_ID = os.getenv("WECHAT_PAY_PUBLIC_KEY_ID", "").strip()
+# 异步通知地址：挂在公网 HTTPS 入口下（与支付宝同口径，由 APP_PUBLIC_URL 派生）
+WECHAT_PAY_NOTIFY_URL = f"{APP_PUBLIC_URL}/api/billing/wechat/notify"
+WECHAT_PAY_REFUND_NOTIFY_URL = f"{APP_PUBLIC_URL}/api/billing/wechat/refund-notify"
+# 订单支付有效期（喂微信 time_expire 与本地惰性关单，口径同 ALIPAY_ORDER_TIMEOUT）
+WECHAT_PAY_ORDER_TIMEOUT = os.getenv("WECHAT_PAY_ORDER_TIMEOUT", "2h")
+
+
+def wechat_pay_enabled() -> bool:
+    """商户号/appid/APIv3 密钥/证书序列号/商户私钥五项齐备时微信渠道可用。
+
+    微信支付公钥可选（回退平台证书模式），故不参与 enabled 判定。
+    """
+    return bool(
+        WECHAT_PAY_MCH_ID
+        and WECHAT_PAY_APP_ID
+        and WECHAT_PAY_API_V3_KEY
+        and WECHAT_PAY_SERIAL_NO
+        and WECHAT_PAY_PRIVATE_KEY
+    )
 
 
 # ── 邮件单据通道（专属收件地址，catch-all 邮箱 IMAP 拉取）────────────────

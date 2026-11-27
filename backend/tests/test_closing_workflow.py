@@ -229,3 +229,39 @@ async def test_closing_action_serializes_binding_and_deduplicates():
     assert first["closingBinding"] == binding
     assert first["actionVersion"] == 1
     assert first["expiresAt"]
+
+
+def test_vat_exemption_preview_message_formats_threshold_and_amounts():
+    from decimal import Decimal
+
+    from services.accounting_core_service import _format_vat_exemption_preview_message
+
+    quarterly = _format_vat_exemption_preview_message(
+        "本季度",
+        Decimal("77.23"),
+        Decimal("300000.00"),
+        Decimal("0.77"),
+    )
+    assert quarterly == (
+        "本季度累计销售额 ¥77.23（未超 30 万元 免税额度），"
+        "确认结账时将自动生成免税凭证，减免 ¥0.77 并转入营业外收入，无需手动处理。"
+    )
+
+    monthly = _format_vat_exemption_preview_message(
+        "本月",
+        Decimal("12345.67"),
+        Decimal("100000.00"),
+        Decimal("123.46"),
+    )
+    assert "¥12,345.67（未超 10 万元 免税额度）" in monthly
+    assert "减免 ¥123.46 并转入营业外收入，无需手动处理。" in monthly
+
+    non_round_threshold = _format_vat_exemption_preview_message(
+        "本季度",
+        Decimal("120000.00"),
+        Decimal("155000.50"),
+        Decimal("1200.00"),
+    )
+    assert "（未超 ¥155,000.50 免税额度）" in non_round_threshold
+    assert "减免 ¥1,200.00" in non_round_threshold
+

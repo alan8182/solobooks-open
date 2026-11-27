@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import calendar
 import hashlib
+import os
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -25,11 +26,13 @@ from openpyxl.utils import get_column_letter
 from sqlalchemy import select
 
 from core.money import ZERO, money, money_text
-from db.models import BackupRecord, ChartAccount, Invoice, JournalEntry, JournalLine
+from db.models import AuthUser, BackupRecord, ChartAccount, Invoice, JournalEntry, JournalLine
 from db.session import session_scope
 from services.account_service import get_company
 
-ARCHIVE_DIR = Path(__file__).resolve().parent.parent / "data" / "archives"
+_DEFAULT_ARCHIVE_DIR = Path(__file__).resolve().parent.parent / "data" / "archives"
+# 生产必须指向持久卷（deploy/docker-compose.yml），否则容器重建后归档件全丢。
+ARCHIVE_DIR = Path(os.environ.get("SOLOBOOKS_ARCHIVE_DIR", "").strip() or _DEFAULT_ARCHIVE_DIR)
 MAX_MONTHS = 24
 MAX_LINES = 50_000
 
@@ -271,6 +274,136 @@ async def build_archive(
         "fingerprint": fingerprint,
         "debitTotal": money_text(debit_total),
         "creditTotal": money_text(credit_total),
+    }
+
+
+async def build_ledger_pdf_archive(
+    company_id: str,
+    user_id: str,
+    *,
+    year: int,
+    month: str | None = None,
+    scope: str = "year",
+    snapshot_id: str | None = None,
+) -> dict[str, Any]:
+    """生成带封面、目录、书签的连续电子账簿 PDF 并落盘登记到 backup_records。"""
+    from services.ledger_book_pdf_service import render_ledger_book_pdf_async
+    from services.ledger_book_service import build_ledger_book
+    from services.ledger_book_snapshot_service import (
+        find_matching_issued_snapshot,
+        render_snapshot_pdf,
+        render_snapshot_pdf_from_row_async,
+        safe_book_filename_part,
+    )
+
+    book_no: str | None = None
+    source_pdf_path: str | None = None
+    if snapshot_id:
+        rendered = await render_snapshot_pdf(company_id, snapshot_id)
+        source_pdf_path = rendered.get("archivePath")
+        pdf_bytes = rendered["pdfBytes"]
+        pdf_sha256 = rendered["pdfSha256"]
+        page_count = int(rendered["pageCount"])
+        content_hash_val = str(rendered["contentHash"] or "")
+        voucher_count = int(rendered["voucherCount"])
+        status = str(rendered["status"])
+        book_no = str(rendered["bookNo"])
+        period = str(rendered["period"])
+        book_kind = str(rendered["bookKind"])
+        period_from = f"{period}-01" if book_kind == "yearly" else period
+        period_to = f"{period}-12" if book_kind == "yearly" else period
+        company_label = rendered["fileName"].split("_电子账簿_", 1)[0]
+        record_scope = f"正式账簿PDF:{book_no}"
+        label_part = book_no
+    else:
+        if scope not in ("month", "year"):
+            raise ValueError("scope 只能是 month 或 year")
+        if scope == "month" and not month:
+            raise ValueError("月度电子账簿归档需要提供 month 参数（YYYY-MM）")
+
+        book = await build_ledger_book(company_id, month=month, year=year, scope=scope)
+        meta = book.get("meta") or {}
+        book_kind = "yearly" if scope == "year" else "monthly"
+        period = str(meta.get("year") or year) if scope == "year" else str(meta.get("month") or month or "")
+        period_from = f"{period}-01" if scope == "year" else period
+        period_to = f"{period}-12" if scope == "year" else period
+        company_label = safe_book_filename_part(meta.get("companyName"), "账套")
+        content_hash_val = str(meta.get("contentHash") or "")
+        voucher_count = int(meta.get("entryCount") or 0)
+
+        matched = await find_matching_issued_snapshot(
+            company_id,
+            book_kind=book_kind,
+            period=period,
+            content_hash_value=content_hash_val,
+        )
+        if matched is not None:
+            rendered = await render_snapshot_pdf_from_row_async(matched)
+            source_pdf_path = rendered.get("archivePath")
+            pdf_bytes = rendered["pdfBytes"]
+            pdf_sha256 = rendered["pdfSha256"]
+            page_count = int(rendered["pageCount"])
+            status = str(rendered["status"])
+            book_no = str(rendered["bookNo"])
+            record_scope = f"正式账簿PDF:{book_no}"
+            label_part = book_no
+        else:
+            async with session_scope() as session:
+                nickname = await session.scalar(select(AuthUser.nickname).where(AuthUser.user_id == user_id))
+            rendered_obj = await render_ledger_book_pdf_async(
+                book,
+                snapshot_status=None,
+                generated_by=str(nickname or meta.get("generatedBy") or user_id),
+            )
+            pdf_bytes = rendered_obj.pdf_bytes
+            pdf_sha256 = rendered_obj.pdf_sha256
+            page_count = rendered_obj.page_count
+            status = "preview"
+            record_scope = f"电子账簿PDF:{period}"
+            label_part = period
+
+    file_name = f"{company_label}_电子账簿_{label_part}_{datetime.now():%Y%m%d%H%M%S}.pdf"
+    if source_pdf_path and Path(source_pdf_path).exists():
+        # 签发件已经是不可变归档，归档记录直接指向它，避免同一份 PDF 反复占盘
+        path = Path(source_pdf_path)
+    else:
+        ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+        path = ARCHIVE_DIR / f"{company_id[:12]}_{uuid4().hex[:8]}_{file_name}"
+        path.write_bytes(pdf_bytes)
+    size = path.stat().st_size
+    fingerprint = (content_hash_val or pdf_sha256)[:32]
+
+    async with session_scope() as session:
+        record = BackupRecord(
+            id=str(uuid4()),
+            company_id=company_id,
+            file_path=str(path),
+            file_name=file_name,
+            scope=record_scope[:64],
+            period_from=period_from[:7],
+            period_to=period_to[:7],
+            size_bytes=size,
+            voucher_count=voucher_count,
+            data_fingerprint=fingerprint,
+            created_by=user_id,
+        )
+        session.add(record)
+        await session.flush()
+        record_id = record.id
+
+    return {
+        "id": record_id,
+        "fileName": file_name,
+        "filePath": str(path),
+        "sizeBytes": size,
+        "voucherCount": voucher_count,
+        "pageCount": page_count,
+        "periodFrom": period_from[:7],
+        "periodTo": period_to[:7],
+        "fingerprint": fingerprint,
+        "pdfSha256": pdf_sha256,
+        "bookNo": book_no,
+        "status": status,
     }
 
 
@@ -592,6 +725,7 @@ async def list_records(company_id: str, limit: int = 50) -> list[dict[str, Any]]
         {
             "id": row.id,
             "fileName": row.file_name,
+            "fileFormat": "pdf" if row.file_name.lower().endswith(".pdf") else "xlsx",
             "scope": row.scope,
             "periodFrom": row.period_from,
             "periodTo": row.period_to,

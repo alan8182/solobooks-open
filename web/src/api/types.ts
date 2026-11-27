@@ -24,8 +24,47 @@ export interface AuthResponse {
   token_type: string
   user_id: string
   company_id: string
-  expires_in: number
+  /** 后端历史上以字符串返回（JWT 过期秒数），这里保持宽松，不做数值运算 */
+  expires_in: string | number
   has_password?: boolean
+}
+
+// ===== 微信开放平台网站应用扫码登录 =====
+// 与小程序 `wechat_bound` / `openid` 完全分离：网站应用只走 wechat_web_* 字段。
+
+/** GET /api/auth/wechat/web/config */
+export interface WechatWebConfigResponse {
+  enabled: boolean
+}
+
+/** GET /api/auth/wechat/web/authorize-url */
+export interface WechatWebAuthorizeUrlParams {
+  redirect?: string
+  privacy_accepted_at?: string
+  tos_version?: string
+  privacy_version?: string
+}
+
+export interface WechatWebAuthorizeUrlResponse {
+  /** 归一化后的扫码地址（后端字段名为 authorize_url，API 层统一成 url） */
+  url: string
+}
+
+/**
+ * POST /api/auth/wechat/web/exchange 的结果：
+ * - 已有可用登录态 → AuthResponse
+ * - 首次登录 / 微信账号还没有手机号 → `{ phoneRequired: true }`（此时没有 JWT）
+ *
+ * 后端实际返回 snake_case 的 `phone_required`，由 `api/auth.ts` 归一化，
+ * 页面只面对这一个契约。
+ */
+export type WechatWebExchangeResult = AuthResponse | { phoneRequired: true }
+
+/** POST /api/auth/wechat/web/bind-phone */
+export interface WechatWebBindPhoneRequest {
+  phone: string
+  code: string
+  biz_id?: string
 }
 
 export interface PhoneSendCodeRequest {
@@ -66,16 +105,23 @@ export interface UserProfile {
   avatar: string
   phone: string
   phone_bound: boolean
+  /** 小程序 openid 绑定状态（语义不变，不要与网站应用混用） */
   wechat_bound: boolean
+  /** 微信开放平台网站应用（PC 扫码登录）绑定状态；旧后端可能不返回 */
+  wechat_web_bound?: boolean
   has_password?: boolean
   companies: CompanyInfo[]
   current_company_id: string
+  /** 从其他代账转入且尚未完成期初建账时为 true，后端据此拦截业务数据导入与记账 */
+  opening_balance_required?: boolean
+  opening_balance_reason?: string | null
   server_time: string
 }
 
 export interface CompanyInfo {
   company_id: string
   name: string
+  onboardingType?: 'new' | 'migration'
   type?: string
   taxpayerType?: string
   industry?: string
@@ -86,6 +132,10 @@ export interface CompanyInfo {
   /** 营业执照成立日期；成立早于账套启用时用于期初损益累计起点 */
   incorporationDate?: string
   taxId?: string
+  /** 注册地省份（如「浙江省」）；用于跳转本省电子税务局、社保费率匹配 */
+  province?: string
+  /** 注册地计划单列市（如「宁波市」）；省本级为空 */
+  city?: string
   restrictedIndustry?: boolean
   /** 增值税申报周期（小规模可按税局核定选月报/季报） */
   vatFilingCycle?: string
@@ -111,6 +161,8 @@ export interface CreateCompanyRequest {
   startDate?: string
   incorporationDate?: string
   taxId?: string
+  province?: string
+  city?: string
   restrictedIndustry?: boolean
   vatFilingCycle?: string
   businessIncomeIitFilingCycle?: string
@@ -118,6 +170,27 @@ export interface CreateCompanyRequest {
 
 export interface SwitchCompanyRequest {
   company_id?: string
+}
+
+/** 营业执照识别结果：只做新建主体表单的预填，落库仍要用户核对后提交。 */
+export interface LicenseOcrResult {
+  /** 执照上的公司名称原文 */
+  name: string
+  /** 统一社会信用代码（已去空格、转大写） */
+  taxId: string
+  /** 校验位是否通过；不通过只提示，不丢税号 */
+  taxIdValid: boolean
+  /** 执照「类型」原文，如「有限责任公司(自然人独资)」 */
+  entityType: string
+  /** YYYY-MM-DD */
+  incorporationDate: string
+  address: string
+  businessScope: string
+  legalRepresentative: string
+  /** 0~1 */
+  confidence: number
+  /** 后端给出的核对提示（未识别到某字段、校验位不通过等） */
+  warnings: string[]
 }
 
 // ===== Record Types =====
@@ -217,6 +290,10 @@ export interface ConfirmRequest {
   sourceType?: string
   dedupFingerprint?: string
   payer?: string
+  partner_id?: string | null
+  department_id?: string | null
+  project_id?: string | null
+  employee_id?: string | null
   rdProjectId?: string
   rdExpenseType?: RdExpenseType
   rdOriginalAmount?: MoneyInput
@@ -588,6 +665,7 @@ export interface ArchiveItem {
   complianceStatus?: 'compliant' | 'missing' | 'questionable' | string
   riskTag?: string
   attachmentCount?: number
+  missingReason?: string
   note?: string
 }
 
@@ -1633,4 +1711,5 @@ export interface DemoBookDeleteResponse {
   companyId: string
   /** 删除当前账套时后端会先切到这本，前端需要跟着换 token */
   nextCompanyId: string | null
+  accessToken?: string | null
 }

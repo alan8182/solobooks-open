@@ -69,7 +69,7 @@ const isCollapsed = computed(() => {
 
 /** unknown 附件在限定入口下可选的类型（单一入口时只有一个选项） */
 const kindChoices = computed<InboxImportKind[]>(() =>
-  props.kinds && props.kinds.length > 0 ? props.kinds : ['invoice', 'bank', 'wechat_bill'],
+  props.kinds && props.kinds.length > 0 ? props.kinds : ['invoice', 'bank', 'wechat_bill', 'alipay_bill'],
 )
 
 async function reload(showLoading = true) {

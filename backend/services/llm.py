@@ -63,7 +63,7 @@ def _uid():
 
 
 def _retry(fn, max_retries=3, delay=1.0):
-    """简单重试机制"""
+    """简单重试机制：退避指数递增（delay/2delay/4delay…上限 8s），给供应商瞬断留恢复窗口"""
     last_err = None
     for attempt in range(max_retries):
         try:
@@ -74,7 +74,7 @@ def _retry(fn, max_retries=3, delay=1.0):
             if "403" in err_msg or "401" in err_msg or "quota" in err_msg or "exhausted" in err_msg:
                 raise e
             if attempt < max_retries - 1:
-                time.sleep(delay * (attempt + 1))
+                time.sleep(min(delay * (2 ** attempt), 8.0))
     raise last_err
 
 
@@ -155,7 +155,13 @@ async def _write_usage_async(row: dict) -> None:
     async with session_scope() as session:
         session.add(LlmUsage(**row))
         if _should_count_quota(row):
-            await record_consumption_async(session, user_id=row["user_id"], tokens=row["total_tokens"])
+            await record_consumption_async(
+                session,
+                user_id=row["user_id"],
+                tokens=row["total_tokens"],
+                scene=row.get("scene") or "",
+                model=row.get("model") or "",
+            )
 
 
 def _write_usage_sync(row: dict) -> None:
@@ -170,7 +176,13 @@ def _write_usage_sync(row: dict) -> None:
     with Session(engine) as session:
         session.add(LlmUsage(**row))
         if _should_count_quota(row):
-            record_consumption_sync(session, user_id=row["user_id"], tokens=row["total_tokens"])
+            record_consumption_sync(
+                session,
+                user_id=row["user_id"],
+                tokens=row["total_tokens"],
+                scene=row.get("scene") or "",
+                model=row.get("model") or "",
+            )
         session.commit()
 
 
@@ -299,9 +311,16 @@ def chat_text(system_prompt: str, user_message: str, **kwargs) -> str:
         )
         return content
     except Exception as exc:  # noqa: BLE001
+        # 失败必须留可见日志：llm_usage 只存异常类型不存消息，没有这行日志
+        # 供应商侧故障（如 2026-11-18 DeepSeek 空回复事件）在容器日志里无处可查
+        duration_ms = int((time.monotonic() - started) * 1000)
+        logger.warning(
+            "LLM 调用失败 model=%s scene=%s 耗时=%dms: %s",
+            model, attribution.get("scene"), duration_ms, exc,
+        )
         _record_usage(
             model=model,
-            duration_ms=int((time.monotonic() - started) * 1000),
+            duration_ms=duration_ms,
             status="error",
             error_type=type(exc).__name__,
             **attribution,
@@ -429,9 +448,16 @@ def chat_vision(system_prompt: str, image_url: str, **kwargs) -> str:
         )
         return content
     except Exception as exc:  # noqa: BLE001
+        # 失败必须留可见日志：llm_usage 只存异常类型不存消息，没有这行日志
+        # 供应商侧故障（如 2026-11-18 DeepSeek 空回复事件）在容器日志里无处可查
+        duration_ms = int((time.monotonic() - started) * 1000)
+        logger.warning(
+            "LLM 调用失败 model=%s scene=%s 耗时=%dms: %s",
+            model, attribution.get("scene"), duration_ms, exc,
+        )
         _record_usage(
             model=model,
-            duration_ms=int((time.monotonic() - started) * 1000),
+            duration_ms=duration_ms,
             status="error",
             error_type=type(exc).__name__,
             **attribution,

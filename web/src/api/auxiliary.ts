@@ -5,7 +5,7 @@
 
 import apiClient from './client'
 
-export type AuxiliaryKind = 'partner' | 'department' | 'project'
+export type AuxiliaryKind = 'partner' | 'department' | 'project' | 'employee'
 
 export interface AuxiliaryItem {
   id: string
@@ -22,6 +22,9 @@ export interface AuxiliaryItem {
   phone?: string
   address?: string
   mnemonic?: string
+  // employee 专属
+  department?: string
+  isOwner?: boolean
 }
 
 export interface AuxiliaryListResponse {
@@ -35,6 +38,7 @@ const PATH: Record<AuxiliaryKind, string> = {
   partner: '/api/partners',
   department: '/api/departments',
   project: '/api/projects',
+  employee: '/api/employees',
 }
 
 export function listAuxiliary(
@@ -68,6 +72,7 @@ export interface AuxiliaryOptions {
   partners: AuxiliaryItem[]
   departments: AuxiliaryItem[]
   projects: AuxiliaryItem[]
+  employees: AuxiliaryItem[]
 }
 
 export function getAuxiliaryOptions(keyword = '', limit = 20): Promise<AuxiliaryOptions> {
@@ -76,7 +81,12 @@ export function getAuxiliaryOptions(keyword = '', limit = 20): Promise<Auxiliary
 
 export function assignEntryAuxiliary(
   entryId: string,
-  payload: { partner_id?: string | null; department_id?: string | null; project_id?: string | null },
+  payload: {
+    partner_id?: string | null
+    department_id?: string | null
+    project_id?: string | null
+    employee_id?: string | null
+  },
 ): Promise<{ ok: boolean; updatedLines: number }> {
   return apiClient.put(`/api/record/entries/${entryId}/auxiliary`, payload)
 }

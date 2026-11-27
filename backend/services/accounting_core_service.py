@@ -37,6 +37,7 @@ from core.errors import (
 from core.money import ZERO, money, money_text, positive_money
 from db.models import (
     AccountingPeriod,
+    Attachment,
     AuditEvent,
     AuthUser,
     ChartAccount,
@@ -59,6 +60,7 @@ from db.models import (
 from services.account_mapper import CATEGORY_TO_ACCOUNT, COUNTERPARTY_ACCOUNTS, get_voucher_hint
 from services.account_classification import is_profit_loss_code
 from services.reversal_pairs import same_period_reversal_exclusions
+from services.platform_bill_common import SETTLEMENT_SOURCES
 from services.period_resolution_service import (
     SYSTEM_ENTRY_TYPES,
     PeriodResolution,
@@ -225,15 +227,15 @@ def assert_book_started(company: Company, occurred_on: date, entry_type: str) ->
     )
 
 
-# 1012 为历史编码（现 1012001 其他货币资金-微信待结算），保留以兼容存量行
-MONEY_ACCOUNT_CODES = ("1002", "1012001", "1012")
+# 1012 为历史编码（现 1012001 微信待结算 / 1012002 支付宝待结算），保留以兼容存量行
+MONEY_ACCOUNT_CODES = ("1002", "1012001", "1012002", "1012")
 
 
 async def _entry_money_link_amount(session: AsyncSession, company_id: str, entry_id: str) -> Decimal:
-    """核销关联金额：优先 1002 银行存款净额，为 0 时回落 1012 其他货币资金（微信待结算）净额。
+    """核销关联金额：优先 1002 银行存款净额，为 0 时回落到平台待结算科目净额。
 
-    微信商户资金先归集到 1012，提现结算才进 1002，与匹配层
-    _entry_group_reconciliation_effect 的口径保持一致。
+    微信/支付宝商户资金先归集到 1012001/1012002，提现结算才进 1002，
+    与匹配层 _entry_group_reconciliation_effect 的口径保持一致。
     """
     for code in MONEY_ACCOUNT_CODES:
         amount = (
@@ -331,6 +333,14 @@ async def sync_bank_reconciliation(
         entry = await session.get(JournalEntry, entry_id)
         if entry is None or entry.company_id != company_id:
             raise AccountingError(NOT_FOUND, "银行核销对应的权威凭证不存在", 404)
+        # 权威层兜底：任何调用方都不能把已冲销/作废凭证挂成银行核销凭证
+        # （2026-11-23 事故：批量确认复用已冲销的 bank-<流水id> 凭证重新建链）。
+        if entry.status not in {"draft", "pending_review", "posted"}:
+            raise AccountingError(
+                "INVALID_MATCH",
+                "已冲销或作废的凭证不能作为银行核销凭证",
+                409,
+            )
         bank_amount = (
             await session.execute(
                 select(func.coalesce(func.sum(JournalLine.amount), 0)).where(
@@ -620,6 +630,11 @@ async def record_audit(
     reason: str | None = None,
     entity_version: int | None = None,
 ) -> AuditEvent:
+    safe_request_id = (
+        request_id
+        if len(request_id) <= 128
+        else f"{request_id[:119]}:{hashlib.sha256(request_id.encode('utf-8')).hexdigest()[:8]}"
+    )
     event = AuditEvent(
         id=str(uuid4()),
         company_id=company_id,
@@ -631,7 +646,7 @@ async def record_audit(
         before=_json_safe(before) if before is not None else None,
         after=_json_safe(after) if after is not None else None,
         reason=reason,
-        request_id=request_id,
+        request_id=safe_request_id,
     )
     if session.bind and session.bind.dialect.name == "sqlite":
         maximum = (await session.execute(select(func.max(AuditEvent.sequence_no)))).scalar_one_or_none() or 0
@@ -858,6 +873,63 @@ def _normalize_voucher_lines(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return normalized
 
 
+def _settlement_side_for(direction: str) -> str | None:
+    """凭证的结算侧：支出票在贷方，收入票在借方。
+
+    分类只决定费用/收入科目；结算侧承载的是「这笔钱怎么付/怎么收」
+    （银行存款、应付款、预付款、往来暂付）。两者是相互独立的事实。
+    """
+    if direction == "expense":
+        return "credit"
+    if direction == "income":
+        return "debit"
+    return None
+
+
+def _preserve_settlement_lines(
+    rebuilt: dict[str, Any],
+    original_lines: Iterable[JournalLine],
+    direction: str,
+) -> dict[str, Any]:
+    """改分类/重算分录时沿用原凭证的结算侧（含辅助核算）。
+
+    历史事故（2026-11 百度云 1,794）：发票凭证原本挂在 2241（老板垫付/待付款），
+    改分类时按 payer=company_account 整张重算，贷方被改成 1002 银行直付，
+    账面银行存款被凭空减掉；之后又派生报销凭证，等于同一笔钱扣了两次。
+
+    规则：更正分类只允许改费用/收入科目，不得顺手改结算对手科目。原凭证的
+    结算侧金额与新分录另一侧相等时整组搬回；金额不等（例如同时改了金额）则
+    放弃沿用，交给调用方按规则重算。
+    """
+    side = _settlement_side_for(direction)
+    if side is None:
+        return rebuilt
+    preserved = [line for line in original_lines if str(line.direction) == side]
+    if not preserved:
+        return rebuilt
+    other = "debit" if side == "credit" else "credit"
+    preserved_total = sum((money(line.amount) for line in preserved), ZERO)
+    other_total = sum(
+        (positive_money(raw.get("amount")) for raw in rebuilt.get(other) or []), ZERO
+    )
+    if preserved_total <= ZERO or preserved_total != other_total:
+        return rebuilt
+    output = dict(rebuilt)
+    output[side] = [
+        {
+            "accountCode": str(line.account_code),
+            "accountName": str(line.account_name),
+            "amount": money_text(money(line.amount)),
+            "quantity": line.quantity,
+            "unitPrice": line.unit_price,
+            "unit": line.unit,
+            "auxiliary": _json_safe(line.auxiliary or {}),
+        }
+        for line in preserved
+    ]
+    return output
+
+
 def _display_account_name(account: ChartAccount, parent_names: dict[str, str]) -> str:
     """凭证行上的科目名：子科目已自带父前缀时不重复拼接。
 
@@ -900,8 +972,13 @@ async def _add_lines(
     require_rd_detail = entry.entry_type not in {"closing", "opening"}
     # 辅助核算同理由服务端收口：标准凭证校验 id 有效性并按 id 回填 name；
     # 冲销/结转/期初忠实重放历史行，不再校验（历史档案可能已停用）。
-    from core.chart_policy import is_person_advance_account
-    from services.auxiliary_service import normalize_line_auxiliary, resolve_entry_person
+    from core.chart_policy import auxiliary_kinds_for_account, is_person_advance_account
+    from services.auxiliary_service import (
+        ensure_counterparty_partner,
+        normalize_line_auxiliary,
+        resolve_entry_employee,
+        resolve_entry_person,
+    )
 
     strict_auxiliary = entry.entry_type not in {"reversal", "closing", "opening"}
     # 垫付人身份挂在往来单位上：科目名只有「其他应付款」，谁的钱全靠这一行辅助
@@ -910,6 +987,10 @@ async def _add_lines(
     meta = meta if meta is not None else (entry.metadata_json or {})
     person_partner: dict[str, str] | None = None
     person_partner_resolved = False
+    person_employee: dict[str, str] | None = None
+    person_employee_resolved = False
+    counterparty_partner: dict[str, str] | None = None
+    counterparty_partner_resolved = False
     for line_no, line in enumerate(raw_lines, start=1):
         account = accounts[line["accountCode"]]
         auxiliary = line.get("auxiliary") or {}
@@ -944,6 +1025,49 @@ async def _add_lines(
                         "partner_id": person_partner["id"],
                         "partner_name": person_partner["name"],
                     }
+            # 员工垫付（employee_personal:<姓名>）若命中在职员工档案，同时补挂 employee_id，
+            # 让「职员余额表/明细账」也能直接查到员工垫付往来。
+            if (
+                "employee" in auxiliary_kinds_for_account(account.code)
+                and is_person_advance_account(account.code)
+                and not auxiliary.get("employee_id")
+                and not auxiliary.get("employee_name")
+                and str(meta.get("paymentStatus") or "").strip().lower() != "unpaid"
+            ):
+                if not person_employee_resolved:
+                    person_employee = await resolve_entry_employee(
+                        session, entry.company_id, payer=meta.get("payer")
+                    )
+                    person_employee_resolved = True
+                if person_employee:
+                    auxiliary = {
+                        **auxiliary,
+                        "employee_id": person_employee["id"],
+                        "employee_name": person_employee["name"],
+                    }
+            # 银行流水带来的交易对手：往来科目（1122/2202/122199/2241/3001）
+            # 没挂上单位时按对手方补档案。垫付类科目上一步已按付款人挂好，
+            # 发票导入已按票面购销方挂好——这里只补空位，绝不覆盖。
+            if (
+                "partner" in auxiliary_kinds_for_account(account.code)
+                and not auxiliary.get("partner_id")
+                and not auxiliary.get("partner_name")
+            ):
+                counterparty = str(meta.get("counterparty") or "").strip()
+                if counterparty:
+                    if not counterparty_partner_resolved:
+                        # 并发建同一对手方会撞 code 唯一键并毒化事务，先上锁
+                        await _advisory_lock(session, f"counterparty-partner:{entry.company_id}")
+                        counterparty_partner = await ensure_counterparty_partner(
+                            session, entry.company_id, counterparty
+                        )
+                        counterparty_partner_resolved = True
+                    if counterparty_partner:
+                        auxiliary = {
+                            **auxiliary,
+                            "partner_id": counterparty_partner["id"],
+                            "partner_name": counterparty_partner["name"],
+                        }
         journal_line = JournalLine(
                 journal_entry_id=entry.id,
                 company_id=entry.company_id,
@@ -1138,10 +1262,15 @@ async def _post_existing(
         source = await session.get(SourceTransaction, entry.source_transaction_id) if entry.source_transaction_id else None
         if source is None or source.company_id != entry.company_id or source.status == "void":
             raise AccountingError("SOURCE_REQUIRED", "缺少有效原始业务来源，不能过账", 409)
-    from services.closing_validation_service import possible_duplicate_wechat_income
-    duplicate_candidates = await possible_duplicate_wechat_income(session, entry)
-    if duplicate_candidates:
-        raise AccountingError("POSSIBLE_DUPLICATE_WECHAT_INCOME", "银行到账可能重复记为微信收入，请先核对原收入和结算关系", 409, {"candidateEntryIds": duplicate_candidates})
+    from services.closing_validation_service import possible_duplicate_platform_income
+    duplicate = await possible_duplicate_platform_income(session, entry)
+    if duplicate:
+        raise AccountingError(
+            "POSSIBLE_DUPLICATE_PLATFORM_INCOME",
+            f"银行到账可能重复记为{duplicate['label']}收入，请先核对原收入和结算关系",
+            409,
+            {"candidateEntryIds": duplicate["candidateEntryIds"], "platform": duplicate["platform"]},
+        )
     before = await serialize_journal(session, entry)
     entry.voucher_no = entry.voucher_no or await _allocate_voucher_no(session, entry.company_id, entry.period_start)
     entry.status = "posted"
@@ -1188,6 +1317,11 @@ async def create_entry(
     occurred_on = _parse_date(payload.get("occurDate") or payload.get("date"))
     entry_type = str(payload.get("entryType") or "standard")
     assert_book_started(company, occurred_on, entry_type)
+    source_type = str(payload.get("sourceType") or payload.get("source") or "").strip()
+    if entry_type not in ("opening", "closing", "reversal") and source_type != "legacy_import":
+        from services.setup_readiness_service import assert_migration_opening_ready
+
+        await assert_migration_opening_ready(session, company_id, company=company)
 
     # 业务日期 → 记账期间。系统凭证（期初/结转/冲销）由调用方给定期间，它们的
     # occurred_on 未必是业务发生日，不参与补记判定。
@@ -1840,6 +1974,24 @@ async def _rebind_invoice_after_repost(
     ``invoiceNumber``（外部来源键唯一约束不允许重复占用）而不再被识别为发票，
     结账向导第一步就会把同一张票显示成两行。
     """
+    # 通用原始凭证附件（支付截图/报销单/工资表等）直接挂 journal_entry_id：
+    # 冲销重记后同步迁往新凭证，不依赖是否有发票行，避免出现指向 reversed 凭证的悬空附件（A3）。
+    bound_attachments = (
+        await session.execute(
+            select(Attachment).where(
+                Attachment.company_id == company_id,
+                Attachment.journal_entry_id == old_entry_id,
+                Attachment.status == "active",
+            )
+        )
+    ).scalars().all()
+    if bound_attachments:
+        now = _utcnow()
+        for attachment in bound_attachments:
+            attachment.journal_entry_id = new_entry.id
+            attachment.updated_at = now
+        await session.flush()
+
     invoice = (
         await session.execute(
             select(Invoice).where(
@@ -1882,6 +2034,77 @@ async def _rebind_invoice_after_repost(
     )
 
 
+async def _rebind_bank_matches_after_repost(
+    session: AsyncSession,
+    *,
+    company_id: str,
+    old_entry_id: str,
+    new_entry: JournalEntry,
+    user_id: str,
+    request_id: str,
+    rebind_link_ids: list[str] | None = None,
+) -> None:
+    """自动冲销重记后，把银行流水配对（ReconciliationLink + 兼容流水表）迁到新活凭证（A3）。"""
+    if await _entry_money_link_amount(session, company_id, new_entry.id) == ZERO:
+        return
+    if rebind_link_ids:
+        links = (
+            await session.execute(
+                select(ReconciliationLink).where(
+                    ReconciliationLink.company_id == company_id,
+                    ReconciliationLink.id.in_(rebind_link_ids),
+                )
+            )
+        ).scalars().all()
+    else:
+        links = (
+            await session.execute(
+                select(ReconciliationLink).where(
+                    ReconciliationLink.company_id == company_id,
+                    ReconciliationLink.journal_entry_id == old_entry_id,
+                    ReconciliationLink.status == "confirmed",
+                )
+            )
+        ).scalars().all()
+    for link in links:
+        link.journal_entry_id = new_entry.id
+        link.status = "confirmed"
+    rebound_legacy = 0
+    try:
+        async with session.begin_nested():
+            res_match = await session.execute(
+                text(
+                    "UPDATE bank_statement_matches SET entry_id = :new_id "
+                    "WHERE company_id = :cid AND entry_id = :old_id"
+                ),
+                {"new_id": new_entry.id, "cid": company_id, "old_id": old_entry_id},
+            )
+            res_stmt = await session.execute(
+                text(
+                    "UPDATE bank_statements SET matched_entry_id = :new_id "
+                    "WHERE company_id = :cid AND matched_entry_id = :old_id"
+                ),
+                {"new_id": new_entry.id, "cid": company_id, "old_id": old_entry_id},
+            )
+            rebound_legacy = int(res_match.rowcount or 0) + int(res_stmt.rowcount or 0)
+    except (OperationalError, ProgrammingError):
+        rebound_legacy = 0
+    if links or rebound_legacy:
+        await session.flush()
+        await record_audit(
+            session,
+            company_id=company_id,
+            user_id=user_id,
+            action="rebind_bank_match_after_repost",
+            entity_type="journal_entry",
+            entity_id=new_entry.id,
+            request_id=request_id,
+            before={"entryId": old_entry_id},
+            after={"entryId": new_entry.id, "reboundLinks": len(links), "reboundLegacyRows": rebound_legacy},
+            entity_version=new_entry.version,
+        )
+
+
 async def update_draft(
     session: AsyncSession,
     entry_id: str,
@@ -1898,10 +2121,26 @@ async def update_draft(
         # 开票/付款状态是申报与对账跟踪标志，不影响借贷；已过账凭证允许只更新它们（投影层），
         # 其余任何字段修改仍然必须走冲销。结账向导第二步允许带 autoReverseRepost
         # 同时改「用途分类」——分类决定科目，同样只能冲销重记，不能静默覆盖。
-        if updates and set(updates).issubset(POSTED_PROJECTION_FIELDS | {"category"} | RD_DETAIL_FIELDS):
+        allowed_posted_fields = (
+            POSTED_PROJECTION_FIELDS
+            | {"category"}
+            | RD_DETAIL_FIELDS
+            | ({"title", "direction", "accountCode", "accountName"} if auto_reverse_repost else set())
+        )
+        if updates and set(updates).issubset(allowed_posted_fields):
             current_meta = entry.metadata_json or {}
             category_changed = "category" in updates and (
                 str(updates.get("category") or "") != str(current_meta.get("category") or "")
+            )
+            title_changed = "title" in updates and (
+                str(updates.get("title") or "").strip() != str(current_meta.get("title") or entry.summary or "").strip()
+            )
+            direction_changed = "direction" in updates and (
+                str(updates.get("direction") or "") != str(current_meta.get("direction") or "")
+            )
+            account_changed = (
+                ("accountCode" in updates and str(updates.get("accountCode") or "") != str(current_meta.get("accountCode") or ""))
+                or ("accountName" in updates and str(updates.get("accountName") or "") != str(current_meta.get("accountName") or ""))
             )
             repost_reason = ""
             # 研发归集明细落到 4301 的哪个末级科目，属权威层：一旦带上就只能冲销重记，
@@ -1935,11 +2174,26 @@ async def update_draft(
                 )
                 if wants_bank != has_bank or person_changed:
                     repost_reason = "付款去向与凭证科目不一致"
-            if not repost_reason and category_changed:
-                repost_reason = "用途分类已变更，需按新科目重记"
+            if not repost_reason and (category_changed or title_changed or direction_changed or account_changed):
+                repost_reason = "用途分类或科目已变更，需按新科目重记"
             if repost_reason:
                 if auto_reverse_repost and entry.status == "posted":
                     # ponytail: 结账页一键确认去向/科目 → 后台自动红冲原凭证 + 按新参数重记过账
+                    # 若已绑定银行流水，同一事务内先暂解链接、红冲、重记后再迁移到新活凭证（A3）
+                    confirmed_links = (
+                        await session.execute(
+                            select(ReconciliationLink).where(
+                                ReconciliationLink.company_id == company_id,
+                                ReconciliationLink.journal_entry_id == entry.id,
+                                ReconciliationLink.status == "confirmed",
+                            )
+                        )
+                    ).scalars().all()
+                    rebind_link_ids = [lnk.id for lnk in confirmed_links]
+                    for lnk in confirmed_links:
+                        lnk.status = "void"
+                    if confirmed_links:
+                        await session.flush()
                     await reverse_journal(
                         session,
                         entry.id,
@@ -1981,7 +2235,7 @@ async def update_draft(
                     new_payload["id"] = str(uuid4())
                     # 补记前缀由 create_entry 按日期重新判定后统一添加，
                     # 直接沿用旧摘要会把「补记2026-07｜」叠成两层。
-                    repost_title = entry.summary
+                    repost_title = str(updates.get("title") or "").strip() or entry.summary
                     if repost_title.startswith("补记") and "｜" in repost_title[:12]:
                         repost_title = repost_title.split("｜", 1)[1]
                     new_payload["title"] = repost_title
@@ -2002,6 +2256,15 @@ async def update_draft(
                         user_id=user_id,
                         request_id=request_id,
                     )
+                    await _rebind_bank_matches_after_repost(
+                        session,
+                        company_id=company_id,
+                        old_entry_id=entry.id,
+                        new_entry=reposted,
+                        user_id=user_id,
+                        request_id=request_id,
+                        rebind_link_ids=rebind_link_ids,
+                    )
                     return reposted
                 raise AccountingError(
                     ENTRY_POSTED_IMMUTABLE,
@@ -2017,7 +2280,7 @@ async def update_draft(
         raise AccountingError(
             ENTRY_POSTED_IMMUTABLE, "已过账凭证不能修改，请使用冲销", 409, _locked_entry_context(entry)
         )
-    if (entry.metadata_json or {}).get("source") == "wechat_settlement":
+    if (entry.metadata_json or {}).get("source") in SETTLEMENT_SOURCES:
         raise AccountingError("SYSTEM_SETTLEMENT", "结算凭证按银行净额生成，请取消对账后重新确认，不能直接修改", 409)
     old_period = await get_or_create_period(session, company_id, entry.period_start, lock=True)
     assert_period_writable(old_period)
@@ -2165,6 +2428,24 @@ async def update_draft(
             metadata.pop("voucherLines", None)
             rebuilt_payload.pop("voucherLines", None)
         raw_lines = _normalize_voucher_lines(rebuilt_payload)
+        # 只改分类/标题时沿用原结算侧：草稿发票改科目不能把 2241 挂账
+        # 改写成 1002 银行直付（付款去向由 payer/paymentStatus 单独决定）。
+        rebuilt_direction = str(rebuilt_payload.get("direction") or "expense")
+        if (
+            "voucherLines" not in updates
+            and not ({"payer", "paymentStatus", "amount", "direction"} & set(updates))
+            and _settlement_side_for(rebuilt_direction) is not None
+        ):
+            rebuilt_voucher = {
+                "debit": [line for line in raw_lines if line["direction"] == "debit"],
+                "credit": [line for line in raw_lines if line["direction"] == "credit"],
+            }
+            rebuilt_voucher = _preserve_settlement_lines(
+                rebuilt_voucher,
+                await _entry_lines(session, entry.id),
+                rebuilt_direction,
+            )
+            raw_lines = _normalize_voucher_lines({"voucherLines": rebuilt_voucher})
         await session.execute(delete(JournalLine).where(JournalLine.journal_entry_id == entry.id))
         await session.flush()
         # 新的 metadata 在函数末尾才写回 entry，这里必须把改后的整份 meta 带下去，
@@ -2306,6 +2587,33 @@ async def _preview_person_partner_name(
     return ""
 
 
+PREPAID_ACCOUNT_CODE = "1123"  # 预付账款：预存扣款的冲减科目
+
+
+async def _prepaid_account_balance(session: AsyncSession, company_id: str) -> Decimal:
+    """预付账款（1123）当前净余额：仅已过账凭证，借 - 贷。
+
+    「预存扣款」守门的取数口径：草稿未过账不计入，冲销凭证不计入，
+    与用户在科目余额表里看到的已入账口径一致。
+    """
+    totals = (
+        await session.execute(
+            select(
+                func.coalesce(func.sum(JournalLine.amount).filter(JournalLine.direction == "debit"), 0),
+                func.coalesce(func.sum(JournalLine.amount).filter(JournalLine.direction == "credit"), 0),
+            )
+            .join(JournalEntry, JournalEntry.id == JournalLine.journal_entry_id)
+            .where(
+                JournalEntry.company_id == company_id,
+                JournalEntry.status == "posted",
+                JournalLine.company_id == company_id,
+                JournalLine.account_code == PREPAID_ACCOUNT_CODE,
+            )
+        )
+    ).one()
+    return money(totals[0]) - money(totals[1])
+
+
 async def preview_voucher_lines(
     session: AsyncSession,
     entry_id: str,
@@ -2349,6 +2657,17 @@ async def preview_voucher_lines(
         raise AccountingError("RD_DETAIL_REQUIRED", "研发费用必须选择研发项目和费用类别", 422)
     direction = str(meta.get("direction") or "expense")
     lines = _normalize_voucher_lines(_json_safe(meta))
+    # 预览必须与落账同口径：用户只改分类时，付款去向沿用原凭证的结算侧，
+    # 不能预览成贷 1002、落账却保留 2241（反之亦然）。
+    if payer is None and payment_status is None and _settlement_side_for(direction) is not None:
+        preview_voucher = {
+            "debit": [line for line in lines if line["direction"] == "debit"],
+            "credit": [line for line in lines if line["direction"] == "credit"],
+        }
+        preview_voucher = _preserve_settlement_lines(
+            preview_voucher, await _entry_lines(session, entry_id), direction
+        )
+        lines = _normalize_voucher_lines({"voucherLines": preview_voucher})
     # 与落账同一套科目校验：草稿改单按 enforce_leaf=False 重放，
     # 已过账重记走 create_entry 按末级科目校验，预览不能比落账更宽松。
     accounts = await _load_accounts(
@@ -2404,6 +2723,67 @@ async def preview_voucher_lines(
                 "message": "这笔凭证的分录曾被人工调整，确认入账会按系统规则重新生成并覆盖手改结果",
             }
         )
+    # 「预存扣款」守门：冲减的是前期预付余额，余额不足会把预付账款挂成贷方
+    # （等于虚挂一笔应付），先在预览里把数字摆出来，确认权仍在用户。
+    if str(meta.get("payer") or "") == "prepaid_deduct" and direction == "expense":
+        deduct = sum(
+            (money(line["amount"]) for line in lines if line["direction"] == "credit" and line["accountCode"] == PREPAID_ACCOUNT_CODE),
+            ZERO,
+        )
+        if deduct > ZERO:
+            balance = await _prepaid_account_balance(session, company_id)
+            if balance < deduct:
+                warnings.append(
+                    {
+                        "code": "PREPAID_BALANCE_INSUFFICIENT",
+                        "message": (
+                            f"预付账款当前余额 {money_text(balance)}，不足以冲减本笔 {money_text(deduct)}；"
+                            "确认后预付账款将出现贷方余额（相当于对供应商的应付款）。"
+                            "若这笔钱此前已被记成费用，请改用「前期已付款」挂接原凭证"
+                        ),
+                        "currentBalance": money_text(balance),
+                        "deductAmount": money_text(deduct),
+                    }
+                )
+    if str(meta.get("source") or "") == "invoice_import" and direction == "expense":
+        effective_payer = str(meta.get("payer") or "")
+        effective_payment_status = str(meta.get("paymentStatus") or "")
+        if (
+            effective_payment_status == "unpaid"
+            or effective_payer in ("boss_personal", "personal")
+            or effective_payer.startswith("employee_personal")
+        ):
+            from services.invoice_prior_payment_service import find_prior_payment_candidates
+
+            prior = await find_prior_payment_candidates(
+                session,
+                company_id=company_id,
+                invoice_entry_id=entry.id,
+                limit=3,
+                lookback_days=90,
+            )
+            top = next(
+                (
+                    c
+                    for c in prior.get("candidates", [])
+                    if c.get("confidence") == "counterparty" and not str(c.get("entryId") or "").startswith("reim-")
+                ),
+                None,
+            )
+            if top:
+                warnings.append(
+                    {
+                        "code": "PRIOR_PAYMENT_DUPLICATE_RISK",
+                        "message": (
+                            f"检测到 {top['occurredOn']} 已有同销方同金额公户付款「{top['summary']}」（¥{top['amount']}），"
+                            "继续按当前去向入账会造成费用重复记账并虚增往来挂账，建议改用「前期已付款」挂接原凭证"
+                        ),
+                        "priorEntryId": str(top["entryId"]),
+                        "priorOccurredOn": str(top["occurredOn"]),
+                        "priorSummary": str(top["summary"]),
+                        "priorAmount": str(top["amount"]),
+                    }
+                )
 
     return {
         "entryId": entry.id,
@@ -2595,7 +2975,7 @@ async def adjust_voucher_lines(
             _locked_entry_context(entry),
         )
     metadata = dict(entry.metadata_json or {})
-    if metadata.get("source") == "wechat_settlement":
+    if metadata.get("source") in SETTLEMENT_SOURCES:
         raise AccountingError(
             "SYSTEM_SETTLEMENT", "结算凭证按银行净额生成，请取消对账后重新确认，不能直接调整", 409
         )
@@ -2822,6 +3202,24 @@ async def reverse_journal(
         raise AccountingError(
             ENTRY_POSTED_IMMUTABLE, "只有已过账凭证可以冲销", 409, _locked_entry_context(original)
         )
+    # A3：冲销已匹配的凭证必须同步回退流水匹配，不能留下「流水指向已冲销凭证」的
+    # 悬空引用。这里强制先取消对账，由取消对账负责回退 billingStatus/paymentDate。
+    linked = (
+        await session.execute(
+            select(ReconciliationLink.id).where(
+                ReconciliationLink.company_id == company_id,
+                ReconciliationLink.journal_entry_id == entry_id,
+                ReconciliationLink.status == "confirmed",
+            ).limit(1)
+        )
+    ).first()
+    if linked:
+        raise AccountingError(
+            "ENTRY_RECONCILED",
+            "凭证已关联银行流水，请先取消对账后再冲销",
+            409,
+            _locked_entry_context(original),
+        )
     if not reason or not reason.strip():
         raise AccountingError("REVERSAL_REASON_REQUIRED", "冲销必须填写原因")
     # 冲销默认落在原凭证期间（红字与原凭证同期相消，月度报表才不失真）；
@@ -2945,20 +3343,43 @@ async def correct_entry_category(
     """更正已过账凭证的分类/科目：红字冲销原凭证 + 按新分类重建并双双过账。
 
     合规留痕：原凭证生成红字冲销（reversal 凭证），新凭证独立成单；两者过账后
-    账面净额即新分类口径，报表/对账/税务口径一致。只适用于普通业务凭证，发票
-    挂账（贷 2241/借 1122）等特殊凭证应走冲销后手动重做。
+    账面净额即新分类口径，报表/对账/税务口径一致。
+
+    新凭证必须沿用原凭证的业务字段与投影里的申报/对账跟踪字段，并把发票主数据
+    从旧凭证迁到新凭证（否则 ``invoices.entry_id`` 会指向已冲销凭证）；已关联
+    银行流水的凭证不允许在此更正，必须先取消对账，避免流水挂到红冲记录上。
     """
     from services.account_mapper import get_voucher_hint
 
     original = await get_journal(session, entry_id, company_id=company_id, lock=True)
     if original.status != "posted":
         raise AccountingError(ENTRY_POSTED_IMMUTABLE, "只有已过账凭证可以更正科目", 409, _locked_entry_context(original))
+    if original.entry_type != "standard":
+        # 冲销/结转/期初凭证不是普通业务单据：再冲销会形成冲销链（A1 禁止）
+        raise AccountingError(
+            "ENTRY_NOT_CORRECTABLE", "系统凭证不支持更正科目，请走对应业务流程", 422, {"entryId": entry_id}
+        )
+    linked = (
+        await session.execute(
+            select(ReconciliationLink.id).where(
+                ReconciliationLink.company_id == company_id,
+                ReconciliationLink.journal_entry_id == entry_id,
+                ReconciliationLink.status == "confirmed",
+            ).limit(1)
+        )
+    ).first()
+    if linked:
+        raise AccountingError(
+            "ENTRY_RECONCILED", "凭证已关联银行流水，请先取消对账后再更正科目", 409, {"entryId": entry_id}
+        )
     meta = dict(original.metadata_json or {})
     direction = str(meta.get("direction") or "expense")
     amount = money(meta.get("amount") or ZERO)
     payer = str(meta.get("payer") or "company_account")
     if not new_category or not new_category.strip():
         raise AccountingError("INVALID_CATEGORY", "请选择更正后的分类", 422, {"entryId": entry_id})
+    # 结算侧必须先落到内存：更正只允许改分类，付款去向沿用原凭证。
+    original_lines = await _entry_lines(session, entry_id)
 
     reversal = await reverse_journal(
         session,
@@ -2978,8 +3399,39 @@ async def correct_entry_category(
         vat_amount=meta.get("vatAmount"),
         payment_status=meta.get("paymentStatus"),
     )
-    corrected = await create_entry(
-        session,
+    # 发票挂账凭证的 2241/1002 是业务事实，不能因为改分类被 payer 默认值改写。
+    hint = _preserve_settlement_lines(hint, original_lines, direction)
+    # 沿用原凭证 metadata 的业务字段；投影独有的跟踪字段（开票状态/付款日期/
+    # 关联单号）再补回来，否则重记后列表与对账页会显示成未开票/未付款。
+    original_projection = await session.get(LegacyEntryProjection, original.id)
+    legacy_payload: dict[str, Any] = {}
+    if original_projection is not None:
+        try:
+            legacy_payload = (
+                json.loads(original_projection.payload)
+                if isinstance(original_projection.payload, str)
+                else dict(original_projection.payload or {})
+            )
+        except (json.JSONDecodeError, TypeError):
+            legacy_payload = {}
+    # 发票号是外部来源键：原凭证的 SourceTransaction 还占着这个键，重记时不能
+    # 再作为 payload 传入（会撞 DUPLICATE_SOURCE）；过账后统一由发票主数据迁回。
+    invoice_number = str(meta.get("invoiceNumber") or legacy_payload.get("invoiceNumber") or "").strip()
+    new_payload: dict[str, Any] = {**meta}
+    for drop_key in (
+        "id",
+        "voucherLines",
+        "voucherNo",
+        "voucher_no",
+        "dedupFingerprint",
+        "wechat_transaction_key",
+        "invoiceNumber",
+        # 旧凭证的补记授权不能随重记带走：否则改科目会静默写进已关账期间
+        "allowBackfill",
+        "backfillReason",
+    ):
+        new_payload.pop(drop_key, None)
+    new_payload.update(
         {
             "id": f"correct-{original.id[:12]}-{uuid4().hex[:6]}",
             "title": meta.get("title") or original.summary,
@@ -2989,13 +3441,22 @@ async def correct_entry_category(
             "occurDate": original.occurred_on.isoformat(),
             "payer": payer,
             "source": str(meta.get("source") or "manual"),
-            "paymentStatus": meta.get("paymentStatus"),
-            "invoiceNumber": meta.get("invoiceNumber"),
-            "invoiceType": meta.get("invoiceType"),
             "voucherLines": hint,
             "voucherAuthority": "system",
             "reason": f"更正自 {original.id}",
-        },
+        }
+    )
+    for key in PROJECTION_BACKFILL_KEYS:
+        if key in ("payer", "paymentStatus", "invoiceNumber"):
+            continue
+        if key not in new_payload and legacy_payload.get(key) is not None:
+            new_payload[key] = legacy_payload[key]
+    for key in ("is_archive_only", "isArchiveOnly"):
+        if key not in new_payload and legacy_payload.get(key) is not None:
+            new_payload[key] = legacy_payload[key]
+    corrected = await create_entry(
+        session,
+        new_payload,
         company_id=company_id,
         user_id=user_id,
         request_id=f"{request_id}:new",
@@ -3003,8 +3464,64 @@ async def correct_entry_category(
     )
     await post_journal(session, reversal.id, company_id=company_id, user_id=user_id, request_id=f"{request_id}:post-rev")
     await post_journal(session, corrected.id, company_id=company_id, user_id=user_id, request_id=f"{request_id}:post-new")
+    await _rebind_invoice_after_repost(
+        session,
+        company_id=company_id,
+        old_entry_id=original.id,
+        new_entry=corrected,
+        user_id=user_id,
+        request_id=request_id,
+    )
+    if invoice_number:
+        # 无发票主数据的普通凭证（如手工登记发票号）：迁移函数不会写号，这里补回，
+        # 否则列表与重复导入校验会认不出原发票。
+        corrected_projection = await session.get(LegacyEntryProjection, corrected.id)
+        if corrected_projection is not None:
+            try:
+                corrected_payload = (
+                    json.loads(corrected_projection.payload)
+                    if isinstance(corrected_projection.payload, str)
+                    else dict(corrected_projection.payload or {})
+                )
+            except (json.JSONDecodeError, TypeError):
+                corrected_payload = {}
+            if not str(corrected_payload.get("invoiceNumber") or "").strip():
+                corrected_payload["invoiceNumber"] = invoice_number
+                corrected_projection.payload = json.dumps(
+                    _json_safe(corrected_payload), ensure_ascii=False, separators=(",", ":")
+                )
+                corrected_projection.updated_at = _iso_now()
     await _sync_projection(session, corrected)
     return {"reversalId": reversal.id, "correctedId": corrected.id}
+
+
+# 工资页打开某个月就自动建表（GET /salary/sheets/{month} 的语义），没员工、没
+# 保存过的月份会留下 0 条 salary_records 的草稿空壳。空壳不是业务活动：算进
+# 期间列表会让选择器冒出幽灵月份，算进「启用日期之前的数据」会报出用户根本
+# 找不到的工资表（体检提示与工资页互相矛盾）。只认有实据的表：有员工记录、
+# 状态已推进，或挂过任何一张凭证。
+_SUBSTANTIVE_SALARY_SHEET_SQL = (
+    "SELECT s.month AS month, ("
+    "EXISTS (SELECT 1 FROM salary_records r WHERE r.sheet_id = s.id)"
+    " OR COALESCE(s.status, '') <> 'draft'"
+    " OR s.accrual_voucher_id IS NOT NULL"
+    " OR s.payment_voucher_id IS NOT NULL"
+    " OR s.ss_paid_voucher_id IS NOT NULL"
+    " OR s.tax_paid_voucher_id IS NOT NULL"
+    " OR s.hf_paid_voucher_id IS NOT NULL"
+    ") AS substantive FROM salary_sheets s WHERE s.company_id = ?"
+)
+
+
+def _salary_sheet_row_is_substantive(row: Any) -> bool:
+    """读 _SUBSTANTIVE_SALARY_SHEET_SQL 的 substantive 列。
+
+    结构里没有该列（旧桩/旧连接）时保守按「有实据」处理，宁可多报也不吞数据。
+    """
+    try:
+        return bool(row["substantive"])
+    except (KeyError, IndexError, TypeError):
+        return True
 
 
 async def available_periods(
@@ -3071,12 +3588,12 @@ async def available_periods(
             logger.warning("关账顺序检查：辅助表月份查询失败，跳过该来源 company=%s: %s", company_id, exc)
         try:
             salary_cursor = await conn.execute(
-                "SELECT DISTINCT month FROM salary_sheets WHERE company_id = ?",
+                _SUBSTANTIVE_SALARY_SHEET_SQL,
                 (company_id,),
             )
             for row in await salary_cursor.fetchall():
                 month = str(row["month"] or "")[:7]
-                if len(month) == 7 and not below_floor(month):
+                if len(month) == 7 and not below_floor(month) and _salary_sheet_row_is_substantive(row):
                     months.setdefault(month, None)
         except Exception as exc:
             logger.warning("关账顺序检查：辅助表月份查询失败，跳过该来源 company=%s: %s", company_id, exc)
@@ -3127,12 +3644,16 @@ async def pre_book_start_activity(
             logger.warning("关账顺序检查：辅助表月份查询失败，跳过该来源 company=%s: %s", company_id, exc)
         try:
             cursor = await conn.execute(
-                "SELECT month FROM salary_sheets WHERE company_id = ?",
+                _SUBSTANTIVE_SALARY_SHEET_SQL,
                 (company_id,),
             )
             for row in await cursor.fetchall():
                 month = str(row["month"] or "")[:7]
-                if len(month) == 7 and month < floor_key:
+                if (
+                    len(month) == 7
+                    and month < floor_key
+                    and _salary_sheet_row_is_substantive(row)
+                ):
                     salary_count += 1
                     months.add(month)
         except Exception as exc:
@@ -3433,7 +3954,7 @@ async def _salary_accrual_close_check(
                     "WHERE ss.company_id = :company_id "
                     "AND acc.status = 'posted' "
                     "AND COALESCE(pay.status, '') != 'posted' "
-                    "AND ss.month <= :month "
+                    "AND ss.month < :month "
                     "GROUP BY ss.month ORDER BY ss.month"
                 ),
                 {"company_id": company_id, "month": month},
@@ -3445,7 +3966,7 @@ async def _salary_accrual_close_check(
         total = sum((money(row["net_salary"]) for row in rows), ZERO)
         notice = {
             "code": "SALARY_PAYABLE_OUTSTANDING",
-            "name": "已计提未发放工资",
+            "name": "工资超期未发放",
             "severity": "warning",
             "count": len(rows),
             "amount": money_text(total),
@@ -3453,17 +3974,132 @@ async def _salary_accrual_close_check(
                 {
                     "businessPeriod": row["month"],
                     "amount": money_text(row["net_salary"]),
-                    "description": f"{row['month']} 工资已计提，尚未确认发放",
+                    "description": f"{row['month']} 工资已计提，超过次月发薪窗口仍未发放",
                 }
                 for row in rows
             ],
             "suggestedAction": "salary",
+            # 最早一期：结账提示上的「去工资表」直接落到真正欠发的那个月。
+            "suggestedMonth": str(rows[0]["month"]),
             "message": (
-                f"有 {len(rows)} 个月工资已计提但尚未发放，合计 {money_text(total)} 元。"
-                "发放时可延至次月，凭银行流水核销应付职工薪酬，不影响本月结账。"
+                f"有 {len(rows)} 个月工资已计提，超过次月发薪窗口仍未发放，合计 {money_text(total)} 元。"
+                "如果已通过银行代发，请到工资表登记发薪并核销应付职工薪酬；"
+                "如果还没发，请确认是否漏记了这笔付款。"
             ),
         }
     return check, notice
+
+
+_PLATFORM_CLEARING_ACCOUNT_METADATA: dict[str, tuple[str, str]] = {
+    "1012001": ("微信支付待结算", "微信支付月度交易账单"),
+    "1012002": ("支付宝待结算", "支付宝月度交易账单"),
+    "1012": ("其他货币资金（平台待结算）", "微信/支付宝月度交易账单"),
+    "1012099": ("其他平台待结算", "平台月度交易账单"),
+}
+_CLEARING_NEGATIVE_TOLERANCE = Decimal("0.01")
+
+
+def _aggregate_platform_clearing_posted(
+    account_rows: Iterable[tuple[Any, ...]],
+) -> tuple[dict[str, Decimal], dict[str, str]]:
+    """按科目代码汇总 1012*（平台待结算）已过账净余额及科目名称。"""
+    posted_by_code: dict[str, Decimal] = {}
+    names_by_code: dict[str, str] = {}
+    for row in account_rows:
+        code = str(row[0] or "")
+        if not code.startswith("1012"):
+            continue
+        posted_by_code[code] = money(
+            posted_by_code.get(code, ZERO) + money(row[2]) - money(row[3])
+        )
+        if code not in names_by_code and row[1]:
+            names_by_code[code] = str(row[1])
+    return posted_by_code, names_by_code
+
+
+def _platform_clearing_close_check(
+    account_rows: Iterable[tuple[Any, ...]],
+    draft_clearing_deltas: dict[str, Decimal],
+    bank_withdrawal_credits: dict[str, Decimal],
+    *,
+    pending_count: int,
+) -> dict[str, Any] | None:
+    """检查 1012*（微信/支付宝待结算）期末余额是否为负且存在当期银行提现贷方。
+
+    只导银行提现（借 1002 / 贷 1012*）、漏导平台月度账单（借 1012*）时，资产负债表里会和
+    1002 银行存款互相抵消、试算仍然平衡，唯一破绽是 1012* 期末为负；而纯平台退款等
+    等待次月银行扣款的临时负挂账不误拦截。
+    """
+    posted_by_code, names_by_code = _aggregate_platform_clearing_posted(account_rows)
+
+    negative_accounts: list[dict[str, Any]] = []
+    for code in sorted(posted_by_code):
+        posted_bal = posted_by_code[code]
+        if posted_bal >= -_CLEARING_NEGATIVE_TOLERANCE:
+            continue
+        if money(bank_withdrawal_credits.get(code, ZERO)) <= ZERO:
+            continue
+        account_name, bill_hint = _PLATFORM_CLEARING_ACCOUNT_METADATA.get(
+            code,
+            (names_by_code.get(code) or f"平台待结算（{code}）", "平台月度交易账单"),
+        )
+        draft_delta = money(draft_clearing_deltas.get(code, ZERO))
+        projected_bal = money(posted_bal + draft_delta)
+        negative_accounts.append(
+            {
+                "accountCode": code,
+                "accountName": account_name,
+                "balance": money_text(posted_bal),
+                "projectedBalance": money_text(projected_bal),
+                "billHint": bill_hint,
+                "resolvedByDrafts": projected_bal >= -_CLEARING_NEGATIVE_TOLERANCE,
+            }
+        )
+
+    if not negative_accounts:
+        return None
+
+    still_negative = [item for item in negative_accounts if not item["resolvedByDrafts"]]
+    if still_negative:
+        total_deficit = sum((abs(money(item["balance"])) for item in still_negative), ZERO)
+        if len(still_negative) == 1:
+            only = still_negative[0]
+            msg = (
+                f"{only['accountName']}（{only['balance']} 元）期末余额为负，"
+                f"可能漏导本月{only['billHint']}（或期初余额未录入）"
+            )
+        else:
+            joined = "、".join(f"{item['accountName']}（{item['balance']} 元）" for item in still_negative)
+            msg = f"{joined}期末余额为负，可能漏导本月平台月度交易账单（或期初余额未录入）"
+        return {
+            "code": "PLATFORM_CLEARING_BALANCE",
+            "name": "平台待结算核对",
+            "status": "blocking",
+            "uiStatus": "blocked",
+            "count": len(still_negative),
+            "totalAmount": money_text(total_deficit),
+            "accounts": still_negative,
+            "message": msg,
+        }
+
+    details = "、".join(
+        f"{item['accountName']}（当前 {item['balance']} 元）" for item in negative_accounts
+    )
+    check: dict[str, Any] = {
+        "code": "PLATFORM_CLEARING_BALANCE",
+        "name": "平台待结算核对",
+        "status": "needs_review",
+        "uiStatus": "incomplete",
+        "count": len(negative_accounts),
+        "totalAmount": money_text(
+            sum((abs(money(item["balance"])) for item in negative_accounts), ZERO)
+        ),
+        "accounts": negative_accounts,
+        "message": f"{details}待过账凭证入账后余额将恢复正常",
+    }
+    if pending_count:
+        check["blockedByPendingCount"] = pending_count
+    return check
 
 
 async def period_close_checks(session: AsyncSession, company_id: str, month: Any) -> dict[str, Any]:
@@ -3563,6 +4199,7 @@ async def period_close_checks(session: AsyncSession, company_id: str, month: Any
     account_debit = sum((money(row[2]) for row in account_rows), ZERO)
     account_credit = sum((money(row[3]) for row in account_rows), ZERO)
     voucher_issues = []
+    draft_entry_ids: list[str] = []
     month_entries = (await session.execute(
         select(JournalEntry, SourceTransaction)
         .outerjoin(SourceTransaction, SourceTransaction.id == JournalEntry.source_transaction_id)
@@ -3577,6 +4214,7 @@ async def period_close_checks(session: AsyncSession, company_id: str, month: Any
         reasons = []
         if entry.status == "draft":
             reasons.append("pending_post")
+            draft_entry_ids.append(entry.id)
         elif entry.status == "pending_review":
             reasons.append("pending_review")
         if entry.entry_type == "standard" and entry.status in ACTIVE_ENTRY_STATUSES and (
@@ -3612,7 +4250,7 @@ async def period_close_checks(session: AsyncSession, company_id: str, month: Any
     report_issues = [item for item in statement.checks[2:] if item["level"] == "error"]
     # Compare the actual exported statement's cash to authoritative account
     # balances, rather than comparing debit and credit totals a second time.
-    ledger_cash = sum((money(row[2]) - money(row[3]) for row in account_rows if row[0] in {"1001", "1002", "1012001", "1012"}), ZERO)
+    ledger_cash = sum((money(row[2]) - money(row[3]) for row in account_rows if row[0] in {"1001", "1002", "1012001", "1012002", "1012"}), ZERO)
     report_cash = money(statement.balance_current.get("cash", ZERO))
     if ledger_cash != report_cash:
         report_issues.append({"level": "error", "message": "账簿货币资金与申报财务报表不一致"})
@@ -3633,6 +4271,69 @@ async def period_close_checks(session: AsyncSession, company_id: str, month: Any
     }
     salary_check, salary_notice = await _salary_accrual_close_check(
         session, company_id, month_start
+    )
+    posted_clearing, _ = _aggregate_platform_clearing_posted(account_rows)
+    candidate_negative_codes = sorted(
+        code for code, bal in posted_clearing.items() if bal < -_CLEARING_NEGATIVE_TOLERANCE
+    )
+    bank_withdrawal_credits: dict[str, Decimal] = {}
+    draft_clearing_deltas: dict[str, Decimal] = {}
+    if candidate_negative_codes:
+        from sqlalchemy.orm import aliased
+
+        bank_line = aliased(JournalLine)
+        withdrawal_rows = (
+            await session.execute(
+                select(
+                    JournalLine.account_code,
+                    func.coalesce(func.sum(JournalLine.amount), 0),
+                )
+                .join(JournalEntry, JournalEntry.id == JournalLine.journal_entry_id)
+                .where(
+                    JournalEntry.company_id == company_id,
+                    JournalEntry.period_start == month_start,
+                    JournalEntry.status == "posted",
+                    JournalLine.account_code.in_(candidate_negative_codes),
+                    JournalLine.direction == "credit",
+                    JournalLine.journal_entry_id.in_(
+                        select(bank_line.journal_entry_id).where(
+                            bank_line.company_id == company_id,
+                            bank_line.account_code == "1002",
+                            bank_line.direction == "debit",
+                        )
+                    ),
+                )
+                .group_by(JournalLine.account_code)
+            )
+        ).all()
+        bank_withdrawal_credits = {
+            str(code): money(amt) for code, amt in withdrawal_rows
+        }
+        if draft_entry_ids:
+            draft_rows = (
+                await session.execute(
+                    select(
+                        JournalLine.account_code,
+                        func.coalesce(func.sum(JournalLine.amount).filter(JournalLine.direction == "debit"), 0),
+                        func.coalesce(func.sum(JournalLine.amount).filter(JournalLine.direction == "credit"), 0),
+                    )
+                    .where(
+                        JournalLine.company_id == company_id,
+                        JournalLine.journal_entry_id.in_(draft_entry_ids),
+                        JournalLine.account_code.in_(candidate_negative_codes),
+                    )
+                    .group_by(JournalLine.account_code)
+                )
+            ).all()
+            draft_clearing_deltas = {
+                str(code): money(money(debit_amt) - money(credit_amt))
+                for code, debit_amt, credit_amt in draft_rows
+            }
+    platform_clearing_check = _platform_clearing_close_check(
+        account_rows,
+        draft_clearing_deltas,
+        bank_withdrawal_credits,
+        pending_count=pending_count,
     )
     # 关账顺序与 _close_period_in_transaction 的守卫同口径：更早的月份还有业务
     # 或仍未关账时本期不能结。这里让体检清单提前暴露它，否则界面显示“可以结账”，
@@ -3696,6 +4397,7 @@ async def period_close_checks(session: AsyncSession, company_id: str, month: Any
         *await _intangible_close_checks(session, company_id, month_start),
         *await _fixed_asset_close_checks(session, company_id, month_start),
         *([salary_check] if salary_check else []),
+        *([platform_clearing_check] if platform_clearing_check else []),
         {
             "code": "PERIOD_ORDER",
             "name": "关账顺序",
@@ -3858,6 +4560,27 @@ async def period_close_checks(session: AsyncSession, company_id: str, month: Any
                 ),
             }
         )
+    from services.invoice_prior_payment_service import find_duplicate_prior_payment_invoices
+
+    duplicate_prior = await find_duplicate_prior_payment_invoices(
+        session, company_id=company_id, month_start=month_start
+    )
+    if duplicate_prior["count"]:
+        notices.append(
+            {
+                "code": "DUPLICATE_PRIOR_PAYMENT_INVOICE",
+                "name": "疑似先付后票重复记账",
+                "severity": "warning",
+                "count": duplicate_prior["count"],
+                "amount": duplicate_prior["amount"],
+                "records": duplicate_prior["records"],
+                "message": (
+                    f"本月有 {duplicate_prior['count']} 笔非公户进项发票（合计 ¥{duplicate_prior['amount']}），"
+                    "在近 90 天内已存在同销方同金额且未挂票的公户付款凭证。"
+                    "若实为同一笔先付款后收票业务，请核对并冲销或挂接原付款凭证，避免费用重复记账与往来余额虚增。"
+                ),
+            }
+        )
     vat_base = await _calculate_vat_exemption_base(session, company_id, month_start)
     if vat_base and vat_base["exemptable_vat"] > ZERO:
         cycle_name = "本季度" if vat_base["config"].filing_cycle == "quarter" else "本月"
@@ -3869,9 +4592,11 @@ async def period_close_checks(session: AsyncSession, company_id: str, month: Any
                     "severity": "info",
                     "count": 1,
                     "amount": str(vat_base["exemptable_vat"]),
-                    "message": (
-                        f"{cycle_name}累计销售额 ¥{vat_base['revenue_net']}（未超 ¥{vat_base['threshold']} 免税限额），"
-                        f"确认结账时系统将自动生成免税凭证，减免增值税 ¥{vat_base['exemptable_vat']} 并转入营业外收入。"
+                    "message": _format_vat_exemption_preview_message(
+                        cycle_name,
+                        vat_base["revenue_net"],
+                        vat_base["threshold"],
+                        vat_base["exemptable_vat"],
                     ),
                 }
             )
@@ -3962,6 +4687,27 @@ async def _generate_vat_exemption_transfer(
         confirm=True,
     )
     return [entry]
+
+
+def _format_vat_exemption_preview_message(
+    cycle_name: str,
+    revenue_net: Decimal,
+    threshold: Decimal,
+    exemptable_vat: Decimal,
+) -> str:
+    """格式化小微免税预告正文，整万阈值简写为「X 万元」并给金额加千分位。"""
+    revenue_val = money(revenue_net)
+    threshold_val = money(threshold)
+    exempt_val = money(exemptable_vat)
+    ten_thousand = Decimal("10000")
+    if threshold_val >= ten_thousand and threshold_val % ten_thousand == ZERO:
+        threshold_label = f"{int(threshold_val // ten_thousand)} 万元"
+    else:
+        threshold_label = f"¥{threshold_val:,.2f}"
+    return (
+        f"{cycle_name}累计销售额 ¥{revenue_val:,.2f}（未超 {threshold_label} 免税额度），"
+        f"确认结账时将自动生成免税凭证，减免 ¥{exempt_val:,.2f} 并转入营业外收入，无需手动处理。"
+    )
 
 
 async def _calculate_vat_exemption_base(

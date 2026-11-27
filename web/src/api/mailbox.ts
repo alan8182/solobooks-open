@@ -14,7 +14,7 @@ export interface MailboxInfo {
   address: string
 }
 
-export type InboxImportKind = 'invoice' | 'bank' | 'wechat_bill' | 'unknown'
+export type InboxImportKind = 'invoice' | 'bank' | 'wechat_bill' | 'alipay_bill' | 'unknown'
 export type InboxStatus = 'pending' | 'consumed' | 'dismissed' | 'unsupported'
 
 export interface InboxDocumentItem {

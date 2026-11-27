@@ -27,7 +27,7 @@ describe('操作指引内容', () => {
   })
 
   it('注册表按 id 取得到，未知 id 返回 null', () => {
-    const ids: GuideId[] = ['wechat-bill', 'bank-statement', 'tax-registration', 'iit']
+    const ids: GuideId[] = ['wechat-bill', 'alipay-bill', 'bank-statement', 'invoice-list', 'tax-registration', 'iit', 'social-insurance', 'social-enrollment']
     ids.forEach((id) => {
       expect(getGuide(id)?.id, `${id} 未登记`).toBe(id)
     })
@@ -64,10 +64,30 @@ describe('操作指引内容', () => {
     })
   })
 
+  it('官方办理入口必须是已核实的 https 地址', () => {
+    // 入口是「点一下就去办事」的直达链接，写错比没有更糟：用户会以为税局网站坏了
+    GUIDE_LIST.filter((guide) => guide.entry).forEach((guide) => {
+      expect(guide.entry!.url, `${guide.id} 入口不是 https`).toMatch(/^https:\/\//)
+      expect(guide.entry!.label.length, `${guide.id} 入口缺按钮文案`).toBeGreaterThan(0)
+    })
+    expect(getGuide('invoice-list')?.entry?.url)
+      .toBe('https://12366.chinatax.gov.cn/bsfw/onlinetaxation/main')
+    // 社保与发票一样没有全国统一登录地址：按主体注册地拼本省电子税务局
+    expect(getGuide('social-insurance')?.entry?.url)
+      .toBe('https://12366.chinatax.gov.cn/bsfw/onlinetaxation/main')
+    expect(getGuide('social-insurance')?.entry?.companyRegion).toBe(true)
+    // 平台账单的后台入口：用户从指引里一键进后台导账单
+    expect(getGuide('wechat-bill')?.entry?.url).toBe('https://pay.weixin.qq.com/')
+    expect(getGuide('alipay-bill')?.entry?.url).toBe('https://b.alipay.com/home.htm')
+  })
+
   it('只有长文指引走独立页，其余走就地抽屉', () => {
     expect(isPageGuide('iit')).toBe(true)
     expect(isPageGuide('wechat-bill')).toBe(false)
     expect(isPageGuide('bank-statement')).toBe(false)
+    expect(isPageGuide('invoice-list')).toBe(false)
     expect(isPageGuide('tax-registration')).toBe(false)
+    expect(isPageGuide('social-insurance')).toBe(false)
+    expect(isPageGuide('social-enrollment')).toBe(false)
   })
 })

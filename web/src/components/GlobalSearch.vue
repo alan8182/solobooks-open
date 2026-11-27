@@ -126,17 +126,20 @@ const allPages = computed<CommandPage[]>(() => {
   }
 
   for (const item of NAV_ITEMS) {
-    if (!itemVisible(item.workspace, viewStore.mode)) continue
+    // 老板视图全量可搜：所有能力都在侧栏「更多」里，搜索不能再按会计视图过滤
+    const parentVisible = viewStore.isBoss || itemVisible(item.workspace, viewStore.mode)
     const label = viewStore.isBoss && item.bossLabel ? item.bossLabel : item.label
 
-    if (item.path) {
+    if (parentVisible && item.path) {
       addPage(label, item.path, item.icon, item.group, [label, item.label, item.path])
     }
-    if (item.children) {
-      for (const child of item.children) {
-        if (!itemVisible(child.workspace, viewStore.mode)) continue
-        addPage(`${label} · ${child.label}`, child.path, child.icon, item.group, [child.label, child.path, label])
-      }
+    if (!item.children) continue
+    for (const child of item.children) {
+      const allowed = parentVisible
+        && (viewStore.isBoss || itemVisible(child.workspace, viewStore.mode))
+      if (!allowed) continue
+      const childLabel = viewStore.isBoss && child.bossLabel ? child.bossLabel : child.label
+      addPage(`${label} · ${childLabel}`, child.path, child.icon, item.group, [child.label, childLabel, child.path, label])
     }
   }
   return pages

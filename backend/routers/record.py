@@ -27,6 +27,7 @@ from models.schemas import (
 from config import ZHIPU_API_KEY
 from core.errors import AccountingError
 from services.asr import transcribe_uploaded_audio
+from services.quota_service import is_paid_plan_active
 from services.llm import _uid, chat_text_json, chat_vision_json
 from services.classifier import CLASSIFIER_V3_PROMPT, BATCH_SPLIT_V3_PROMPT
 from services.ocr import RECEIPT_FROM_OCR_V3_PROMPT, RECEIPT_VL_V3_PROMPT
@@ -40,6 +41,10 @@ from services.vat_service import get_vat_config_from_session, is_vat_sales_entry
 from core.money import ZERO, money
 from services.tax_rules import compute_vat, get_risk_tags, is_tax_deductible, sanitize_risk_tags
 from db.session import get_db_session
+from services.setup_readiness_service import (
+    assert_migration_opening_ready,
+    require_migration_opening_ready,
+)
 from services.accounting_core_service import (
     RD_ACCOUNT_BY_TYPE,
     RD_ACCOUNT_NAMES,
@@ -111,25 +116,9 @@ def _clean_entry_payload(entry: dict) -> dict:
 
 
 def _attach_auxiliary(voucher: dict, auxiliary: dict[str, str | None]) -> dict:
-    """把辅助核算挂到允许的科目行上（白名单见 core.chart_policy）。
+    from services.auxiliary_service import attach_auxiliary_to_voucher
 
-    客户端只传 id；name 由服务端在落库时按主数据回填（accounting_core._add_lines），
-    这里不复制任何客户端文案。
-    """
-    from core.chart_policy import auxiliary_kinds_for_account
-
-    requested = {key: value for key, value in auxiliary.items() if value}
-    if not requested:
-        return voucher
-    output: dict = {}
-    for side in ("debit", "credit"):
-        lines = []
-        for line in voucher.get(side) or []:
-            allowed = auxiliary_kinds_for_account(str(line.get("accountCode") or ""))
-            matched = {key: value for key, value in requested.items() if key.removesuffix("_id") in allowed}
-            lines.append({**line, "auxiliary": {**(line.get("auxiliary") or {}), **matched}} if matched else line)
-        output[side] = lines
-    return output
+    return attach_auxiliary_to_voucher(voucher, auxiliary)
 
 
 async def _attach_quantity(
@@ -304,6 +293,7 @@ async def record_text(
     session: AsyncSession = Depends(get_db_session),
 ):
     """文字/语音记账 — LLM 分类 + 科目映射 + 税务标签（注入公司画像 top-K 分类习惯）"""
+    await assert_migration_opening_ready(session, ctx.company_id)
     user_msg = req.text
     if req.client_time:
         user_msg = f"【上下文 - 手机时间：{req.client_time}】\n用户输入：{user_msg}"
@@ -389,6 +379,7 @@ async def record_receipt(image: UploadFile = File(...), ctx: AuthContext = Depen
 
     当前仅支持 PNG/JPG/JPEG/BMP，单文件 ≤8MB；不支持 PDF。
     """
+    await require_migration_opening_ready(ctx.company_id)
     if not (ZHIPU_API_KEY and ZHIPU_API_KEY.strip()):
         raise HTTPException(
             status_code=503,
@@ -403,6 +394,7 @@ async def record_receipt(image: UploadFile = File(...), ctx: AuthContext = Depen
 @router.post("/receipt-url", response_model=RecordReceiptResponse)
 async def record_receipt_url(req: CloudFileRequest, ctx: AuthContext = Depends(require_auth)):
     """拍单据（云存储 URL 版）：下载临时文件后复用 OCR 流程。"""
+    await require_migration_opening_ready(ctx.company_id)
     if not (ZHIPU_API_KEY and ZHIPU_API_KEY.strip()):
         raise HTTPException(
             status_code=503,
@@ -414,12 +406,21 @@ async def record_receipt_url(req: CloudFileRequest, ctx: AuthContext = Depends(r
     return await _parse_receipt_from_bytes(content, filename, content_type, ctx)
 
 
+async def _require_paid_speech_member(ctx: AuthContext) -> None:
+    if not await is_paid_plan_active(ctx.user_id):
+        raise HTTPException(
+            status_code=403,
+            detail="语音提问为付费会员专属功能，请升级套餐后使用",
+        )
+
+
 @router.post("/speech", response_model=SpeechTextResponse)
 async def record_speech(audio: UploadFile = File(...), ctx: AuthContext = Depends(require_auth)):
     """
     语音转文字：接收小程序 RecorderManager 等上传的短音频，调用 DashScope Paraformer。
     个人主体小程序无需微信同声传译插件。
     """
+    await _require_paid_speech_member(ctx)
     content = await audio.read()
     try:
         text = await asyncio.to_thread(
@@ -438,6 +439,7 @@ async def record_speech(audio: UploadFile = File(...), ctx: AuthContext = Depend
 @router.post("/speech-url", response_model=SpeechTextResponse)
 async def record_speech_url(req: CloudFileRequest, ctx: AuthContext = Depends(require_auth)):
     """语音转文字（云存储 URL 版）：下载临时文件后调用 ASR。"""
+    await _require_paid_speech_member(ctx)
     content, resp_ct = await _fetch_cloud_file(req.fileUrl)
     filename = req.filename or "speech.wav"
     content_type = req.contentType or resp_ct
@@ -458,6 +460,7 @@ async def record_speech_url(req: CloudFileRequest, ctx: AuthContext = Depends(re
 @router.post("/batch", response_model=RecordBatchResponse)
 async def record_batch(req: RecordBatchRequest, ctx: AuthContext = Depends(require_auth)):
     """连续日志拆分"""
+    await require_migration_opening_ready(ctx.company_id)
     result = await asyncio.to_thread(
         chat_text_json,
         BATCH_SPLIT_V3_PROMPT,
@@ -494,6 +497,7 @@ async def record_confirm(
     )
     if cached is not None:
         return ConfirmResponse(**cached)
+    await assert_migration_opening_ready(session, ctx.company_id)
 
     # 增值税口径唯一来源：小规模征收率、起征点、申报周期都从公司档案读。
     # 一般纳税人直接抛错，避免以错误口径生成凭证与底稿。
@@ -562,6 +566,7 @@ async def record_confirm(
                     "partner_id": req.partner_id or req.partnerId,
                     "department_id": req.department_id or req.departmentId,
                     "project_id": req.project_id or req.projectId,
+                    "employee_id": req.employee_id or req.employeeId,
                 },
             ),
             req.quantity,
@@ -601,6 +606,7 @@ class EntryAuxiliaryRequest(BaseModel):
     partner_id: Optional[str] = None
     department_id: Optional[str] = None
     project_id: Optional[str] = None
+    employee_id: Optional[str] = None
 
 
 @router.put("/entries/{entry_id}/auxiliary")
@@ -609,17 +615,20 @@ async def assign_entry_auxiliary_route(
     req: EntryAuxiliaryRequest,
     ctx: AuthContext = Depends(require_auth),
 ):
-    """给草稿凭证补挂辅助核算（已过账凭证不可改，只能红冲后重做）。"""
+    """给草稿凭证补挂或清除辅助核算（已过账凭证不可改，只能红冲后重做）。"""
     from services.auxiliary_service import assign_entry_auxiliary
 
+    provided = set(req.model_fields_set)
+    raw_map = {
+        "partner_id": req.partner_id,
+        "department_id": req.department_id,
+        "project_id": req.project_id,
+        "employee_id": req.employee_id,
+    }
     auxiliary = {
         key: value
-        for key, value in {
-            "partner_id": req.partner_id,
-            "department_id": req.department_id,
-            "project_id": req.project_id,
-        }.items()
-        if value
+        for key, value in raw_map.items()
+        if (key in provided) or (value is not None and str(value).strip())
     }
     if not auxiliary:
         raise HTTPException(status_code=422, detail="请至少选择一个辅助核算项")

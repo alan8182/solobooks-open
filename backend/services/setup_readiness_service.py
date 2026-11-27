@@ -23,7 +23,7 @@ from typing import Any, Literal, Sequence
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.errors import FORBIDDEN, NOT_FOUND, AccountingError
+from core.errors import FORBIDDEN, NOT_FOUND, OPENING_BALANCE_REQUIRED, AccountingError
 from core.money import ZERO, money
 from db.models import (
     ChartAccount,
@@ -268,7 +268,7 @@ async def _opening_result(
                 .where(
                     JournalEntry.company_id == company_id,
                     JournalEntry.occurred_on < first_day,
-                    JournalEntry.status.in_(POSTED_STATUSES),
+                    JournalEntry.status == "posted",
                 )
                 .exists()
             )
@@ -523,3 +523,67 @@ async def compute_readiness(
         "generatedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "items": items,
     }
+
+
+async def migration_opening_status(
+    session: AsyncSession,
+    company_id: str,
+    *,
+    company: Company | None = None,
+    today: date | None = None,
+) -> dict[str, Any]:
+    """判断从其他代账转入的账套是否仍待完成期初建账（只读单点真值）。"""
+    if company is None:
+        company = await session.get(Company, company_id)
+    if company is None or str((company.payload or {}).get("onboardingType") or "").strip() != "migration":
+        return {"required": False, "status": "waived", "detail": None, "fiscalYear": None}
+
+    fiscal_year = resolve_fiscal_year(company, today)
+    payload = company.payload or {}
+    if not str(payload.get("startDate") or "").strip():
+        return {
+            "required": True,
+            "status": "locked",
+            "detail": "请先完善启用日期并完成期初建账",
+            "fiscalYear": fiscal_year,
+        }
+
+    opening_status, opening_detail, _ = await _opening_result(session, company, fiscal_year)
+    required = opening_status != "done"
+    return {
+        "required": required,
+        "status": opening_status,
+        "detail": opening_detail or "从原代账转入的账套，需先完成期初建账",
+        "fiscalYear": fiscal_year,
+    }
+
+
+async def assert_migration_opening_ready(
+    session: AsyncSession,
+    company_id: str,
+    *,
+    company: Company | None = None,
+) -> None:
+    """硬门禁：代账转入账套未完成期初建账时阻断数据导入与日常业务记账。"""
+    info = await migration_opening_status(session, company_id, company=company)
+    if info["required"]:
+        raise AccountingError(
+            OPENING_BALANCE_REQUIRED,
+            f"该账套从其他代账转入，尚未完成期初建账（{info['detail']}），请先完成期初建账再导入数据或记账。",
+            409,
+            {
+                "companyId": company_id,
+                "onboardingType": "migration",
+                "openingStatus": info["status"],
+                "fiscalYear": info["fiscalYear"],
+                "deepLink": "/mine/opening",
+            },
+        )
+
+
+async def require_migration_opening_ready(company_id: str) -> None:
+    """无外层 session 路由使用的期初建账门禁包装。"""
+    from db.session import session_scope
+
+    async with session_scope() as session:
+        await assert_migration_opening_ready(session, company_id)

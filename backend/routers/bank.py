@@ -17,6 +17,10 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from db.session import get_db_session
 from deps.auth import AuthContext, require_auth
+from services.setup_readiness_service import (
+    assert_migration_opening_ready,
+    require_migration_opening_ready,
+)
 from pydantic import BaseModel, Field
 from services.bank_service import (
     confirm_suggestion_flow,
@@ -72,6 +76,7 @@ async def import_bank(
     )
     if cached is not None:
         return cached
+    await assert_migration_opening_ready(session, ctx.company_id)
     await ensure_bank_schema()
     result = await import_statements_core(
         session,
@@ -228,6 +233,7 @@ async def import_bank_json(
     )
     if cached is not None:
         return cached
+    await assert_migration_opening_ready(session, ctx.company_id)
     await ensure_bank_schema()
     result = await import_statements_core(
         session,
@@ -252,6 +258,7 @@ class ParseColumnsRequest(BaseModel):
 @router.post("/parse-columns")
 async def parse_bank_columns(req: ParseColumnsRequest, ctx: AuthContext = Depends(require_auth)):
     """LLM 列映射：将 Excel 列名映射到系统字段"""
+    await require_migration_opening_ready(ctx.company_id)
     prompt = BANK_COLUMN_MAPPING_PROMPT.format(columns=", ".join(req.columns))
     fallback = [{"column": c, "mapping": None} for c in req.columns]
     result = await asyncio.to_thread(
@@ -308,6 +315,12 @@ class ConfirmSuggestionRequest(BaseModel):
     skipDuplicateCheck: bool = False
     # 记住此规则：后续同对方户名/摘要特征自动归入当前科目
     rememberRule: bool = False
+    # 账套启用前遗留期初应付工资/社保公积金的显式冲销确认
+    settleOpeningPayroll: bool = False
+    # 当月发票草稿按个人垫付报销两步核销时由前端显式传入（boss_personal / employee_personal[:姓名]）
+    reimbursementPayer: Optional[str] = None
+    # 撤销已过账的对账认领时，在同一事务内解绑并红字冲销对应入账/结算/报销凭证
+    reversePostedBankEntries: bool = False
 
 
 class BatchConfirmRulesRequest(BaseModel):
@@ -425,6 +438,26 @@ async def batch_confirm_rules(
         stmt_id = stmt["id"]
         stmt_amount = safe_money(stmt["amount"])
         entry_id = f"bank-{stmt_id}"
+        # save_entry 对已存在凭证是「只返回、不报错」：若该 id 已被之前过账又冲销的
+        # 凭证占用，继续往下会把冲销凭证重新挂成已核销（2026-11-23 事故）。
+        # 批量确认只能复用草稿/待审，其余一律跳过，交给用户手动确认。
+        existing_status = None
+        probe = await get_conn()
+        try:
+            try:
+                cursor = await probe.execute(
+                    "SELECT status FROM journal_entries WHERE id = ? AND company_id = ?",
+                    (entry_id, ctx.company_id),
+                )
+                occupied = await cursor.fetchone()
+                existing_status = str(occupied["status"] or "") if occupied else None
+            except Exception:
+                # 单测/legacy 夹具可能没有权威 journal 表：按未占用处理
+                existing_status = None
+        finally:
+            await probe.close()
+        if existing_status is not None and existing_status not in {"draft", "pending_review"}:
+            continue
         entry_data = {
             "id": entry_id,
             "title": fast_rule["title"],

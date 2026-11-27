@@ -16,8 +16,11 @@ import {
 import {
   normalizeVoucherLines,
   generateVoucherLines,
+  amountSignForDirection,
+  getAccountByCategory,
   type VoucherLine,
 } from '@/utils/accounting'
+import { formatAccountPreviewLabel } from '@/utils/closingWizard'
 import type { useEntryStore } from '@/stores/entry'
 
 export function useBatchPost(options: {
@@ -39,31 +42,76 @@ export function useBatchPost(options: {
   const batchPostConfirmVisible = ref(false)
   const batchPostWalkthrough = ref(false)
   const batchPostWalkthroughTotal = ref(0)
+  const walkthroughIndex = ref(0)
   const currentVoucherEntry = ref<any>(null)
   const currentVoucherPostingOptions = ref<any>(null)
 
-  // 本月待过账的草稿/待复核凭证明细（过账确认弹层用）
-  // 归档底稿（仅归档不记账，如平台手续费发票）是证据不是待过账凭证，不进清单
+  // 本月账目最终核对清单（关账前确认弹层用）：包含本期所有有效业务凭证（待封存草稿 + 已入账凭证），
+  // 剔除归档底稿、已冲销原凭证/红字凭证及期末结转凭证。
   const batchPostEntries = computed(() =>
     entryStore.activeEntries
       .filter((e: any) => {
-        const status = e.voucherStatus || ''
-        return entryPeriod(e) === month.value && (status === 'draft' || status === 'pending_review')
-          && !(e.isArchiveOnly || e.is_archive_only)
+        const status = String(e.voucherStatus || e.status || '')
+        const entryType = String(e.entryType || e.entry_type || '')
+        if (entryPeriod(e) !== month.value) return false
+        if (e.isArchiveOnly || e.is_archive_only) return false
+        if (entryType === 'closing' || entryType === 'reversal' || e.isClosingTransfer || status === 'reversed') return false
+        return !status || status === 'draft' || status === 'pending_review' || status === 'posted'
       })
-      .map((e: any) => ({
-        id: e.id,
-        title: e.title,
-        amount: e.amount,
-        direction: e.direction,
-        category: e.category || '',
-        accountName: e.accountName || '',
-        date: e.occurDate || '',
-      })),
+      .map((e: any) => {
+        const rawAmount = Number(e.amount) || 0
+        const direction = String(e.direction || '')
+        const category = String(e.category || '')
+        const voucherStatus = String(e.voucherStatus || e.status || 'draft')
+        const lines = normalizeVoucherLines(e.voucherLines)
+        const bankLine = lines.find((l) => l.code === '1002' || l.code.startsWith('1012'))
+        const isOutflow = bankLine
+          ? bankLine.side === 'credit'
+          : rawAmount < 0
+            ? direction !== 'expense'
+            : amountSignForDirection(direction, category) === '-' || direction === 'expense'
+
+        const date = String(e.occurDate || '').slice(0, 10)
+        const shortDate = date.length >= 10 ? date.slice(5, 10) : date
+        const rawTitle = String(e.title || '').trim()
+        const displayTitle = rawTitle.replace(/-\d{4}-\d{2}-\d{2}$/, '').trim() || rawTitle
+
+        const counterLine = lines.find(
+          (l) => l.code !== '1002' && !l.code.startsWith('1012') && !l.code.startsWith('2221'),
+        )
+        const targetAcct = counterLine
+          ? { code: counterLine.code, name: counterLine.name }
+          : e.accountCode || e.accountName
+            ? { code: String(e.accountCode || ''), name: String(e.accountName || '') }
+            : getAccountByCategory(category, isOutflow ? 'expense' : 'income')
+        const accountPreview = formatAccountPreviewLabel(category, targetAcct)
+        const subtitle = displayTitle === category
+          ? accountPreview || category
+          : [category, accountPreview].filter(Boolean).join(' · ')
+
+        return {
+          id: e.id,
+          title: e.title,
+          displayTitle,
+          subtitle,
+          amount: Math.abs(rawAmount),
+          direction: e.direction,
+          isOutflow,
+          category,
+          accountName: e.accountName || '',
+          date,
+          shortDate,
+          voucherStatus,
+          isDraft: voucherStatus !== 'posted',
+        }
+      }),
   )
 
-  async function openVoucherModal(entryId: string) {
+  async function openVoucherModal(entryId: string, fromWalkthrough = false) {
     if (!entryId) return
+    if (!fromWalkthrough) {
+      batchPostWalkthrough.value = false
+    }
     showVoucherModal.value = true
     voucherModalLoading.value = true
     currentVoucherEntry.value = null
@@ -139,12 +187,27 @@ export function useBatchPost(options: {
   function startWalkthrough() {
     const first = batchPostEntries.value[0]
     if (!first) {
-      message.info('本月没有待过账的草稿凭证')
+      message.info('本月没有可核对的账目凭证')
       return
     }
+    walkthroughIndex.value = 0
     batchPostWalkthrough.value = true
     batchPostWalkthroughTotal.value = batchPostEntries.value.length
-    openVoucherModal(first.id)
+    openVoucherModal(first.id, true)
+  }
+
+  function advanceWalkthrough() {
+    const nextIdx = walkthroughIndex.value + 1
+    const next = batchPostEntries.value[nextIdx]
+    if (next) {
+      walkthroughIndex.value = nextIdx
+      openVoucherModal(next.id, true)
+    } else {
+      batchPostWalkthrough.value = false
+      showVoucherModal.value = false
+      batchPostConfirmVisible.value = true
+      message.success('本月账目已逐笔核对完成，可确认无误并锁账')
+    }
   }
 
   function startWalkthroughFromConfirm() {
@@ -184,6 +247,7 @@ export function useBatchPost(options: {
     batchPostConfirmVisible,
     batchPostWalkthrough,
     batchPostWalkthroughTotal,
+    walkthroughIndex,
     currentVoucherEntry,
     currentVoucherPostingOptions,
     batchPostEntries,
@@ -192,6 +256,7 @@ export function useBatchPost(options: {
     handleBatchPostMonth,
     openBatchPostConfirm,
     startWalkthrough,
+    advanceWalkthrough,
     startWalkthroughFromConfirm,
     confirmBatchPost,
     modalVoucherLines,

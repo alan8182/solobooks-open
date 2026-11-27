@@ -8,7 +8,7 @@ import { mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import { createRouter, createMemoryHistory } from 'vue-router'
 import { defineComponent, h } from 'vue'
-import { NMessageProvider } from 'naive-ui'
+import { NDialogProvider, NMessageProvider } from 'naive-ui'
 import InvoiceLedger from '@/pages/invoice/ledger.vue'
 import InvoiceImportDrawer from '@/pages/invoice/InvoiceImportDrawer.vue'
 import router from '@/router'
@@ -52,6 +52,7 @@ vi.mock('@/api/invoices', () => ({
     scanned: 10,
     created: 1,
   }),
+  getParkedAttachmentCount: vi.fn().mockResolvedValue({ count: 0 }),
 }))
 
 vi.mock('@/api/rd', () => ({
@@ -63,7 +64,9 @@ function withProvider(comp: any, props: any = {}) {
   return defineComponent({
     render() {
       return h(NMessageProvider, null, {
-        default: () => h(comp, props),
+        default: () => h(NDialogProvider, null, {
+          default: () => h(comp, props),
+        }),
       })
     },
   })
@@ -92,6 +95,7 @@ describe('InvoiceLedger and Import Merger', () => {
         plugins: [localRouter],
         stubs: {
           InvoiceImportDrawer: true,
+          InvoiceAttachmentDrawer: true,
           SoloSkeleton: true,
           SoloFieldHelp: true,
         },

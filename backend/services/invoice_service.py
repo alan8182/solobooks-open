@@ -16,8 +16,11 @@ from services.entry_service import save_entry
 from services.account_mapper import (
     CATEGORY_TO_ACCOUNT,
     EMPLOYEE_PAYER_PREFIX,
+    INTERNAL_SETTLEMENT_CATEGORIES,
     PAYER_BOSS,
     get_voucher_hint,
+    is_alias_category,
+    lookup as lookup_account,
     normalize_payer,
 )
 from services.invoice_llm_prompts import INVOICE_CLASSIFY_PROMPT
@@ -42,6 +45,27 @@ def _normalize_name(name: str) -> str:
     if not name:
         return ""
     return name.replace("（", "(").replace("）", ")").strip().lower()
+
+
+_USCC_PATTERN = re.compile(r"\b9[1239]\d{6}[0-9A-HJ-NPQRTUWXY]{10}\b")
+
+
+def _mask_own_company_in_prompt(text: str, company_name: str = "") -> str:
+    """脱敏发给 LLM 的提示词文本：剥离我方企业全称与 18 位统一社会信用代码。"""
+    if not text:
+        return text
+    masked = _USCC_PATTERN.sub("[统一社会信用代码已脱敏]", text)
+    target = company_name.strip()
+    if target:
+        variants = {
+            target,
+            target.replace("（", "(").replace("）", ")"),
+            target.replace("(", "（").replace(")", "）"),
+        }
+        for variant in variants:
+            if variant:
+                masked = masked.replace(variant, "我方企业")
+    return masked
 
 
 def _is_iso_date(value: str) -> bool:
@@ -199,6 +223,16 @@ async def parse_invoice_rows(rows: List[Dict[str, Any]], company_id: str = "") -
         seller_name = str(row.get("seller_name") or row.get("seller") or row.get("销售方") or "").strip()
         buyer_name = str(row.get("buyer_name") or row.get("buyer") or row.get("购买方") or "").strip()
 
+        # 发票要素门槛：任何真实发票至少能给出号码或开票日期。只带金额的行是
+        # 银行流水/其他表格被误映射进来的典型形态（2026-11 杭州银行流水上传到
+        # 发票导入，账户余额列被当成金额，批量生成了 16 条无号码无日期的草稿）。
+        # 这里按行拒绝，避免调用方绕过前端文件校验直接打 /api/invoice/import。
+        if not invoice_number and not invoice_date:
+            errors.append({
+                "row": i,
+                "reason": "缺少发票号码和开票日期，无法识别为发票行；银行流水请用银行流水导入",
+            })
+            continue
         if not invoice_number and not amount:
             errors.append({"row": i, "reason": "缺少发票号码和金额"})
             continue
@@ -230,6 +264,8 @@ async def parse_invoice_rows(rows: List[Dict[str, Any]], company_id: str = "") -
             )
             is_duplicate = fingerprint in existing_fingerprints
 
+        item_name = str(row.get("item_name") or "").strip()
+        suggested_category = match_category_by_item(item_name, direction) or ""
         valid.append({
             "invoice_number": invoice_number,
             "invoice_date": invoice_date,
@@ -239,6 +275,13 @@ async def parse_invoice_rows(rows: List[Dict[str, Any]], company_id: str = "") -
             "direction": direction,
             "is_duplicate": is_duplicate,
             "title": f"发票-{seller_name or invoice_number}",
+            # 电票 XML/PDF 管线没有分类列，预览默认值不能一律兜底「其他支出」：
+            # 品名已写明「软件测试服务」这类无争议科目时，先给确定性建议，用户仍可改。
+            # 只有支出方向才给建议（收入/往来另有科目口径）。
+            "suggestedCategory": suggested_category,
+            "suggestedCategoryReason": (
+                f"按发票品名「{item_name}」建议" if suggested_category else ""
+            ),
             **{k: v for k, v in row.items() if k not in ("invoice_number", "invoice_date", "amount", "seller_name", "buyer_name", "direction", "title")},
         })
 
@@ -246,7 +289,26 @@ async def parse_invoice_rows(rows: List[Dict[str, Any]], company_id: str = "") -
 
 
 # 收入类科目：销项票的类别必须落在这里，贷方科目才是收入/增值税，挂账凭证才能过收支校验
-INCOME_CATEGORIES = ("主营业务收入", "其他业务收入", "营业外收入")
+INCOME_CATEGORIES = (
+    "主营业务收入",
+    "其他业务收入",
+    "营业外收入",
+    "非流动资产处置净收益",
+    "政府补助",
+    "捐赠收益",
+    "盘盈收益",
+)
+
+
+def _category_fits_direction(category: str, direction: str) -> bool:
+    """分类是否与方向同侧：销项必须落收入类，进项不能落收入类。"""
+    if not category or category not in CATEGORY_TO_ACCOUNT:
+        return False
+    if direction == "income":
+        return category in INCOME_CATEGORIES
+    if direction == "expense":
+        return category not in INCOME_CATEGORIES
+    return True
 
 
 def match_category_by_item(item_name: str, direction: str) -> str | None:
@@ -260,7 +322,7 @@ def match_category_by_item(item_name: str, direction: str) -> str | None:
     text = str(item_name or "").lower()
     rules = (
         (("房租", "租金", "租赁", "物业"), "租金物业"),
-        (("机票", "火车", "高铁", "住宿", "酒店", "差旅"), "差旅费"),
+        (("机票", "火车", "高铁", "动车", "铁路", "客票", "票价", "住宿", "酒店", "差旅"), "差旅费"),
         (("打车", "出租车", "网约车", "交通"), "交通费"),
         (("办公用品", "文具", "打印", "纸张", "耗材", "办公"), "办公费"),
         (("餐饮", "宴请", "招待", "饭"), "业务招待费"),
@@ -268,9 +330,10 @@ def match_category_by_item(item_name: str, direction: str) -> str | None:
         (("快递", "物流", "运输", "运费"), "运费及物流"),
         (("电费", "水费", "水电", "燃气"), "水电通讯费"),
         (("宽带", "话费", "通讯", "电信"), "通讯费"),
-        (("软件", "系统", "小程序", "域名", "云", "服务器", "技术服务", "信息技术", "saas", "接口"), "信息技术服务费"),
-        (("认证", "注册", "商标", "资质"), "信息技术服务费"),
-        (("手续费", "汇兑"), "银行及金融手续费"),
+        # 支付通道费先判定：微信/支付宝的「支付通道服务费」是交易手续费，
+        # 不是信息技术服务，不能被下面的 IT 规则抢走。
+        (("支付通道", "通道服务费", "支付服务费", "手续费", "汇兑"), "银行及金融手续费"),
+        (("软件", "系统", "域名", "云", "服务器", "技术服务", "信息技术", "saas", "接口", "短信", "验证码"), "信息技术服务费"),
     )
     for keywords, category in rules:
         if any(kw in text for kw in keywords):
@@ -288,28 +351,47 @@ async def classify_invoice(
     amount = row.get("amount", 0)
     total_amount = row.get("total_amount", 0)
 
+    # 调用方显式给了方向（导入预览里用户确认过/parse 按购销方判定）就以它为准：
+    # 否则 LLM 可能把销项票判成支出，配出贷方费用科目的怪凭证。
+    requested_direction = str(row.get("direction") or "").strip()
+    explicit_direction = (
+        requested_direction
+        if requested_direction in ("expense", "income", "owner_transfer")
+        else ""
+    )
     suggested_direction_str = ""
-    default_direction = "expense"
+    default_direction = explicit_direction or "expense"
+    seller_for_llm = seller
+    buyer_for_llm = buyer
 
-    if company_name:
+    if company_name and not explicit_direction:
         co_norm = _normalize_name(company_name)
         seller_norm = _normalize_name(seller)
         buyer_norm = _normalize_name(buyer)
         if co_norm and seller_norm and (co_norm in seller_norm or seller_norm in co_norm):
-            suggested_direction_str = "\n(注：此发票销售方包含我司名称，属于我司销售开票，因此这笔交易方向应为 income)"
+            suggested_direction_str = "\n(注：此发票销售方为我方企业，属于我方销售开票，因此这笔交易方向应为 income)"
             default_direction = "income"
+            seller_for_llm = "我方企业（销方）"
         elif co_norm and buyer_norm and (co_norm in buyer_norm or buyer_norm in co_norm):
-            suggested_direction_str = "\n(注：此发票购买方包含我司名称，属于我司采购进项，因此这笔交易方向应为 expense)"
+            suggested_direction_str = "\n(注：此发票购买方为我方企业，属于我方采购进项，因此这笔交易方向应为 expense)"
             default_direction = "expense"
+            buyer_for_llm = "我方企业（购方）"
 
-    # 品名确定性匹配优先：命中规范二级科目分类就不再依赖 LLM，
-    # 避免发票品名多种多样时被 LLM 归到兜底「其他支出」
-    matched = match_category_by_item(item, default_direction)
-    if matched:
-        return {"direction": default_direction, "category": matched, "reason": f"品名关键词「{item}」匹配到规范分类"}
+    business_context = str(row.get("business_context") or "").strip()
 
-    # 根据真实方向过滤候选科目池，防止大模型跨类别乱分类
-    all_categories = list(CATEGORY_TO_ACCOUNT.keys())
+    # 品名确定性匹配优先：仅在无用户补充说明时命中规范二级科目即直接返回，
+    # 避免批量导入被 LLM 归到兜底「其他支出」；用户显式补充了业务说明时
+    # 说明正是为了请大模型结合背景重新判断，不能再被品名规则短路。
+    if not business_context:
+        matched = match_category_by_item(item, default_direction)
+        if matched:
+            return {"direction": default_direction, "category": matched, "reason": f"品名关键词「{item}」匹配到规范分类"}
+
+    # 根据真实方向过滤候选科目池，防止大模型跨类别乱分类（剔除口语别名和内部结算分类）
+    all_categories = [
+        c for c in CATEGORY_TO_ACCOUNT.keys()
+        if not is_alias_category(c) and c not in INTERNAL_SETTLEMENT_CATEGORIES
+    ]
     income_cats = list(INCOME_CATEGORIES)
     owner_cats = ["股东投入", "股东垫付", "资本公积", "老板投入", "老板垫付"]
     
@@ -324,8 +406,11 @@ async def classify_invoice(
     if not categories:
         categories = all_categories
 
-    context_str = f"\n用户补充的业务说明/用途: {row.get('business_context')}" if row.get("business_context") else ""
-    invoice_info = f"销售方: {seller}\n购买方: {buyer}\n特定业务/项目: {row.get('特定业务类型') or '-'}\n货物/应税劳务项目: {item}\n规格型号: {row.get('specification') or '-'}\n单位: {row.get('unit') or '-'}\n数量: {row.get('quantity') or '-'}\n单价: {row.get('unit_price') or '-'}\n不含税金额: {amount}\n税率: {row.get('tax_rate') or '-'}\n税额: {row.get('tax_amount') or 0}\n价税合计: {total_amount}{suggested_direction_str}{context_str}"
+    context_str = f"\n用户补充的业务说明/用途: {business_context}" if business_context else ""
+    invoice_info = _mask_own_company_in_prompt(
+        f"销售方: {seller_for_llm}\n购买方: {buyer_for_llm}\n特定业务/项目: {row.get('特定业务类型') or '-'}\n货物/应税劳务项目: {item}\n规格型号: {row.get('specification') or '-'}\n单位: {row.get('unit') or '-'}\n数量: {row.get('quantity') or '-'}\n单价: {row.get('unit_price') or '-'}\n不含税金额: {amount}\n税率: {row.get('tax_rate') or '-'}\n税额: {row.get('tax_amount') or 0}\n价税合计: {total_amount}\n备注: {row.get('remark') or '-'}{suggested_direction_str}{context_str}",
+        company_name,
+    )
 
     prompt = INVOICE_CLASSIFY_PROMPT.format(
         seller_name=invoice_info,
@@ -569,10 +654,51 @@ async def import_invoices(company_id: str, user_id: str, rows: List[Dict[str, An
     async def process_row(index: int, row: Dict[str, Any]) -> Dict[str, Any]:
         async with sem:
             if classify:
-                suggestion = await classify_invoice(row, company_name, user_id=user_id, company_id=company_id)
+                direction = str(row.get("direction") or "expense").strip() or "expense"
+                explicit_category = str(row.get("category") or "").strip()
+                suggested_category = str(row.get("suggestedCategory") or "").strip()
+                if explicit_category and _category_fits_direction(explicit_category, direction):
+                    # 预览里用户确认过（或按品名规则给出）的分类优先，不让 LLM 改写；
+                    # 只有缺分类 / 分类与方向不同侧时才补分类。
+                    suggestion = {
+                        "direction": direction,
+                        "category": explicit_category,
+                        "reason": "沿用导入行已确认分类",
+                    }
+                    category_source = "manual"
+                elif suggested_category and _category_fits_direction(suggested_category, direction):
+                    # 调用方没有提交 category，但 parse 已按品名给出建议：直接采用
+                    # 规则结论，省掉一次 LLM 调用。
+                    suggestion = {
+                        "direction": direction,
+                        "category": suggested_category,
+                        "reason": "沿用品名规则建议分类",
+                    }
+                    category_source = "rule"
+                elif direction == "income":
+                    # 销项票没有分类列时沿用旧口径，不为每一行发一次 LLM 请求；
+                    # 其他业务收入等特殊情况由用户在预览里显式改。
+                    suggestion = {
+                        "direction": "income",
+                        "category": "主营业务收入",
+                        "reason": "销项票按主营业务收入兜底",
+                    }
+                    category_source = "fallback"
+                else:
+                    suggestion = await classify_invoice(
+                        row, company_name, user_id=user_id, company_id=company_id
+                    )
+                    reason = str(suggestion.get("reason") or "")
+                    if reason.startswith("品名关键词"):
+                        category_source = "rule"
+                    elif "默认值" in reason:
+                        category_source = "fallback"
+                    else:
+                        category_source = "llm"
             else:
                 direction = str(row.get("direction") or "expense")
                 category = str(row.get("category") or "").strip()
+                raw_category = category
                 # 类别必须与方向同侧，否则挂账凭证会被收支校验拒绝（销项票误标支出类别
                 # 会配出贷方支出科目）：
                 #   - 销项票缺类别 / 误标支出类别 → 主营业务收入
@@ -582,6 +708,7 @@ async def import_invoices(company_id: str, user_id: str, rows: List[Dict[str, An
                 elif direction == "expense" and category in INCOME_CATEGORIES:
                     category = "其他支出"
                 suggestion = {"direction": direction, "category": category}
+                category_source = "manual" if raw_category else "fallback"
 
         seller = str(row.get("seller_name") or "").strip()
         item = str(row.get("item_name") or "").strip()
@@ -615,6 +742,10 @@ async def import_invoices(company_id: str, user_id: str, rows: List[Dict[str, An
             "occurDate": row.get("invoice_date", datetime.now(timezone.utc).strftime("%Y-%m-%d")),
             "merchant": row.get("seller_name", ""),
             "source": "invoice_import",
+            # 分类来源留痕：manual=用户/调用方确认，rule=品名规则，llm=模型补分类，
+            # fallback=仍落到兜底科目（导入后需复核）。诊断脚本与后续复核都读它。
+            "categorySource": category_source,
+            "categoryReason": str(suggestion.get("reason") or ""),
             "invoiceNumber": row.get("invoice_number", ""),
             "billingStatus": "has_invoice",
             "is_archive_only": is_archive,

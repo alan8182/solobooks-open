@@ -320,7 +320,7 @@ Agent 驾驶舱式布局，按「先处理、再看数」排列：
 ## 7. 全局交互模式约定
 
 - **AI 动作审批**：AI 产生的一切入账操作先成为 pending `AgentActionItem`，经 `AgentActionCard` 人工批准/拒绝后才执行；批准接口支持批量剔除明细与逐行修正。全链路口径「AI 起草、人工确认」。
-- **过账底线**：standard 凭证过账必须有有效原始业务来源（`source_transaction`，缺失/作废返回 409）；银行导入且摘要含微信的凭证过账前做疑似重复收入检查（`POSSIBLE_DUPLICATE_WECHAT_INCOME`，候选返回前端核对）；微信结算单已有收入/手续费账目时拦截重复核销（`EXISTING_WECHAT_ENTRIES`）；工资类支出流水不得直接记费用（`SALARY_REQUIRES_PAYROLL`），社保/公积金类支出不得直接记费用（`PAYROLL_LIABILITY_REQUIRES_PAYROLL`），必须走工资计提、发放与缴款核销。
+- **过账底线**：standard 凭证过账必须有有效原始业务来源（`source_transaction`，缺失/作废返回 409）；银行导入且摘要含微信/支付宝的凭证过账前做疑似重复收入检查（`POSSIBLE_DUPLICATE_PLATFORM_INCOME`，按摘要判定平台、只在该平台账单凭证里比对，候选与平台返回前端核对）；微信结算单已有收入/手续费账目时拦截重复核销（`EXISTING_WECHAT_ENTRIES`）；工资类支出流水不得直接记费用（`SALARY_REQUIRES_PAYROLL`），社保/公积金类支出不得直接记费用（`PAYROLL_LIABILITY_REQUIRES_PAYROLL`），必须走工资计提、发放与缴款核销。
 - **制单复核分离**：`posting_policy=maker_checker` 的公司，制单人不能复核自己的凭证；过账能力以 `posting-options` 接口为准。
 - **SSE 流式**：Agent 会话统一走 fetch + SSE（非 axios），事件协议见 §3.1。
 - **删除确认**：统一 `useDeleteConfirm` 组合式函数（NModal 二次确认）。

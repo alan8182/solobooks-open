@@ -389,7 +389,7 @@ def test_demo_reuse_repairs_books_created_without_statements(client, auth_header
 
 
 def test_deleting_the_only_demo_book_creates_empty_replacement(client, auth_headers):
-    """演示账套是唯一账套时允许删除，并自动补一本空白正式账套承接。"""
+    """演示账套是唯一账套时允许删除，并自动补一本空白正式账套且签发新令牌承接。"""
     run_as("u_demo_only")
     demo_id = client.post("/api/setup/demo", headers=auth_headers).json()["companyId"]
 
@@ -399,6 +399,13 @@ def test_deleting_the_only_demo_book_creates_empty_replacement(client, auth_head
     body = response.json()
     assert body["deleted"] is True
     assert body["nextCompanyId"] and body["nextCompanyId"] != demo_id
+    assert body.get("accessToken")
+
+    # 切走后必须能拿返回的新令牌继续调接口，不能因旧令牌仍指着已删除的演示账套而 403
+    app.dependency_overrides.pop(require_auth, None)
+    me = client.get("/api/auth/me", headers={"Authorization": f"Bearer {body['accessToken']}"})
+    assert me.status_code == 200, me.text
+    assert me.json()["current_company_id"] == body["nextCompanyId"]
 
 
 def test_deleting_demo_switches_to_company_with_empty_payload(client, auth_headers):
@@ -531,3 +538,121 @@ def test_switch_company_tolerates_empty_payload(client, auth_headers):
 
     assert response.status_code == 200, response.text
     assert response.json()["company_id"] == company_id
+
+
+def test_demo_book_closure_and_full_module_scenarios(client, auth_headers):
+    """演示账套覆盖 M-2 已结账、M-1 待结账零阻塞、资产折旧、研发辅助、账龄、健康体检与智能撮合。"""
+    from services.demo_book_service import _month_sequence
+
+    user_id = "u_demo_full_showcase"
+    run_as(user_id)
+    created = client.post("/api/setup/demo", headers=auth_headers)
+    assert created.status_code == 200, created.text
+    company_id = created.json()["companyId"]
+
+    app.dependency_overrides[require_auth] = lambda: AuthContext(
+        user_id=user_id, company_id=company_id
+    )
+
+    today = date.today()
+    window = _month_sequence(today, 3)
+    m2_month = f"{window[0][0]:04d}-{window[0][1]:02d}"
+    m1_month = f"{window[1][0]:04d}-{window[1][1]:02d}"
+    m0_month = f"{window[2][0]:04d}-{window[2][1]:02d}"
+
+    # 1. 期间状态：M-2 已结账，M-1 未结账且 canClose == True
+    periods_res = client.get("/api/periods/available", headers=auth_headers)
+    assert periods_res.status_code == 200, periods_res.text
+    month_statuses = {item["month"]: item["status"] for item in periods_res.json()["months"]}
+    assert month_statuses.get(m2_month) == "closed"
+    assert month_statuses.get(m1_month) in ("open", None)
+
+    close_checks = client.get(f"/api/periods/{m1_month}/close-checks", headers=auth_headers)
+    assert close_checks.status_code == 200, close_checks.text
+    close_body = close_checks.json()
+    assert close_body["canClose"] is True, close_body
+    assert close_body["blockingCount"] == 0
+
+    # 2. 固定资产卡片 + M-1 已提折旧 + 三方勾稽平衡
+    assets_res = client.get("/api/asset/assets", headers=auth_headers)
+    assert assets_res.status_code == 200, assets_res.text
+    assets = assets_res.json()["items"]
+    assert any(item["name"] == "MacBook Pro 及 4K 研发显示器组" for item in assets)
+
+    dep_runs = client.get(f"/api/asset/depreciation/runs?period={m1_month}", headers=auth_headers)
+    assert dep_runs.status_code == 200, dep_runs.text
+    assert dep_runs.json().get("items")
+
+    asset_recon = client.get("/api/asset/reconciliation", headers=auth_headers)
+    assert asset_recon.status_code == 200, asset_recon.text
+    recon_body = asset_recon.json()
+    assert recon_body["applicable"] is True
+    assert recon_body["balanced"] is True, recon_body
+
+    # 3. 研发辅助核算：项目 + 立项证据 + M-1 研发台账 + M0 待归集 4301
+    rd_projects = client.get("/api/rd/projects", headers=auth_headers)
+    assert rd_projects.status_code == 200, rd_projects.text
+    assert any(item["code"] == "RD-2026-01" for item in rd_projects.json())
+
+    rd_evidence = client.get("/api/rd/evidence", headers=auth_headers)
+    assert rd_evidence.status_code == 200, rd_evidence.text
+    assert any(item.get("referenceNo") == "NS-RD-2026-001" for item in rd_evidence.json()["items"])
+
+    rd_ledger = client.get(
+        f"/api/rd/ledger?startDate={m2_month}-01&endDate={today.isoformat()}",
+        headers=auth_headers,
+    )
+    assert rd_ledger.status_code == 200, rd_ledger.text
+    assert Decimal(rd_ledger.json()["total"]) == Decimal("1200.00")
+
+    rd_unalloc = client.get("/api/rd/unallocated", headers=auth_headers)
+    assert rd_unalloc.status_code == 200, rd_unalloc.text
+    assert rd_unalloc.json()["count"] >= 1
+
+    # 4. 应收 / 应付账龄 + 辅助核算主档
+    ar_aging = client.get(f"/api/report/ar-aging?as_of={today.isoformat()}", headers=auth_headers)
+    assert ar_aging.status_code == 200, ar_aging.text
+    assert Decimal(ar_aging.json()["total"]) >= Decimal("6200.00")
+
+    ap_aging = client.get(f"/api/report/ap-aging?as_of={today.isoformat()}", headers=auth_headers)
+    assert ap_aging.status_code == 200, ap_aging.text
+    assert Decimal(ap_aging.json()["total"]) >= Decimal("3600.00")
+
+    aux_opts = client.get("/api/auxiliary/options", headers=auth_headers)
+    assert aux_opts.status_code == 200, aux_opts.text
+    aux_body = aux_opts.json()
+    assert aux_body["departments"]
+    assert aux_body["projects"]
+    assert aux_body["partners"]
+
+    # 5. M-1 健康体检高分 & M0 存在未清项时健康接口正常返回（不因 checks 列表结构报 500）
+    health_res = client.post(
+        "/api/health-score",
+        headers=auth_headers,
+        json={"month": m1_month, "includeDiagnosis": False},
+    )
+    assert health_res.status_code == 200, health_res.text
+    assert health_res.json()["totalScore"] >= 85
+
+    health_m0 = client.post(
+        "/api/health-score",
+        headers=auth_headers,
+        json={"month": m0_month, "includeDiagnosis": False},
+    )
+    assert health_m0.status_code == 200, health_m0.text
+    assert 0 <= health_m0.json()["totalScore"] <= 100
+
+    # 6. M0 智能撮合待办 & 不对 1122 应收收入生成虚假垫付应付待办
+    todos_res = client.get("/api/todos", headers=auth_headers)
+    assert todos_res.status_code == 200, todos_res.text
+    todos = todos_res.json()["todos"]
+    assert any(
+        ((t.get("meta") or {}).get("aiSuggestion") or {}).get("action") == "link_invoice_expense"
+        and (t.get("meta") or {}).get("candidateExpenseId")
+        for t in todos
+    )
+    assert not any(
+        t.get("type") == "invoice_unpaid" and (t.get("meta") or {}).get("direction") == "income"
+        for t in todos
+    )
+

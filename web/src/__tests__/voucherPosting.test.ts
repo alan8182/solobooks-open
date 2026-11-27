@@ -55,123 +55,62 @@ beforeEach(() => {
 afterEach(() => vi.clearAllMocks())
 
 describe('voucher posting workflow', () => {
-  it.each([
-    ['draft', { canPost: true }, '确认过账', 'post'],
-    ['pending_review', { canApprove: true }, '复核并过账', 'approve'],
-    ['draft', { canSubmit: true, canPost: false }, '提交复核', 'submit'],
-  ] as const)('reviews %s through the permitted action %s', async (status, options, label, action) => {
-    const entry = { id: 'draft', title: '测试收入', amount: 5, direction: 'income', category: '主营业务收入', occurDate: '2026-07-14', voucherStatus: status, voucherLines: { debit: [{ accountCode: '1012001', accountName: '微信待结算', amount: 5 }], credit: [{ accountCode: '5001', accountName: '主营业务收入', amount: 5 }] } }
-    h.store = { activeEntries: [entry], fetchEntries: vi.fn(async () => {}) }
-    h.options.mockResolvedValue(options)
-    h[action].mockResolvedValue({ entry: { ...entry, voucherStatus: action === 'submit' ? 'pending_review' : 'posted', voucherRef: action === 'submit' ? '' : 'VOU-202607-000001' } })
-    const wrapper = mount(EntryDetail)
+  it('hides manual post action for single-user draft and keeps review workflow actions', async () => {
+    const draftEntry = { id: 'draft', title: '测试收入', amount: 5, direction: 'income', category: '主营业务收入', occurDate: '2026-07-14', voucherStatus: 'draft', voucherLines: { debit: [{ accountCode: '1012001', accountName: '微信待结算', amount: 5 }], credit: [{ accountCode: '5001', accountName: '主营业务收入', amount: 5 }] } }
+    h.store = { activeEntries: [draftEntry], fetchEntries: vi.fn(async () => {}) }
+    h.options.mockResolvedValue({ canPost: true, canSubmit: false, canApprove: false })
+    const draftWrapper = mount(EntryDetail)
     await flushPromises()
-    const matchAction = (button: { text: () => string }) => button.text().trim().startsWith(label)
-    const button = wrapper.findAll('button').find(matchAction)!
-    await button.trigger('click')
-    expect(h[action]).not.toHaveBeenCalled()
-    const modal = wrapper.find('.test-modal')
-    expect(modal.text()).toContain('1012001')
-    expect(modal.text()).toContain('5001')
-    await modal.findAll('button').find(matchAction)!.trigger('click')
-    await flushPromises()
-    expect(h[action]).toHaveBeenCalledExactlyOnceWith('draft')
-    expect(h.error).not.toHaveBeenCalled()
-    expect(wrapper.text()).toContain(action === 'submit' ? '待复核' : '已过账')
-    wrapper.unmount()
+    expect(draftWrapper.text()).toContain('待关账封存')
+    expect(draftWrapper.findAll('button').find(b => b.text().trim().startsWith('确认过账'))).toBeUndefined()
+    draftWrapper.unmount()
+
+    for (const [status, options, label, action] of [
+      ['pending_review', { canApprove: true }, '复核并过账', 'approve'],
+      ['draft', { canSubmit: true, canPost: false }, '提交复核', 'submit'],
+    ] as const) {
+      const entry = { ...draftEntry, voucherStatus: status }
+      h.store = { activeEntries: [entry], fetchEntries: vi.fn(async () => {}) }
+      h.options.mockResolvedValue(options)
+      h[action].mockResolvedValue({ entry: { ...entry, voucherStatus: action === 'submit' ? 'pending_review' : 'posted', voucherRef: action === 'submit' ? '' : 'VOU-202607-000001' } })
+      const wrapper = mount(EntryDetail)
+      await flushPromises()
+      const matchAction = (button: { text: () => string }) => button.text().trim().startsWith(label)
+      const button = wrapper.findAll('button').find(matchAction)!
+      await button.trigger('click')
+      expect(h[action]).not.toHaveBeenCalled()
+      const modal = wrapper.find('.test-modal')
+      expect(modal.text()).toContain('1012001')
+      expect(modal.text()).toContain('5001')
+      await modal.findAll('button').find(matchAction)!.trigger('click')
+      await flushPromises()
+      expect(h[action]).toHaveBeenCalledExactlyOnceWith('draft')
+      expect(h.error).not.toHaveBeenCalled()
+      expect(wrapper.text()).toContain(action === 'submit' ? '待复核' : '已过账')
+      wrapper.unmount()
+      vi.clearAllMocks()
+    }
   })
 
-  it('shows all month blockers and provides batch post all action', async () => {
+  it('shows drafts as pending close seal and navigates to closing-wizard instead of manual batch posting', async () => {
     const entries = Array.from({ length: 15 }, (_, i) => ({ id: `july-${i}`, title: `七月收入-${i}`, amount: 5, direction: 'income', occurDate: '2026-07-14', voucherStatus: 'draft' }))
     h.store = { activeEntries: [...entries, { id: 'old', title: '六月收入', occurDate: '2026-06-14', voucherStatus: 'draft' }], fetchEntries: vi.fn(async () => {}) }
     h.checks.mockResolvedValue({ checks: [{ code: 'VOUCHER_TO_SOURCE', records: entries.map(e => ({ entryId: e.id, title: e.title, date: e.occurDate, reasons: ['pending_post'] })) }] })
-    h.dialogInfo.mockImplementation((opts: any) => opts.onPositiveClick?.())
-    h.batchPost.mockResolvedValue({ total: 15, postedCount: 15, failedCount: 0, postedEntryIds: entries.map(e => e.id), failedEntries: [] })
 
     const wrapper = mount(VoucherList)
     await flushPromises()
     expect(h.checks).toHaveBeenCalledWith('2026-07')
     expect(wrapper.text()).toContain('七月收入-14')
     expect(wrapper.text()).not.toContain('六月收入')
+    expect(wrapper.text()).toContain('待关账封存')
+    expect(wrapper.findAll('button').find(button => button.text().includes('一键过账全部'))).toBeUndefined()
+    expect(wrapper.findAll('button').find(button => button.text().includes('批量过账所选'))).toBeUndefined()
 
-    // Verify batch post button is present and clickable
-    const batchAllBtn = wrapper.findAll('button').find(button => button.text().includes('一键过账全部'))
-    expect(batchAllBtn).toBeDefined()
-    expect(batchAllBtn!.text()).toContain('15')
-
-    await batchAllBtn!.trigger('click')
-    await flushPromises()
-
-    expect(h.dialogInfo).toHaveBeenCalled()
-    expect(h.batchPost).toHaveBeenCalledWith({ entryIds: entries.map(e => e.id) })
-    expect(h.success).toHaveBeenCalledWith(expect.stringContaining('成功批量过账 15 笔'))
-
-    wrapper.unmount()
-  })
-
-  it('handles partial failures in batch post cleanly with warning', async () => {
-    const entries = [
-      { id: 'e-1', title: '正常凭证', amount: 10, occurDate: '2026-07-10', voucherStatus: 'draft' },
-      { id: 'e-2', title: '不平衡凭证', amount: 20, occurDate: '2026-07-11', voucherStatus: 'draft' },
-    ]
-    h.store = { activeEntries: entries, fetchEntries: vi.fn(async () => {}) }
-    h.checks.mockResolvedValue({ checks: [] })
-    h.dialogInfo.mockImplementation((opts: any) => opts.onPositiveClick?.())
-    h.batchPost.mockResolvedValue({
-      total: 2,
-      postedCount: 1,
-      failedCount: 1,
-      postedEntryIds: ['e-1'],
-      failedEntries: [{ entryId: 'e-2', title: '不平衡凭证', code: 'UNBALANCED_ENTRY', reason: '借贷不平衡' }],
-    })
-
-    const wrapper = mount(VoucherList)
-    await flushPromises()
-
-    const batchAllBtn = wrapper.findAll('button').find(button => button.text().includes('一键过账全部'))!
-    await batchAllBtn.trigger('click')
-    await flushPromises()
-
-    expect(h.warning).toHaveBeenCalledWith(expect.stringContaining('已过账 1 笔凭证；1 笔因需复核或异常未过账'))
-    expect(h.dialogWarning).toHaveBeenCalled()
-
-    wrapper.unmount()
-  })
-
-  it('supports selecting individual entries and batch posting only selected', async () => {
-    const entries = [
-      { id: 'sel-1', title: '选中的凭证', amount: 10, occurDate: '2026-07-10', voucherStatus: 'draft' },
-      { id: 'sel-2', title: '未选的凭证', amount: 20, occurDate: '2026-07-11', voucherStatus: 'draft' },
-    ]
-    h.store = { activeEntries: entries, fetchEntries: vi.fn(async () => {}) }
-    h.checks.mockResolvedValue({ checks: [] })
-    h.dialogInfo.mockImplementation((opts: any) => opts.onPositiveClick?.())
-    h.batchPost.mockResolvedValue({
-      total: 1,
-      postedCount: 1,
-      failedCount: 0,
-      postedEntryIds: ['sel-1'],
-      failedEntries: [],
-    })
-
-    const wrapper = mount(VoucherList)
-    await flushPromises()
-
-    // 列表为数据表格，行序随排序变化，所以按内容定位而不是索引
-    const targetRow = wrapper.findAll('.n-data-table-tr').find((row) => row.text().includes('选中的凭证'))
-    expect(targetRow).toBeDefined()
-    await targetRow!.find('.n-checkbox').trigger('click')
-    await flushPromises()
-
-    expect(wrapper.text()).toContain('已勾选 1 笔')
-    const selectedBtn = wrapper.findAll('button').find(button => button.text().includes('批量过账所选 (1)'))
-    expect(selectedBtn).toBeDefined()
-
-    await selectedBtn!.trigger('click')
-    await flushPromises()
-
-    expect(h.batchPost).toHaveBeenCalledWith({ entryIds: ['sel-1'] })
-    expect(h.success).toHaveBeenCalledWith(expect.stringContaining('成功批量过账 1 笔'))
+    const goCloseBtn = wrapper.findAll('button').find(button => button.text().includes('前往月度结账'))
+    expect(goCloseBtn).toBeDefined()
+    expect(goCloseBtn!.text()).toContain('15 笔待封存')
+    await goCloseBtn!.trigger('click')
+    expect(h.push).toHaveBeenCalledWith({ path: '/closing-wizard', query: { month: '2026-07' } })
 
     wrapper.unmount()
   })
@@ -255,8 +194,41 @@ describe('voucher posting workflow', () => {
     expect(postedWrapper.find('.voucher-card').exists()).toBe(true)
     expect(postedWrapper.find('.voucher-table').exists()).toBe(true)
     expect(postedWrapper.text()).toContain('VOU-202607-000008')
+    expect(postedWrapper.find('.edit-section').exists()).toBe(false)
 
     wrapper.unmount()
     postedWrapper.unmount()
+  })
+
+  it('hides edit form and reverse button on posted reversal entries', async () => {
+    const reversalEntry = {
+      id: 'draft',
+      title: '冲销：企业网银服务费',
+      amount: -25,
+      direction: 'expense',
+      category: '银行及金融手续费',
+      occurDate: '2026-10-02',
+      voucherStatus: 'posted',
+      voucherRef: 'VOU-202610-000030',
+      entryType: 'reversal',
+      isReversal: true,
+      reversalOf: 'orig-1',
+      voucherLines: {
+        debit: [{ accountCode: '1002', accountName: '银行存款', amount: 25 }],
+        credit: [{ accountCode: '5603002', accountName: '财务费用-手续费', amount: 25 }],
+      },
+    }
+    h.store = { activeEntries: [reversalEntry], fetchEntries: vi.fn(async () => {}) }
+    h.options.mockResolvedValue({ canPost: false, canReverse: true })
+
+    const wrapper = mount(EntryDetail)
+    await flushPromises()
+
+    expect(wrapper.find('.edit-section').exists()).toBe(false)
+    expect(wrapper.text()).toContain('冲销凭证')
+    const reverseBtn = wrapper.find('.header-right').findAll('button').find(b => b.text().trim() === '冲销')
+    expect(reverseBtn).toBeUndefined()
+
+    wrapper.unmount()
   })
 })

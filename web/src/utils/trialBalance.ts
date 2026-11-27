@@ -134,3 +134,66 @@ export function trialBalanceTotals(rows: TrialBalanceRow[]): TrialBalanceTotals 
     },
   }
 }
+
+export type TrialBalanceStatusFilter = 'all' | 'matched' | 'unmatched' | 'rollup' | 'zero'
+
+export function isTrialBalanceZeroRow(row: TrialBalanceRow): boolean {
+  return row.status === 'skipped_zero'
+}
+
+/**
+ * 会计科目编码层级（用于原表缩进与一级汇总加粗）：
+ * - 0: 一级（<= 4 位，如 1002、2221）
+ * - 1: 二级（5~7 位，如 1122001、2211001）
+ * - 2: 三级及以上（> 7 位，如 2221001005）
+ */
+export function trialBalanceAccountDepth(code: string): 0 | 1 | 2 {
+  const cleaned = String(code || '').trim().replace(/[.\-_]/g, '')
+  if (!cleaned || cleaned.length <= 4) return 0
+  if (cleaned.length <= 7) return 1
+  return 2
+}
+
+export interface TrialBalanceFilterOptions {
+  statusFilter?: TrialBalanceStatusFilter
+  hideZero?: boolean
+  query?: string
+}
+
+export function filterTrialBalanceRows(
+  rows: TrialBalanceRow[],
+  opts: TrialBalanceFilterOptions = {},
+): TrialBalanceRow[] {
+  const statusFilter = opts.statusFilter || 'all'
+  const query = String(opts.query || '').trim().toLowerCase()
+
+  return rows.filter((row) => {
+    if (statusFilter === 'matched' && row.status !== 'matched') return false
+    if (statusFilter === 'unmatched' && row.status !== 'unmatched') return false
+    if (
+      statusFilter === 'rollup'
+      && row.status !== 'skipped_rollup'
+      && row.status !== 'skipped_partner_rollup'
+    ) {
+      return false
+    }
+    if (statusFilter === 'zero' && !isTrialBalanceZeroRow(row)) return false
+
+    if (query) {
+      const haystacks = [
+        row.original_code,
+        row.original_name,
+        row.partner_name,
+        row.target_code,
+        row.target_name,
+        row.note,
+      ]
+      return haystacks.some(v => String(v || '').toLowerCase().includes(query))
+    }
+
+    if (opts.hideZero && statusFilter !== 'zero' && isTrialBalanceZeroRow(row)) {
+      return false
+    }
+    return true
+  })
+}

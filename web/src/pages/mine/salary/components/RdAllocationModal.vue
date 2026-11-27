@@ -24,9 +24,25 @@ const emit = defineEmits<{
   (e: 'saved', allocations: RdSalaryAllocation[]): void
 }>()
 
+interface DraftAllocationRow {
+  id?: string
+  month?: string
+  employeeId: string
+  projectId: string
+  allocationPercent: number
+  allocationBasis: string
+}
+
 const message = useMessage()
 const saving = ref(false)
-const draft = ref<RdSalaryAllocation[]>([])
+const draft = ref<DraftAllocationRow[]>([])
+
+const round2 = (n: number) => Math.round(n * 100) / 100
+
+const totalPercent = computed(() =>
+  round2(draft.value.reduce((sum, row) => sum + Number(row.allocationPercent || 0), 0)),
+)
+const remainingPercent = computed(() => round2(100 - totalPercent.value))
 
 const projectOptions = computed(() =>
   props.projects
@@ -38,12 +54,19 @@ watch(() => props.show, (visible) => {
   if (visible && props.employee) {
     const employeeId = props.employee.employee_id
     const existing = props.allocations.filter((a) => a.employeeId === employeeId)
-    draft.value = existing.map((item) => ({ ...item }))
+    draft.value = existing.map((item) => ({
+      id: item.id,
+      month: item.month,
+      employeeId: item.employeeId,
+      projectId: item.projectId,
+      allocationPercent: Math.round(Number(item.allocationRate || 0) * 10000) / 100,
+      allocationBasis: item.allocationBasis,
+    }))
     if (!draft.value.length) {
       draft.value = [{
         employeeId,
         projectId: '',
-        allocationRate: 1,
+        allocationPercent: 100,
         allocationBasis: '日常研发工时表',
       }]
     }
@@ -59,7 +82,7 @@ function addRow() {
   draft.value.push({
     employeeId: props.employee.employee_id,
     projectId: '',
-    allocationRate: 0,
+    allocationPercent: remainingPercent.value > 0 ? remainingPercent.value : 0,
     allocationBasis: '',
   })
 }
@@ -70,23 +93,35 @@ function removeRow(index: number) {
 
 async function handleSave() {
   if (!props.employee) return
-  const totalRate = draft.value.reduce((sum, row) => sum + Number(row.allocationRate || 0), 0)
 
   if (draft.value.some((row) => !row.projectId || !row.allocationBasis.trim())) {
     message.warning('每条工时分配都必须选择研发项目并填写工时依据')
     return
   }
 
-  if (totalRate > 1.000001) {
+  if (draft.value.some((row) => Number(row.allocationPercent || 0) <= 0)) {
+    message.warning('每条工时分配比例需大于 0%')
+    return
+  }
+
+  if (totalPercent.value > 100.0001) {
     message.warning('项目工时分配比例合计不能超过 100%')
     return
   }
 
   saving.value = true
   const employeeId = props.employee.employee_id
+  const mapped: RdSalaryAllocation[] = draft.value.map((row) => ({
+    ...(row.id ? { id: row.id } : {}),
+    ...(row.month ? { month: row.month } : {}),
+    employeeId: row.employeeId,
+    projectId: row.projectId,
+    allocationRate: Math.round(Number(row.allocationPercent || 0) * 100) / 10000,
+    allocationBasis: row.allocationBasis,
+  }))
   const next = [
     ...props.allocations.filter((item) => item.employeeId !== employeeId),
-    ...draft.value,
+    ...mapped,
   ]
 
   try {
@@ -107,7 +142,7 @@ async function handleSave() {
     :show="show"
     preset="card"
     :title="`${employee?.employee_name || ''} · 研发项目工时分配`"
-    style="width: min(760px, 92vw); border-radius: 14px"
+    style="width: min(760px, 92vw); border-radius: var(--solo-radius-lg)"
     @update:show="closeModal"
   >
     <p class="modal-hint">
@@ -124,14 +159,15 @@ async function handleSave() {
           style="flex: 2"
         />
         <NInputNumber
-          v-model:value="allocation.allocationRate"
-          :min="0.01"
-          :max="1"
-          :step="0.05"
-          placeholder="分配比例 0~1"
+          v-model:value="allocation.allocationPercent"
+          :min="1"
+          :max="100"
+          :step="5"
+          :precision="2"
+          placeholder="分配比例 1~100"
           style="flex: 1"
         >
-          <template #suffix>（{{ ((allocation.allocationRate || 0) * 100).toFixed(0) }}%）</template>
+          <template #suffix>%</template>
         </NInputNumber>
         <NInput
           v-model:value="allocation.allocationBasis"
@@ -140,6 +176,12 @@ async function handleSave() {
         />
         <NButton text type="error" @click="removeRow(index)">删除</NButton>
       </div>
+    </div>
+
+    <div class="allocation-summary" :class="{ 'is-over': totalPercent > 100 }">
+      <span>已分配合计：<strong>{{ totalPercent }}%</strong></span>
+      <span v-if="totalPercent <= 100">剩余未分配：<strong>{{ Math.max(remainingPercent, 0) }}%</strong></span>
+      <span v-else class="over-warn">已超出 {{ round2(totalPercent - 100) }}%，请调整至 100% 以内</span>
     </div>
 
     <NButton dashed block style="margin-top: 10px" @click="addRow">+ 增加分配项目</NButton>
@@ -171,5 +213,25 @@ async function handleSave() {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+.allocation-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
+  padding: 8px 12px;
+  border-radius: var(--solo-radius);
+  background: var(--solo-bg-soft);
+  font-size: 12px;
+  color: var(--solo-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+.allocation-summary.is-over {
+  background: var(--solo-expense-bg);
+  color: var(--solo-expense);
+}
+.over-warn {
+  font-weight: 600;
 }
 </style>

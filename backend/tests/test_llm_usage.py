@@ -12,6 +12,8 @@ import asyncio
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from services.token_service import create_access_token
 
 from tests.conftest import TEST_CORE_DB
@@ -265,3 +267,67 @@ async def _ensure_schema() -> None:
 
     async with get_engine().begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+
+
+# ---------------------------------------------------------------------------
+# LLM 失败可观测性与重试退避（2026-11-18 DeepSeek 空回复事件防再犯）
+# ---------------------------------------------------------------------------
+
+def test_retry_backoff_is_exponential_and_capped(monkeypatch):
+    """退避从线性 1s/2s 改为指数 1s/2s/4s…（上限 8s），供应商瞬断多一档恢复窗口。"""
+    from services import llm
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(llm.time, "sleep", lambda s: sleeps.append(s))
+
+    attempts = {"n": 0}
+
+    def flaky():
+        attempts["n"] += 1
+        if attempts["n"] < 4:
+            raise RuntimeError("transient")
+        return "ok"
+
+    assert llm._retry(flaky, max_retries=4, delay=1.0) == "ok"
+    assert sleeps == [1.0, 2.0, 4.0]
+
+    # 上限 8s：退避封顶，避免批量场景下重试串联拖死调用
+    sleeps.clear()
+    attempts["n"] = 0
+
+    def always_fail():
+        raise RuntimeError("down")
+
+    monkeypatch.setattr(llm.time, "sleep", lambda s: sleeps.append(s))
+    with pytest.raises(RuntimeError):
+        llm._retry(always_fail, max_retries=4, delay=10.0)
+    assert sleeps == [8.0, 8.0, 8.0]
+
+
+def test_chat_text_failure_logs_warning_with_message(monkeypatch, caplog):
+    """失败留可见日志（含异常消息与 scene）：llm_usage 只存异常类型，
+    容器日志是排查供应商故障的唯一现场（2026-11-18 事件的盲点）。"""
+    import logging
+    from types import SimpleNamespace
+
+    from services import llm
+
+    class _FakeCompletions:
+        def create(self, **kwargs):
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=None))]
+            )
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=_FakeCompletions()))
+    monkeypatch.setattr(llm, "_oai", lambda: fake_client)
+    monkeypatch.setattr(llm.time, "sleep", lambda s: None)
+
+    with caplog.at_level(logging.WARNING, logger="services.llm"):
+        with pytest.raises(RuntimeError, match="empty content"):
+            llm.chat_text("系统提示", "用户消息", scene="bank_statement", user_id="u-log-test")
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(
+        "LLM 调用失败" in r.getMessage() and "bank_statement" in r.getMessage()
+        for r in warnings
+    )

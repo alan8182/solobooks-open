@@ -64,6 +64,30 @@ CATEGORY_TO_ACCOUNT = {
         "accountType": "损益-收入",
         "defaultCounterparty": "1002"
     },
+    "非流动资产处置净收益": {
+        "accountCode": "5301001",
+        "accountName": "营业外收入-非流动资产处置净收益",
+        "accountType": "损益-收入",
+        "defaultCounterparty": "1002"
+    },
+    "政府补助": {
+        "accountCode": "5301002",
+        "accountName": "营业外收入-政府补助",
+        "accountType": "损益-收入",
+        "defaultCounterparty": "1002"
+    },
+    "捐赠收益": {
+        "accountCode": "5301003",
+        "accountName": "营业外收入-捐赠收益",
+        "accountType": "损益-收入",
+        "defaultCounterparty": "1002"
+    },
+    "盘盈收益": {
+        "accountCode": "5301004",
+        "accountName": "营业外收入-盘盈收益",
+        "accountType": "损益-收入",
+        "defaultCounterparty": "1002"
+    },
     "利息收入": {
         "accountCode": "5603005",
         "accountName": "财务费用-利息收入",
@@ -199,6 +223,14 @@ CATEGORY_TO_ACCOUNT = {
         "accountType": "负债",
         "defaultCounterparty": "1002"
     },
+    # 代扣代缴员工个税：走工资模块按流水核销 2221012，银行页直接记费用会与
+    # 企业所得税费用（5801）混淆——个税是被代扣员工的钱，不是公司费用。
+    "个税代缴": {
+        "accountCode": "2221012",
+        "accountName": "应交税费-应交个人所得税",
+        "accountType": "负债",
+        "defaultCounterparty": "1002"
+    },
     "员工福利": {
         "accountCode": "5602014",
         "accountName": "管理费用-职工福利费",
@@ -300,6 +332,144 @@ CATEGORY_TO_ACCOUNT = {
     "营业外支出": {
         "accountCode": "5711",
         "accountName": "营业外支出",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "罚款支出": {
+        "accountCode": "5711011",
+        "accountName": "营业外支出-罚款支出",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "税收滞纳金": {
+        "accountCode": "5711010",
+        "accountName": "营业外支出-税收滞纳金",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "捐赠支出": {
+        "accountCode": "5711003",
+        "accountName": "营业外支出-捐赠支出",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "赞助支出": {
+        "accountCode": "5711002",
+        "accountName": "营业外支出-赞助支出",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "非流动资产处置净损失": {
+        "accountCode": "5711001",
+        "accountName": "营业外支出-非流动资产处置净损失",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "盘亏损失": {
+        "accountCode": "5711004",
+        "accountName": "营业外支出-盘亏损失",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "坏账损失": {
+        "accountCode": "5711005",
+        "accountName": "营业外支出-坏账损失",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "存货毁损报废损失": {
+        "accountCode": "5711006",
+        "accountName": "营业外支出-存货毁损报废损失",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "长期债券投资损失": {
+        "accountCode": "5711007",
+        "accountName": "营业外支出-无法收回的长期债券投资损失",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "长期股权投资损失": {
+        "accountCode": "5711008",
+        "accountName": "营业外支出-无法收回的长期股权投资损失",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "自然灾害损失": {
+        "accountCode": "5711009",
+        "accountName": "营业外支出-自然灾害等不可抗力因素造成的损失",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "广告费": {
+        "accountCode": "5601015",
+        "accountName": "销售费用-广告费",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "展览费": {
+        "accountCode": "5601009",
+        "accountName": "销售费用-展览费",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "商品维修费": {
+        "accountCode": "5601010",
+        "accountName": "销售费用-商品维修费",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "装卸费": {
+        "accountCode": "5601012",
+        "accountName": "销售费用-装卸费",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "包装费": {
+        "accountCode": "5601013",
+        "accountName": "销售费用-包装费",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "保险费": {
+        "accountCode": "5601014",
+        "accountName": "销售费用-保险费",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "修理费": {
+        "accountCode": "5602003",
+        "accountName": "管理费用-修理费",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "开办费": {
+        "accountCode": "5602009",
+        "accountName": "管理费用-开办费",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "研究费用": {
+        "accountCode": "5602010",
+        "accountName": "管理费用-研究费用",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "利息费用": {
+        "accountCode": "5603001",
+        "accountName": "财务费用-利息费用",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "汇兑损益": {
+        "accountCode": "5603003",
+        "accountName": "财务费用-汇兑损益",
+        "accountType": "损益-费用",
+        "defaultCounterparty": "1002"
+    },
+    "现金折扣": {
+        "accountCode": "5603004",
+        "accountName": "财务费用-现金折扣",
         "accountType": "损益-费用",
         "defaultCounterparty": "1002"
     },
@@ -438,6 +608,295 @@ EXPENSE_FALLBACK_ACCOUNT = {
     "defaultCounterparty": "1002",
 }
 
+# 口语/兼容别名：支持查表和前端兜底映射，但不重复写入 AI Prompt 与标准下拉列表
+CATEGORY_ALIASES: set[str] = {
+    "咨询服务",
+    "技术服务",
+    "信息技术服务",
+    "信息技术服务收入",
+    "差旅",
+    "交通",
+    "交通费",
+    "办公",
+    "咨询",
+    "顾问费",
+    "业务招待",
+    "餐饮",
+    "餐饮费",
+    "员工福利",
+    "房租物业",
+    "通讯费",
+    "设备采购",
+}
+
+# 内部自动核销/结算分类：由对账或工资模块专用，不放入通用记账/发票 OCR Prompt 候选
+INTERNAL_SETTLEMENT_CATEGORIES: set[str] = {
+    "微信支付结算",
+    "支付宝结算",
+    "平台提现结算",
+    "股东垫付报销",
+    "员工垫付报销",
+}
+
+GROUP_ORDER: tuple[str, ...] = (
+    "收入",
+    "员工成本",
+    "费用支出",
+    "采购与往来",
+    "资本",
+    "往来",
+    "销售与财务费用",
+    "营业外支出",
+    "营业外收入",
+)
+
+CATEGORY_GROUPS: dict[str, str] = {
+    # 收入
+    "主营业务收入": "收入",
+    "咨询服务收入": "收入",
+    "技术服务收入": "收入",
+    "其他业务收入": "收入",
+    "营业外收入": "收入",
+    "利息收入": "收入",
+    # 营业外收入（明细）
+    "政府补助": "营业外收入",
+    "非流动资产处置净收益": "营业外收入",
+    "捐赠收益": "营业外收入",
+    "盘盈收益": "营业外收入",
+    # 员工成本
+    "工资发放": "员工成本",
+    "社保公积金": "员工成本",
+    "个税代缴": "员工成本",
+    # 费用支出（日常管理与经营）
+    "差旅费": "费用支出",
+    "办公费": "费用支出",
+    "业务招待费": "费用支出",
+    "研发支出-费用化支出": "费用支出",
+    "信息技术服务费": "费用支出",
+    "咨询费": "费用支出",
+    "租金物业": "费用支出",
+    "银行及金融手续费": "费用支出",
+    "水电通讯费": "费用支出",
+    "推广费": "费用支出",
+    "运费及物流": "费用支出",
+    "员工福利费": "费用支出",
+    "修理费": "费用支出",
+    "开办费": "费用支出",
+    "研究费用": "费用支出",
+    "其他支出": "费用支出",
+    # 销售与财务费用（细分）
+    "广告费": "销售与财务费用",
+    "展览费": "销售与财务费用",
+    "商品维修费": "销售与财务费用",
+    "装卸费": "销售与财务费用",
+    "包装费": "销售与财务费用",
+    "保险费": "销售与财务费用",
+    "利息费用": "销售与财务费用",
+    "汇兑损益": "销售与财务费用",
+    "现金折扣": "销售与财务费用",
+    # 营业外支出
+    "罚款支出": "营业外支出",
+    "税收滞纳金": "营业外支出",
+    "捐赠支出": "营业外支出",
+    "赞助支出": "营业外支出",
+    "非流动资产处置净损失": "营业外支出",
+    "盘亏损失": "营业外支出",
+    "坏账损失": "营业外支出",
+    "存货毁损报废损失": "营业外支出",
+    "长期债券投资损失": "营业外支出",
+    "长期股权投资损失": "营业外支出",
+    "自然灾害损失": "营业外支出",
+    "营业外支出": "营业外支出",
+    # 采购与往来
+    "原材料采购": "采购与往来",
+    "商品采购": "采购与往来",
+    "生产成本": "采购与往来",
+    "人力成本": "采购与往来",
+    "固定资产": "采购与往来",
+    "无形资产": "采购与往来",
+    "供应商付款": "采购与往来",
+    "预付账款": "采购与往来",
+    "其他应收款": "采购与往来",
+    "其他应付款": "采购与往来",
+    "往来款": "采购与往来",
+    "往来退款": "采购与往来",
+    "税费缴纳": "采购与往来",
+    "所得税费用": "采购与往来",
+    # 资本与股东往来
+    "股东投入": "资本",
+    "资本公积": "资本",
+    "股东垫付": "往来",
+    "股东取现": "往来",
+    "股东垫付报销": "往来",
+    "员工垫付报销": "往来",
+    "微信支付结算": "收入",
+    "支付宝结算": "收入",
+    "平台提现结算": "收入",
+}
+
+_CATEGORY_DIRECTION_OVERRIDES: dict[str, str] = {
+    "主营业务收入": "income",
+    "咨询服务收入": "income",
+    "技术服务收入": "income",
+    "其他业务收入": "income",
+    "营业外收入": "income",
+    "非流动资产处置净收益": "income",
+    "政府补助": "income",
+    "捐赠收益": "income",
+    "盘盈收益": "income",
+    "利息收入": "income",
+    "往来退款": "income",
+    "股东投入": "owner_transfer",
+    "资本公积": "owner_transfer",
+    "股东垫付": "owner_transfer",
+    "股东取现": "owner_transfer",
+    "其他应收款": "owner_transfer",
+    "其他应付款": "owner_transfer",
+    "往来款": "owner_transfer",
+    "股东垫付报销": "owner_transfer",
+    "员工垫付报销": "owner_transfer",
+    "微信支付结算": "owner_transfer",
+    "支付宝结算": "owner_transfer",
+    "平台提现结算": "owner_transfer",
+}
+
+CATEGORY_PROMPT_HINTS: dict[str, str] = {
+    "工资发放": "必须走工资模块按流水核销，不得直接记费用",
+    "社保公积金": "已计提时走工资模块缴纳",
+    "个税代缴": "代扣代缴员工个税，走工资模块按流水核销应交个人所得税，不得记所得税费用",
+    "税费缴纳": "小规模纳税人正常税款缴纳，含增值税/附加税等；不含罚款滞纳金",
+    "罚款支出": "税务罚款/逾期申报罚款/行政处罚等，企业所得税不得税前扣除",
+    "税收滞纳金": "逾期缴税产生的滞纳金，企业所得税不得税前扣除",
+    "政府补助": "政府补贴/稳岗返还/财政奖励/个税手续费返还等",
+    "广告费": "广告投放/平台投流宣传",
+    "研究费用": "日常非立项研究支出；正式立项研发项目请选「研发支出-费用化支出」",
+    "利息费用": "银行借款或贷款利息支出",
+    "汇兑损益": "外币结算或结汇汇率差",
+    "往来款": "支出记其他应收款-待收款项、收入记其他应付款",
+    "往来退款": "前期暂付款的退回，冲减往来，不算收入",
+}
+
+_OCR_VAT_RATE_BY_CATEGORY: dict[str, str] = {
+    "原材料采购": "13%",
+    "商品采购": "13%",
+    "生产成本": "13%",
+    "固定资产": "13%",
+    "运费及物流": "9%",
+    "人力成本": "0%",
+    "员工福利费": "0%",
+    "税费缴纳": "0%",
+    "所得税费用": "0%",
+    "营业外支出": "0%",
+    "罚款支出": "0%",
+    "税收滞纳金": "0%",
+    "捐赠支出": "0%",
+    "赞助支出": "0%",
+    "非流动资产处置净损失": "0%",
+    "盘亏损失": "0%",
+    "坏账损失": "0%",
+    "存货毁损报废损失": "0%",
+    "长期债券投资损失": "0%",
+    "长期股权投资损失": "0%",
+    "自然灾害损失": "0%",
+    "利息费用": "0%",
+    "汇兑损益": "0%",
+    "现金折扣": "0%",
+}
+
+_OCR_EXCLUDED_CATEGORIES: set[str] = {
+    "工资发放",
+    "社保公积金",
+    "个税代缴",
+    "往来款",
+    "往来退款",
+    "其他应收款",
+    "其他应付款",
+    "供应商付款",
+    "预付账款",
+}
+
+
+def category_direction(category: str) -> str:
+    """规范分类的标准方向（income | expense | owner_transfer）。"""
+    return _CATEGORY_DIRECTION_OVERRIDES.get(category, "expense")
+
+
+def category_group(category: str) -> str:
+    """规范分类所属语义分组，未登记时回落费用支出。"""
+    return CATEGORY_GROUPS.get(category, "费用支出")
+
+
+def is_alias_category(category: str) -> bool:
+    """是否为仅作口语/历史兼容的别名。"""
+    return category in CATEGORY_ALIASES
+
+
+def render_prompt_category_table(scene: str = "bank") -> str:
+    """从 CATEGORY_TO_ACCOUNT 单一真相源生成各 AI 场景使用的 Markdown 映射表。"""
+    canonical = [
+        (cat, info)
+        for cat, info in CATEGORY_TO_ACCOUNT.items()
+        if not is_alias_category(cat) and cat not in INTERNAL_SETTLEMENT_CATEGORIES
+    ]
+    if scene == "ocr":
+        lines = [
+            "| 分类 | 科目代码 | 科目名称 | VAT税率 |",
+            "|---|---|---|---|",
+        ]
+        for cat, info in canonical:
+            if category_direction(cat) != "expense" or cat in _OCR_EXCLUDED_CATEGORIES:
+                continue
+            vat_rate = _OCR_VAT_RATE_BY_CATEGORY.get(cat, "6%")
+            hint = CATEGORY_PROMPT_HINTS.get(cat)
+            name_cell = f"{info['accountName']}（{hint}）" if hint else info["accountName"]
+            lines.append(f"| {cat} | {info['accountCode']} | {name_cell} | {vat_rate} |")
+        return "\n".join(lines)
+
+    if scene in ("classifier", "batch"):
+        allowed = [
+            (cat, info)
+            for cat, info in canonical
+            if cat not in {"工资发放", "社保公积金", "个税代缴", "往来退款"}
+        ]
+        if scene == "classifier":
+            lines = [
+                "| 用户分类 | 方向 | 会计科目代码 | 会计科目名称 | 科目类型 |",
+                "|---|---|---|---|---|",
+            ]
+            for cat, info in allowed:
+                direction = category_direction(cat)
+                hint = CATEGORY_PROMPT_HINTS.get(cat)
+                name_cell = f"{info['accountName']}（{hint}）" if hint else info["accountName"]
+                lines.append(
+                    f"| {cat} | {direction} | {info['accountCode']} | {name_cell} | {info['accountType']} |"
+                )
+            return "\n".join(lines)
+        lines = [
+            "| 用户分类 | 方向 | 会计科目代码 | 会计科目名称 |",
+            "|---|---|---|---|",
+        ]
+        for cat, info in allowed:
+            direction = category_direction(cat)
+            lines.append(
+                f"| {cat} | {direction} | {info['accountCode']} | {info['accountName']} |"
+            )
+        return "\n".join(lines)
+
+    # scene == "bank"
+    lines = [
+        "| 用户分类 | 方向 | 会计科目代码 | 会计科目名称 |",
+        "|---|---|---|---|",
+    ]
+    for cat, info in canonical:
+        direction = "expense/income" if cat == "往来款" else category_direction(cat)
+        hint = CATEGORY_PROMPT_HINTS.get(cat)
+        name_cell = f"{info['accountName']}（{hint}）" if hint else info["accountName"]
+        lines.append(
+            f"| {cat} | {direction} | {info['accountCode']} | {name_cell} |"
+        )
+    return "\n".join(lines)
+
+
 def lookup(category: str) -> Optional[dict]:
     """根据用户分类查找科目"""
     # 兼容口语化老数据
@@ -447,6 +906,8 @@ def lookup(category: str) -> Optional[dict]:
         category = "股东垫付"
     elif category == "老板取现":
         category = "股东取现"
+    elif category == "税费支出":
+        category = "税费缴纳"
     return CATEGORY_TO_ACCOUNT.get(category)
 
 
@@ -519,6 +980,8 @@ def get_voucher_hint(
         category = "股东垫付报销"
     elif category == "老板取现":
         category = "老板取现"
+    elif category == "税费支出":
+        category = "税费缴纳"
     elif category == "往来款":
         # 支出方向保留「往来款」→ 122199 待收款项；收入方向按暂收落 2241
         if direction != "expense":

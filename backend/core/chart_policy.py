@@ -20,15 +20,17 @@ from typing import Any
 
 CONTAINER_CODES = frozenset({"1221", "2211", "2221"})
 
-# ── 辅助核算挂载口径（P0 WP2）─────────────────────────────────────────────────
-# 只做三个维度：往来单位 / 部门 / 项目。
-# 职员往来已由 122101/122103 子科目覆盖、存货走后续进销存、现金流维度与
-# 本产品"公式法现金流量表"冲突，均不做。
+# ── 辅助核算挂载口径（P0 WP2 + 职员扩展）─────────────────────────────────────
+# 四个维度：往来单位 / 部门 / 项目 / 职员。
+# 存货走数量金额式与后续进销存、现金流维度与本产品"公式法现金流量表"冲突，均不做。
 #
 # 挂载白名单放在这里而不是散在路由里：与 AGGREGATE_PARENT_CODES 的归集口径
 # 同源，避免"能挂的科目"和"能出账的科目"两套口径漂移。
-PARTNER_ACCOUNT_PREFIXES = ("1122", "1123", "2202", "2203", "1221", "2241")
+# 3001 实收资本：认缴/实缴按股东区分是工商与税务的硬要求（认缴进度、股权
+# 转让、股东借款转增资本都要落到具体股东），不挂辅助就只能看到一个总数。
+PARTNER_ACCOUNT_PREFIXES = ("1122", "1123", "2202", "2203", "1221", "2241", "3001")
 DEPARTMENT_PROJECT_ACCOUNT_PREFIXES = ("5001", "5051", "5401", "5402", "5601", "5602", "5603", "4301")
+EMPLOYEE_ACCOUNT_PREFIXES = ("1221", "2211", "2241", "5001", "5051", "5401", "5402", "5601", "5602", "5603", "4301")
 
 # ── 数量金额式核算（P1 WP-D）─────────────────────────────────────────────────
 # 数量标志是 chart_accounts.quantity_enabled（用户可开可关），这里只定义
@@ -58,6 +60,8 @@ def auxiliary_kinds_for_account(code: str) -> frozenset[str]:
         kinds.add("partner")
     if any(value.startswith(prefix) for prefix in DEPARTMENT_PROJECT_ACCOUNT_PREFIXES):
         kinds.update({"department", "project"})
+    if any(value.startswith(prefix) for prefix in EMPLOYEE_ACCOUNT_PREFIXES):
+        kinds.add("employee")
     return frozenset(kinds)
 
 

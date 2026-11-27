@@ -12,7 +12,6 @@ import {
   type Employee, type SalaryRecord, type SalarySheet, type RdSalaryAllocation,
   type SalaryPaymentSuggestion, type PayrollLiabilitySuggestion, type PayrollRates, type DepartmentItem,
 } from '@/api/salary'
-import { SoloMonthPicker } from '@/components/ui'
 import { useWorkspaceViewStore } from '@/stores/workspaceView'
 import { getRdProjects } from '@/api/rd'
 import type { RdProject } from '@/api/types'
@@ -41,7 +40,6 @@ const rdProjects = ref<RdProject[]>([])
 const rdAllocations = ref<RdSalaryAllocation[]>([])
 const paymentSuggestions = ref<SalaryPaymentSuggestion[]>([])
 const liabilitySuggestions = ref<PayrollLiabilitySuggestion[]>([])
-const totals = ref({ count: 0, net: 0, cost: 0, withheld: 0 })
 
 const sheetTabRef = ref<InstanceType<typeof SalarySheetTab> | null>(null)
 
@@ -68,14 +66,10 @@ const housingFund = computed(() => ({
 const taxInitialSpecial = computed(() =>
   Number(employees.value.find((e) => e.id === taxTarget.value?.employee_id)?.special_additional_deduction || 0))
 
-const statusPill = computed(() => {
-  const boss = viewStore.isBoss
-  switch (sheet.value?.status) {
-    case 'paid': return { cls: 'pill-paid', icon: 'ri-checkbox-circle-line', text: boss ? '已发薪完结' : '已发放记账' }
-    case 'accrued': return { cls: 'pill-accrued', icon: 'ri-time-line', text: boss ? '已确认（待发薪）' : '已计提记账' }
-    case 'pending_review': return { cls: 'pill-pending', icon: 'ri-shield-flash-line', text: '待复核' }
-    default: return { cls: 'pill-draft', icon: 'ri-draft-line', text: boss ? '草稿（待确认）' : '草稿（待计提）' }
-  }
+const ratesButtonSuffix = computed(() => {
+  if (!payrollRates.value) return ''
+  if (payrollRates.value.isCustomized) return ' · 自定义'
+  return payrollRates.value.regionDesc ? ' · 默认' : ''
 })
 
 async function fetchEmployees() {
@@ -129,6 +123,16 @@ async function fetchPaymentSuggestions() {
 function onSheetUpdated(data: SalarySheet) {
   sheet.value = data
   records.value = data.records || []
+}
+
+async function fetchRdAllocations() {
+  if (!selectedMonth.value) return
+  try {
+    const data: any = await getRdSalaryAllocations(selectedMonth.value)
+    rdAllocations.value = data.allocations || []
+  } catch {
+    // ignore silent refresh failure
+  }
 }
 
 function openAddEmployee() {
@@ -210,76 +214,34 @@ usePageRefresh(() => Promise.all([fetchSalarySheet(), fetchPaymentSuggestions()]
   <div class="salary-page">
     <div class="page-header">
       <div class="header-left">
-        <div class="title-row">
-          <h2>{{ viewStore.isBoss ? '工资薪金' : '薪酬与社保管理' }}</h2>
-          <span v-if="sheet" class="status-pill" :class="statusPill.cls">
-            <i :class="statusPill.icon" />{{ statusPill.text }}
-          </span>
-        </div>
+        <h2>{{ viewStore.isBoss ? '工资薪金' : '薪酬与社保管理' }}</h2>
         <p class="subtitle">
           {{ viewStore.isBoss ? '核对每月员工工资与社保个税，确认后自动入账' : '管理在职员工花名册，按月核算工资、社保公积金及个税并自动生成记账凭证' }}
         </p>
       </div>
       <div class="header-actions">
-        <div class="month-selector">
-          <span class="control-label">结算月份</span>
-          <SoloMonthPicker v-model:value="selectedMonth" :clearable="false" class="month-picker" />
-        </div>
-      </div>
-    </div>
-
-    <div class="stats-grid">
-      <div class="stat-card">
-        <div class="stat-label">本月应发人数</div>
-        <div class="stat-value">{{ totals.count }} <small>人 / 花名册 {{ employees.length }} 人</small></div>
-        <div class="stat-desc">按入职日期计入当月工资表</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">本月实发工资</div>
-        <div class="stat-value text-income">{{ formatMoney(totals.net) }}</div>
-        <div class="stat-desc">员工到手净额</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">代扣代缴</div>
-        <div class="stat-value text-warn">{{ formatMoney(totals.withheld) }}</div>
-        <div class="stat-desc">个人社保公积金 + 个税</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">企业总人工成本</div>
-        <div class="stat-value text-primary">{{ formatMoney(totals.cost) }}</div>
-        <div class="stat-desc">应发工资 + 单位社保公积金</div>
+        <NButton size="small" secondary @click="showRates = true">
+          <template #icon><i class="ri-percent-line" /></template>
+          {{ viewStore.isBoss ? '社保比例' : '社保公积金比例' }}{{ ratesButtonSuffix }}
+        </NButton>
+        <NButton size="small" secondary @click="showDept = true">
+          <template #icon><i class="ri-team-line" /></template>部门设置
+        </NButton>
       </div>
     </div>
 
     <div class="tabs-toolbar">
       <NTabs v-model:value="activeTab" type="segment" class="salary-tabs">
-        <NTab name="sheet">工资表结算（{{ selectedMonth }}）· {{ totals.count }}</NTab>
+        <NTab name="sheet">月度工资表</NTab>
         <NTab name="roster">员工花名册 · {{ employees.length }}</NTab>
       </NTabs>
-      <div class="tabs-actions">
-        <NButton v-if="activeTab === 'roster' || !viewStore.isBoss" size="small" quaternary @click="showDept = true">
-          <template #icon><i class="ri-team-line" /></template>部门设置
-        </NButton>
-        <NButton size="small" quaternary @click="showRates = true">
-          <template #icon><i class="ri-percent-line" /></template>{{ viewStore.isBoss ? '社保比例' : '社保公积金比例' }}
-        </NButton>
-        <NButton
-          v-if="activeTab === 'sheet'"
-          size="small"
-          secondary
-          :loading="sheetTabRef?.exporting"
-          @click="sheetTabRef?.exportSheet()"
-        >
-          <template #icon><i class="ri-download-2-line" /></template>导出工资表
-        </NButton>
-      </div>
     </div>
 
     <NSpin :show="loading">
       <SalarySheetTab
         v-show="activeTab === 'sheet'"
         ref="sheetTabRef"
-        :selected-month="selectedMonth"
+        v-model:selected-month="selectedMonth"
         :sheet="sheet"
         :records="records"
         :employees="employees"
@@ -292,11 +254,11 @@ usePageRefresh(() => Promise.all([fetchSalarySheet(), fetchPaymentSuggestions()]
         :housing-fund="housingFund"
         @sheet-updated="onSheetUpdated"
         @reload-suggestions="fetchPaymentSuggestions"
+        @reload-rd="fetchRdAllocations"
         @open-rd="(row) => { rdTarget = row; showRd = true }"
         @open-tax="(row) => { taxTarget = row; showTax = true }"
         @goto-roster="activeTab = 'roster'"
         @add-employee="openAddEmployee"
-        @totals="(t) => (totals = t)"
       />
       <EmployeeRosterTab
         v-show="activeTab === 'roster'"
@@ -308,10 +270,25 @@ usePageRefresh(() => Promise.all([fetchSalarySheet(), fetchPaymentSuggestions()]
       />
     </NSpin>
 
-    <EmployeeModal v-model:show="showEmployee" :employee="editingEmployee" :department-options="departmentOptions" @saved="onEmployeeChanged" />
+    <EmployeeModal
+      v-model:show="showEmployee"
+      :employee="editingEmployee"
+      :department-options="departmentOptions"
+      :selected-month="selectedMonth"
+      :is-draft-sheet="sheet?.status === 'draft'"
+      :payroll-rates="payrollRates"
+      @saved="onEmployeeChanged"
+    />
     <DepartmentModal v-model:show="showDept" :departments="departments" @updated="(d) => (departments = d)" />
     <PayrollRatesModal v-model:show="showRates" :selected-month="selectedMonth" :payroll-rates="payrollRates" @saved="onRatesSaved" />
-    <TaxCalcModal v-model:show="showTax" :target="taxTarget" :selected-month="selectedMonth" :initial-special-additional="taxInitialSpecial" @apply="onTaxApply" />
+    <TaxCalcModal
+      v-model:show="showTax"
+      :target="taxTarget"
+      :selected-month="selectedMonth"
+      :initial-special-additional="taxInitialSpecial"
+      :readonly="sheet?.status !== 'draft'"
+      @apply="onTaxApply"
+    />
     <RdAllocationModal v-model:show="showRd" :employee="rdTarget" :selected-month="selectedMonth" :projects="rdProjects" :allocations="rdAllocations" @saved="(a) => (rdAllocations = a)" />
   </div>
 </template>
@@ -320,7 +297,7 @@ usePageRefresh(() => Promise.all([fetchSalarySheet(), fetchPaymentSuggestions()]
 .salary-page {
   max-width: var(--page-width);
   margin: 0 auto;
-  padding: 16px 0 48px;
+  padding: 16px 0 88px;
   width: 100%;
   box-sizing: border-box;
 }
@@ -329,25 +306,18 @@ usePageRefresh(() => Promise.all([fetchSalarySheet(), fetchPaymentSuggestions()]
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 20px;
+  margin-bottom: 16px;
 }
 .header-left {
   flex: 1;
   min-width: 0;
 }
-.title-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: nowrap;
-}
-.title-row h2 {
+.header-left h2 {
   margin: 0;
-  font-size: 20px;
-  font-weight: 600;
+  font-size: 22px;
+  font-weight: 650;
+  line-height: 1.3;
   color: var(--solo-text-primary);
-  white-space: nowrap;
-  flex-shrink: 0;
 }
 .subtitle {
   margin: 4px 0 0;
@@ -360,72 +330,10 @@ usePageRefresh(() => Promise.all([fetchSalarySheet(), fetchPaymentSuggestions()]
 .header-actions {
   display: flex;
   align-items: center;
-  gap: 12px;
-  flex-shrink: 0;
-  white-space: nowrap;
-}
-.month-selector {
-  display: inline-flex;
-  align-items: center;
   gap: 8px;
-}
-.control-label {
-  font-size: 13px;
-  color: var(--solo-text-secondary);
-  white-space: nowrap;
-}
-.month-picker {
-  width: 130px;
-}
-
-.status-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 3px 10px;
-  border-radius: 999px;
-  font-size: 12px;
-  font-weight: 500;
-  white-space: nowrap;
   flex-shrink: 0;
+  white-space: nowrap;
 }
-.pill-paid { background: color-mix(in oklch, var(--solo-income) 14%, transparent); color: var(--solo-income); }
-.pill-accrued { background: rgba(245, 158, 11, 0.15); color: #d97706; }
-.pill-pending { background: rgba(59, 130, 246, 0.15); color: #2563eb; }
-.pill-draft { background: var(--solo-bg-hover, #f1f4f8); color: var(--solo-text-secondary); }
-
-.stats-grid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 12px;
-  margin-bottom: 16px;
-}
-.stat-card {
-  background: var(--solo-bg-card);
-  border: 1px solid var(--solo-border-light);
-  border-radius: var(--solo-radius-lg);
-  padding: 10px 14px;
-  min-height: 84px;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  overflow: hidden;
-}
-.stat-label { font-size: 12px; font-weight: 500; color: var(--solo-text-secondary); }
-.stat-value {
-  font-size: 18px; font-weight: 700; line-height: 1.3; margin: 2px 0;
-  font-variant-numeric: tabular-nums; white-space: nowrap;
-  overflow: hidden; text-overflow: ellipsis; color: var(--solo-text-primary);
-}
-.stat-value small { font-size: 12px; font-weight: 400; color: var(--solo-text-muted); }
-.stat-desc {
-  font-size: 11.5px; color: var(--solo-text-muted);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.text-income { color: var(--solo-income); }
-.text-warn { color: #d97706; }
-.text-primary { color: var(--solo-primary); }
 
 .tabs-toolbar {
   display: flex;
@@ -436,14 +344,7 @@ usePageRefresh(() => Promise.all([fetchSalarySheet(), fetchPaymentSuggestions()]
   flex-wrap: wrap;
 }
 .salary-tabs {
-  max-width: 440px;
-}
-.tabs-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-shrink: 0;
-  white-space: nowrap;
+  max-width: 360px;
 }
 
 @media (max-width: 768px) {
@@ -453,23 +354,7 @@ usePageRefresh(() => Promise.all([fetchSalarySheet(), fetchPaymentSuggestions()]
     gap: 12px;
   }
   .header-actions {
-    justify-content: space-between;
-  }
-  .tabs-toolbar {
-    flex-direction: column;
-    align-items: stretch;
-  }
-  .tabs-actions {
-    justify-content: flex-end;
-  }
-  .stats-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
-
-@media (max-width: 480px) {
-  .stats-grid {
-    grid-template-columns: 1fr;
+    justify-content: flex-start;
   }
 }
 </style>

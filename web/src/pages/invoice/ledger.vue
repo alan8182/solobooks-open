@@ -5,10 +5,12 @@ import { computed, h, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { NButton, NCard, NFormItem, NInput, NSelect, NTag, useMessage } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
-import { backfillInvoices, getInvoices, getInvoiceSummary } from '@/api/invoices'
-import type { InvoiceLedgerItem, InvoiceSummaryResponse } from '@/api/invoices'
+import { backfillInvoices, getInvoices, getInvoiceSummary, getParkedAttachmentCount } from '@/api/invoices'
+import type { InvoiceImportRow, InvoiceLedgerItem, InvoiceSummaryResponse } from '@/api/invoices'
 import { SoloFieldHelp, SoloMonthPicker, SoloTable } from '@/components/ui'
 import { formatDate, formatMoney, getCurrentMonth } from '@/utils/format'
+import { originalDocumentCellText } from '@/utils/invoiceAttachments'
+import InvoiceAttachmentDrawer from '@/components/business/InvoiceAttachmentDrawer.vue'
 import InvoiceImportDrawer from './InvoiceImportDrawer.vue'
 
 const route = useRoute()
@@ -29,6 +31,12 @@ const pageSize = ref(20)
 const summary = ref<InvoiceSummaryResponse | null>(null)
 const backfilling = ref(false)
 const showImport = ref(false)
+// 原件归档：行级抽屉 + 未匹配原件抽屉
+const parkedCount = ref(0)
+const showAttachments = ref(false)
+const activeInvoice = ref<InvoiceLedgerItem | null>(null)
+const showParked = ref(false)
+const importDrawerRef = ref<InstanceType<typeof InvoiceImportDrawer> | null>(null)
 
 function openImport() {
   showImport.value = true
@@ -74,6 +82,29 @@ async function load() {
   } finally {
     loading.value = false
   }
+  loadParkedCount()
+}
+
+async function loadParkedCount() {
+  try {
+    parkedCount.value = (await getParkedAttachmentCount()).count
+  } catch {
+    // 提醒条失败不打扰主列表
+  }
+}
+
+function openAttachments(row: InvoiceLedgerItem) {
+  activeInvoice.value = row
+  showAttachments.value = true
+}
+
+async function onChanged() {
+  await load()
+}
+
+function generateFromParked(rows: InvoiceImportRow[]) {
+  showParked.value = false
+  void importDrawerRef.value?.openWithRows(rows)
 }
 
 function search() {
@@ -185,6 +216,33 @@ const columns: DataTableColumns<InvoiceLedgerItem> = [
     },
   },
   {
+    title: '原件',
+    key: 'attachments',
+    width: 140,
+    render(row) {
+      const children: ReturnType<typeof h>[] = [
+        h(
+          'span',
+          {
+            class: 'attachment-link',
+            title: '查看/补传电子原件（XML/PDF/OFD）',
+            onClick: (event: MouseEvent) => {
+              event.stopPropagation()
+              openAttachments(row)
+            },
+          },
+          originalDocumentCellText(row.attachmentCount, row.hasOriginalXml),
+        ),
+      ]
+      if (row.verifyStatus === 'verified') {
+        children.push(
+          h(NTag, { size: 'tiny', type: 'success', bordered: false, style: 'margin-left: 6px;' }, () => '已查验'),
+        )
+      }
+      return h('div', { style: 'display:flex;align-items:center;' }, children)
+    },
+  },
+  {
     title: '凭证号',
     key: 'voucherRef',
     width: 120,
@@ -267,6 +325,12 @@ usePageRefresh(load)
       </NCard>
     </div>
 
+    <!-- 未匹配原件提醒条：原件已归档但台账还没有对应发票 -->
+    <div v-if="parkedCount > 0" class="parked-banner mb-4">
+      <span class="parked-text">有 {{ parkedCount }} 份未匹配的发票原件（XML 已归档，还没入账）</span>
+      <NButton size="tiny" secondary @click="showParked = true">去处理</NButton>
+    </div>
+
     <div class="filter-bar mb-4">
       <NFormItem label="起始月份" label-placement="left" :show-feedback="false">
         <SoloMonthPicker v-model:value="monthFrom" style="width: 130px;" clearable placeholder="起始月份" />
@@ -291,7 +355,7 @@ usePageRefresh(load)
         :columns="columns"
         :data="items"
         :loading="loading"
-        :scroll-x="1050"
+        :scroll-x="1190"
         :pagination="pagination"
         clickable
         empty-title="本期没有发票"
@@ -307,7 +371,22 @@ usePageRefresh(load)
     </NCard>
 
     <!-- 发票导入抽屉：合并自原 /record/invoice-import 页面 -->
-    <InvoiceImportDrawer v-model:show="showImport" @success="load" />
+    <InvoiceImportDrawer ref="importDrawerRef" v-model:show="showImport" @success="onChanged" />
+
+    <!-- 原件抽屉：行级管理 + 未匹配暂存 -->
+    <InvoiceAttachmentDrawer
+      :show="showAttachments"
+      :invoice="activeInvoice"
+      @update:show="showAttachments = $event"
+      @changed="onChanged"
+    />
+    <InvoiceAttachmentDrawer
+      :show="showParked"
+      :invoice="null"
+      @update:show="showParked = $event"
+      @changed="onChanged"
+      @generate="generateFromParked"
+    />
   </div>
 </template>
 
@@ -344,4 +423,23 @@ usePageRefresh(load)
 }
 .filter-bar :deep(.n-form-item) { margin-bottom: 0; width: auto; flex: 0 0 auto; }
 :deep(.balance) { font-weight: 700; color: var(--solo-primary); }
+/* 原件列：可点击打开附件抽屉（阻断行点击跳凭证） */
+.attachment-link {
+  color: var(--solo-primary);
+  cursor: pointer;
+  font-variant-numeric: tabular-nums;
+}
+.attachment-link:hover { text-decoration: underline; }
+/* 未匹配原件提醒条：只给待处理上色（低饱和底 + 深色字） */
+.parked-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 16px;
+  padding: 10px 16px;
+  background: var(--solo-warning-bg);
+  border: 1px solid var(--solo-border-light);
+  border-radius: 8px;
+}
+.parked-text { font-size: 13px; color: var(--solo-warning); }
 </style>

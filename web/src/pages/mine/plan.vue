@@ -6,7 +6,11 @@ import {
   NAlert,
   NButton,
   NCard,
+  NCheckbox,
   NDataTable,
+  NDrawer,
+  NDrawerContent,
+  NInputNumber,
   NProgress,
   NSpin,
   NTag,
@@ -16,15 +20,19 @@ import {
 import { useUsageStore } from '@/stores/usage'
 import {
   createBillingOrder,
+  createFirstMonthPromoOrder,
+  createTokenTopupOrder,
   fetchBillingOrder,
   fetchBillingOrders,
   fetchPricing,
   type BillingOrder,
   type BillingOrderStatus,
+  type PaymentChannel,
   type PricingCatalog,
   type PricingItem,
 } from '@/api/billing'
 import { SoloStatusBadge } from '@/components/ui'
+import WechatPayQrModal from './WechatPayQrModal.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -37,6 +45,29 @@ const orders = ref<BillingOrder[]>([])
 const ordersLoading = ref(false)
 const creatingPlan = ref('')
 const pollingOrderNo = ref('')
+const agreedToTerms = ref(false)
+
+// ── 支付入口（渠道可用性以后端 pricing 为唯一真相）──
+// 套餐、新人体验包与 AI 点数充值统一走「1 步直出」：默认优先拉起微信扫码弹窗
+// （弹窗内可直接切支付宝并附底部条款）；若仅开通支付宝则直接下单跳转收银台。
+type PurchaseTarget =
+  | { kind: 'plan'; planCode: string }
+  | { kind: 'topup'; amountYuan: number }
+  | { kind: 'promo' }
+const activePurchaseTarget = ref<PurchaseTarget | null>(null)
+const switchingToAlipay = ref(false)
+const wechatModalVisible = ref(false)
+const wechatOrder = ref<{
+  orderNo: string
+  codeUrl: string
+  amount: string
+  planName: string
+  expiresAt: string
+} | null>(null)
+
+const alipayAvailable = computed(() => pricing.value?.alipayEnabled ?? false)
+const wechatAvailable = computed(() => pricing.value?.wechatEnabled ?? false)
+const anyChannelAvailable = computed(() => alipayAvailable.value || wechatAvailable.value)
 
 // ── 当前套餐与用量 ──
 const quotaInfo = computed(() => usageStore.summary?.quota ?? null)
@@ -53,6 +84,12 @@ const quotaPercent = computed(() => {
   if (!limit || limit <= 0) return 0
   return Math.min(100, Math.round((used / limit) * 100))
 })
+// 套餐本期剩余（不含充值点数）；usedTokens 含超出套餐后从点数扣减的部分
+const planRemainingTokens = computed(() => {
+  const limit = effectiveLimitTokens.value
+  if (limit === null) return null
+  return Math.max(0, limit - (quotaInfo.value?.usedTokens ?? 0))
+})
 
 function formatTokens(n: number) {
   if (n >= 10000) return `${(n / 10000).toFixed(1)}w`
@@ -65,6 +102,68 @@ function formatPriceDisplay(raw?: string | null, fallback = '') {
   if (!Number.isFinite(num)) return raw
   return Number.isInteger(num) ? num.toLocaleString('zh-CN') : raw
 }
+
+// ── AI 点数充值（与套餐独立，余额永久有效；消耗先套餐后点数）──
+const tokenTopup = computed(() => pricing.value?.tokenTopup ?? null)
+const tokenBalance = computed(() => quotaInfo.value?.tokenBalance ?? 0)
+const promoTokenBalance = computed(() => quotaInfo.value?.promoTokenBalance ?? 0)
+const firstMonthPromo = computed(() => pricing.value?.firstMonthPromo ?? null)
+const showPromoCard = computed(() =>
+  Boolean(firstMonthPromo.value?.enabled && firstMonthPromo.value?.eligible),
+)
+const highlightedPromo = computed(() => route.query.promo === 'first_month')
+const creatingPromo = ref(false)
+const topupAvailable = computed(
+  () => Boolean(tokenTopup.value?.enabled) && anyChannelAvailable.value,
+)
+const TOPUP_QUICK_YUAN = [10, 30, 100, 300]
+const topupYuan = ref<number | null>(10)
+const creatingTopup = ref(false)
+const topupTokens = computed(() => {
+  const yuan = topupYuan.value
+  const perYuan = tokenTopup.value?.tokensPerYuan ?? 0
+  if (!yuan || !perYuan) return 0
+  return Math.round(yuan * perYuan)
+})
+const topupAmountValid = computed(() => {
+  const cfg = tokenTopup.value
+  const yuan = topupYuan.value
+  if (!cfg || !yuan) return false
+  return Number.isInteger(yuan) && yuan >= cfg.minYuan && yuan <= cfg.maxYuan
+})
+
+const promoTermsTitle = computed(() => '新人体验包服务条款')
+const activeModalTerms = computed<{ title: string; lines: string[] }>(() => {
+  const target = activePurchaseTarget.value
+  if (target?.kind === 'topup') {
+    return {
+      title: '充值服务条款',
+      lines: [
+        'AI 点数为虚拟商品，支付成功后立即到账且永久有效，不随套餐到期清零。',
+        '消耗顺序：先扣本期套餐额度，套餐用尽后自动扣点数余额。',
+        '退款规则：仅未消耗的点数部分可联系客服原路退回，已消耗部分不予退还；充值不改变当前套餐与账套上限。',
+      ],
+    }
+  }
+  if (target?.kind === 'promo') {
+    return {
+      title: promoTermsTitle.value,
+      lines: [
+        `新人一次性特惠（限购 1 次），支付后立即到账，有效期 ${firstMonthPromo.value?.validDays ?? 30} 天，到期未使用自动失效。`,
+        '消耗顺序：先扣本期套餐额度，再扣体验包额度，最后扣永久充值余额。',
+        '可联系客服全额退还实付金额，退款后收回剩余体验包额度且不恢复首单特惠资格。',
+      ],
+    }
+  }
+  return {
+    title: '套餐服务条款',
+    lines: [
+      '开通即按年订阅并激活对应权益（每年 1000 万 Token 额度及 1 对 1 旧账导入），到期可续费顺延。',
+      '7 日内未启动人工服务可全额退费；已交付人工服务（旧账导入 100 元/次、季度审账 180 元/次）按次扣减后退还余款。',
+      '本平台为 AI 辅助自管账软件，不构成法定审计报告。',
+    ],
+  }
+})
 
 // ── 套餐方案展示目录（价格严格取后端 /api/billing/pricing 唯一真相）──
 interface PlanCardItem {
@@ -81,14 +180,14 @@ interface PlanCardItem {
 const PLAN_CARDS: PlanCardItem[] = [
   {
     code: 'trial',
-    badge: '默认入门 · 零门槛体验',
-    name: '云端免费试用版',
-    tagline: '免部署开箱即用，功能与标准版一致，每月 10 万 Token · 最多 3 个账套',
+    badge: '默认入门 · 首月 20 万 Token',
+    name: '免费体验版',
+    tagline: '免部署开箱即用，功能与标准版一致',
     fallbackPrice: '0',
     unit: '基础免费',
     features: [
       { text: '全功能开放：AI 记账、三张报表与申报小抄（最多 3 个公司账套）', included: true },
-      { text: '每月 10 万 Token 体验额度（含多模态票据识别与问答）', included: true },
+      { text: '新用户首月 20 万 Token（新人可 ¥1 扩容至 100 万），次月起每月 10 万 Token', included: true },
       { text: '银行流水、微信 / 支付宝账单与发票自动解析导入', included: true },
       { text: '1 对 1 历史旧账导入（需自助导入）', included: false },
       { text: '专属服务群与会计师季度审账', included: false },
@@ -98,31 +197,31 @@ const PLAN_CARDS: PlanCardItem[] = [
     code: 'standard',
     badge: '主力推荐 · 每日仅 ¥1.6',
     name: '云端标准版',
-    tagline: '专业财务会计师 1 对 1 帮你把旧账导进来，年享 500 万 Token 额度',
+    tagline: '专业财务顾问/会计师 1 对 1 帮你把旧账导进来',
     fallbackPrice: '598',
     unit: '元 / 年',
     recommended: true,
     features: [
-      { text: '每年 500 万 AI Token 额度（含文本问答与多模态票据识别）', included: true },
-      { text: '最多支持 3 个公司账套（更多账套将通过未来代账版开放）', included: true },
-      { text: '1 对 1 历史旧账导入与期初建账（注册财务会计师负责）', included: true },
+      { text: '每年 1000 万 AI Token 额度（含文本问答与多模态票据识别）', included: true },
+      { text: '最多支持 3 个公司账套（更多账套将通过未来机构联营版开放）', included: true },
+      { text: '1 对 1 历史旧账导入与期初建账（专业财务顾问/会计师协助）', included: true },
       { text: '专属问题服务群（系统实操指导 + 日常财税问题响应）', included: true },
-      { text: '老板私卡垫资与免税提现冲销、研发辅助账与申报小抄', included: true },
+      { text: '老板私卡垫资合规冲销归还、研发辅助账与申报小抄', included: true },
     ],
   },
   {
     code: 'pro',
     badge: '人机双签 · 会计师季度护航',
     name: '人机双签版',
-    tagline: 'AI 处理日常流水，中级注册财务会计师每季度审账并出具分析报告',
+    tagline: 'AI 处理日常流水，专业会计师每季度审账复核',
     fallbackPrice: '2,980',
     unit: '元 / 年',
     features: [
-      { text: '含标准版全部软件功能、每年 500 万 Token（3 个账套）与 1 对 1 旧账导入', included: true },
-      { text: '中级注册财务会计师每季度审账复核（人机双签把关）', included: true },
+      { text: '含标准版全部软件功能、每年 1000 万 Token（3 个账套）与 1 对 1 旧账导入', included: true },
+      { text: '专业会计师每季度审账复核（内部管理把关，非事务所法定审计报告）', included: true },
       { text: '每季度出具专属《季度财务分析报告》', included: true },
       { text: '每季度 30 分钟视频在线问答（1 对 1 筹划与解读）', included: true },
-      { text: '日常经营财务问答（合同节税、公转私合规随时问）', included: true },
+      { text: '日常经营财务问答（合同合规、公转私规范随时问）', included: true },
     ],
   },
 ]
@@ -134,6 +233,10 @@ const pricingByCode = computed<Record<string, PricingItem>>(() => {
   }
   return map
 })
+
+const promoCreatingDisabled = computed(
+  () => creatingPromo.value || Boolean(creatingPlan.value) || creatingTopup.value,
+)
 
 const highlightedPlan = computed(() => {
   const q = route.query.plan
@@ -173,22 +276,102 @@ async function loadOrders() {
   }
 }
 
-async function handleBuy(planCode: string) {
-  if (creatingPlan.value || planCode === 'trial') return
-  if (pricing.value && !pricing.value.alipayEnabled) {
-    message.info('当前环境暂未开通在线支付宝收款，请联系客服开通套餐')
+async function createOrderForTarget(target: PurchaseTarget, channel: PaymentChannel) {
+  if (target.kind === 'plan') return createBillingOrder(target.planCode, channel)
+  if (target.kind === 'promo') return createFirstMonthPromoOrder(channel)
+  return createTokenTopupOrder(target.amountYuan, channel)
+}
+
+function setTargetBusy(target: PurchaseTarget, busy: boolean) {
+  if (target.kind === 'plan') creatingPlan.value = busy ? target.planCode : ''
+  else if (target.kind === 'promo') creatingPromo.value = busy
+  else creatingTopup.value = busy
+}
+
+function isTargetBusy(target: PurchaseTarget): boolean {
+  if (target.kind === 'plan') return Boolean(creatingPlan.value)
+  if (target.kind === 'promo') return promoCreatingDisabled.value
+  return creatingTopup.value || Boolean(creatingPlan.value)
+}
+
+async function startPurchase(target: PurchaseTarget) {
+  if (isTargetBusy(target)) return
+  if (pricing.value && !anyChannelAvailable.value) {
+    message.info('当前环境暂未开通在线收款，请联系客服办理')
     return
   }
-  creatingPlan.value = planCode
+  const preferredChannel: PaymentChannel = wechatAvailable.value ? 'wechat' : 'alipay'
+  agreedToTerms.value = true
+  setTargetBusy(target, true)
   try {
-    const order = await createBillingOrder(planCode)
-    message.success('订单已创建，正在跳转支付宝收银台…')
-    window.location.href = order.payUrl
+    const order = await createOrderForTarget(target, preferredChannel)
+    if (preferredChannel === 'alipay') {
+      message.success('订单已创建，正在跳转支付宝收银台…')
+      window.location.href = order.payUrl ?? ''
+      return
+    }
+    activePurchaseTarget.value = target
+    wechatOrder.value = {
+      orderNo: order.orderNo,
+      codeUrl: order.codeUrl ?? '',
+      amount: order.amount,
+      planName: order.planName,
+      expiresAt: order.expiresAt,
+    }
+    wechatModalVisible.value = true
   } catch (err: unknown) {
     message.error(extractErrorMessage(err, '创建订单失败，请重试'))
   } finally {
-    creatingPlan.value = ''
+    setTargetBusy(target, false)
   }
+}
+
+async function handleSwitchToAlipay() {
+  const target = activePurchaseTarget.value
+  if (!target || !alipayAvailable.value || switchingToAlipay.value) return
+  switchingToAlipay.value = true
+  try {
+    const order = await createOrderForTarget(target, 'alipay')
+    wechatModalVisible.value = false
+    message.success('订单已创建，正在跳转支付宝收银台…')
+    window.location.href = order.payUrl ?? ''
+  } catch (err: unknown) {
+    wechatModalVisible.value = false
+    message.error(extractErrorMessage(err, '切换支付宝失败，请重试'))
+  } finally {
+    switchingToAlipay.value = false
+  }
+}
+
+async function handleBuy(planCode: string) {
+  if (planCode === 'trial') return
+  await startPurchase({ kind: 'plan', planCode })
+}
+
+async function handleTopup() {
+  if (creatingTopup.value || creatingPlan.value) return
+  if (!topupAvailable.value) {
+    message.info('当前环境暂未开通在线充值')
+    return
+  }
+  if (!topupAmountValid.value) {
+    const cfg = tokenTopup.value
+    message.warning(
+      cfg ? `请输入 ${cfg.minYuan}–${cfg.maxYuan} 之间的整数元金额` : '充值暂不可用',
+    )
+    return
+  }
+  await startPurchase({ kind: 'topup', amountYuan: topupYuan.value as number })
+}
+
+async function handleBuyPromo() {
+  if (!showPromoCard.value) return
+  await startPurchase({ kind: 'promo' })
+}
+
+function handleWechatPaySuccess() {
+  wechatModalVisible.value = false
+  void Promise.all([usageStore.ensureLoaded(true), loadOrders(), loadPricing()])
 }
 
 async function pollOrderStatus(orderNo: string) {
@@ -198,8 +381,14 @@ async function pollOrderStatus(orderNo: string) {
       try {
         const order = await fetchBillingOrder(orderNo)
         if (order.status === 'activated') {
-          message.success('支付成功，套餐已生效')
-          await Promise.all([usageStore.ensureLoaded(true), loadOrders()])
+          message.success(
+            order.orderType === 'token_topup'
+              ? '支付成功，AI 点数已到账'
+              : order.orderType === 'first_month_promo'
+                ? '支付成功，新人体验包 80 万 Token 已到账'
+                : '支付成功，套餐已生效',
+          )
+          await Promise.all([usageStore.ensureLoaded(true), loadOrders(), loadPricing()])
           return
         }
         if (order.status === 'closed' || order.status === 'failed') {
@@ -243,13 +432,32 @@ const orderColumns: DataTableColumns<BillingOrder> = [
     minWidth: 190,
     render: (row) => h('span', { class: 'order-mono' }, row.orderNo),
   },
-  { title: '订阅套餐', key: 'subject', minWidth: 160 },
+  {
+    title: '商品',
+    key: 'subject',
+    minWidth: 210,
+    render: (row) =>
+      h('span', { class: 'order-subject' }, [
+        h('span', null, row.subject),
+        row.orderType === 'token_topup'
+          ? h('span', { class: 'order-type-chip' }, 'AI 点数')
+          : row.orderType === 'first_month_promo'
+            ? h('span', { class: 'order-type-chip' }, '新人特惠')
+            : null,
+      ]),
+  },
   {
     title: '金额',
     key: 'amount',
     width: 110,
     align: 'right',
     render: (row) => `¥${row.amount}`,
+  },
+  {
+    title: '支付渠道',
+    key: 'channel',
+    width: 95,
+    render: (row) => (row.channel === 'wechat' ? '微信支付' : '支付宝'),
   },
   {
     title: '状态',
@@ -274,10 +482,16 @@ const orderColumns: DataTableColumns<BillingOrder> = [
   },
 ]
 
+const showOrdersDrawer = ref(false)
+
+function openOrdersDrawer() {
+  showOrdersDrawer.value = true
+  void loadOrders()
+}
+
 onMounted(() => {
   usageStore.ensureLoaded(true)
   void loadPricing()
-  void loadOrders()
 
   const orderNo = route.query.orderNo
   if (typeof orderNo === 'string' && orderNo) {
@@ -298,12 +512,15 @@ onMounted(() => {
           返回个人设置
         </NButton>
         <h2>套餐与订阅</h2>
-        <p class="plan-subtitle">查看当前账号套餐周期、AI Token 额度消耗、年付升级方案与订阅订单记录</p>
       </div>
+      <NButton size="small" secondary @click="openOrdersDrawer">
+        <template #icon><i class="ri-file-list-3-line" /></template>
+        我的订单
+      </NButton>
     </div>
 
     <NAlert v-if="pollingOrderNo" type="info" :bordered="false" class="mb-4">
-      正在确认支付宝订单 <strong>{{ pollingOrderNo }}</strong> 的支付结果，请稍候…
+      正在确认订单 <strong>{{ pollingOrderNo }}</strong> 的支付结果，请稍候…
     </NAlert>
 
     <!-- 1. 当前套餐与额度概览 -->
@@ -320,44 +537,43 @@ onMounted(() => {
                 当前不限 AI 用量
               </NTag>
               <NTag v-else-if="quotaInfo?.periodType === 'annual'" size="small" type="primary" :bordered="false">
-                年付 {{ formatTokens(effectiveLimitTokens ?? 5000000) }} 额度
+                年付额度
               </NTag>
-              <NTag v-else size="small" :bordered="false">月度体验额度</NTag>
+              <NTag v-else size="small" :bordered="false">
+                {{ currentPlanCode === 'trial' && (quotaInfo?.limitTokens ?? 0) >= 200_000 ? '首月体验期' : '月度体验额度' }}
+              </NTag>
+              <NTag v-if="promoTokenBalance > 0" size="small" type="warning" :bordered="false">
+                新人特惠剩余 {{ formatTokens(promoTokenBalance) }}（{{ quotaInfo?.promoExpiresAt }} 到期）
+              </NTag>
               <NTag v-if="quotaInfo?.maxCompanies != null" size="small" :bordered="false">
                 账套 {{ quotaInfo.companyCount ?? 0 }} / {{ quotaInfo.maxCompanies }}
               </NTag>
             </div>
-            <p class="current-plan-desc">
-              <template v-if="quotaInfo?.limitTokens === null && currentPlanCode === 'trial'">
-                当前为自有部署环境，使用您自备的模型服务，AI 对话与票据识别不设月度用量限制（本月已使用 {{ formatTokens(quotaInfo?.usedTokens ?? 0) }} tokens）。
-              </template>
-              <template v-else-if="quotaInfo?.limitTokens === null">
-                当前方案不设 AI Token 用量限制，本月已使用 {{ formatTokens(quotaInfo?.usedTokens ?? 0) }} tokens。
-              </template>
-              <template v-else-if="quotaInfo?.periodType === 'annual'">
-                年付订阅期内每年享 {{ formatTokens(effectiveLimitTokens ?? 5000000) }} Token 额度（含文本问答与多模态票据识别），跨账套共享；最多支持 {{ quotaInfo?.maxCompanies ?? 3 }} 个公司账套（未来将面向代账机构开放更多账套）。到期未续费将自动回落为免费体验版。
-              </template>
-              <template v-else>
-                每月赠送 10 万 Token 体验额度（含文本问答与多模态票据识别），跨账套共享；最多支持 {{ quotaInfo?.maxCompanies ?? 3 }} 个公司账套，升级云端标准版可享每年 500 万额度。
-              </template>
+            <p v-if="quotaInfo?.limitTokens === null && currentPlanCode === 'trial'" class="current-plan-desc">
+              自有部署环境，使用自备模型服务，AI 用量不设限。
+            </p>
+            <p v-else-if="quotaInfo?.limitTokens === null" class="current-plan-desc">
+              当前方案不设 AI 用量限制。
             </p>
           </div>
-          <div class="current-usage-stat">
-            <span class="stat-label">{{ quotaInfo?.periodType === 'annual' ? '本年度已消耗 AI Token' : '本月已消耗 AI Token' }}</span>
-            <strong class="stat-value">
-              {{ formatTokens(quotaInfo?.usedTokens ?? currentMonth?.totalTokens ?? 0) }}
-            </strong>
+          <div class="current-usage-stats">
+            <div class="current-usage-stat">
+              <span class="stat-label">{{ quotaInfo?.periodType === 'annual' ? '本年度已消耗 AI Token' : '本月已消耗 AI Token' }}</span>
+              <strong class="stat-value">
+                {{ formatTokens(quotaInfo?.usedTokens ?? currentMonth?.totalTokens ?? 0) }}<span
+                  v-if="effectiveLimitTokens !== null"
+                  class="stat-total"
+                > / {{ formatTokens(effectiveLimitTokens) }}</span>
+              </strong>
+            </div>
           </div>
         </div>
 
         <div v-if="effectiveLimitTokens !== null" class="quota-bar-wrap">
           <div class="quota-meta">
             <span>计费周期：{{ quotaInfo?.periodStart }} ~ {{ quotaInfo?.periodEnd }}</span>
-            <span>
-              已用 {{ formatTokens(quotaInfo?.usedTokens ?? 0) }} / {{ formatTokens(effectiveLimitTokens) }}
-              <template v-if="(quotaInfo?.bonusTokens ?? 0) > 0">
-                （含赠送 {{ formatTokens(quotaInfo?.bonusTokens ?? 0) }}）
-              </template>
+            <span v-if="(quotaInfo?.bonusTokens ?? 0) > 0">
+              含赠送 {{ formatTokens(quotaInfo?.bonusTokens ?? 0) }}
             </span>
           </div>
           <NProgress
@@ -369,28 +585,81 @@ onMounted(() => {
             :status="quotaPercent >= 100 ? 'error' : 'default'"
           />
           <div class="quota-tip">
-            {{
-              quotaPercent >= 100
-                ? (currentPlanCode === 'trial'
-                  ? '本期 10 万体验额度已用完，请升级云端标准版或等待下个周期自动恢复'
-                  : '本年度 AI Token 额度已用完，请联系客服或等待下个订阅周期自动恢复')
-                : `本期剩余 ${formatTokens(quotaInfo?.remainingTokens ?? 0)} tokens`
-            }}
+            <template v-if="quotaPercent >= 100">
+              <template v-if="promoTokenBalance > 0">
+                套餐额度已用完，后续优先从新人体验包扣减（剩余 {{ formatTokens(promoTokenBalance) }} 点，{{ quotaInfo?.promoExpiresAt }} 到期）
+              </template>
+              <template v-else-if="tokenBalance > 0">
+                套餐额度已用完，后续 AI 调用自动从点数余额扣减（当前 {{ formatTokens(tokenBalance) }} 点）
+              </template>
+              <template v-else-if="currentPlanCode === 'trial'">
+                <template v-if="showPromoCard">
+                  本期体验额度已用完，可 ¥1 解锁 80 万新人体验包，或升级云端标准版
+                </template>
+                <template v-else>
+                  本期体验额度已用完，请升级云端标准版、充值 AI 点数或等待下个周期自动恢复
+                </template>
+              </template>
+              <template v-else>
+                本年度 AI Token 额度已用完，请充值 AI 点数、联系客服或等待下个订阅周期自动恢复
+              </template>
+            </template>
+            <template v-else>
+              本期剩余 {{ formatTokens(planRemainingTokens ?? 0) }} tokens
+            </template>
           </div>
         </div>
       </NSpin>
+    </NCard>
+
+    <!-- 1.5 新人首月 AI 体验包（仅限未买过、未订阅年付的 trial 用户展示） -->
+    <NCard
+      v-if="showPromoCard"
+      :bordered="false"
+      class="plan-card-shell mb-4 promo-card"
+      :class="{ highlighted: highlightedPromo }"
+    >
+      <div class="promo-row">
+        <div class="promo-main">
+          <div class="promo-badge-row">
+            <span class="promo-badge">新人首月限时特惠 · 每账号限购 1 次</span>
+          </div>
+          <h4 class="promo-title">{{ firstMonthPromo?.name || '新人首月 AI 体验包' }}</h4>
+          <p class="promo-desc">
+            立享 <strong>{{ formatTokens(firstMonthPromo?.tokens ?? 800_000) }}</strong> Token（80 万额外额度），自支付成功日起
+            <strong>{{ firstMonthPromo?.validDays ?? 30 }} 天有效</strong>，先用套餐额度、再用体验包。长期记账推荐下方 ¥598/年 云端标准版。
+          </p>
+        </div>
+        <div class="promo-action">
+          <div class="promo-price-box">
+            <span class="promo-currency">¥</span>
+            <span class="promo-price">{{ formatPriceDisplay(firstMonthPromo?.priceYuan, '1') }}</span>
+            <del class="promo-original">原价 ¥{{ formatPriceDisplay(firstMonthPromo?.originalPriceYuan, '80') }}</del>
+          </div>
+          <NButton
+            type="primary"
+            class="promo-submit"
+            :loading="creatingPromo"
+            :disabled="creatingPromo || Boolean(creatingPlan) || creatingTopup || Boolean(pricing && !anyChannelAvailable)"
+            @click="handleBuyPromo"
+          >
+            <template #icon><i class="ri-flashlight-line" /></template>
+            <template v-if="pricing && !anyChannelAvailable">暂未开通在线支付</template>
+            <template v-else>¥{{ formatPriceDisplay(firstMonthPromo?.priceYuan, '1') }} 立即解锁 80 万</template>
+          </NButton>
+        </div>
+      </div>
     </NCard>
 
     <!-- 2. 订阅方案对比与下单 -->
     <div class="section-head">
       <div>
         <h3>选择适合您的订阅方案</h3>
-        <p>支持支付宝年付即时开通权益；如需注册财务会计师 1 对 1 旧账导入或季度审账把关，可按需选择对应方案。</p>
       </div>
     </div>
 
     <NAlert
-      v-if="pricing && !pricing.alipayEnabled"
+      v-if="pricing && !anyChannelAvailable"
       type="warning"
       :bordered="false"
       class="mb-4"
@@ -456,46 +725,137 @@ onMounted(() => {
               :type="tier.recommended || highlightedPlan === tier.code ? 'primary' : 'default'"
               :secondary="!tier.recommended && highlightedPlan !== tier.code"
               :loading="creatingPlan === tier.code"
-              :disabled="Boolean(creatingPlan) || Boolean(pricing && !pricing.alipayEnabled)"
+              :disabled="Boolean(creatingPlan) || Boolean(pricing && !anyChannelAvailable)"
               @click="handleBuy(tier.code)"
             >
-              <template #icon><i class="ri-alipay-line" /></template>
-              <template v-if="pricing && !pricing.alipayEnabled">暂未开通在线支付</template>
+              <template #icon><i class="ri-secure-payment-line" /></template>
+              <template v-if="pricing && !anyChannelAvailable">暂未开通在线支付</template>
               <template v-else-if="currentPlanCode === tier.code">续费顺延 1 年</template>
               <template v-else>立即开通 {{ pricingByCode[tier.code]?.planName || tier.name }}</template>
             </NButton>
           </div>
         </div>
       </div>
+
+      <div class="purchase-terms-box mb-6">
+        <NCheckbox v-model:checked="agreedToTerms" class="terms-checkbox">
+          <span>
+            下单前请确认：我已阅读并同意
+            <a href="/agreement" target="_blank" rel="noreferrer">《服务协议（含付费订阅与退款规则）》</a>
+            及
+            <a href="/privacy" target="_blank" rel="noreferrer">《隐私政策》</a>
+          </span>
+        </NCheckbox>
+        <p class="terms-note">
+          本平台为 AI 辅助自管账软件，不构成法定审计报告。年付开通 7 日内未启动人工服务可全额退费；已交付人工服务（旧账导入 100 元/次、季度审账复核 180 元/次）按次扣减后退还余款。
+        </p>
+      </div>
     </NSpin>
 
-    <!-- 3. 线下交付与订单记录 -->
-    <NCard :bordered="false" class="plan-card-shell mb-4">
-      <div class="orders-header">
-        <div>
-          <h4>我的订阅订单</h4>
-          <p class="orders-tip">
-            支付宝付款成功后系统自动生效；开通「云端标准版」或「人机双签版」后，可凭订单号联系右下角客服加入专属服务群并预约注册财务会计师 1 对 1 旧账导入。
+    <!-- 3. AI 点数充值（与套餐独立，余额永久有效） -->
+    <NCard v-if="tokenTopup?.enabled" :bordered="false" class="plan-card-shell mb-4 topup-card">
+      <div class="topup-head">
+        <div class="topup-head-main">
+          <h4>AI 点数充值</h4>
+          <p>
+            1 元 = {{ tokenTopup.tokensPerYuan.toLocaleString('zh-CN') }} 点（1 点 = 1 token），永久有效；先扣套餐额度，用尽后自动扣点数。
           </p>
         </div>
-        <NButton size="small" secondary :loading="ordersLoading" @click="loadOrders">
-          <template #icon><i class="ri-refresh-line" /></template>
-          刷新订单
+        <div class="current-usage-stat">
+          <span class="stat-label">当前点数余额</span>
+          <strong class="stat-value">{{ formatTokens(tokenBalance) }}</strong>
+        </div>
+      </div>
+
+      <div class="topup-body">
+        <div class="topup-quick">
+          <button
+            v-for="yuan in TOPUP_QUICK_YUAN"
+            :key="yuan"
+            type="button"
+            class="topup-quick-btn"
+            :class="{ active: topupYuan === yuan }"
+            :disabled="creatingTopup"
+            @click="topupYuan = yuan"
+          >
+            {{ yuan }} 元
+          </button>
+        </div>
+        <NInputNumber
+          v-model:value="topupYuan"
+          class="topup-input"
+          :min="tokenTopup.minYuan"
+          :max="tokenTopup.maxYuan"
+          :precision="0"
+          :step="1"
+          :show-button="false"
+          :disabled="creatingTopup"
+          placeholder="自定义金额"
+        >
+          <template #prefix>¥</template>
+        </NInputNumber>
+        <div class="topup-preview">
+          到账 <strong>{{ formatTokens(topupTokens) }}</strong> 点
+        </div>
+        <NButton
+          type="primary"
+          class="topup-submit"
+          :loading="creatingTopup"
+          :disabled="!topupAvailable || !topupAmountValid"
+          @click="handleTopup"
+        >
+          <template #icon><i class="ri-add-circle-line" /></template>
+          立即充值
         </NButton>
       </div>
-      <NDataTable
-        :columns="orderColumns"
-        :data="orders"
-        :loading="ordersLoading"
-        :bordered="false"
-        size="small"
-        :scroll-x="780"
-      >
-        <template #empty>
-          <div class="orders-empty">暂无在线订阅订单记录</div>
-        </template>
-      </NDataTable>
+
+      <NAlert v-if="!anyChannelAvailable" type="warning" :bordered="false" class="mt-2">
+        当前暂未开启在线支付通道；如需充值 AI 点数，请联系客服人工办理。
+      </NAlert>
     </NCard>
+
+    <!-- 4. 订阅与充值订单右侧抽屉 -->
+    <NDrawer v-model:show="showOrdersDrawer" placement="right" :width="840" style="max-width: 94vw;">
+      <NDrawerContent closable>
+        <template #header>
+          <div class="orders-drawer-header">
+            <span>我的订单</span>
+            <NButton size="small" secondary :loading="ordersLoading" @click="loadOrders">
+              <template #icon><i class="ri-refresh-line" /></template>
+              刷新订单
+            </NButton>
+          </div>
+        </template>
+        <NDataTable
+          :columns="orderColumns"
+          :data="orders"
+          :loading="ordersLoading"
+          :bordered="false"
+          size="small"
+          :scroll-x="780"
+        >
+          <template #empty>
+            <div class="orders-empty">暂无在线订单记录</div>
+          </template>
+        </NDataTable>
+      </NDrawerContent>
+    </NDrawer>
+
+    <WechatPayQrModal
+      v-if="wechatOrder"
+      v-model:show="wechatModalVisible"
+      :order-no="wechatOrder.orderNo"
+      :code-url="wechatOrder.codeUrl"
+      :amount="wechatOrder.amount"
+      :plan-name="wechatOrder.planName"
+      :expires-at="wechatOrder.expiresAt"
+      :can-switch-alipay="alipayAvailable"
+      :switching-alipay="switchingToAlipay"
+      :terms-title="activeModalTerms.title"
+      :terms-lines="activeModalTerms.lines"
+      @switch-alipay="handleSwitchToAlipay"
+      @success="handleWechatPaySuccess"
+    />
   </div>
 </template>
 
@@ -507,7 +867,19 @@ onMounted(() => {
 }
 
 .plan-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 12px;
   margin-bottom: 20px;
+}
+
+.orders-drawer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding-right: 12px;
 }
 
 .back-btn {
@@ -520,12 +892,6 @@ onMounted(() => {
   font-size: 22px;
   font-weight: 700;
   color: var(--solo-text-primary);
-}
-
-.plan-subtitle {
-  margin: 4px 0 0;
-  font-size: 13.5px;
-  color: var(--solo-text-muted);
 }
 
 .mb-4 {
@@ -569,6 +935,13 @@ onMounted(() => {
   line-height: 1.6;
 }
 
+.current-usage-stats {
+  display: flex;
+  align-items: flex-start;
+  gap: 28px;
+  flex-shrink: 0;
+}
+
 .current-usage-stat {
   display: flex;
   flex-direction: column;
@@ -586,6 +959,12 @@ onMounted(() => {
   font-weight: 700;
   color: var(--solo-primary);
   font-variant-numeric: tabular-nums;
+}
+
+.stat-total {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--solo-text-muted);
 }
 
 .quota-bar-wrap {
@@ -619,12 +998,6 @@ onMounted(() => {
   font-size: 16px;
   font-weight: 650;
   color: var(--solo-text-primary);
-}
-
-.section-head p {
-  margin: 4px 0 0;
-  font-size: 13px;
-  color: var(--solo-text-muted);
 }
 
 .tiers-grid {
@@ -766,22 +1139,242 @@ onMounted(() => {
   color: var(--solo-text-primary);
 }
 
-.orders-tip {
-  margin: 4px 0 0;
-  font-size: 12.5px;
-  color: var(--solo-text-muted);
-  line-height: 1.5;
-}
-
 .orders-empty {
   padding: 24px 0;
   color: var(--solo-text-muted);
   font-size: 13px;
 }
 
+.purchase-terms-box {
+  padding: 14px 16px;
+  border-radius: var(--solo-radius-md, 10px);
+  border: 1px solid var(--solo-border);
+  background: var(--solo-bg-card);
+}
+
+.terms-checkbox {
+  font-size: 13px;
+  color: var(--solo-text-primary);
+}
+
+.terms-checkbox a {
+  color: var(--solo-primary);
+  text-decoration: none;
+}
+
+.terms-checkbox a:hover {
+  text-decoration: underline;
+}
+
+.terms-note {
+  margin: 8px 0 0 24px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--solo-text-muted);
+}
+
 :deep(.order-mono) {
   font-family: monospace;
   font-size: 12.5px;
+}
+
+:deep(.order-subject) {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+:deep(.order-type-chip) {
+  padding: 0 6px;
+  border-radius: 4px;
+  background: var(--solo-primary-soft);
+  color: var(--solo-primary);
+  font-size: 11px;
+  line-height: 18px;
+}
+
+.mt-2 {
+  margin-top: 8px;
+}
+
+/* ── 新人首月体验包卡片 ── */
+.promo-card {
+  border: 1px solid var(--solo-border);
+  background: var(--solo-bg-blue-soft);
+}
+
+.promo-card.highlighted {
+  border-color: var(--solo-primary);
+  box-shadow: var(--solo-shadow);
+}
+
+.promo-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.promo-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.promo-badge-row {
+  margin-bottom: 6px;
+}
+
+.promo-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: var(--solo-radius-pill);
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--solo-warning);
+  background: var(--solo-warning-bg);
+}
+
+.promo-title {
+  margin: 0 0 6px;
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--solo-text-primary);
+}
+
+.promo-desc {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--solo-text-secondary);
+}
+
+.promo-action {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.promo-price-box {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.promo-currency {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--solo-primary);
+}
+
+.promo-price {
+  font-size: 28px;
+  font-weight: 750;
+  color: var(--solo-primary);
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+
+.promo-original {
+  margin-left: 4px;
+  font-size: 12px;
+  color: var(--solo-text-muted);
+}
+
+@media (max-width: 768px) {
+  .promo-row {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .promo-action {
+    width: 100%;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+  }
+}
+
+/* ── AI 点数充值卡片 ── */
+.topup-card {
+  border: 1px solid var(--solo-border);
+}
+
+.topup-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.topup-head-main h4 {
+  margin: 0 0 6px;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--solo-text-primary);
+}
+
+.topup-head-main p {
+  margin: 0;
+  max-width: 620px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--solo-text-muted);
+}
+
+.topup-body {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.topup-quick {
+  display: flex;
+  gap: 8px;
+}
+
+.topup-quick-btn {
+  min-width: 64px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--solo-border);
+  background: var(--solo-bg-card);
+  color: var(--solo-text-primary);
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.topup-quick-btn:hover:not(:disabled) {
+  border-color: var(--solo-primary);
+}
+
+.topup-quick-btn.active {
+  border-color: var(--solo-primary);
+  background: var(--solo-primary-soft);
+  color: var(--solo-primary);
+  font-weight: 600;
+}
+
+.topup-quick-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.topup-input {
+  width: 130px;
+}
+
+.topup-preview {
+  font-size: 13px;
+  color: var(--solo-text-muted);
+}
+
+.topup-preview strong {
+  color: var(--solo-primary);
+  font-size: 15px;
 }
 
 @media (max-width: 900px) {

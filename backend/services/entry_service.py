@@ -54,6 +54,7 @@ def _deterministic_entry(entry: Dict[str, Any], *, trusted_voucher: bool = False
             prepared.get("amount") or 0,
             str(prepared.get("payer") or "company_account"),
             vat_rate=prepared.get("vatRate") if prepared.get("vatSeparated") else None,
+            payment_status=prepared.get("paymentStatus"),
         ))
     else:
         prepared = {**prepared, "voucherLines": apply_rd_detail_to_voucher(

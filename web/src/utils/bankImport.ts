@@ -196,14 +196,20 @@ export function parseBankSheet(sheet: XLSX.WorkSheet): Record<string, unknown>[]
 
   const json: Record<string, unknown>[] = []
 
+  // 汇总行只认「整格就是汇总标签」：合计 / 合计：18,719.77 / 累计借金额 /
+  // 总记录数 12。不能见字就丢——一笔真实流水的「其它摘要」可能写成
+  // 「金额是合计可开的，部分是报销收入」，按子串匹配会把整行当表尾静默丢掉
+  // （2026-10 的 -104.30「报销顺丰快递费」就是这样消失的，导入回报仍是 0 跳过）。
+  const SUMMARY_CELL = /^(累计|合计|总计|总记录数)[一-龥]{0,4}[:：]?[¥￥]?[\d.,]*$/
+  const isSummaryCell = (cell: unknown) => SUMMARY_CELL.test(String(cell ?? '').replace(/\s+/g, ''))
+
   for (let i = headerIndex + 1; i < rawRows.length; i++) {
     const row = rawRows[i]
     if (!row || row.length === 0) continue
 
     // Skip empty or summary rows
-    const firstCell = String(row[0] ?? '').trim()
-    const hasSummaryText = row.some(cell => /累计|合计|总计|总记录数/.test(String(cell ?? '').trim()))
-    if (/累计|合计|总计|总记录数/.test(firstCell) || hasSummaryText) continue
+    const hasSummaryText = row.some(cell => isSummaryCell(cell))
+    if (hasSummaryText) continue
 
     // If a date column is defined but this row has no date, it is likely a footer or summary row
     if (dateColIndices.length > 0) {

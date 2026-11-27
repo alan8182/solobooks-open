@@ -2,7 +2,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NAV_ITEMS, type BossGroup, type NavGroup, type NavItem } from '@/utils/constants'
+import { NAV_ITEMS, type BossGroup, type NavChildItem, type NavGroup, type NavItem } from '@/utils/constants'
 import { useWorkspaceViewStore } from '@/stores/workspaceView'
 import { itemVisible } from '@/utils/workspace'
 import { useClosingStatus } from '@/composables/useClosingStatus'
@@ -17,7 +17,14 @@ const router = useRouter()
 const viewStore = useWorkspaceViewStore()
 const closingStatus = useClosingStatus()
 const expandedMenu = ref<string | null>(null)
+
+const BOSS_GROUPS: BossGroup[] = ['每月', '每天', '复盘']
+const WORKSPACE_GROUPS: NavGroup[] = ['日常', '账务', '周期', '工具']
+
+// 老板视图不做 workspace 过滤：能力一个不少，只是主航只留 bossGroup 项（7 项），
+// 其余入口全部折进左下角「更多」。会计视图仍按 workspace 过滤、设置留在导航里。
 const visibleItems = computed<NavItem[]>(() => {
+  if (viewStore.isBoss) return NAV_ITEMS
   return NAV_ITEMS
     .filter((item) => itemVisible(item.workspace, viewStore.mode))
     .map((item) => ({
@@ -26,40 +33,64 @@ const visibleItems = computed<NavItem[]>(() => {
     }))
     .filter((item) => Boolean(item.path) || Boolean(item.children?.length))
 })
-const BOSS_GROUPS: BossGroup[] = ['每月', '每天', '复盘', '设置']
-const WORKSPACE_GROUPS: NavGroup[] = ['日常', '账务', '周期', '工具']
 
-// 设置收纳：老板视图折进左下角小图标（低频入口不占主航）；
-// 会计视图必须留在导航里——会计科目、期初设置、备份与归档这些"不配就用不了"，
-// 藏进 36px 图标后新用户根本不知道它们存在。
-// 移动端抽屉本来就没有左下角图标位，设置一律留在导航里。
-const SETTINGS_LABEL = '设置'
 const navPool = computed<NavItem[]>(() => {
-  if (props.mobile || viewStore.isAccounting) return visibleItems.value
-  return visibleItems.value.filter((item) => item.label !== SETTINGS_LABEL)
+  if (viewStore.isAccounting) return visibleItems.value
+  // 只有分到「每月 / 每天 / 复盘」的项进主航；设置与专业页都走「更多」
+  return visibleItems.value.filter(
+    (item) => Boolean(item.bossGroup) && BOSS_GROUPS.includes(item.bossGroup as BossGroup),
+  )
 })
-const settingsItem = computed<NavItem | null>(
-  () => visibleItems.value.find((item) => item.label === SETTINGS_LABEL) ?? null,
-)
-// 会计视图已把设置放回导航，左下角图标不再重复出现
-const showSettingsLauncher = computed(
-  () => !props.mobile && !viewStore.isAccounting && settingsItem.value !== null,
-)
-const settingsOpen = ref(false)
-const settingsAnchorRef = ref<HTMLElement | null>(null)
-const settingsActive = computed(
-  () => settingsItem.value?.children?.some((child) => isActive(child.path)) ?? false,
+
+interface MoreLink {
+  path: string
+  label: string
+  icon: string
+}
+interface MoreSection {
+  label: string
+  items: MoreLink[]
+}
+
+// 「更多」收录所有非主航入口：顶层项按 group 合并（经营账本 + 发票台账 → 账务），
+// 父组用自己的名字（凭证与账簿 / 专项核算 / 设置）。桌面 flyout 与移动端抽屉共用。
+const moreSections = computed<MoreSection[]>(() => {
+  const sections: MoreSection[] = []
+  for (const item of NAV_ITEMS) {
+    // 只跳过真正在主航的项；设置虽然带 bossGroup='设置'，仍要进「更多」
+    if (item.bossGroup && BOSS_GROUPS.includes(item.bossGroup as BossGroup)) continue
+    const links: MoreLink[] = item.path
+      ? [{ path: item.path, label: item.label, icon: item.icon }]
+      : (item.children ?? []).map((child) => ({
+          path: child.path,
+          label: childDisplayLabel(child),
+          icon: child.icon,
+        }))
+    if (!links.length) continue
+    const label = item.path ? item.group : item.label
+    const last = sections[sections.length - 1]
+    if (last && last.label === label) last.items.push(...links)
+    else sections.push({ label, items: links })
+  }
+  return sections
+})
+
+const showMoreLauncher = computed(() => !props.mobile && viewStore.isBoss)
+const moreOpen = ref(false)
+const moreAnchorRef = ref<HTMLElement | null>(null)
+const moreActive = computed(
+  () => moreSections.value.some((section) => section.items.some((link) => isActive(link.path))),
 )
 
 // 菜单只由点击开关（不再悬停触发）；点别处或按 Esc 都收起。
 function onDocClick(e: MouseEvent) {
-  if (!settingsOpen.value) return
-  const anchor = settingsAnchorRef.value
-  if (anchor && !anchor.contains(e.target as Node)) settingsOpen.value = false
+  if (!moreOpen.value) return
+  const anchor = moreAnchorRef.value
+  if (anchor && !anchor.contains(e.target as Node)) moreOpen.value = false
 }
 
 function onDocKeydown(e: KeyboardEvent) {
-  if (e.key === 'Escape' && settingsOpen.value) settingsOpen.value = false
+  if (e.key === 'Escape' && moreOpen.value) moreOpen.value = false
 }
 
 onMounted(() => {
@@ -118,6 +149,10 @@ function itemDisplayLabel(item: NavItem) {
   return viewStore.isBoss && item.bossLabel ? item.bossLabel : item.label
 }
 
+function childDisplayLabel(child: NavChildItem) {
+  return viewStore.isBoss && child.bossLabel ? child.bossLabel : child.label
+}
+
 function isExpanded(label: string) {
   return expandedMenu.value === label
 }
@@ -127,7 +162,7 @@ function toggleMenu(label: string) {
 }
 
 function navigate(path: string) {
-  settingsOpen.value = false
+  moreOpen.value = false
   router.push(path)
   emit('navigate')
 }
@@ -135,7 +170,7 @@ function navigate(path: string) {
 watch(
   [() => route.path, () => viewStore.mode],
   () => {
-    settingsOpen.value = false
+    moreOpen.value = false
     const activeParent = navPool.value.find((item) => isParentActive(item))
     expandedMenu.value = activeParent?.label ?? null
   },
@@ -249,41 +284,88 @@ watch(
               @click="navigate(child.path)"
             >
               <i :class="[child.icon, 'subnav-icon']" />
-              <span>{{ child.label }}</span>
+              <span>{{ childDisplayLabel(child) }}</span>
             </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 移动端没有左下角图标位：把「更多」作为可展开分组放进抽屉 -->
+      <div v-if="mobile && viewStore.isBoss" class="nav-group">
+        <span v-if="!collapsed" class="group-label">更多</span>
+        <div class="nav-entry" :class="{ open: isExpanded('更多'), 'parent-active': moreActive }">
+          <button
+            type="button"
+            class="nav-item"
+            :aria-expanded="isExpanded('更多')"
+            @click="toggleMenu('更多')"
+          >
+            <span class="nav-item-inner">
+              <i class="ri-apps-2-line nav-icon" />
+              <span class="nav-label">更多</span>
+            </span>
+            <i
+              class="ri-arrow-down-s-line nav-chevron"
+              :class="{ rotated: isExpanded('更多') }"
+              aria-hidden="true"
+            />
+          </button>
+          <div v-if="isExpanded('更多')" class="subnav" aria-label="更多二级菜单">
+            <template v-for="section in moreSections" :key="section.label">
+              <span class="subnav-title">{{ section.label }}</span>
+              <button
+                v-for="link in section.items"
+                :key="link.path"
+                type="button"
+                class="subnav-item"
+                :class="{ active: isActive(link.path) }"
+                @click="navigate(link.path)"
+              >
+                <i :class="[link.icon, 'subnav-icon']" />
+                <span>{{ link.label }}</span>
+              </button>
+            </template>
           </div>
         </div>
       </div>
     </nav>
 
     <div v-if="!mobile" class="view-switch-footer">
-      <div v-if="showSettingsLauncher" ref="settingsAnchorRef" class="settings-anchor" :class="{ open: settingsOpen }">
+      <div v-if="showMoreLauncher" ref="moreAnchorRef" class="settings-anchor" :class="{ open: moreOpen }">
         <button
           type="button"
           class="settings-btn"
-          :class="{ active: settingsActive }"
-          :title="settingsActive ? '设置（当前所在）' : '设置'"
-          aria-label="设置菜单"
+          :class="{ active: moreActive }"
+          :title="moreActive ? '更多（当前所在）' : '更多'"
+          aria-label="更多菜单"
           aria-haspopup="menu"
-          :aria-expanded="settingsOpen"
-          @click="settingsOpen = !settingsOpen"
+          :aria-expanded="moreOpen"
+          @click="moreOpen = !moreOpen"
         >
-          <i class="ri-settings-4-line" />
-          <span v-if="!collapsed" class="settings-btn-label">设置</span>
+          <i class="ri-apps-2-line" />
+          <span v-if="!collapsed" class="settings-btn-label">更多</span>
         </button>
-        <div class="settings-flyout" :aria-label="`设置二级菜单`">
-          <span class="subnav-title">设置</span>
-          <button
-            v-for="child in settingsItem?.children ?? []"
-            :key="child.path"
-            type="button"
-            class="subnav-item"
-            :class="{ active: isActive(child.path) }"
-            @click="navigate(child.path)"
+        <div class="settings-flyout" aria-label="更多二级菜单">
+          <!-- 分组各占一列：19 项铺成一条竖列时必然要滚动，四列后最高一列 8 项、
+               约 310px，桌面任意高度都能一眼看全。 -->
+          <div
+            v-for="section in moreSections"
+            :key="section.label"
+            class="settings-column"
           >
-            <i :class="[child.icon, 'subnav-icon']" />
-            <span>{{ child.label }}</span>
-          </button>
+            <span class="subnav-title">{{ section.label }}</span>
+            <button
+              v-for="link in section.items"
+              :key="link.path"
+              type="button"
+              class="subnav-item"
+              :class="{ active: isActive(link.path) }"
+              @click="navigate(link.path)"
+            >
+              <i :class="[link.icon, 'subnav-icon']" />
+              <span>{{ link.label }}</span>
+            </button>
+          </div>
         </div>
       </div>
       <button
@@ -487,19 +569,62 @@ watch(
   left: 0;
   z-index: 130;
   display: none;
-  width: 184px;
-  max-height: 62vh;
+  /* 四列按内容自适应，再窄也保留 176px；1024 以下侧栏整体切移动端，不会用到这里 */
+  width: min(800px, calc(100vw - 260px));
+  max-height: calc(100vh - 120px);
   overflow-y: auto;
   padding: 8px;
   border: 1px solid var(--solo-border);
   border-radius: 8px;
   background: var(--solo-bg-sidebar);
   box-shadow: var(--solo-shadow);
+  flex-direction: row;
+  gap: 0;
+}
+/* 分组一列；列间用竖线分隔，组标题留在列首，比横线更易扫读 */
+.settings-column {
+  display: flex;
+  flex: 1 1 176px;
   flex-direction: column;
+  min-width: 0;
+  padding: 0 10px;
   gap: 2px;
+}
+.settings-column + .settings-column {
+  border-left: 1px solid var(--solo-border-light);
+}
+.settings-column:first-child {
+  padding-left: 4px;
+}
+.settings-column:last-child {
+  padding-right: 4px;
+}
+/* 导航里的分组标题仍用横线分隔；「更多」已按列分组，不再画横线 */
+.subnav .subnav-title:not(:first-child) {
+  margin-top: 6px;
+  padding-top: 9px;
+  border-top: 1px solid var(--solo-border-light);
 }
 .settings-anchor.open > .settings-flyout {
   display: flex;
+  /* 从按钮方向轻轻弹出：只做入场，不做退场，Esc/点外收起要立即消失 */
+  transform-origin: bottom left;
+  animation: settings-flyout-in 160ms cubic-bezier(0.2, 0, 0, 1);
+}
+@keyframes settings-flyout-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .settings-anchor.open > .settings-flyout {
+    animation: none;
+  }
 }
 .sidebar.collapsed .settings-flyout {
   bottom: 0;

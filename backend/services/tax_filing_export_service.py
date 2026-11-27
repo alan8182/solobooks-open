@@ -33,7 +33,8 @@ EXPORT_DIR = BACKEND_DIR / "data" / "tax_exports"
 
 # 贷方性质科目：累计折旧/摊销 + 损益收入类（《小企业会计准则》5xxx 收入段）
 CREDIT_NATURE_CODES = {"1602", "1702", "5001", "5051", "5111", "5301"}
-CASH_ACCOUNT_CODES = {"1001", "1002", "1012001", "1012"}
+CREDIT_NATURE_PREFIXES = tuple(CREDIT_NATURE_CODES)
+CASH_ACCOUNT_CODES = {"1001", "1002", "1012001", "1012002", "1012"}
 
 
 @dataclass
@@ -137,7 +138,7 @@ def _sum_prefix(balances: Dict[str, Decimal], *prefixes: str) -> Decimal:
 
 
 def _normal_balance(code: str, debit: Decimal, credit: Decimal) -> Decimal:
-    if code in CREDIT_NATURE_CODES or code.startswith(("2", "3")):
+    if code.startswith(CREDIT_NATURE_PREFIXES) or code.startswith(("2", "3")):
         return credit - debit
     return debit - credit
 
@@ -466,10 +467,10 @@ def _cash_map(entries: list[dict[str, Any]], start: date, end: date, opening_cas
             if str(line.get("accountCode") or "") not in CASH_ACCOUNT_CODES
         }
         category = str(entry.get("category") or "")
-        if counterpart_codes & {"5001", "5051"}:
+        if any(code.startswith(("5001", "5051")) for code in counterpart_codes):
             out["sales_cash"] += net_cash
             continue
-        if counterpart_codes & {"5301"} or any(code.startswith("5603") for code in counterpart_codes):
+        if any(code.startswith(("5301", "5603")) for code in counterpart_codes):
             if net_cash > ZERO:
                 out["other_operating_in"] += amount
             else:

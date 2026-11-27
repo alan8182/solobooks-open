@@ -158,12 +158,11 @@ describe('ReportPage Dual-View UX (Boss vs Accounting)', () => {
     // 标题与副标题脱敏
     expect(wrapper.text()).toContain('经营概览')
     expect(wrapper.text()).toContain('企业实时收支、手头现钱与往来账款')
-    expect(wrapper.text()).toContain('建立老板财务直觉')
 
     // 4 宫格核心人话标题
     expect(wrapper.text()).toContain('收入')
     expect(wrapper.text()).toContain('支出')
-    expect(wrapper.text()).toContain('净赚 (落袋利润)')
+    expect(wrapper.text()).toContain('净赚')
     expect(wrapper.text()).toContain('预估本月应缴税')
 
     // 真金白银头寸速览条：包含 4 项，去除会计专业括号
@@ -213,7 +212,7 @@ describe('ReportPage Dual-View UX (Boss vs Accounting)', () => {
     // 4 宫格会计术语
     expect(wrapper.text()).toContain('营业收入')
     expect(wrapper.text()).toContain('总支出')
-    expect(wrapper.text()).toContain('净赚 (利润)')
+    expect(wrapper.text()).toContain('净利润')
     expect(wrapper.text()).toContain('预计本月税负')
 
     // 头寸速览条保留准则科目全称，不渲染老板垫资

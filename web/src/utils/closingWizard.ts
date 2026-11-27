@@ -3,11 +3,15 @@
  * Licensed under the SoloBooks License v2.0.
  */
 
+import { formatMoney } from './format'
+
 export interface ClosingWizardEntryLike {
   id?: string
   direction?: string
   amount?: number | string | null
   billingStatus?: string | null
+  paymentDate?: string | null
+  category?: string | null
   voucherLines?: unknown
   payer?: string | null
   paymentStatus?: string | null
@@ -20,11 +24,67 @@ export interface ClosingWizardEntryLike {
   invoiceNumber?: string | null
   title?: string | null
   occurDate?: string | null
+  buyer_name?: string | null
+  buyerName?: string | null
+}
+
+export interface AdvanceBalanceEntryLike {
+  id: string
+  sourceId?: string | null
+  voucherNo?: string
+  date: string
+  period: string
+  summary: string
+  category: string
+  amount: string
+  direction: 'advance' | 'reimbursement'
+  isCurrentMonth: boolean
+}
+
+export interface AdvanceBalancePersonLike {
+  payer: string
+  kind: 'boss' | 'employee'
+  name: string
+  opening: string | number
+  advance: string | number
+  reimbursed: string | number
+  closing: string | number
+  count: number
+  lastDate: string
+  entries?: AdvanceBalanceEntryLike[]
+}
+
+export interface AdvanceBalancesSnapshot {
+  month?: string
+  items: AdvanceBalancePersonLike[]
+  totals?: {
+    opening: string | number
+    advance: string | number
+    reimbursed: string | number
+    closing: string | number
+  }
+}
+
+export interface BossLedgerSummary {
+  customerOwes: number
+  customerCount: number
+  companyOwesSupplier: number
+  supplierCount: number
+  companyOwesBossAndEmp: number
+  bossOnly: number
+  empOnly: number
+  advanceOpening: number
+  advanceMonthOccurred: number
+  advanceMonthReimbursed: number
+  fromAdvanceLedger: boolean
+  hasAny: boolean
 }
 
 export interface ClosingWizardStatementLike {
   matched_entry_id?: string | null
   matched_entry_ids?: string[] | null
+  description?: string | null
+  transaction_date?: string | null
 }
 
 /** 研发支出分类名：结账第二步据此决定是否就地展开研发归集。 */
@@ -151,6 +211,65 @@ export function getStatementMatchedEntryIds(statement?: ClosingWizardStatementLi
   return ids
 }
 
+// ── 发票销方 ↔ 流水对手方亲和 ────────────────────────────────────────────────
+// 与后端 services/bank_service.py 的 seller_affinity 同口径：金额+日期之外的
+// 第三道配对证据。「疑似对应」提示不能只靠金额巧合（社保金库 vs 科技公司发票）。
+
+function affinityClean(text: string): string {
+  return String(text || '').replace(/[^\w\u4e00-\u9fa5]/g, '')
+}
+
+function hanSet(text: string): Set<string> {
+  return new Set(String(text || '').match(/[\u4e00-\u9fa5]/g) || [])
+}
+
+/** 流水描述里的结构化对手方：「… (对方: xxx)」中的 xxx；无则空串。 */
+export function statementCounterpartyOf(description?: string | null): string {
+  const match = String(description || '').match(/[(（]对方[:：]\s*([^)）]+)[)）]/)
+  return (match?.[1] || '').trim()
+}
+
+/** 发票类账目的销方名：标题「发票-」前缀之后的部分（导入即以此生成标题）。 */
+export function entrySellerName(entry?: ClosingWizardEntryLike | null): string {
+  const title = String(entry?.title || '')
+  return title.includes('发票-') ? title.split('发票-').pop()!.trim() : ''
+}
+
+/** 发票类账目的对手方名：销项发票（income）取购方，进项发票（expense）取销方。 */
+function entryInvoiceCounterpartyName(entry?: ClosingWizardEntryLike | null): string {
+  if (entry?.direction === 'income') {
+    return String(entry.buyer_name || entry.buyerName || '').trim()
+  }
+  return entrySellerName(entry)
+}
+
+/**
+ * 发票对手方（进项取销方、销项取购方）与流水是否相关。任一满足即相关：
+ * - 流水「对方」与发票对手方互相包含（≥2 字）
+ * - 去掉对方段后的描述与发票对手方有足够汉字交集：报销场景（描述含「报销/垫付」）
+ *   商户名常只有 2 字品牌（百度/智谱），阈值放宽到 2；非报销场景保持 ≥3
+ * - 清洗后整段互相包含（≥6 字）
+ * 非发票类账目（标题无「发票-」）或缺失购方名的销项发票无从判断对手方，返回 true 走原有规则。
+ */
+export function statementSellerAffinity(
+  statement?: ClosingWizardStatementLike | null,
+  entry?: ClosingWizardEntryLike | null,
+): boolean {
+  const seller = affinityClean(entryInvoiceCounterpartyName(entry))
+  if (!seller) return true
+  const desc = String(statement?.description || '')
+  const counterparty = affinityClean(statementCounterpartyOf(desc))
+  if (counterparty.length >= 2 && (
+    counterparty === seller || counterparty.includes(seller) || seller.includes(counterparty)
+  )) return true
+  const descBody = affinityClean(desc.replace(/[(（]对方[:：][^)）]+[)）]/g, ''))
+  const isReimbursement = descBody.includes('报销') || descBody.includes('垫付')
+  const threshold = isReimbursement ? 2 : 3
+  const common = [...hanSet(descBody)].filter((ch) => hanSet(seller).has(ch)).length
+  if (common >= threshold) return true
+  return descBody.length >= 6 && (descBody.includes(seller) || seller.includes(descBody))
+}
+
 export function amountClassForDirection(direction?: string, amount?: number | string | null): 'income' | 'expense' {
   if (direction === 'income') return 'income'
   if (direction === 'expense') return 'expense'
@@ -226,18 +345,159 @@ export function buildSuggestedMatchPair(suggestion: any, entries: ClosingWizardE
   }
 }
 
+/** 判断是否为银行核销生成的垫付报销还款凭证（属于已发生的还款动作，非未报销垫付单据）。 */
+export function isReimbursementSettlementEntry(entry?: ClosingWizardEntryLike | null): boolean {
+  if (!entry) return false
+  if (String(entry.id || '').startsWith('reim-')) return true
+  const category = String(entry.category || '').trim()
+  return entry.direction === 'owner_transfer' && (category === '股东垫付报销' || category === '员工垫付报销')
+}
+
 /**
  * 判断单据是否已确认为非公户银行存款结算（包括个人垫付、未付款挂账、预存扣除、平台未提现等）。
  * 此类单据不通过公司银行公户进出，无需且无法匹配公户银行流水。
  */
 export function isNonBankSettledEntry(entry?: ClosingWizardEntryLike | null): boolean {
-  if (!entry) return false
+  if (!entry || isReimbursementSettlementEntry(entry)) return false
   const payer = String((entry as any).payer || '')
   const paymentStatus = String((entry as any).paymentStatus || '')
   if (paymentStatus === 'unpaid') return true
   if (payer === 'boss_personal' || payer.startsWith('employee_personal')) return true
   if (['prepaid_deduct', 'platform_balance', 'advance_offset'].includes(payer)) return true
   return false
+}
+
+/** 截至目标月份是否已通过公户收付/报销核销结清；若在更晚月份才核销，回看目标月份时仍算未结清。 */
+export function isSettledAsOfMonth(
+  entry?: ClosingWizardEntryLike | null,
+  targetMonth?: string | null,
+): boolean {
+  if (!entry) return false
+  if (!isReconciledEntry(entry) && (entry as any).billing_status !== 'reconciled') return false
+  const payMonth = String(entry.paymentDate || (entry as any).payment_date || '').slice(0, 7)
+  if (payMonth && targetMonth && payMonth > targetMonth) return false
+  return true
+}
+
+/** 截至目标月份仍未报销的个人垫付支出单据。 */
+export function isUnreimbursedPersonalAdvanceEntry(
+  entry?: ClosingWizardEntryLike | null,
+  targetMonth?: string | null,
+): boolean {
+  if (!entry) return false
+  if ((entry as any).is_archive_only || (entry as any).isArchiveOnly) return false
+  if (isReversalLikeEntry(entry) || isReimbursementSettlementEntry(entry)) return false
+  if (entry.direction !== 'expense') return false
+  if (String(entry.paymentStatus || '') === 'unpaid') return false
+  const payer = String(entry.payer || '')
+  if (payer !== 'boss_personal' && !payer.startsWith('employee_personal')) return false
+  return !isSettledAsOfMonth(entry, targetMonth)
+}
+
+/**
+ * 老板往来小账本汇总（方案 A）：
+ * - 客户欠款 / 待付供应商款：从当月已确认挂账且截至当期未核销的单据汇总
+ * - 公司欠老板/员工垫付款：优先以 2241 垫付台账接口期末未报余额为权威真值，并叠加尚未过账的当期垫付草稿
+ */
+export function computeBossLedgerSummary(
+  confirmedEntries: ClosingWizardEntryLike[],
+  advanceBalances: AdvanceBalancesSnapshot | null,
+  targetMonth?: string | null,
+): BossLedgerSummary {
+  let customerOwesCents = 0
+  let customerCount = 0
+  let supplierOwesCents = 0
+  let supplierCount = 0
+  let bossCents = 0
+  let empCents = 0
+
+  for (const item of confirmedEntries) {
+    const amtCents = Math.round(Math.abs(Number(item.amount) || 0) * 100)
+    const status = String(item.paymentStatus || '')
+    if (status === 'unpaid' && !isSettledAsOfMonth(item, targetMonth)) {
+      if (item.direction === 'income') {
+        customerOwesCents += amtCents
+        customerCount += 1
+      } else if (item.direction === 'expense') {
+        supplierOwesCents += amtCents
+        supplierCount += 1
+      }
+    }
+  }
+
+  let advanceOpening = 0
+  let advanceMonthOccurred = 0
+  let advanceMonthReimbursed = 0
+  const fromAdvanceLedger = Boolean(advanceBalances && Array.isArray(advanceBalances.items))
+
+  if (fromAdvanceLedger && advanceBalances) {
+    const postedIds = new Set<string>()
+    for (const person of advanceBalances.items) {
+      const closingCents = Math.max(0, Math.round((Number(person.closing) || 0) * 100))
+      if (person.kind === 'boss') {
+        bossCents += closingCents
+      } else {
+        empCents += closingCents
+      }
+      for (const e of person.entries || []) {
+        const eid = String(e.id || '').trim()
+        const sid = String(e.sourceId || '').trim()
+        if (eid) postedIds.add(eid)
+        if (sid) postedIds.add(sid)
+      }
+    }
+    advanceOpening = Math.round((Number(advanceBalances.totals?.opening) || 0) * 100) / 100
+    advanceMonthOccurred = Math.round((Number(advanceBalances.totals?.advance) || 0) * 100) / 100
+    advanceMonthReimbursed = Math.round((Number(advanceBalances.totals?.reimbursed) || 0) * 100) / 100
+
+    for (const item of confirmedEntries) {
+      const voucherStatus = String(item.voucherStatus || item.status || '')
+      const itemId = String(item.id || '').trim()
+      if (
+        voucherStatus !== 'posted'
+        && (!itemId || !postedIds.has(itemId))
+        && isUnreimbursedPersonalAdvanceEntry(item, targetMonth)
+      ) {
+        const amtCents = Math.round(Math.abs(Number(item.amount) || 0) * 100)
+        if (String(item.payer || '') === 'boss_personal') {
+          bossCents += amtCents
+        } else {
+          empCents += amtCents
+        }
+      }
+    }
+  } else {
+    for (const item of confirmedEntries) {
+      if (!isUnreimbursedPersonalAdvanceEntry(item, targetMonth)) continue
+      const amtCents = Math.round(Math.abs(Number(item.amount) || 0) * 100)
+      if (String(item.payer || '') === 'boss_personal') {
+        bossCents += amtCents
+      } else {
+        empCents += amtCents
+      }
+    }
+  }
+
+  const customerOwes = customerOwesCents / 100
+  const companyOwesSupplier = supplierOwesCents / 100
+  const bossOnly = bossCents / 100
+  const empOnly = empCents / 100
+  const companyOwesBossAndEmp = (bossCents + empCents) / 100
+
+  return {
+    customerOwes,
+    customerCount,
+    companyOwesSupplier,
+    supplierCount,
+    companyOwesBossAndEmp,
+    bossOnly,
+    empOnly,
+    advanceOpening,
+    advanceMonthOccurred,
+    advanceMonthReimbursed,
+    fromAdvanceLedger,
+    hasAny: customerOwes > 0 || companyOwesSupplier > 0 || companyOwesBossAndEmp > 0 || advanceMonthReimbursed > 0,
+  }
 }
 
 /** 冲销凭证、被冲销原凭证，以及由系统冲销后重记的凭证都不再参与人工重新选择。 */
@@ -434,6 +694,7 @@ export function voucherLinesSummary(
 export const DISPOSITION_EXCLUDED_CATEGORIES = new Set([
   '工资发放',
   '社保公积金',
+  '个税代缴',
   '微信支付结算',
   '支付宝结算',
   '平台提现结算',
@@ -474,4 +735,434 @@ export function dispositionCategoryGroups(
 export function dispositionCategoryOf(value?: string | null): string {
   const parts = String(value || '').split('|')
   return parts.length > 1 ? parts[1] : ''
+}
+
+/**
+ * 轻视觉科目副标签：分类名与会计科目名完全相同时去重（如「资本公积」→「3002」），
+ * 不同时保留「科目名 + 科目代码」（如「股东投入」→「实收资本 3001」），
+ * 兼顾老板可读性与伴随式财务专业感。
+ */
+export function formatAccountPreviewLabel(
+  category?: string | null,
+  account?: { name?: string | null; code?: string | null } | null,
+): string {
+  if (!account) return ''
+  const cat = String(category || '').trim()
+  const name = String(account.name || '').trim()
+  const code = String(account.code || '').trim()
+  if (name && name === cat) return code
+  return [name, code].filter(Boolean).join(' ')
+}
+
+/** 多义项分类的白话经营含义（面向非财务老板，按业务后果区分） */
+export const AMBIGUITY_CATEGORY_HINTS: Record<string, string> = {
+  股东投入: '计入公司实缴注册资本（工商登记出资，不能随意原路退回）',
+  资本公积: '超过注册资本的溢价投入（归属公司权益，不改注册资本）',
+  股东垫付: '算股东暂借给公司，日后公司有钱时可免税原路还回个人',
+  主营业务收入: '公司日常主营业务收款（计入营业收入与应税所得）',
+  其他业务收入: '非主营但与经营相关的附带收入（如转租、材料转让等）',
+  营业外收入: '偶发进账（如实名验证打款、政府补助、违约金等）',
+  往来款: '暂付/暂收押金、保证金或验证退款，不计入利润或费用',
+  其他支出: '无法归入专项的零星日常费用（直接计入当期管理费用）',
+  税费缴纳: '正常缴纳税款（冲减应交增值税余额；不含罚款滞纳金）。社保/公积金、代扣个税请选下面各自的选项，按应付职工薪酬核销',
+  社保公积金: '社保/公积金缴纳（企+个一并冲减已计提的应付职工薪酬；建账前的遗留会冲销期初应付）',
+  个税代缴: '代扣代缴员工个税（冲减应交个人所得税 2221012，不计入公司所得税费用）',
+  罚款支出: '税务或行政罚款（计入营业外支出 5711011，企业所得税不得税前扣除）',
+  税收滞纳金: '逾期缴税滞纳金（计入营业外支出 5711010，企业所得税不得税前扣除）',
+  所得税费用: '缴纳企业所得税（计入所得税费用 5801）',
+}
+
+export function categoryPlainHint(category?: string | null): string {
+  return AMBIGUITY_CATEGORY_HINTS[String(category || '').trim()] || ''
+}
+
+const BANK_CHANNEL_WORDS = new Set([
+  '汇兑',
+  '入账',
+  '转账',
+  '网银转账',
+  '跨行汇款',
+  '网上银行',
+  '代付',
+  '代收',
+  '银联',
+  '收款',
+  '付款',
+])
+
+export interface ParsedBankStatementDisplay {
+  counterparty: string
+  summary: string
+  channel: string
+  raw: string
+}
+
+/**
+ * 清洗银行流水原始描述（如「汇兑 | 附言: 投资款 (对方: 何静谷)」）用于卡片展示：
+ * 把对手方和附言前置，通道词（汇兑/入账）退为次要元信息；原始描述保留在 raw 供悬停查看。
+ */
+export function parseBankStatementDisplay(description?: string | null): ParsedBankStatementDisplay {
+  const raw = String(description || '').trim()
+  if (!raw) return { counterparty: '', summary: '', channel: '', raw: '' }
+
+  let body = raw
+  let counterparty = ''
+  const partyMatch = body.match(/(?:\(|（)对方\s*[:：]\s*(.+?)(?:\)|）)\s*$/)
+  if (partyMatch) {
+    counterparty = partyMatch[1].trim()
+    body = body.slice(0, partyMatch.index).trim()
+  }
+
+  const rawParts = body
+    .split('|')
+    .map((part) => part.trim())
+    .filter(Boolean)
+
+  let channel = ''
+  if (rawParts.length > 1 && BANK_CHANNEL_WORDS.has(rawParts[0])) {
+    channel = rawParts.shift()!
+  }
+
+  let summary = rawParts
+    .map((part) => part.replace(/^附言\s*[:：]\s*/, '').trim())
+    .filter(Boolean)
+    .join(' · ')
+
+  // 避免「何静谷 · 何静谷实缴出资款」重复出现对手方姓名
+  if (counterparty && summary.startsWith(counterparty) && summary.length > counterparty.length) {
+    const trimmed = summary.slice(counterparty.length).replace(/^[\s·\-—:：]+/, '').trim()
+    if (trimmed) summary = trimmed
+  }
+
+  // 若只剩通道词且有对手方，把通道词移入 channel（如「汇兑 (对方: 何静谷)」）
+  if (!channel && counterparty && BANK_CHANNEL_WORDS.has(summary)) {
+    channel = summary
+    summary = ''
+  }
+
+  return { counterparty, summary, channel, raw }
+}
+
+export interface MultiMatchPoolInfo {
+  poolKind: 'advancement' | 'pending_invoice' | 'other'
+  poolKey: string
+  poolLabel: string
+}
+
+export interface MultiMatchEvaluation {
+  selectedCount: number
+  selectedTotal: number
+  statementAbs: number
+  diff: number
+  isHomogeneous: boolean
+  poolError: string
+  amountMatches: boolean
+  canConfirm: boolean
+  tolerance: number
+}
+
+/**
+ * 归类合并报销/多票核销候选项所属资金池，与后端 `confirm_suggestion_flow` /
+ * `_try_multi_invoice_match` 保持同一口径：个人垫付不可与非垫付混选，不同垫付人不可混选。
+ */
+export function classifyMultiMatchCandidate(entry?: ClosingWizardEntryLike | null): MultiMatchPoolInfo | null {
+  if (!entry) return null
+  const payer = String(entry.payer || '').trim()
+  const isPersonal = payer === 'boss_personal'
+    || payer === 'employee_personal'
+    || payer.startsWith('employee_personal:')
+  if (isPersonal) {
+    const bankEffect = entry.voucherLines ? voucherAccountEffect(entry, '1002') : 0
+    if (Math.abs(bankEffect) >= 0.01) {
+      return { poolKind: 'other', poolKey: 'company_bank', poolLabel: '公户账目' }
+    }
+    let poolLabel = '员工垫付'
+    if (payer === 'boss_personal') {
+      poolLabel = '老板垫付'
+    } else if (payer.startsWith('employee_personal:')) {
+      const empName = payer.slice('employee_personal:'.length).trim()
+      poolLabel = empName ? `员工(${empName})垫付` : '员工垫付'
+    }
+    return {
+      poolKind: 'advancement',
+      poolKey: `adv:${payer}`,
+      poolLabel,
+    }
+  }
+  const voucher = entry.voucherLines as {
+    debit?: Array<{ accountCode?: string }>
+    credit?: Array<{ accountCode?: string }>
+  } | null | undefined
+  const isPendingInvoice = Boolean(voucher) && (
+    (Array.isArray(voucher?.credit) && voucher.credit.some((l) => String(l.accountCode) === '2241'))
+    || (Array.isArray(voucher?.debit) && voucher.debit.some((l) => String(l.accountCode) === '1122'))
+  )
+  if (isPendingInvoice || String(entry.source || '') === 'invoice_import') {
+    return {
+      poolKind: 'pending_invoice',
+      poolKey: 'pending_invoice',
+      poolLabel: '待付款发票',
+    }
+  }
+  return { poolKind: 'other', poolKey: 'company_bank', poolLabel: '公户账目' }
+}
+
+/** 实时计算多票合并核销勾选的合计数、资金池一致性与差额可提交状态。 */
+export function evaluateMultiMatchSelection(
+  statementAmount: number | string | null | undefined,
+  selectedEntries: ClosingWizardEntryLike[],
+): MultiMatchEvaluation {
+  const statementCents = Math.round(Math.abs(Number(statementAmount) || 0) * 100)
+  const selectedCents = selectedEntries.reduce(
+    (sum, item) => sum + Math.round(Math.abs(Number(item?.amount) || 0) * 100),
+    0,
+  )
+  const diffCents = selectedCents - statementCents
+  const selectedCount = selectedEntries.length
+  const classified = selectedEntries
+    .map((item) => classifyMultiMatchCandidate(item))
+    .filter((item): item is MultiMatchPoolInfo => item !== null)
+  const hasAdv = classified.some((item) => item.poolKind === 'advancement')
+  const hasNonAdv = classified.some((item) => item.poolKind !== 'advancement')
+  const advKeys = new Set(
+    classified.filter((item) => item.poolKind === 'advancement').map((item) => item.poolKey),
+  )
+
+  let isHomogeneous = true
+  let poolError = ''
+  if (hasAdv && hasNonAdv) {
+    isHomogeneous = false
+    poolError = '个人垫付报销暂不支持与待付款发票或公户账目混合合并，请分开核销'
+  } else if (advKeys.size > 1) {
+    isHomogeneous = false
+    poolError = '多笔垫付合并报销仅支持同一垫付人，请按垫付人分别核销'
+  }
+
+  const tolerance = hasAdv && !hasNonAdv ? 0.05 : 0.01
+  const toleranceCents = Math.round(tolerance * 100)
+  const amountMatches = selectedCount > 0 && Math.abs(diffCents) <= toleranceCents
+  return {
+    selectedCount,
+    selectedTotal: selectedCents / 100,
+    statementAbs: statementCents / 100,
+    diff: diffCents / 100,
+    isHomogeneous,
+    poolError,
+    amountMatches,
+    canConfirm: selectedCount > 0 && isHomogeneous && amountMatches,
+    tolerance,
+  }
+}
+
+export interface MatchSuggestionLike {
+  statementId?: string | null
+  type?: string | null
+  matchedEntryId?: string | null
+  matchedEntryIds?: string[] | null
+  invoiceReimbursement?: unknown
+}
+
+/**
+ * 收集已被银行流水 `match` 建议认领的单据 ID（同时兼容 1:1 matchedEntryId 与 1:N matchedEntryIds）。
+ * 供「待确认款项的单据」列表剔除重复展示，避免同一张发票在上方流水与兜底列表同时出现、诱导误操作。
+ * 注意：带有 `invoiceReimbursement`（疑似个人垫付报销、尚未确认垫付人与科目）的建议不屏蔽下方发票，
+ * 让老板先在下方按全站统一流程确认垫付人与用途分类，再回到上方确认报销配对。
+ */
+export function collectSuggestedMatchedEntryIds(
+  suggestions: MatchSuggestionLike[],
+  activeStatementIds?: Set<string>,
+): Set<string> {
+  const claimed = new Set<string>()
+  for (const sug of suggestions) {
+    if (!sug || sug.type !== 'match') continue
+    if (sug.invoiceReimbursement) continue
+    if (activeStatementIds && sug.statementId != null && !activeStatementIds.has(String(sug.statementId))) {
+      continue
+    }
+    const ids = Array.isArray(sug.matchedEntryIds) && sug.matchedEntryIds.length > 0
+      ? sug.matchedEntryIds
+      : [sug.matchedEntryId]
+    for (const rawId of ids) {
+      const id = String(rawId || '').trim()
+      if (id) claimed.add(id)
+    }
+  }
+  return claimed
+}
+
+/** 清洗发票品名：去掉「*信息技术服务*」这类税目星号前缀，超长时截断保留核心商品/服务名。 */
+function cleanInvoiceItemName(raw?: string | null): string {
+  const text = String(raw || '').trim()
+  if (!text) return ''
+  const stripped = text.replace(/(?:^|(?<=[,，;；、\s]))\*[^*]+\*\s*/g, '').trim()
+  const core = (stripped || text.replace(/\*/g, '').trim())
+  if (core.length <= 20) return core
+  return `${core.slice(0, 20)}…`
+}
+
+/**
+ * 为第二步「匹配单据（match）」卡片生成「来源 + 确认后果」白话说明，
+ * 让用户在点「确认配对」前看懂原单日期、性质/品名以及点击后是否会新增报销凭证。
+ */
+export function formatMatchExplanation(sug: any, liveEntry?: any): string {
+  if (!sug || sug.type !== 'match') return ''
+
+  const ids = Array.isArray(sug.matchedEntryIds) && sug.matchedEntryIds.length > 0
+    ? sug.matchedEntryIds
+    : [sug.matchedEntryId].filter(Boolean)
+
+  if (ids.length > 1) {
+    const entries = Array.isArray(sug.matchedEntries) ? sug.matchedEntries : []
+    const total = entries.length > 0
+      ? entries.reduce((sum: number, item: any) => sum + Math.abs(Number(item?.amount) || 0), 0)
+      : Math.abs(Number(sug.statement?.amount) || 0)
+    const allAdv = entries.length > 0 && entries.every((item: any) => {
+      const p = String(item?.payer || '').trim()
+      return Boolean(item?.isAdvancement) || p === 'boss_personal' || p === 'employee_personal' || p.startsWith('employee_personal:')
+    })
+    const totalText = formatMoney(total)
+    return allAdv
+      ? `合并匹配 ${ids.length} 笔垫付单据（合计 ${totalText}）· 确认后生成汇总报销还款凭证，不重复记费用`
+      : `合并匹配 ${ids.length} 笔单据（合计 ${totalText}）· 确认后统一核销对应垫付/待付单据`
+  }
+
+  const snapshot = sug.matchedEntry || {}
+  const entry = liveEntry ? { ...snapshot, ...liveEntry } : snapshot
+  if (!entry || (!entry.id && entry.amount == null && !entry.occurDate && !entry.payer && !entry.source)) {
+    return ''
+  }
+
+  const dateText = String(entry.occurDate || '').slice(0, 10)
+  const datePrefix = dateText ? `${dateText} ` : ''
+  const amountText = formatMoney(Math.abs(Number(entry.amount ?? sug.statement?.amount) || 0))
+  const cleanItem = cleanInvoiceItemName(entry.item_name ?? entry.itemName)
+  const payer = String(entry.payer || '').trim()
+  const isPersonal = Boolean(entry.isAdvancement)
+    || payer === 'boss_personal'
+    || payer === 'employee_personal'
+    || payer.startsWith('employee_personal:')
+
+  if (isPersonal) {
+    let label = '个人垫付单据'
+    if (payer === 'boss_personal') {
+      label = '老板垫付单据'
+    } else if (payer.startsWith('employee_personal:')) {
+      const empName = payer.slice('employee_personal:'.length).trim()
+      label = empName ? `员工（${empName}）垫付单据` : '员工垫付单据'
+    }
+    const detailText = cleanItem ? `（品名：${cleanItem}）` : `（${amountText}）`
+    return `${datePrefix}${label}${detailText}· 确认后生成报销还款凭证（冲减其他应付款），不重复记费用`
+  }
+
+  if (entry.isPendingInvoice || String(entry.source || '') === 'invoice_import') {
+    const isIncome = String(entry.direction || '') === 'income'
+    const label = cleanItem ? '发票' : (isIncome ? '待收款发票' : '待付款发票')
+    const detailText = cleanItem ? `（品名：${cleanItem}）` : `（${amountText}）`
+    const consequence = isIncome
+      ? '确认后按公户收款核销该发票，不重复记收入'
+      : '确认后按公户付款核销该发票，不重复记费用'
+    return `${datePrefix}${label}${detailText}· ${consequence}`
+  }
+
+  return `${datePrefix}已有记账（${amountText}）· 确认后仅关联核销流水，不新增凭证`
+}
+
+const MATCH_CATEGORY_SCOPE_HINTS: Record<string, string> = {
+  信息技术服务费: '适用于云服务、软件订阅、技术开发与测试等支出；如属在研研发项目，可点「修改单据」改挂研发支出',
+  办公费: '适用于日常办公用品、平台认证年费、打印耗材等支出',
+  咨询费: '适用于财税代理、法律、管理及专项咨询服务',
+  '广告费/推广费': '适用于投放推广、宣传物料与品牌营销支出',
+  差旅费: '适用于因公出差的交通、住宿与差旅补贴',
+  业务招待费: '适用于商务宴请、客户礼品等招待支出',
+  房租物业费: '适用于办公场地租金、物业费与基础水电支出',
+  物流快递费: '适用于快递邮寄与货物运输费用',
+  银行及金融手续费: '适用于银行转账手续费、支付通道服务费等',
+  '研发支出-费用化支出': '用于已立项研发项目的研发阶段费用归集',
+  其他支出: '当前为兜底科目，建议点「修改单据」按真实业务用途确认具体科目',
+  主营业务收入: '日常主营业务开票收入，计入营业收入',
+}
+
+/**
+ * 为第二步「匹配单据（match）」卡片的 [i] 提示生成简明「科目归类依据」，
+ * 说清该单据为什么落在当前科目（人工确认 / 规则或 AI 依据 / 发票品名）以及该科目的适用范围。
+ */
+export function formatMatchCategoryBasis(sug: any, liveEntry?: any): string {
+  if (!sug || sug.type !== 'match') return ''
+  const ids = Array.isArray(sug.matchedEntryIds) && sug.matchedEntryIds.length > 0
+    ? sug.matchedEntryIds
+    : [sug.matchedEntryId].filter(Boolean)
+  if (ids.length > 1) return ''
+
+  const snapshot = sug.matchedEntry || {}
+  const entry = liveEntry ? { ...snapshot, ...liveEntry } : snapshot
+  if (!entry || typeof entry !== 'object') return ''
+
+  const cat = String(entry.category || '').trim()
+  const rawItem = String(entry.item_name ?? entry.itemName ?? '').trim()
+  const cleanItem = cleanInvoiceItemName(rawItem)
+  const source = String(entry.categorySource || '').trim()
+  const reason = String(entry.categoryReason || '').trim()
+  if (!cat && !rawItem && !reason) return ''
+
+  const snapshotCat = String(snapshot.category || '').trim()
+  const categoryChangedLive = Boolean(liveEntry?.category && snapshotCat && String(liveEntry.category).trim() !== snapshotCat)
+  const isFallbackReason = reason.includes('默认值') || reason.includes('主营业务收入兜底')
+
+  let basis = ''
+  if (source === 'manual' || categoryChangedLive) {
+    basis = `已人工确认归入「${cat || '当前科目'}」${rawItem ? `（发票品名：${rawItem}）` : ''}`
+  } else if (reason && !isFallbackReason) {
+    const hasItemInReason = Boolean(rawItem && (reason.includes(rawItem) || (cleanItem && reason.includes(cleanItem))))
+    basis = rawItem && !hasItemInReason ? `${reason}（发票品名：${rawItem}）` : reason
+  } else if (rawItem) {
+    basis = cat ? `按发票品名「${rawItem}」归入「${cat}」` : `发票品名「${rawItem}」`
+  } else {
+    basis = `当前归入「${cat}」`
+  }
+
+  const scopeHint = cat ? MATCH_CATEGORY_SCOPE_HINTS[cat] : ''
+  return scopeHint ? `${basis.replace(/[；;。]+$/, '')}；${scopeHint}` : basis
+}
+
+/**
+ * 提取单笔匹配单据当前的分类与会计科目文本（如「5602015 管理费用-信息技术服务费」），
+ * 让用户在点「确认配对」前先一眼看到原单据将落进哪个科目。
+ */
+export function formatMatchAccountLabel(sug: any, liveEntry?: any): string {
+  if (!sug || sug.type !== 'match') return ''
+  const ids = Array.isArray(sug.matchedEntryIds) && sug.matchedEntryIds.length > 0
+    ? sug.matchedEntryIds
+    : [sug.matchedEntryId].filter(Boolean)
+  if (ids.length > 1) return ''
+
+  const snapshot = sug.matchedEntry || {}
+  const entry = liveEntry ? { ...snapshot, ...liveEntry } : snapshot
+  if (!entry || typeof entry !== 'object') return ''
+
+  const voucher = entry.voucherLines as { debit?: any[]; credit?: any[] } | undefined
+  let code = String(entry.accountCode || '').trim()
+  let name = String(entry.accountName || '').trim()
+
+  if (voucher && (Array.isArray(voucher.debit) || Array.isArray(voucher.credit))) {
+    const primarySide = String(entry.direction || '') === 'income' ? (voucher.credit || []) : (voucher.debit || [])
+    const mainLine = primarySide.find((line) => !String(line?.accountCode || '').startsWith('2221')) || primarySide[0]
+    if (mainLine) {
+      code = String(mainLine.accountCode || code).trim()
+      name = String(mainLine.accountName || name).trim()
+    }
+  }
+
+  const cat = String(entry.category || '').trim()
+  if (code && name) {
+    return cat && !name.includes(cat) ? `${cat} · ${code} ${name}` : `${code} ${name}`
+  }
+  if (name) return name
+  if (cat) return cat
+  return ''
+}
+
+/** 发票支出类兜底科目：未识别出具体业务用途时落到其他支出，对账确认前需由用户拍板。 */
+export function isFallbackInvoiceCategory(category?: string | null): boolean {
+  const normalized = String(category || '').trim()
+  return !normalized || normalized === '其他支出' || normalized === '管理费用-其他'
 }

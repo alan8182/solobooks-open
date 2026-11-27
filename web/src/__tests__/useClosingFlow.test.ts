@@ -14,6 +14,10 @@ const harness = vi.hoisted(() => ({
   error: vi.fn(),
   incomeStatement: vi.fn(),
   getTodos: vi.fn(),
+  success: vi.fn(),
+  reportError: vi.fn(),
+  ledgerPdf: vi.fn(),
+  saveBlob: vi.fn(),
 }))
 
 vi.mock('@/api/client', () => ({
@@ -26,7 +30,7 @@ vi.mock('naive-ui', () => ({
   useMessage: () => ({
     warning: harness.warning,
     error: harness.error,
-    success: vi.fn(),
+    success: harness.success,
   }),
   useDialog: () => ({ warning: vi.fn() }),
 }))
@@ -37,8 +41,10 @@ vi.mock('@/api/report', () => ({
 vi.mock('@/api/todo', () => ({
   getTodos: harness.getTodos,
 }))
-vi.mock('@/utils/errorPresenter', () => ({ reportErrorToast: vi.fn() }))
+vi.mock('@/utils/errorPresenter', () => ({ reportErrorToast: harness.reportError }))
 vi.mock('@/composables/useRescue', () => ({ offerRescue: () => false }))
+vi.mock('@/api/backup', () => ({ createLedgerPdfArchive: harness.ledgerPdf }))
+vi.mock('@/utils/download', () => ({ saveBlobFile: harness.saveBlob }))
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -199,5 +205,86 @@ describe('useClosingFlow closing todos', () => {
     // 失败静默：不允许因待办接口异常弹出错误提示打断结账成功页
     expect(harness.error).not.toHaveBeenCalled()
     expect(harness.warning).not.toHaveBeenCalled()
+  })
+})
+
+describe('useClosingFlow PDF archive export', () => {
+  function mountFlow() {
+    return useClosingFlow({
+      month: ref('2026-10'),
+      currentStep: ref(3),
+      periodCloseChecks: ref<any>(null),
+      hasBlockingPayroll: ref(false),
+      isZeroRecordMonth: ref(false),
+      confirmZeroActivity: ref(false),
+      loadReconciliationHealth: vi.fn(async () => {}),
+      hasBlockingReconciliationRisk: () => false,
+      entryStore: { fetchEntries: vi.fn(async () => {}) } as any,
+    })
+  }
+
+  it('requests and saves the real ledger PDF instead of a fake toast', async () => {
+    const blob = new Blob(['%PDF-1.4'], { type: 'application/pdf' })
+    harness.ledgerPdf.mockResolvedValue(blob)
+    const flow = mountFlow()
+
+    await flow.downloadReport()
+
+    expect(harness.ledgerPdf).toHaveBeenCalledWith({
+      year: 2026,
+      month: '2026-10',
+      scope: 'month',
+    })
+    expect(harness.saveBlob).toHaveBeenCalledWith(blob, '电子账簿_2026-10.pdf')
+    expect(harness.success).toHaveBeenCalled()
+    expect(flow.reportLoading.value).toBe(false)
+  })
+
+  it('reports failure and downloads nothing when archive generation fails', async () => {
+    harness.ledgerPdf.mockRejectedValue(new Error('server down'))
+    const flow = mountFlow()
+
+    await flow.downloadReport()
+
+    expect(harness.saveBlob).not.toHaveBeenCalled()
+    expect(harness.success).not.toHaveBeenCalled()
+    expect(harness.reportError).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.any(Error),
+      '生成电子账簿 PDF 失败',
+    )
+    expect(flow.reportLoading.value).toBe(false)
+  })
+})
+
+describe('useClosingFlow fetchClosedMetrics', () => {
+  it('将银行利息收入（finance_expenses < 0）归入本月收入与利息提示，避免成本费用显示为负数', async () => {
+    harness.incomeStatement.mockResolvedValue({
+      rows: [
+        { key: 'operating_revenue', values: { current: 0 } },
+        { key: 'nonoperating_income', values: { current: 2.29 } },
+        { key: 'finance_expenses', values: { current: -12.7 } },
+      ],
+      totals: { netProfit: { current: 14.99 } },
+    })
+
+    const flow = useClosingFlow({
+      month: ref('2026-09'),
+      currentStep: ref(3),
+      periodCloseChecks: ref<any>(null),
+      hasBlockingPayroll: ref(false),
+      isZeroRecordMonth: ref(false),
+      confirmZeroActivity: ref(false),
+      loadReconciliationHealth: vi.fn(async () => {}),
+      hasBlockingReconciliationRisk: () => false,
+      entryStore: { fetchEntries: vi.fn(async () => {}) } as any,
+    })
+
+    await flow.fetchClosedMetrics()
+
+    expect(flow.monthlyIncome.value).toBe(14.99)
+    expect(flow.monthlyExpense.value).toBe(0)
+    expect(flow.netProfit.value).toBe(14.99)
+    expect(flow.monthlyInterestIncome.value).toBe(12.7)
   })
 })
